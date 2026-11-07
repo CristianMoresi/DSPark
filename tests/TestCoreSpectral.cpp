@@ -15,6 +15,8 @@
 #include <chrono>
 #include <thread>
 #include <cmath>
+#include <cstdint>
+#include <iostream>
 #include <vector>
 
 using namespace dspark;
@@ -1642,4 +1644,70 @@ DSPARK_TEST(Convolver_non_uniform_nulls_against_direct_convolution)
         }
     }
     EXPECT_GT(split, 10);
+}
+
+// A long IR runs on growing tail partitions (1024, 2048, 4096, then 8192 for
+// the rest): 280 of 1024 became 40 in four levels for a 6 s IR. A pure
+// speed-up: the convolution must stay exact, at any block size.
+DSPARK_TEST(ZeroLatencyConvolver_growing_partitions_null_against_exact)
+{
+    const int irLen = 288000; // 6 s at 48 kHz
+    const int total = 320000;
+    uint32_t rng = 0x5A5A5A5Au;
+    auto frand = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<float>(rng >> 8) / 8388608.0f - 1.0f;
+    };
+    std::vector<float> ir(static_cast<size_t>(irLen));
+    double env = 1.0;
+    for (auto& v : ir) { v = static_cast<float>(frand() * env); env *= 0.99998; }
+    std::vector<float> x(static_cast<size_t>(total));
+    for (auto& v : x) v = 0.5f * frand();
+
+    // Exact reference: one double-precision FFT convolution.
+    int N = 4;
+    while (N < total + irLen) N <<= 1;
+    std::vector<double> a(static_cast<size_t>(N), 0.0), b(static_cast<size_t>(N), 0.0);
+    std::vector<double> A(static_cast<size_t>(N) + 2), B(static_cast<size_t>(N) + 2), ref(static_cast<size_t>(N));
+    for (int i = 0; i < total; ++i) a[static_cast<size_t>(i)] = x[static_cast<size_t>(i)];
+    for (int i = 0; i < irLen; ++i) b[static_cast<size_t>(i)] = ir[static_cast<size_t>(i)];
+    FFTReal<double> fft(N);
+    fft.forward(a.data(), A.data());
+    fft.forward(b.data(), B.data());
+    for (int k = 0; k <= N / 2; ++k)
+    {
+        const double re = A[static_cast<size_t>(2 * k)] * B[static_cast<size_t>(2 * k)]
+                        - A[static_cast<size_t>(2 * k + 1)] * B[static_cast<size_t>(2 * k + 1)];
+        const double im = A[static_cast<size_t>(2 * k)] * B[static_cast<size_t>(2 * k + 1)]
+                        + A[static_cast<size_t>(2 * k + 1)] * B[static_cast<size_t>(2 * k)];
+        A[static_cast<size_t>(2 * k)] = re;
+        A[static_cast<size_t>(2 * k + 1)] = im;
+    }
+    fft.inverse(A.data(), ref.data());
+    double peak = 0.0;
+    for (int i = 0; i < total; ++i) peak = std::max(peak, std::abs(ref[static_cast<size_t>(i)]));
+
+    for (int block : { 64, 0 })
+    {
+        ZeroLatencyConvolver<float> conv;
+        conv.prepare(ir.data(), irLen);
+        EXPECT_EQ(conv.getNumTailLevels(), 4);
+        EXPECT_EQ(conv.getNumTailPartitions(), 2 + 2 + 2 + 34);
+        std::vector<float> y = x;
+        uint32_t br = 11u;
+        for (int i = 0; i < total;)
+        {
+            int n = block;
+            if (n <= 0) { br = br * 1103515245u + 12345u; n = 1 + static_cast<int>((br >> 16) % 900); }
+            n = std::min(n, total - i);
+            conv.processInPlace(y.data() + i, n);
+            i += n;
+        }
+        double err = 0.0;
+        for (int i = 0; i < total; ++i)
+            err = std::max(err, std::abs(static_cast<double>(y[static_cast<size_t>(i)]) - ref[static_cast<size_t>(i)]));
+        const double db = 20.0 * std::log10(err / peak);
+        std::cout << "  block " << block << ": max error " << db << " dB re peak\n";
+        EXPECT_LT(db, -115.0);
+    }
 }

@@ -207,6 +207,11 @@ public:
 
     /**
      * @brief Sets the phase/processing mode of the crossover (IIR or linear-phase).
+     *
+     * Linear phase adds the crossover's fixed latency (3072 samples at
+     * 48 kHz, whatever the block size; see CrossoverFilter::getLatency()),
+     * which getLatency() includes.
+     *
      * @param mode Selected filter mode from the CrossoverFilter enum.
      */
     void setCrossoverMode(typename CrossoverFilter<T, MaxBands>::FilterMode mode) noexcept

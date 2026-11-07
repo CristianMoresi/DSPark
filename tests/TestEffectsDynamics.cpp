@@ -21,9 +21,12 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -2973,5 +2976,514 @@ DSPARK_TEST(CrossoverFilter_band_sum_is_flat)
             worst = std::max(worst, std::abs(10.0 * std::log10(re * re + im * im)));
         }
         EXPECT_LT(worst, 1e-5);
+    }
+}
+
+// ============================================================================
+// Round 2: decoupled Clean ballistics, feed-forward block path, feedback RMS
+// loop floor, fixed-length linear-phase crossover, block-independent glide.
+// ============================================================================
+
+namespace {
+
+// Least-squares fit of a tone of known frequency over [from, to); returns the
+// residual-to-tone power ratio (THD+N, dB) and the tone's peak level (dBFS).
+template <typename T>
+std::pair<double, double> toneThdnAndLevel(const std::vector<T>& y, int from, int to, double f, double fs)
+{
+    double ss = 0, sc = 0, cc = 0, ys = 0, yc = 0;
+    for (int i = from; i < to; ++i)
+    {
+        const double s = std::sin(2.0 * kPiD * f * i / fs), c = std::cos(2.0 * kPiD * f * i / fs);
+        const double v = static_cast<double>(y[static_cast<size_t>(i)]);
+        ss += s * s; sc += s * c; cc += c * c; ys += v * s; yc += v * c;
+    }
+    const double det = ss * cc - sc * sc;
+    const double a = (ys * cc - yc * sc) / det, b = (yc * ss - ys * sc) / det;
+    double err = 0, sig = 0;
+    for (int i = from; i < to; ++i)
+    {
+        const double fit = a * std::sin(2.0 * kPiD * f * i / fs) + b * std::cos(2.0 * kPiD * f * i / fs);
+        const double e = static_cast<double>(y[static_cast<size_t>(i)]) - fit;
+        err += e * e; sig += fit * fit;
+    }
+    return { 10.0 * std::log10(err / sig), 20.0 * std::log10(std::sqrt(a * a + b * b)) };
+}
+
+// Runs a mono buffer through a CrossoverFilter in blocks (random sizes in
+// [1, block] when `randomSizes`), collecting every band.
+std::vector<Vec> crossoverSplit(CrossoverFilter<float>& x, const Vec& in, int bands, int block,
+                                bool randomSizes = false)
+{
+    const int n = static_cast<int>(in.size());
+    std::vector<Vec> out(static_cast<size_t>(bands), Vec(static_cast<size_t>(n), 0.0f));
+    Vec work = in;
+    uint32_t rng = 0x2468ACE1u;
+    for (int off = 0; off < n;)
+    {
+        int m = block;
+        if (randomSizes)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            m = 1 + static_cast<int>((rng >> 8) % static_cast<uint32_t>(block));
+        }
+        m = std::min(m, n - off);
+        float* ip = work.data() + off;
+        AudioBufferView<float> iv(&ip, 1, m);
+        std::vector<float*> p(static_cast<size_t>(bands));
+        std::vector<AudioBufferView<float>> views;
+        for (int b = 0; b < bands; ++b)
+        {
+            p[static_cast<size_t>(b)] = out[static_cast<size_t>(b)].data() + off;
+            views.emplace_back(&p[static_cast<size_t>(b)], 1, m);
+        }
+        x.processBlock(iv, views.data(), bands);
+        off += m;
+    }
+    return out;
+}
+
+// Zero-phase magnitude (dB) of a kernel centred at `centre`, at `f`.
+double kernelResponseDb(const Vec& h, int centre, int halfSpan, double f, double fs)
+{
+    double re = 0, im = 0;
+    for (int i = -halfSpan; i < halfSpan; ++i)
+    {
+        const double v = h[static_cast<size_t>(centre + i)];
+        const double ph = -2.0 * kPiD * f * i / fs;
+        re += v * std::cos(ph); im += v * std::sin(ph);
+    }
+    return 10.0 * std::log10(re * re + im * im);
+}
+
+} // namespace
+
+// Defect: the Clean peak detector's branching one-pole released toward every
+// zero crossing of a tone, so the gain rode the waveform: a 1 kHz tone 14 dB
+// over a 4:1 threshold at 5/100 ms measured THD+N -65.5 dB, and the level sat
+// 0.8 dB above the peak-referenced static curve (the envelope sagged between
+// peaks). The opt-in decoupled ballistics measure -102 dB and land on the
+// curve.
+DSPARK_TEST(Compressor_clean_peak_gain_does_not_ride_a_tone)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 3.0);
+    Compressor<double> comp;
+    comp.prepare(AudioSpec{ fs, 512, 1 });
+    comp.setThreshold(-20.0);
+    comp.setRatio(4.0);
+    comp.setAttack(5.0);
+    comp.setRelease(100.0);
+    comp.setCleanBallistics(Compressor<double>::CleanBallistics::Decoupled);
+    // Default detector (Peak) and character (Clean).
+
+    const double amp = std::pow(10.0, -6.0 / 20.0); // peak 14 dB over the threshold
+    std::vector<double> y(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) y[static_cast<size_t>(i)] = amp * std::sin(2.0 * kPiD * 1000.0 * i / fs);
+    for (int pos = 0; pos < n; pos += 512)
+    {
+        double* chans[1] = { y.data() + pos };
+        comp.processBlock(AudioBufferView<double>(chans, 1, std::min(512, n - pos)));
+    }
+    const auto [thdn, level] = toneThdnAndLevel(y, n - 48000, n, 1000.0, fs);
+    std::cout << "  THD+N " << thdn << " dB, peak level " << level << " dBFS\n";
+    EXPECT_LT(thdn, -95.0);                       // branching: -65.5 dB
+    EXPECT_NEAR(level, -6.0 - 14.0 * 0.75, 0.05); // branching: 0.8 dB above
+}
+
+// The decoupled ballistics keep the knob contract: attack and release t63 of
+// the dB envelope on the knob values (a hold stage plus a smoothing pole, with
+// the hold's release solved so the series still crosses 1/e at the knob).
+DSPARK_TEST(Compressor_clean_decoupled_ballistics_keep_t63_on_the_knobs)
+{
+    const double fs = 48000.0;
+    constexpr int kB = 4; // fine meter grid: the 1 ms attack is only 48 samples
+    const std::pair<double, double> times[] = { { 5.0, 100.0 }, { 1.0, 30.0 }, { 40.0, 60.0 } };
+    for (const auto& [att, rel] : times)
+    {
+        Compressor<double> comp;
+        comp.prepare(AudioSpec{ fs, 64, 1 });
+        comp.setThreshold(-20.0);
+        comp.setRatio(4.0);
+        comp.setAttack(att);
+        comp.setRelease(rel);
+        comp.setCleanBallistics(Compressor<double>::CleanBallistics::Decoupled);
+        // A constant level gives an ideal step to the static target.
+        const int up = static_cast<int>(fs * 2.0), down = static_cast<int>(fs * 1.0);
+        std::vector<double> gr;
+        std::vector<double> x(kB);
+        auto run = [&](double level, int count) {
+            for (int k = 0; k < count; k += kB)
+            {
+                std::fill(x.begin(), x.end(), level);
+                double* ch[1] = { x.data() };
+                comp.processBlock(AudioBufferView<double>(ch, 1, kB));
+                gr.push_back(comp.getGainReductionDb());
+            }
+        };
+        run(1.0, up);   // 0 dBFS: 20 dB over, 15 dB of reduction
+        run(0.0, down);
+        const size_t edge = static_cast<size_t>(up / kB);
+        const double depth = gr[edge - 1];
+        EXPECT_NEAR(depth, -15.0, 1e-3);
+        // Interpolated t63 crossings on the kB-sample meter (sampled at the
+        // end of each block: the crossing time is measured from that grid).
+        auto t63 = [&](size_t from, size_t to, double start, double end) {
+            const double level = end + (start - end) * std::exp(-1.0);
+            double prev = start;
+            for (size_t b = from; b < to; ++b)
+            {
+                const double a = prev - level, c = gr[b] - level;
+                if ((a < 0) != (c < 0))
+                    return (static_cast<double>(b - from) + a / (a - c)) * kB / fs * 1000.0;
+                prev = gr[b];
+            }
+            return -1.0;
+        };
+        const double attMs = t63(0, edge, 0.0, depth);
+        const double relMs = t63(edge, gr.size(), depth, 0.0);
+        std::cout << "  " << att << "/" << rel << " ms: attack t63 " << attMs << " ms, release t63 " << relMs << " ms\n";
+        EXPECT_NEAR(attMs, att, att * 0.03 + 0.05);
+        EXPECT_NEAR(relMs, rel, rel * 0.03 + 0.05);
+    }
+}
+
+// The feed-forward block path runs its passes over chunks of frames; each
+// frame does the arithmetic of the per-sample path. Pinned bit-exact against
+// processSample() on a mono stream with live parameter automation, for the
+// decoupled Clean ballistics, the Opto dual envelope and the branching option.
+DSPARK_TEST(Compressor_feed_forward_block_path_matches_processSample)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 1.0);
+    uint32_t rng = 12345u;
+    std::vector<float> x(static_cast<size_t>(n));
+    for (auto& v : x)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = 0.4f * (static_cast<float>(rng >> 8) / 8388608.0f - 1.0f);
+    }
+    for (int setup = 0; setup < 3; ++setup)
+    {
+        Compressor<float> block, sample;
+        for (auto* c : { &block, &sample })
+        {
+            c->prepare(AudioSpec{ fs, 256, 1 });
+            c->setThreshold(-24.0f);
+            c->setRatio(3.0f);
+            c->setKnee(6.0f);
+            c->setAttack(2.0f);
+            c->setRelease(80.0f);
+            if (setup == 1) c->setCharacter(Compressor<float>::Character::Opto);
+            if (setup == 2) c->setCleanBallistics(Compressor<float>::CleanBallistics::Decoupled);
+        }
+        std::vector<float> yb = x, ys = x;
+        for (int pos = 0; pos < n; pos += 256)
+        {
+            if (pos == n / 2) // a threshold glide through the smoothers
+                for (auto* c : { &block, &sample }) c->setThreshold(-30.0f);
+            const int m = std::min(256, n - pos);
+            float* ch[1] = { yb.data() + pos };
+            block.processBlock(AudioBufferView<float>(ch, 1, m));
+            for (int i = pos; i < pos + m; ++i)
+                ys[static_cast<size_t>(i)] = sample.processSample(ys[static_cast<size_t>(i)], 0);
+        }
+        float maxDiff = 0.0f;
+        for (int i = 0; i < n; ++i)
+            maxDiff = std::max(maxDiff, std::abs(yb[static_cast<size_t>(i)] - ys[static_cast<size_t>(i)]));
+        EXPECT_EQ(maxDiff, 0.0f);
+    }
+}
+
+// Defect: in FeedBack with the RMS detector the loop ran faster than the
+// detector's window could report its own effect, so a release shorter than
+// the window overshot and rang: a 12 dB level drop overshot the settled gain
+// by 3.0 dB (window 10 ms, release 1 ms) and a rise over-compressed by 4.5 dB
+// (attack 0.5 ms), with ~40 direction changes. The loop advance is now capped
+// at the critically damped limit for the window's delay (twice that on the
+// attack side): no overshoot either way.
+DSPARK_TEST(Compressor_feedback_rms_loop_does_not_ring)
+{
+    const double fs = 48000.0;
+    const std::pair<float, float> times[] = { { 0.5f, 1.0f }, { 5.0f, 5.0f } };
+    for (const auto& [att, rel] : times)
+    {
+        Compressor<float> comp;
+        comp.prepare(AudioSpec{ fs, 64, 1 });
+        comp.setThreshold(-20.0f);
+        comp.setRatio(4.0f);
+        comp.setAttack(att);
+        comp.setRelease(rel);
+        comp.setTopology(Compressor<float>::Topology::FeedBack);
+        comp.setDetector(Compressor<float>::DetectorType::Rms);
+        comp.setRmsWindow(10.0f);
+        const int seg = static_cast<int>(fs * 1.0);
+        std::vector<float> gr;
+        std::vector<float> buf(64);
+        int t = 0;
+        for (const float amp : { 1.0f, 0.25f, 1.0f })
+        {
+            for (int k = 0; k < seg; k += 64)
+            {
+                for (int i = 0; i < 64; ++i, ++t)
+                    buf[static_cast<size_t>(i)] = amp * static_cast<float>(std::sin(2.0 * kPiD * 1000.0 * t / fs));
+                float* ch[1] = { buf.data() };
+                comp.processBlock(AudioBufferView<float>(ch, 1, 64));
+                gr.push_back(comp.getGainReductionDb());
+            }
+        }
+        const size_t b1 = static_cast<size_t>(seg / 64), b2 = 2 * b1;
+        const float hi = gr[b1 - 1], lo = gr[b2 - 1];
+        float overshoot = 0.0f, undershoot = 0.0f;
+        for (size_t b = b1; b < b2; ++b) overshoot = std::max(overshoot, gr[b] - lo);
+        for (size_t b = b2; b < gr.size(); ++b) undershoot = std::max(undershoot, hi - gr[b]);
+        std::cout << "  attack " << att << " release " << rel << ": overshoot " << overshoot
+                  << " dB, undershoot " << undershoot << " dB\n";
+        EXPECT_NEAR(hi, -12.74f, 0.05f); // the static curve on the RMS level
+        EXPECT_LT(overshoot, 0.05f);
+        EXPECT_LT(undershoot, 0.05f);
+    }
+}
+
+// Defect: the linear-phase FIR length was the host's maxBlockSize, so its
+// low-frequency resolution followed the host: band 0 of a 200 Hz LR24 split
+// read -12.6 dB at 100 Hz with 64-sample blocks (-1.7 dB at 512) against the
+// ideal -0.527 dB. The FIR now has a fixed ~85 ms length with a flat-top
+// window: the ideal response at every block size, and one fixed latency.
+DSPARK_TEST(CrossoverFilter_linear_phase_resolution_is_block_independent)
+{
+    const double fs = 48000.0;
+    int latency = -1;
+    for (int bs : { 64, 512, 4096 })
+    {
+        CrossoverFilter<float> x;
+        x.setNumBands(2);
+        x.setOrder(24);
+        x.setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+        x.prepare(AudioSpec{ fs, bs, 1 });
+        x.setCrossoverFrequency(0, 200.0f);
+        const int n = 1 << 15, t0 = 8192;
+        Vec in(static_cast<size_t>(n), 0.0f);
+        in[static_cast<size_t>(t0)] = 1.0f;
+        const auto out = crossoverSplit(x, in, 2, bs);
+        if (latency < 0) latency = x.getLatency();
+        EXPECT_EQ(x.getLatency(), latency);
+        const int centre = t0 + x.getLatency();
+        const double at100 = kernelResponseDb(out[0], centre, 4096, 100.0, fs);
+        const double at400 = kernelResponseDb(out[0], centre, 4096, 400.0, fs);
+        std::cout << "  maxBlock " << bs << ": band 0 " << at100 << " dB @100 Hz, " << at400 << " dB @400 Hz\n";
+        EXPECT_NEAR(at100, -0.527, 0.02); // 64-sample blocks used to read -12.6
+        EXPECT_NEAR(at400, -24.61, 0.05);
+    }
+    EXPECT_EQ(latency, 3072);
+}
+
+// Defect: band b carried only the high-pass of the split right below it, so
+// close splits did not telescope to 1: 100/150/225 Hz (LR24) summed 0.87 dB
+// off flat, 1.4e-3 away from the delayed input. Each band now carries the
+// high-pass of every split below it, like the IIR tree.
+DSPARK_TEST(CrossoverFilter_linear_phase_close_splits_sum_to_delayed_input)
+{
+    CrossoverFilter<float> x;
+    x.setNumBands(4);
+    x.setOrder(24);
+    x.setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+    x.prepare(AudioSpec{ 48000.0, 512, 1 });
+    x.setCrossoverFrequency(0, 100.0f);
+    x.setCrossoverFrequency(1, 150.0f);
+    x.setCrossoverFrequency(2, 225.0f);
+    const int n = 1 << 15, t0 = 4096;
+    Vec in(static_cast<size_t>(n), 0.0f);
+    in[static_cast<size_t>(t0)] = 1.0f;
+    const auto out = crossoverSplit(x, in, 4, 512);
+    double worst = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        double s = 0.0;
+        for (int b = 0; b < 4; ++b) s += out[static_cast<size_t>(b)][static_cast<size_t>(i)];
+        worst = std::max(worst, std::abs(s - ((i == t0 + x.getLatency()) ? 1.0 : 0.0)));
+    }
+    EXPECT_LT(worst, 1e-5);
+}
+
+// The partitioned linear-phase engine buffers internally: the same input in
+// any block partition gives bit-identical bands.
+DSPARK_TEST(CrossoverFilter_linear_phase_output_is_block_size_independent)
+{
+    const int n = 24000;
+    uint32_t rng = 777u;
+    Vec in(static_cast<size_t>(n));
+    for (auto& v : in)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = 0.3f * (static_cast<float>(rng >> 8) / 8388608.0f - 1.0f);
+    }
+    auto make = [] {
+        auto x = std::make_unique<CrossoverFilter<float>>();
+        x->setNumBands(3);
+        x->setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+        x->prepare(AudioSpec{ 48000.0, 512, 1 });
+        return x;
+    };
+    auto ref = make();
+    const auto a = crossoverSplit(*ref, in, 3, 512);
+    for (int bs : { 1, 7, 333 })
+    {
+        auto x = make();
+        const auto b = crossoverSplit(*x, in, 3, bs, bs == 333);
+        float maxDiff = 0.0f;
+        for (int band = 0; band < 3; ++band)
+            for (int i = 0; i < n; ++i)
+                maxDiff = std::max(maxDiff, std::abs(a[static_cast<size_t>(band)][static_cast<size_t>(i)]
+                                                     - b[static_cast<size_t>(band)][static_cast<size_t>(i)]));
+        EXPECT_EQ(maxDiff, 0.0f);
+    }
+}
+
+// Defect: the IIR glide refreshed its coefficients on a 32-sample grid that
+// restarted at every block, so a crossover glide depended on the host block
+// size (up to 0.14 between 1-sample and 512-sample blocks on a 1 kHz tone).
+// The grid now runs across blocks: bit-identical at any block size.
+DSPARK_TEST(CrossoverFilter_glide_is_block_size_independent)
+{
+    const int n = 12000;
+    const Vec in = makeSine(1000.0, 0.5, 48000.0, n);
+    auto make = [] {
+        auto x = std::make_unique<CrossoverFilter<float>>();
+        x->setNumBands(2);
+        x->prepare(AudioSpec{ 48000.0, 512, 1 });
+        x->setCrossoverFrequency(0, 500.0f);
+        const Vec warm(4096, 0.0f);
+        (void)crossoverSplit(*x, warm, 2, 512);
+        x->setCrossoverFrequency(0, 4000.0f); // glides over the next blocks
+        return x;
+    };
+    auto ref = make();
+    const auto a = crossoverSplit(*ref, in, 2, 512);
+    for (int bs : { 1, 100, 333 })
+    {
+        auto x = make();
+        const auto b = crossoverSplit(*x, in, 2, bs, bs == 333);
+        float maxDiff = 0.0f;
+        for (int i = 0; i < n; ++i)
+            maxDiff = std::max(maxDiff, std::abs(a[0][static_cast<size_t>(i)] - b[0][static_cast<size_t>(i)]));
+        EXPECT_EQ(maxDiff, 0.0f);
+    }
+}
+
+// Defect: in linear-phase mode a live band-count change left the bands it
+// added without an output partition of their own, so the band sum missed or
+// replayed content until the next partition: 0.155 of error against the
+// delayed input (0.70 with the first fixed-length engine) over random
+// band-count, frequency and order changes. Each change now lands as one
+// complete design; until then the playing design's bands are kept, silent or
+// folded into the last requested band, so the sum stays the delayed input.
+DSPARK_TEST(CrossoverFilter_linear_phase_bands_sum_through_live_changes)
+{
+    const int n = 48000 * 6, maxBlock = 700;
+    auto x = std::make_unique<CrossoverFilter<float>>();
+    x->setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+    x->setNumBands(4);
+    x->prepare(AudioSpec{ 48000.0, maxBlock, 2 });
+    const int latency = x->getLatency();
+    Vec in[2], sum[2];
+    uint32_t s = 7u;
+    for (int c = 0; c < 2; ++c)
+    {
+        in[c].resize(static_cast<size_t>(n));
+        sum[c].assign(static_cast<size_t>(n), 0.0f);
+        for (auto& v : in[c]) { s = s * 1664525u + 1013904223u; v = static_cast<float>(s >> 8) / 16777216.0f - 0.5f; }
+    }
+    std::vector<Vec> out(12, Vec(static_cast<size_t>(2 * maxBlock), 0.0f));
+    uint32_t r = 99u;
+    int changes = 0;
+    for (int pos = 0; pos < n;)
+    {
+        r = r * 1103515245u + 12345u;
+        const int m = std::min(n - pos, 1 + static_cast<int>((r >> 16) % static_cast<uint32_t>(maxBlock)));
+        r = r * 1103515245u + 12345u;
+        const int ev = static_cast<int>((r >> 16) % 40u);
+        if (ev == 0) { x->setNumBands(2 + static_cast<int>((r >> 8) % 11u)); ++changes; }
+        else if (ev == 1) { x->setCrossoverFrequency(0, 60.0f + static_cast<float>((r >> 4) % 400u)); ++changes; }
+        else if (ev == 2) { x->setOrder((r & 1u) ? 48 : 12); ++changes; }
+        else if (ev == 3) { x->setOrder(24); ++changes; }
+        float* ich[2] = { in[0].data() + pos, in[1].data() + pos };
+        float* och[12][2];
+        std::vector<AudioBufferView<float>> views;
+        for (int b = 0; b < 12; ++b)
+        {
+            och[b][0] = out[static_cast<size_t>(b)].data();
+            och[b][1] = out[static_cast<size_t>(b)].data() + maxBlock;
+            views.emplace_back(och[b], 2, m);
+        }
+        const int got = x->processBlock(AudioBufferView<float>(ich, 2, m), views.data(), 12);
+        for (int c = 0; c < 2; ++c)
+            for (int b = 0; b < got; ++b)
+                for (int i = 0; i < m; ++i)
+                    sum[c][static_cast<size_t>(pos + i)] += och[b][c][i];
+        pos += m;
+    }
+    double err = 0.0;
+    for (int c = 0; c < 2; ++c)
+        for (int i = latency; i < n; ++i)
+            err = std::max(err, static_cast<double>(std::abs(sum[c][static_cast<size_t>(i)]
+                                                             - in[c][static_cast<size_t>(i - latency)])));
+    std::cout << "  " << changes << " live changes: max |band sum - delayed input| " << err << "\n";
+    EXPECT_GT(changes, 30);
+    EXPECT_LT(err, 1e-5);
+}
+
+// A linear-phase change is designed over a few blocks into the kernel set
+// that is not playing, then swapped in whole: no block pays for the whole
+// design. Pinned: after a move the bands become bit-identical to those of a
+// crossover prepared with the new frequency, and stay so, within eight
+// partitions (8192 samples) at small and large blocks. Mono is the slow
+// case: the design budget follows the steady work, which halves with one
+// channel (7168 samples at 512-sample blocks, 1792 at 64).
+DSPARK_TEST(CrossoverFilter_linear_phase_change_lands_on_the_new_design)
+{
+    for (int block : { 64, 512 })
+    {
+        auto a = std::make_unique<CrossoverFilter<float>>();
+        auto b = std::make_unique<CrossoverFilter<float>>();
+        for (auto* x : { a.get(), b.get() })
+        {
+            x->setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+            x->setNumBands(4);
+        }
+        b->setCrossoverFrequency(0, 230.0f);
+        for (auto* x : { a.get(), b.get() }) x->prepare(AudioSpec{ 48000.0, block, 1 });
+        const int warm = 16384 / block, total = warm + 2 * 48000 / block;
+        std::vector<Vec> oa(4, Vec(static_cast<size_t>(block))), ob(4, Vec(static_cast<size_t>(block)));
+        Vec in(static_cast<size_t>(block));
+        int landed = -1;
+        uint32_t s = 3u;
+        for (int k = 0; k < total; ++k)
+        {
+            if (k == warm) a->setCrossoverFrequency(0, 230.0f);
+            for (auto& v : in) { s = s * 1664525u + 1013904223u; v = static_cast<float>(s >> 8) / 16777216.0f - 0.5f; }
+            for (int t = 0; t < 2; ++t)
+            {
+                auto& o = t == 0 ? oa : ob;
+                float* ip = in.data();
+                float* p[4];
+                std::vector<AudioBufferView<float>> views;
+                for (int band = 0; band < 4; ++band)
+                {
+                    p[band] = o[static_cast<size_t>(band)].data();
+                    views.emplace_back(&p[band], 1, block);
+                }
+                (t == 0 ? *a : *b).processBlock(AudioBufferView<float>(&ip, 1, block), views.data(), 4);
+            }
+            bool same = true;
+            for (int band = 0; band < 4; ++band)
+                same = same && std::memcmp(oa[static_cast<size_t>(band)].data(), ob[static_cast<size_t>(band)].data(),
+                                           sizeof(float) * static_cast<size_t>(block)) == 0;
+            if (k >= warm && same && landed < 0) landed = k - warm;
+            if (k >= warm && !same) landed = -1;
+        }
+        std::cout << "  block " << block << ": new design heard after " << landed << " blocks\n";
+        EXPECT_GT(landed, -1);
+        EXPECT_LT(landed * block, 8193);
     }
 }

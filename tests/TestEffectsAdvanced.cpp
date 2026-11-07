@@ -356,7 +356,8 @@ DSPARK_TEST(CrossoverFilter_linear_phase_engages_after_prepare)
     xover.prepare(spec(48000.0, 512, 1)); // prepared in MinimumPhase
     xover.setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
 
-    EXPECT_EQ(xover.getLatency(), 256);
+    // Half the 4096-tap FIR plus one 1024-sample partition at 48 kHz.
+    EXPECT_EQ(xover.getLatency(), 3072);
 
     AudioBuffer<float> low, high;
     low.resize(1, 512);
@@ -366,30 +367,35 @@ DSPARK_TEST(CrossoverFilter_linear_phase_engages_after_prepare)
     // Impulse: the band sum of an engaged linear-phase engine is a pure delay
     // of getLatency() samples (the IIR fallback would peak at sample 0).
     auto input = makeBuffer(1, 512);
-    std::fill(input.ch(0), input.ch(0) + 512, 0.0f);
-    input.ch(0)[0] = 1.0f;
-    xover.processBlock(input.view(), views, 2);
     int argmax = 0;
     float peak = 0.0f;
-    for (int i = 0; i < 512; ++i)
+    for (int k = 0; k < 8; ++k)
     {
-        const float v = std::fabs(low.getChannel(0)[i] + high.getChannel(0)[i]);
-        if (v > peak) { peak = v; argmax = i; }
+        std::fill(input.ch(0), input.ch(0) + 512, 0.0f);
+        if (k == 0) input.ch(0)[0] = 1.0f;
+        xover.processBlock(input.view(), views, 2);
+        for (int i = 0; i < 512; ++i)
+        {
+            const float v = std::fabs(low.getChannel(0)[i] + high.getChannel(0)[i]);
+            if (v > peak) { peak = v; argmax = k * 512 + i; }
+        }
     }
     EXPECT_EQ(argmax, xover.getLatency());
     EXPECT_NEAR(peak, 1.0f, 0.05f);
 
     // Kernels must follow the setter: after fc 500 -> 4000, a 2 kHz tone
     // belongs in band 0 (low). The old code kept the prepare-time kernels.
+    // The new design is built over the following blocks (14 mono blocks of
+    // 512 samples here) and then needs the latency to reach the output.
     xover.setCrossoverFrequency(0, 4000.0f);
     float e0 = 0.0f, e1 = 0.0f;
-    for (int k = 0; k < 8; ++k)
+    for (int k = 0; k < 40; ++k)
     {
         for (int i = 0; i < 512; ++i)
             input.ch(0)[i] = std::sin(2.0f * 3.14159265f * 2000.0f
                                       * static_cast<float>(k * 512 + i) / 48000.0f);
         xover.processBlock(input.view(), views, 2);
-        if (k >= 4)
+        if (k >= 32)
         {
             e0 += measureRMS(low.getChannel(0), 512);
             e1 += measureRMS(high.getChannel(0), 512);

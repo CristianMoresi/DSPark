@@ -75,6 +75,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         c.setMode(Compressor<float>::Mode::Upward);
         c.setCharacter(Compressor<float>::Character::FET);
         c.setCharacterColor(0.65f);
+        c.setCleanBallistics(Compressor<float>::CleanBallistics::Decoupled);
     })));
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);

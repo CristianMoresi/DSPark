@@ -56,6 +56,18 @@ All notable user-facing changes to DSPark are documented here.
   drive the output differs from the clamp by -10.4 dB (second harmonic
   -33.9 against -15.0 dBc). Setup thread, re-runs the calibration; state key
   "gridModel". The Clamp default is bit-identical to before.
+- `Compressor::setCleanBallistics(CleanBallistics::Decoupled)` (opt-in;
+  Branching stays the default, state key `cleanBallistics`): the Clean
+  character in feed-forward holds the gain target's peaks and smooths the held
+  envelope. On a tone 14 dB over a 4:1 threshold at 5/100 ms, THD+N measures
+  -102 dB at 1 kHz (Branching -65.5) and -42.8 dB at 30 Hz (-35.1), and the
+  level sits on the peak-referenced static curve (Branching reads 0.75 dB
+  less reduction). Attack and release t63 stay on the knobs. It follows the
+  peaks of dense material, so the same settings compress more: 1.9 dB lower
+  output on a drum programme at the defaults, 4.5 dB on a noise-like
+  programme at -24 dB, 3:1.
+- `ZeroLatencyConvolver::getNumTailLevels()`: the number of partition sizes in
+  the tail (see the Changed entry).
 - Run-time AVX2 dispatch: x86-64 builds for the generic baseline also compile
   AVX2+FMA copies of the vector kernels (the FFT passes, `firCorrelate`,
   `dotProduct`, `complexMulAccum`) and select them on CPUs that support them.
@@ -177,6 +189,18 @@ All notable user-facing changes to DSPark are documented here.
   corrected by a Newton or Halley step, replaces it: 31.6 ns per sample at
   8 V peak (148 before), 29.7 ns at 0.01 V (64 before), error -313 dB re
   peak (-191 to -216 before). Output moves by at most that former error.
+- `Compressor`: the feed-forward block path runs its stages as passes over
+  32-frame chunks, with only the ballistics recursion serial. Stereo, 512-frame
+  blocks: Clean Peak 37.9 to 7.9 ns/frame, RMS 48.7 to 15.7, Hilbert 77 to 34,
+  Opto 45 to 9.1; FeedBack Peak 41 to 25 and FET 59 to 33. Output within
+  rounding (max difference -144 dBFS on a drum programme).
+- `ZeroLatencyConvolver`: the tail runs in growing partitions (1024 doubling
+  up to 8192, the number of levels chosen per IR length for the least work
+  per sample), each level's work spread over its block. A 20 s IR takes 122
+  partitions in 4 levels instead of 936: mean cost per 64-sample block 10.4
+  to 2.9 us, largest block 34 to 16 us. Latency stays zero; the output
+  differs within rounding (null against an exact convolution -132 dB, was
+  -126 dB with a 6 s IR).
 - `OfflineSoftClipper<float>`: the analysis padding is sized for a 1e-9
   omitted tail instead of 1e-10 (`kTailTolerance`). The output differs by at
   most 3 ulp, at -149 dB re peak, and Sine/Tanh renders run 2.2x faster on
@@ -291,6 +315,47 @@ All notable user-facing changes to DSPark are documented here.
   `processBlock` unprepared. Re-applying the current value still succeeds.
 - `Saturation<double>::getState()` compiles: the slew sensitivity is written
   as float like every other parameter (the double overload was ambiguous).
+- `CrossoverFilter` linear phase: the FIR length followed the host's
+  maxBlockSize, so the low-frequency response did too (band 0 of a 200 Hz
+  LR24 split read -12.6 dB at 100 Hz with 64-sample blocks, -1.7 dB at 512,
+  against the ideal -0.527). The FIR now spans about 85 ms (4096 taps at
+  48 kHz, scaled with the rate) at every block size and runs in four
+  partitions: the response is the ideal one, the bands sum to the delayed
+  input within 3e-8 (was 1e-3 at 64-sample blocks; close splits at
+  100/150/225 Hz summed with 0.87 dB of ripple, now flat), and the output no
+  longer depends on how the host slices the stream. The latency is fixed at
+  3072 samples at 48 kHz (was maxBlockSize / 2): re-read `getLatency()`,
+  also for `MultibandCompressor` in linear-phase mode. CPU at 48 kHz stereo,
+  12 bands: the steady mean is unchanged (2.4 us per 64-sample block, 18.5 us
+  per 512), but the work now comes once per 1024-sample partition, so with
+  64-sample blocks the block that completes a partition costs 40 us (was
+  7 us, when the FIR was one block long).
+- `CrossoverFilter` linear phase: a change rebuilt every kernel inside one
+  block (150 us for that block at 12 bands, 512-sample blocks, against 21 us
+  for a steady block). A change is now designed over the following blocks
+  into a second kernel set and swapped in whole: the worst block during a
+  redesign stays within 1.5x of the worst steady block, and the new response
+  is heard 9-30 ms after a change with 64-sample blocks, 75-85 ms with 512
+  (stereo; about twice as long in mono; it used to be heard from the next
+  block). Moving a split every 37 blocks raises the 64-sample mean to 6.5 us
+  (3.2 us when the FIR was one block long). A live band-count change also
+  left the bands it added without output for a partition, so the bands
+  stopped summing to the delayed input (0.155 of error on random live
+  changes): it now lands as one complete design, and the sum stays exact
+  (3e-7).
+- `CrossoverFilter` IIR: a frequency glide updated its coefficients every 32
+  samples of each block, so the glide depended on the host's block size (up to
+  0.14 difference against 512-sample blocks). The update grid now runs across
+  blocks; output is unchanged at block sizes that are multiples of 32.
+- `Compressor` FeedBack with the RMS detector: the loop ran faster than its
+  window could report the result, so a 12 dB drop overshot the settled gain by
+  3.0 dB (10 ms window, 1 ms release) and a rise over-compressed by 4.5 dB
+  (0.5 ms attack), ringing for about 40 direction changes. The loop advance is
+  now capped at the critically damped limit for the window (twice that on the
+  attack side): with the default 10 ms window, release settles no faster than
+  22 ms t63 and attack 14 ms, with no overshoot. Slower settings are
+  bit-identical; at the default 5/100 ms a drum programme comes out 0.5 dB
+  louder (less over-compression).
 - `StereoGenerator`: a silent tail reaches exact zero. The band, color and
   DC recursions settled into a subnormal limit cycle near 1e-321 after the
   input stopped, so the output never returned to digital silence and the

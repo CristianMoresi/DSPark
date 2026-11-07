@@ -28,28 +28,55 @@
  * at every crossover. The linear-phase path needs neither (zero-phase
  * magnitudes sum to unity by construction).
  *
- * The linear-phase FIR length equals the prepared maxBlockSize, so its
- * low-frequency resolution scales with the block size: very low crossover
- * frequencies need large blocks to be resolved. Measured on band 0 of a
- * 200 Hz LR24 split at 48 kHz (ideal -0.26 dB at 100 Hz, -24.6 dB at 400 Hz):
- * maxBlockSize 64 gives -12.6 / -13.7 dB, 512 gives -1.7 / -21.1 dB and 4096
- * gives -0.56 / -24.6 dB. The bands always sum to a pure delay. Prepare with
- * the largest block the host allows when splitting low. Kernel recomputation after
- * a frequency/order/band-count change runs on the audio thread from
- * pre-allocated scratch (no allocation, but it is a CPU spike of
- * 2 x numBands FFTs for that block).
+ * The linear-phase FIR has a fixed length of about 85 ms (4096 taps at 44.1
+ * and 48 kHz, scaling with the rate), whatever the host block size, and is
+ * run as a uniformly partitioned convolution (4 partitions, one shared input
+ * transform per channel for all bands). Its latency is fixed: half the FIR
+ * plus one partition, 3072 samples at 48 kHz. The kernels are the ideal
+ * Linkwitz-Riley magnitudes with a flat-top window (cosine tapers on the
+ * outer quarters), which keeps the passband and slopes exact: band 0 of a
+ * 200 Hz LR24 split at 48 kHz measures -0.527 dB at 100 Hz and -24.61 dB at
+ * 400 Hz (ideal -0.527 / -24.61); LR24 stays within 0.03 dB of ideal down to
+ * a 50 Hz split, LR48 down to 100 Hz. The band magnitudes telescope like the
+ * IIR tree (each band carries the high-pass of every split below it), so the
+ * bands sum to the delayed input exactly.
+ *
+ * A frequency, order or band-count change is designed on the audio thread,
+ * from scratch allocated in prepare(), over the blocks that follow: each
+ * band's kernel goes into a second kernel set, and the set is swapped in
+ * whole, so the bands always come from one design and keep summing to the
+ * delayed input (until a band-count change lands, the playing design's
+ * bands are kept, missing ones silent and extra ones folded into the last
+ * requested band). A block carries at most about half a partition's worth of
+ * design work, and a block of up to half a partition that computes a
+ * partition carries none. A change that arrives during a design lets it
+ * finish, then the next design starts from the latest targets, so continuous
+ * automation keeps landing. Measured at 48 kHz stereo: the worst block during
+ * a redesign stays within 1.5x of the worst steady block at 64 and 512-sample
+ * blocks, and the new response is heard 9-30 ms after a change with 64-sample
+ * blocks, 75-85 ms with 512-sample blocks and 130 ms with 1024 (mono takes
+ * about twice as long: the design budget follows the steady work).
+ *
+ * CPU: the work comes once per 1024-sample partition (at 48 kHz), whatever
+ * the host block. With 12 bands, stereo, 48 kHz: a steady stream costs
+ * 2.4 us per 64-sample block on average and 40 us in the block that completes
+ * a partition (one block in 16); 18.5 us per 512-sample block on average and
+ * 40 us in the partition blocks (one in 2). prepare() runs the first design
+ * whole.
  *
  * Threading model:
  * - prepare() / reset() / getState() / setState(): setup or UI threads only
  *   (prepare and getState allocate), never concurrently with processBlock().
  * - setNumBands / setCrossoverFrequency / setOrder / setFilterMode: RT-safe
  *   atomic publications from any thread; the audio thread applies them at
- *   the next block. Frequency changes are smoothed (5 ms) in IIR mode and
- *   applied instantly in linear-phase mode (kernels are rebuilt per change).
+ *   the next block. Frequency changes are smoothed (5 ms) in IIR mode, with
+ *   the coefficients refreshed on a 32-sample grid that runs across blocks
+ *   (the glide does not depend on the host block size), and designed over
+ *   the following blocks in linear-phase mode (see above).
  * - getLatency() and the getters are safe from any thread.
  *
  * Dependencies: Biquad.h, AudioBuffer.h, AudioSpec.h, DspMath.h, FFT.h,
- *               DenormalGuard.h, SmoothedValue.h, StateBlob.h.
+ *               SimdOps.h, DenormalGuard.h, SmoothedValue.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -58,6 +85,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/FFT.h"
+#include "../Core/SimdOps.h"
 #include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
 
@@ -105,8 +133,7 @@ public:
      * Configured split frequencies, band count, order and mode are preserved
      * across prepare() calls (configure-then-prepare is fully supported).
      * The linear-phase engine is always allocated (so a later mode switch
-     * works) unless maxBlockSize exceeds 2^18, in which case linear-phase
-     * mode falls back to the IIR path and getLatency() reports 0.
+     * works); its size depends on the sample rate and channel count only.
      *
      * @param spec Audio environment (sample rate, block size, channels).
      *             Invalid specs are ignored (previous state is kept).
@@ -123,47 +150,62 @@ public:
         // Allocate flat IIR work buffer (Channels * MaxBlockSize)
         workBuf_.assign(static_cast<size_t>(spec.numChannels) * static_cast<size_t>(spec.maxBlockSize), T(0));
 
-        // Linear-phase FFT resources. Allocated regardless of the current mode
-        // so setFilterMode(LinearPhase) after prepare() actually engages
-        // (mode-dependent allocation silently fell back to IIR). lpFft_ acts
-        // as the gate and is created last: if any allocation throws, the
-        // engine stays unavailable but coherent.
+        // Linear-phase resources. Allocated regardless of the current mode so
+        // setFilterMode(LinearPhase) after prepare() actually engages. The
+        // FIR length follows the sample rate (about 85 ms), never the host
+        // block. lpFft_ acts as the gate and is created last: if any
+        // allocation throws, the engine stays unavailable but coherent.
         lpFft_.reset();
-        lpFftSize_ = 0;
+        lpDesignFft_.reset();
         firLength_ = 0;
+        lpPart_ = 0;
         lpLatency_ = 0;
-        if (spec.maxBlockSize <= kLpMaxBlockSize)
         {
-            // For Overlap-Save, FFT size must be >= BlockSize + FIR_Length - 1
-            // We choose FIR_Length = maxBlockSize. Thus FFT >= 2 * maxBlockSize - 1.
-            // Floor at 4: FFTReal requires a power of two >= 4 (it throws
-            // below that, which a prepare with maxBlockSize 1 used to hit).
-            int fftPow2 = 4;
-            while (fftPow2 < spec.maxBlockSize * 2) fftPow2 <<= 1;
-            lpFftSize_ = fftPow2;
-            firLength_ = spec.maxBlockSize; // Use block size as FIR length for good resolution
-            // The kernel is centred at firLength/2 (the circular shift uses
-            // i - halfLen), so the exact group delay is firLength/2 - the old
-            // (firLength-1)/2 under-reported PDC by one sample for even sizes.
-            lpLatency_ = firLength_ / 2;
+            int firLen = 256;
+            const double wanted = spec.sampleRate * kLpFirSeconds;
+            while (firLen < wanted && firLen < kLpMaxFirLength) firLen <<= 1;
+            firLength_ = firLen;
+            lpPart_ = firLen / kLpPartitions;
+            // The kernel is centred at firLength/2; the partitioned engine
+            // adds one partition of buffering.
+            lpLatency_ = firLength_ / 2 + lpPart_;
 
-            const int numBins = lpFftSize_ / 2 + 1;
+            const size_t specLen = static_cast<size_t>(2 * lpPart_ + 2);
+            const size_t chans = static_cast<size_t>(numChannels_);
+            const size_t designBins = static_cast<size_t>(firLength_ + 1); // 2L-point design grid
 
-            lpMagnitudesFlat_.assign(static_cast<size_t>(MaxBands) * static_cast<size_t>(numBins) * 2, T(0));
-            lpPrevBlockFlat_.assign(static_cast<size_t>(spec.numChannels) * static_cast<size_t>(firLength_), T(0));
+            // Two kernel sets: one plays while the next design is built.
+            lpKernelSpec_.assign(2 * static_cast<size_t>(MaxBands * kLpPartitions) * specLen, T(0));
+            lpFdl_.assign(chans * static_cast<size_t>(kLpPartitions) * specLen, T(0));
+            lpFrame_.assign(chans * static_cast<size_t>(2 * lpPart_), T(0));
+            lpOut_.assign(chans * static_cast<size_t>(MaxBands * lpPart_), T(0));
+            lpAccum_.assign(specLen, T(0));
+            lpResult_.assign(static_cast<size_t>(2 * lpPart_), T(0));
 
-            lpFftIn_.assign(static_cast<size_t>(lpFftSize_), T(0));
-            lpFftOut_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-            lpBandFft_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-            lpFftResult_.assign(static_cast<size_t>(lpFftSize_), T(0));
+            // Design scratch, so a live crossover/order change never allocates
+            // on the audio thread (the design steps run there).
+            lpCarry_.assign(designBins, 1.0);
+            lpBinFreq_.assign(designBins, 0.0);
+            lpMag_.assign(designBins, T(0));
+            for (size_t k = 0; k < designBins; ++k)
+                lpBinFreq_[k] = spec.sampleRate * static_cast<double>(k) / static_cast<double>(2 * firLength_);
+            // Flat-top window: a cosine taper over the outer quarter on each side.
+            lpWindow_.assign(static_cast<size_t>(firLength_), T(1));
+            const int taper = firLength_ / 4;
+            for (int i = 0; i < firLength_; ++i)
+            {
+                const int edge = std::min(i, firLength_ - 1 - i);
+                if (edge < taper)
+                    lpWindow_[static_cast<size_t>(i)] = static_cast<T>(
+                        0.5 - 0.5 * std::cos(std::numbers::pi * (static_cast<double>(edge) + 0.5)
+                                             / static_cast<double>(taper)));
+            }
+            lpTimeResponse_.assign(static_cast<size_t>(2 * firLength_ + 2), T(0));
+            lpFirKernel_.assign(static_cast<size_t>(2 * firLength_), T(0));
+            lpPartPad_.assign(static_cast<size_t>(2 * lpPart_), T(0));
 
-            // Pre-allocate recompute scratch so a live crossover/order change never
-            // allocates on the audio thread (recomputeLinearPhaseMagnitudes runs there).
-            lpIdealMagsFlat_.assign(static_cast<size_t>(MaxBands) * static_cast<size_t>(numBins), T(0));
-            lpTimeResponse_.assign(static_cast<size_t>(lpFftSize_ + 2), T(0));
-            lpFirKernel_.assign(static_cast<size_t>(lpFftSize_), T(0));
-
-            lpFft_ = std::make_unique<FFTReal<T>>(lpFftSize_);
+            lpDesignFft_ = std::make_unique<FFTReal<T>>(2 * firLength_);
+            lpFft_ = std::make_unique<FFTReal<T>>(2 * lpPart_);
         }
 
         // Allocate flat allpass correction chains
@@ -185,7 +227,13 @@ public:
         lastNumSplits_ = 0;
         lastMode_ = filterMode_.load(std::memory_order_relaxed);
         dirty_.store(true, std::memory_order_relaxed);
-        lpMagDirty_.store(true, std::memory_order_relaxed);
+        // The first design is built whole here (setup thread); later changes
+        // are spread over blocks by the audio thread.
+        lpActiveSet_ = 0;
+        lpSetBands_ = { 0, 0 };
+        lpDesignActive_ = false;
+        lpDesignRedo_ = false;
+        if (lpFft_ != nullptr) designLinearPhaseNow();
         reset();
 
         prepared_ = true;
@@ -195,7 +243,8 @@ public:
      * @brief Splits input into separate band outputs.
      *
      * The processed span is clamped to the prepared maxBlockSize and to the
-     * shortest output view. Input channels beyond the prepared/16-channel
+     * shortest output view. The linear-phase engine buffers internally, so
+     * any block size up to maxBlockSize gives the same output. Input channels beyond the prepared/16-channel
      * limit are passed through on band 0 (remaining bands silent) so the
      * band sum still reconstructs the input.
      *
@@ -233,9 +282,10 @@ public:
         {
             if (lpActive)
             {
-                // FIR kernels are rebuilt whole per change: apply instantly
-                // (per-sample smoothing cannot apply to a kernel rebuild).
+                // FIR kernels are rebuilt per change (per-sample smoothing
+                // cannot apply to a kernel), from the targets synced here.
                 syncFrequenciesToTargets();
+                lpMagDirty_.store(true, std::memory_order_relaxed);
             }
             else
             {
@@ -374,7 +424,8 @@ public:
     }
 
     /**
-     * @brief Returns latency in samples (0 for IIR, FIR group delay for linear-phase).
+     * @brief Returns latency in samples: 0 for IIR; for linear-phase, half the
+     *        FIR plus one partition (3072 at 48 kHz), whatever the block size.
      *
      * Reports the linear-phase latency only when the engine actually exists
      * (see prepare()); if linear-phase mode fell back to IIR, this returns 0.
@@ -395,7 +446,13 @@ public:
         for (auto& apChain : allpassFlat_)
             for (auto& b : apChain.stages) b.reset();
 
-        std::fill(lpPrevBlockFlat_.begin(), lpPrevBlockFlat_.end(), T(0));
+        std::fill(lpFrame_.begin(), lpFrame_.end(), T(0));
+        std::fill(lpFdl_.begin(), lpFdl_.end(), T(0));
+        std::fill(lpOut_.begin(), lpOut_.end(), T(0));
+        lpPos_ = 0;
+        lpSlot_ = 0;
+        lpOutBands_ = lpSetBands_[static_cast<size_t>(lpActiveSet_)];
+        glideRemain_ = 0;
     }
 
 
@@ -438,7 +495,20 @@ public:
 private:
     static constexpr int kMaxSplits = MaxBands - 1;
     static constexpr int kMaxStagesPerFilter = 4;
-    static constexpr int kLpMaxBlockSize = 1 << 18; ///< Above this, no linear-phase engine (IIR fallback).
+    static constexpr double kLpFirSeconds = 4096.0 / 48000.0; ///< Linear-phase FIR span (rounded up to a power of two).
+    static constexpr int kLpMaxFirLength = 1 << 16; ///< FIR length cap (768 kHz).
+    static constexpr int kLpPartitions = 4;        ///< Uniform partitions of the FIR.
+    static_assert(kLpPartitions % 2 == 0, "the FIR centre must fall on a partition boundary");
+    static constexpr int kGlideGrid = 32;           ///< IIR coefficient refresh grid during a glide (samples).
+    // Linear-phase design pacing, in design units (about the points a step
+    // transforms; one unit is about half a nanosecond on a desktop core). A
+    // band costs 2 units per magnitude bin (two divisions), 2L for the long
+    // inverse FFT and 2L for its partitions: about 6L.
+    static constexpr int kLpMagnitudeUnits = 2;
+    /// Steady cost of one band and channel per partition sample, in units.
+    static constexpr double kLpPartitionUnits = 4.0;
+    /// Share of a partition's work a block may add for design steps.
+    static constexpr double kLpDesignShare = 0.5;
 
     struct SplitPoint
     {
@@ -627,32 +697,35 @@ private:
         DenormalGuard guard;
         const int numSplits = numBands - 1;
 
-        bool anySmoothing = false;
-        for (int i = 0; i < numSplits; ++i)
-            anySmoothing = anySmoothing || freqSmoothers_[i].isSmoothing();
-
-        if (anySmoothing)
+        // During a glide the coefficients are refreshed every kGlideGrid
+        // samples on a grid that runs across blocks: a segment started in one
+        // block keeps its coefficients into the next, so the glide is the
+        // same whatever the host block size.
+        int offset = 0;
+        while (offset < nS)
         {
-            constexpr int kSubBlockSize = 32;
-            int offset = 0;
-            while (offset < nS)
+            if (glideRemain_ == 0)
             {
-                int blockLen = std::min(kSubBlockSize, nS - offset);
+                bool anySmoothing = false;
+                for (int i = 0; i < numSplits; ++i)
+                    anySmoothing = anySmoothing || freqSmoothers_[i].isSmoothing();
+                if (!anySmoothing) break;
                 for (int i = 0; i < numSplits; ++i)
                 {
-                    for (int s = 0; s < blockLen; ++s)
+                    for (int s = 0; s < kGlideGrid; ++s)
                         (void)freqSmoothers_[i].getNextValue();
                     frequencies_[i] = freqSmoothers_[i].getCurrentValue();
                 }
                 updateCoefficients();
-                processIIRRange(input, outputs, numBands, nCh, offset, blockLen);
-                offset += blockLen;
+                glideRemain_ = kGlideGrid;
             }
+            const int len = std::min(glideRemain_, nS - offset);
+            processIIRRange(input, outputs, numBands, nCh, offset, len);
+            offset += len;
+            glideRemain_ -= len;
         }
-        else
-        {
-            processIIRRange(input, outputs, numBands, nCh, 0, nS);
-        }
+        if (offset < nS)
+            processIIRRange(input, outputs, numBands, nCh, offset, nS - offset);
     }
 
     inline T* getWorkBufChannel(int ch) noexcept
@@ -750,156 +823,281 @@ private:
         }
     }
 
-    void recomputeLinearPhaseMagnitudes() noexcept
+    // -- Linear-phase kernel design -------------------------------------------
+    //
+    // A design builds every band's kernel into the kernel set that is not
+    // playing, one small step at a time, then swaps sets in one assignment:
+    // the bands always come from one consistent design, so they keep summing
+    // to the delayed input. Steps per band: the band's ideal magnitudes, the
+    // long inverse FFT, then one windowed partition transform per partition.
+    // Everything runs on the audio thread from scratch allocated in prepare().
+
+    [[nodiscard]] T* lpKernelSet(int set) noexcept
     {
-        if (lpFftSize_ == 0) return;
-        if (!lpMagDirty_.load(std::memory_order_relaxed) ||
-            !lpMagDirty_.exchange(false, std::memory_order_acquire))
-            return;
+        const size_t specLen = static_cast<size_t>(2 * lpPart_ + 2);
+        return lpKernelSpec_.data() + static_cast<size_t>(set) * static_cast<size_t>(MaxBands * kLpPartitions) * specLen;
+    }
 
-        const int numBins = lpFftSize_ / 2 + 1;
-        const int numSplits = numBands_.load(std::memory_order_relaxed) - 1;
+    /// Captures the design targets and arms the step machine.
+    void startLinearPhaseDesign() noexcept
+    {
+        lpDesignBands_ = std::clamp(numBands_.load(std::memory_order_relaxed), 2, MaxBands);
         const double sr = spec_.sampleRate;
-
-        int expo = 0;
+        for (int sp = 0; sp < lpDesignBands_ - 1; ++sp)
+            lpDesignFc_[static_cast<size_t>(sp)] = clampSplitFreq(static_cast<double>(frequencies_[static_cast<size_t>(sp)]), sr);
         switch (order_.load(std::memory_order_relaxed))
         {
-            case 12: expo = 2; break;
-            case 24: expo = 4; break;
-            case 48: expo = 8; break;
+            case 12: lpDesignExpo_ = 2; break;
+            case 48: lpDesignExpo_ = 8; break;
+            default: lpDesignExpo_ = 4; break;
         }
+        lpDesignBand_ = 0;
+        lpDesignStep_ = 0;
+        lpDesignRedo_ = false;
+        lpDesignActive_ = true;
+    }
 
-        // Ideal zero-phase magnitudes go into the pre-allocated flat scratch
-        // lpIdealMagsFlat_[band * numBins + bin] - no audio-thread allocation.
-        const int nBands = numBands_.load(std::memory_order_relaxed);
-
+    /// Band magnitudes for a fixed slope: |LP| = 1/(1 + r^Expo), r = f/fc.
+    template <int Expo>
+    void designBandMagnitudes(double fc, T* mag, int numBins) noexcept
+    {
+        const double* freq = lpBinFreq_.data();
+        double* carry = lpCarry_.data();
         for (int k = 0; k < numBins; ++k)
         {
-            double freq = sr * static_cast<double>(k) / static_cast<double>(lpFftSize_);
-            T lpMag[kMaxSplits], hpMag[kMaxSplits];
-
-            for (int s = 0; s < numSplits; ++s)
-            {
-                double fc = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
-                double ratio = freq / fc;
-                // Ideal Linkwitz-Riley magnitude |LP| = 1/(1 + (f/fc)^N) with
-                // N = expo = order/6 (2/4/8 -> 12/24/48 dB/oct). This must match the
-                // IIR path's slope; the exponent was previously expo*2, which made the
-                // linear-phase crossover twice as steep as the selected order.
-                double rPow = std::pow(ratio, static_cast<double>(expo));
-
-                double denom = 1.0 + rPow;
-                lpMag[s] = static_cast<T>(1.0 / denom);
-                hpMag[s] = static_cast<T>(rPow / denom);
-            }
-
-            lpIdealMagsFlat_[k] = lpMag[0];                              // band 0 (lowpass)
-            for (int b = 1; b < nBands - 1; ++b)
-                lpIdealMagsFlat_[static_cast<size_t>(b * numBins + k)] = hpMag[b - 1] * lpMag[b];
-            lpIdealMagsFlat_[static_cast<size_t>((nBands - 1) * numBins + k)] = hpMag[numSplits - 1];
-        }
-
-        // Window Design & FIR Kernel generation (pre-allocated scratch)
-        for (int b = 0; b < nBands; ++b)
-        {
-            // Prepare complex bins for inverse FFT (zero phase)
-            for (int k = 0; k < numBins; ++k)
-            {
-                lpTimeResponse_[static_cast<size_t>(2 * k)] = lpIdealMagsFlat_[static_cast<size_t>(b * numBins + k)];
-                lpTimeResponse_[static_cast<size_t>(2 * k + 1)] = T(0);
-            }
-
-            lpFft_->inverse(lpTimeResponse_.data(), lpFirKernel_.data());
-
-            // Circular shift, windowing (Blackman), and zero-padding
-            std::fill(lpFftIn_.begin(), lpFftIn_.end(), T(0));
-            int halfLen = firLength_ / 2;
-            const double N = static_cast<double>(firLength_ - 1);
-
-            for (int i = 0; i < firLength_; ++i)
-            {
-                // Un-wrap circular time response to causal shifted response
-                int srcIdx = (i - halfLen + lpFftSize_) % lpFftSize_;
-
-                // Blackman Window (degenerate 1-tap kernel: unity)
-                double window = 1.0;
-                if (N >= 1.0)
-                {
-                    double n = static_cast<double>(i);
-                    window = 0.42 - 0.5 * std::cos(2.0 * std::numbers::pi * n / N) + 0.08 * std::cos(4.0 * std::numbers::pi * n / N);
-                }
-
-                lpFftIn_[static_cast<size_t>(i)] = lpFirKernel_[static_cast<size_t>(srcIdx)] * static_cast<T>(window);
-            }
-
-            // Forward FFT to get the usable overlap-save kernel
-            lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
-
-            // Store complex spectrum contiguously
-            T* bandMagData = lpMagnitudesFlat_.data() + static_cast<size_t>(b * numBins * 2);
-            std::copy(lpFftOut_.begin(), lpFftOut_.begin() + (numBins * 2), bandMagData);
+            const double r = freq[k] / fc;
+            double rPow = r * r;
+            if constexpr (Expo >= 4) rPow *= rPow;
+            if constexpr (Expo >= 8) rPow *= rPow;
+            const double lp = 1.0 / (1.0 + rPow);
+            const double c = carry[k];
+            mag[k] = static_cast<T>(c * lp);
+            carry[k] = c * (rPow * lp); // the high-pass, 1 - lp
         }
     }
 
-    inline T* getPrevBlockChannel(int ch) noexcept
+    /// Runs one design step and returns its cost in design units (points
+    /// processed). The last step of the last band swaps the kernel sets.
+    int linearPhaseDesignStep() noexcept
     {
-        return lpPrevBlockFlat_.data() + static_cast<size_t>(ch) * static_cast<size_t>(firLength_);
+        const int designSize = 2 * firLength_;
+        const int numBins = firLength_ + 1;
+        const int b = lpDesignBand_;
+
+        if (lpDesignStep_ == 0)
+        {
+            // Ideal zero-phase magnitudes of band b. Each band carries the
+            // high-pass of every split below it (lpCarry_, the running
+            // product), like the IIR tree, so the bands telescope to exactly 1
+            // (LP + HP = 1 per split) and sum to the delayed input whatever
+            // the split spacing. Ideal Linkwitz-Riley |LP| = 1/(1 + (f/fc)^N)
+            // with N = order/6 (2/4/8 -> 12/24/48 dB/oct), matching the IIR
+            // path's slope; integer powers by repeated squaring.
+            if (b == 0) std::fill(lpCarry_.begin(), lpCarry_.end(), 1.0);
+            T* mag = lpMag_.data();
+            if (b < lpDesignBands_ - 1)
+            {
+                // One straight loop per slope keeps the divisions vectorised.
+                const double fc = lpDesignFc_[static_cast<size_t>(b)];
+                switch (lpDesignExpo_)
+                {
+                    case 2: designBandMagnitudes<2>(fc, mag, numBins); break;
+                    case 8: designBandMagnitudes<8>(fc, mag, numBins); break;
+                    default: designBandMagnitudes<4>(fc, mag, numBins); break;
+                }
+            }
+            else
+            {
+                for (int k = 0; k < numBins; ++k)
+                    mag[k] = static_cast<T>(lpCarry_[static_cast<size_t>(k)]);
+            }
+            // The imaginary parts stay zero (set in prepare(); the inverse
+            // FFT does not write its input).
+            T* re = lpTimeResponse_.data();
+            for (int k = 0; k < numBins; ++k) re[2 * k] = mag[k];
+            lpDesignStep_ = 1;
+            return kLpMagnitudeUnits * numBins;
+        }
+
+        if (lpDesignStep_ == 1)
+        {
+            lpDesignFft_->inverse(lpTimeResponse_.data(), lpFirKernel_.data());
+            lpDesignStep_ = 2;
+            return designSize;
+        }
+
+        // One partition of band b: the zero-phase response centred at
+        // firLength/2 under the flat-top window (a cosine taper over the
+        // outer quarter on each side: it leaves the response's core
+        // untouched, so the passband and slopes stay exact where a
+        // full-length window would smear them), then its spectrum.
+        const int part = lpDesignStep_ - 2;
+        const int halfLen = firLength_ / 2;
+        const size_t specLen = static_cast<size_t>(2 * lpPart_ + 2);
+        const int first = part * lpPart_; // tap index of the partition start (the
+                                          // centre is a partition boundary)
+        // Tap i reads the inverse FFT at i - halfLen, wrapped into [0, 2L).
+        const int shift = (first >= halfLen) ? -halfLen : designSize - halfLen;
+        const T* src = lpFirKernel_.data() + (first + shift);
+        const T* win = lpWindow_.data() + first;
+        for (int j = 0; j < lpPart_; ++j)
+            lpPartPad_[static_cast<size_t>(j)] = src[j] * win[j];
+        std::fill(lpPartPad_.begin() + lpPart_, lpPartPad_.end(), T(0));
+        lpFft_->forward(lpPartPad_.data(),
+                        lpKernelSet(1 - lpActiveSet_) + static_cast<size_t>(b * kLpPartitions + part) * specLen);
+
+        if (++lpDesignStep_ == 2 + kLpPartitions)
+        {
+            lpDesignStep_ = 0;
+            if (++lpDesignBand_ == lpDesignBands_)
+            {
+                // Every band of the new design is ready: swap. Partitions
+                // processed from here on use it; the partition being emitted
+                // finishes on the previous design.
+                lpActiveSet_ = 1 - lpActiveSet_;
+                lpSetBands_[static_cast<size_t>(lpActiveSet_)] = lpDesignBands_;
+                lpDesignActive_ = false;
+            }
+        }
+        return 2 * lpPart_;
+    }
+
+    /// Runs a whole design at once (prepare(): setup thread).
+    void designLinearPhaseNow() noexcept
+    {
+        lpMagDirty_.store(false, std::memory_order_relaxed);
+        startLinearPhaseDesign();
+        while (lpDesignActive_) (void)linearPhaseDesignStep();
+        lpDesignCredit_ = 0.0;
+    }
+
+    /// Advances a pending design within this block's budget. A change that
+    /// arrives during a design lets the design finish, then starts the next
+    /// one from the latest targets: under continuous automation the kernels
+    /// keep landing (a restart would starve them until the automation stops).
+    void advanceLinearPhaseDesign(int nS, bool partitionDue) noexcept
+    {
+        if (lpMagDirty_.load(std::memory_order_relaxed) &&
+            lpMagDirty_.exchange(false, std::memory_order_acquire))
+        {
+            if (lpDesignActive_) lpDesignRedo_ = true;
+            else { startLinearPhaseDesign(); lpDesignCredit_ = 0.0; }
+        }
+        if (!lpDesignActive_) return;
+
+        // The budget is a share of the work of one partition (the most
+        // expensive steady block), per partition the block spans: a block
+        // that carries design steps costs about that share more than a steady
+        // one, whatever the block size. A block of up to half a partition
+        // that computes a partition runs no design step, so the two costs do
+        // not stack; when such blocks are frequent (a quarter partition or
+        // more) the next block inherits the budget, otherwise it is dropped
+        // (so no block runs two budgets).
+        const double span = static_cast<double>(std::max(nS, lpPart_));
+        const double budget = kLpDesignShare * kLpPartitionUnits * span
+                              * static_cast<double>(lpDesignBands_) * static_cast<double>(numChannels_);
+        if (partitionDue && 2 * nS <= lpPart_)
+        {
+            if (4 * nS > lpPart_) lpDesignCredit_ += budget;
+            return;
+        }
+        lpDesignCredit_ += budget;
+
+        while (lpDesignActive_ && lpDesignCredit_ > 0.0)
+        {
+            lpDesignCredit_ -= static_cast<double>(linearPhaseDesignStep());
+            if (!lpDesignActive_ && lpDesignRedo_) startLinearPhaseDesign();
+        }
+        if (!lpDesignActive_) lpDesignCredit_ = 0.0;
+    }
+
+    /// Per-channel state of the partitioned engine (flat buffers).
+    inline T* lpFrameOf(int ch) noexcept { return lpFrame_.data() + static_cast<size_t>(ch) * static_cast<size_t>(2 * lpPart_); }
+    inline T* lpOutOf(int ch, int band) noexcept
+    {
+        return lpOut_.data() + (static_cast<size_t>(ch) * MaxBands + static_cast<size_t>(band)) * static_cast<size_t>(lpPart_);
+    }
+
+    /// One partition of one channel: transform the input frame into the
+    /// frequency-domain delay line, then for every band of the playing
+    /// design accumulate the partition products and transform the band's
+    /// output partition back.
+    void processLinearPhasePartition(int ch, int numBands) noexcept
+    {
+        const size_t specLen = static_cast<size_t>(2 * lpPart_ + 2);
+        T* frame = lpFrameOf(ch);
+        T* fdl = lpFdl_.data() + static_cast<size_t>(ch) * static_cast<size_t>(kLpPartitions) * specLen;
+        lpFft_->forward(frame, fdl + static_cast<size_t>(lpSlot_) * specLen);
+
+        const T* kernels = lpKernelSet(lpActiveSet_);
+        for (int b = 0; b < numBands; ++b)
+        {
+            std::fill(lpAccum_.begin(), lpAccum_.end(), T(0));
+            const T* kernel = kernels + static_cast<size_t>(b * kLpPartitions) * specLen;
+            for (int part = 0; part < kLpPartitions; ++part)
+            {
+                const int slot = (lpSlot_ - part + kLpPartitions) % kLpPartitions;
+                simd::complexMulAccum(lpAccum_.data(), fdl + static_cast<size_t>(slot) * specLen,
+                                      kernel + static_cast<size_t>(part) * specLen, lpPart_ + 1);
+            }
+            lpFft_->inverse(lpAccum_.data(), lpResult_.data());
+            std::copy_n(lpResult_.begin() + lpPart_, lpPart_, lpOutOf(ch, b));
+        }
+
+        // Overlap-save: the current half becomes the previous half.
+        std::copy_n(frame + lpPart_, lpPart_, frame);
     }
 
     void processLinearPhase(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS,
                             int nCh) noexcept
     {
-        recomputeLinearPhaseMagnitudes();
+        advanceLinearPhaseDesign(nS, lpPos_ + nS >= lpPart_);
 
-        const int numBins = lpFftSize_ / 2 + 1;
-        const int overlapSize = firLength_ - 1;
-
-        for (int ch = 0; ch < nCh; ++ch)
+        int done = 0;
+        while (done < nS)
         {
-            T* channelData = input.getChannel(ch);
-            T* prev = getPrevBlockChannel(ch);
-
-            // Overlap-Save: [overlap block | new samples | zero pad]
-            for (int i = 0; i < overlapSize; ++i)
-                lpFftIn_[static_cast<size_t>(i)] = prev[i];
-
-            for (int i = 0; i < nS; ++i)
+            const int run = std::min(nS - done, lpPart_ - lpPos_);
+            // The output partition was computed with lpOutBands_ bands. Until
+            // a band-count change lands, missing bands are silent and extra
+            // ones fold into the last requested band, so the sum stays exact.
+            const int have = lpOutBands_;
+            for (int ch = 0; ch < nCh; ++ch)
             {
-                const T x = channelData[i];
-                lpFftIn_[static_cast<size_t>(overlapSize + i)] = std::isfinite(x) ? x : T(0);
-            }
-
-            for (int i = overlapSize + nS; i < lpFftSize_; ++i)
-                lpFftIn_[static_cast<size_t>(i)] = T(0);
-
-            // Save tail for next block (the sanitised frame, so it holds no NaN)
-            for (int i = 0; i < overlapSize; ++i)
-                prev[i] = lpFftIn_[static_cast<size_t>(nS + i)];
-
-            lpFft_->forward(lpFftIn_.data(), lpFftOut_.data());
-
-            for (int b = 0; b < numBands; ++b)
-            {
-                const T* kernelSpectrum = lpMagnitudesFlat_.data() + static_cast<size_t>(b * numBins * 2);
-
-                // Complex multiplication
-                for (int k = 0; k < numBins; ++k)
+                // Stage the input first (the outputs may alias it), then emit
+                // the previous partition's results.
+                const T* src = input.getChannel(ch) + done;
+                T* dst = lpFrameOf(ch) + lpPart_ + lpPos_;
+                for (int i = 0; i < run; ++i)
+                    dst[i] = std::isfinite(src[i]) ? src[i] : T(0); // never latch a NaN
+                for (int b = 0; b < numBands; ++b)
                 {
-                    T r1 = lpFftOut_[static_cast<size_t>(2 * k)];
-                    T i1 = lpFftOut_[static_cast<size_t>(2 * k + 1)];
-                    T r2 = kernelSpectrum[2 * k];
-                    T i2 = kernelSpectrum[2 * k + 1];
-
-                    lpBandFft_[static_cast<size_t>(2 * k)]     = r1 * r2 - i1 * i2;
-                    lpBandFft_[static_cast<size_t>(2 * k + 1)] = r1 * i2 + i1 * r2;
+                    T* out = outputs[b].getChannel(ch) + done;
+                    if (b < have) std::copy_n(lpOutOf(ch, b) + lpPos_, run, out);
+                    else std::fill_n(out, run, T(0));
                 }
+                for (int b = numBands; b < have; ++b)
+                {
+                    const T* extra = lpOutOf(ch, b) + lpPos_;
+                    T* out = outputs[numBands - 1].getChannel(ch) + done;
+                    for (int i = 0; i < run; ++i) out[i] += extra[i];
+                }
+            }
+            lpPos_ += run;
+            done += run;
 
-                lpFft_->inverse(lpBandFft_.data(), lpFftResult_.data());
-
-                // Discard garbage and copy valid output
-                T* outCh = outputs[b].getChannel(ch);
-                for (int i = 0; i < nS; ++i)
-                    outCh[i] = lpFftResult_[static_cast<size_t>(overlapSize + i)];
+            if (lpPos_ == lpPart_)
+            {
+                // Every prepared channel advances, so the shared delay-line
+                // slot stays coherent when a later block has more channels.
+                const int playing = lpSetBands_[static_cast<size_t>(lpActiveSet_)];
+                for (int ch = 0; ch < numChannels_; ++ch)
+                {
+                    if (ch >= nCh) std::fill_n(lpFrameOf(ch) + lpPart_, lpPart_, T(0));
+                    processLinearPhasePartition(ch, playing);
+                }
+                lpOutBands_ = playing;
+                lpSlot_ = (lpSlot_ + 1) % kLpPartitions;
+                lpPos_ = 0;
             }
         }
     }
@@ -930,19 +1128,40 @@ private:
     std::vector<AllPassChain> allpassFlat_;
     std::vector<T> workBuf_;
 
-    // Linear-phase state
-    std::unique_ptr<FFTReal<T>> lpFft_;
-    int lpFftSize_ = 0;
+    // Linear-phase state (uniformly partitioned convolution)
+    std::unique_ptr<FFTReal<T>> lpFft_;        // partition transforms (2 x lpPart_); the engine gate
+    std::unique_ptr<FFTReal<T>> lpDesignFft_;  // kernel design (2 x firLength_)
     int firLength_ = 0;
+    int lpPart_ = 0;
     int lpLatency_ = 0;
+    int lpPos_ = 0;        // samples staged in the current partition
+    int lpSlot_ = 0;       // frequency-domain delay line write slot
+    int lpOutBands_ = 0;   // bands in the output partition being emitted
+    int lpActiveSet_ = 0;  // kernel set that plays (audio thread)
+    std::array<int, 2> lpSetBands_ { 0, 0 }; // band count of each kernel set
+    // Design step machine (audio thread; prepare() runs it whole).
+    bool lpDesignActive_ = false;
+    bool lpDesignRedo_ = false;   // a change arrived during the design
+    int lpDesignBand_ = 0;
+    int lpDesignStep_ = 0;        // 0 magnitudes, 1 inverse FFT, 2.. partitions
+    int lpDesignBands_ = 0;
+    int lpDesignExpo_ = 4;
+    std::array<double, kMaxSplits> lpDesignFc_ {};
+    double lpDesignCredit_ = 0.0;
+    int glideRemain_ = 0;  // samples left in the current IIR glide segment
     std::atomic<bool> lpMagDirty_ { true };
 
-    std::vector<T> lpMagnitudesFlat_; // [band * numBins * 2 + complexIdx]
-    std::vector<T> lpPrevBlockFlat_;  // [ch * firLength_ + sampleIdx]
-    std::vector<T> lpFftIn_, lpFftOut_, lpBandFft_, lpFftResult_;
-    std::vector<T> lpIdealMagsFlat_;  // [band * numBins + bin] ideal zero-phase mags (recompute scratch)
-    std::vector<T> lpTimeResponse_;   // IFFT input scratch (lpFftSize_ + 2)
-    std::vector<T> lpFirKernel_;      // IFFT output scratch (lpFftSize_)
+    std::vector<T> lpKernelSpec_;     // [set][(band * partitions + part) * specLen] kernel partition spectra
+    std::vector<T> lpFdl_;            // [(ch * partitions + slot) * specLen] input spectra
+    std::vector<T> lpFrame_;          // [ch * 2 * lpPart_] overlap-save input frame
+    std::vector<T> lpOut_;            // [(ch * MaxBands + band) * lpPart_] current output partition
+    std::vector<T> lpAccum_, lpResult_, lpPartPad_;
+    std::vector<double> lpCarry_;     // [bin] product of the high-passes below the band being designed
+    std::vector<double> lpBinFreq_;   // [bin] design grid frequencies
+    std::vector<T> lpMag_;            // [bin] magnitudes of the band being designed
+    std::vector<T> lpWindow_;         // [tap] flat-top window
+    std::vector<T> lpTimeResponse_;   // design IFFT input scratch (2 x firLength_ + 2)
+    std::vector<T> lpFirKernel_;      // design IFFT output scratch (2 x firLength_)
 };
 
 } // namespace dspark

@@ -8,12 +8,14 @@
  * @brief Modular dynamic range compressor with analog-modeled ballistics and Hilbert detection.
  *
  * Professional compressor with interchangeable detector, topology, and
- * ballistics character. Gain smoothing runs in the log (dB) domain: the
- * transparent characters use a smoothed branching one-pole (the design
- * recommended by Giannoulis/Massberg/Reiss, JAES 2012), and the analog
- * characters (Opto, FET) run a dual-envelope model with compression-history
- * memory that reproduces the two-stage program-dependent release of the
- * hardware they are named after.
+ * ballistics character. Gain smoothing runs in the log (dB) domain: Clean
+ * and Varimu use a branching one-pole (Clean can opt into decoupled
+ * ballistics in feed-forward: a peak hold followed by a smoothing stage,
+ * after the smooth decoupled detector of Giannoulis, Massberg and Reiss,
+ * JAES 2012), and the analog characters (Opto, FET)
+ * run a dual-envelope model with compression-history memory that
+ * reproduces the two-stage program-dependent release of the hardware they
+ * are named after.
  *
  * FeedBack operation is calibrated to the observed curve: the gain element's
  * law is the closed-form inverse of the user's static curve, so the settled
@@ -61,6 +63,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numbers>
 #include <vector>
 
@@ -131,8 +134,12 @@ public:
      */
     enum class Character
     {
-        Clean,    ///< Smoothed branching one-pole in the log domain (modern transparent
-                  ///< design): constant dB-per-second ballistics, knobs mean what they say.
+        Clean,    ///< Modern transparent design: a branching one-pole on the gain
+                  ///< target. In feed-forward, setCleanBallistics(Decoupled) selects an
+                  ///< instant peak hold that releases, then a smoothing stage, so the
+                  ///< gain does not ride the waveform of a tone (THD+N of a 1 kHz tone
+                  ///< 14 dB into 4:1 at 5/100 ms: -102 dB, against -65.5 dB for the
+                  ///< one-pole); attack and release t63 stay on the knobs in both.
 
         Opto,     ///< T4 optical cell model (LA-2A lineage), calibrated to the
                   ///< Teletronix spec: ~50% recovers in one release time (the spec's
@@ -168,6 +175,17 @@ public:
                    ///< The boost fades out when the SUSTAINED level (peak-held, falling
                    ///< 60 dB/s) drops 40 to 60 dB below the threshold, so pauses and the
                    ///< noise floor are not amplified; setRange() bounds the boost.
+    };
+
+    /** @brief Ballistics of the Clean character in feed-forward (see setCleanBallistics). */
+    enum class CleanBallistics
+    {
+        Branching, ///< A single branching one-pole on the gain target (default):
+                   ///< release is exponential from its first sample, the gain
+                   ///< rides the waveform of low-frequency tones.
+        Decoupled  ///< Peak hold plus smoothing stage (opt-in): low gain-riding
+                   ///< distortion, exact peak-referenced level on tones, more
+                   ///< reduction on dense programme (see setCleanBallistics).
     };
 
     /** @brief Automatic makeup-gain behavior (applies in Downward mode). */
@@ -396,45 +414,21 @@ public:
 
         T levelDb = detectLevel(detectorIn, channel, detTypeEff);
 
-        // Sustained-level guard envelope for Upward mode: instant rise,
-        // constant 60 dB/s fall (peak hold with linear decay).
-        T guardDb = levelDb;
-        if (modeType == Mode::Upward)
-        {
-            T& g = upwardGuardDb_[channel];
-            g = std::max(levelDb, g - upwardGuardDecay_);
-            guardDb = g;
-        }
-
         const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
-        T smoothedGR_Db;
-        if (fbImplicit)
-        {
-            smoothedGR_Db = applyBallisticsFeedbackImplicit(levelDb, channel, charType,
-                                                            thresh, ratio, knee);
-        }
-        else if (topoEff == Topology::FeedBack && modeType == Mode::Downward)
-        {
-            const auto law = computeGainFeedback(levelDb, thresh, ratio, knee, charType);
-            const T targetGR_Db = applyHoldAndRange(law.target, channel);
-            smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive, law.slope);
-        }
-        else if (topoEff == Topology::FeedBack)
-        {
-            const auto law = computeGainFeedbackUpward(levelDb, thresh, ratio, knee, guardDb);
-            const T targetGR_Db = applyHoldAndRange(law.target, channel);
-            smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive, law.slope);
-        }
-        else
-        {
-            T targetGR_Db = computeGain(levelDb, thresh, ratio, knee, charType, modeType, guardDb);
-            targetGR_Db = applyHoldAndRange(targetGR_Db, channel);
-            smoothedGR_Db = applyBallistics(targetGR_Db, channel, splitAdaptive);
-        }
+        const bool decoupled = useDecoupled(charType, topoEff);
+        syncDecoupledState(decoupled);
+        const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
+                                   feedbackDetectorDelay(detTypeEff) };
+        const T smoothedGR_Db = gainPath(levelDb, channel, cfg, thresh, ratio, knee);
         T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
 
+        const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
         if (advanceShared)
-            autoMakeupEnv_ = smoothedGR_Db + autoMakeupCoeff_ * (autoMakeupEnv_ - smoothedGR_Db);
+        {
+            syncAdaptiveMakeup(adaptiveMakeup);
+            if (adaptiveMakeup)
+                autoMakeupEnv_ = smoothedGR_Db + autoMakeupCoeff_ * (autoMakeupEnv_ - smoothedGR_Db);
+        }
 
         T makeup = makeupDb;
         if (modeType == Mode::Downward)
@@ -474,6 +468,7 @@ public:
         {
             envFastDb_[ch] = 0.0; // 0 dB gain change = neutral
             envSlowDb_[ch] = 0.0;
+            envHoldDb_[ch] = 0.0;
             upwardGuardDb_[ch] = T(-200);
             fbLastOutput_[ch] = T(0);
             fetDcState_[ch] = T(0);
@@ -704,6 +699,38 @@ public:
         characterColor_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Selects the Clean character's feed-forward ballistics.
+     *
+     * Branching (default) is a single branching one-pole on the gain target.
+     * Decoupled holds the gain target's peaks and smooths the held envelope,
+     * so a sustained tone is compressed without its waveform riding the
+     * gain: THD+N of a 1 kHz tone 14 dB into 4:1 at 5/100 ms measures
+     * -102 dB, against -65.5 dB for Branching, and the gain lands on the
+     * peak-referenced static curve (Branching reads up to 0.8 dB less
+     * reduction on tones). Both honour the attack and release knobs as t63;
+     * Decoupled rounds the first part of the release (within 0.8 dB of the
+     * exponential on a 12 dB release at 5/100 ms).
+     *
+     * Decoupled follows the peaks of dense material, so the same settings
+     * compress more: on a drum programme at the default settings the output
+     * sits 1.9 dB lower than with Branching, on a noise-like programme at
+     * -24 dB, 3:1 it sits 4.5 dB lower. Compare by ear (and retune the
+     * threshold) before switching a preset. Other characters and feedback
+     * operation are not affected; the state key is "cleanBallistics"
+     * (absent = Branching).
+     */
+    void setCleanBallistics(CleanBallistics mode) noexcept
+    {
+        cleanBallistics_.store(clampEnum(mode, CleanBallistics::Decoupled), std::memory_order_relaxed);
+    }
+
+    /** @brief Returns the Clean character's feed-forward ballistics. */
+    [[nodiscard]] CleanBallistics getCleanBallistics() const noexcept
+    {
+        return cleanBallistics_.load(std::memory_order_relaxed);
+    }
+
     /** @brief Returns the character colour amount (see setCharacterColor). */
     [[nodiscard]] T getCharacterColor() const noexcept
     {
@@ -735,6 +762,13 @@ public:
      * Published atomically; the audio thread applies the new window (and
      * resets the sliding state) at its next block, so no control-thread write
      * ever races the per-sample RMS accumulators.
+     *
+     * In FeedBack the RMS window sits inside the loop, which cannot settle
+     * faster than its detector reports: release faster than about
+     * e x (1 + window) samples, and attack faster than half of that, settle
+     * at those bounds, the critically damped limit (observed t63 with the
+     * default 10 ms window: release 22 ms, attack 14 ms). Faster settings
+     * would overshoot and ring.
      *
      * @warning Clamped to the 1-500 ms range of the prepare() pre-allocation.
      */
@@ -808,6 +842,7 @@ public:
         w.write("topology", static_cast<int32_t>(topology_.load(std::memory_order_relaxed)));
         w.write("character", static_cast<int32_t>(character_.load(std::memory_order_relaxed)));
         w.write("characterColor", static_cast<float>(characterColor_.load(std::memory_order_relaxed)));
+        w.write("cleanBallistics", static_cast<int32_t>(cleanBallistics_.load(std::memory_order_relaxed)));
         w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
         w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
@@ -839,6 +874,7 @@ public:
         setTopology(static_cast<Topology>(r.read("topology", 0)));
         setCharacter(static_cast<Character>(r.read("character", 0)));
         setCharacterColor(static_cast<T>(r.read("characterColor", 0.0f)));
+        setCleanBallistics(static_cast<CleanBallistics>(r.read("cleanBallistics", 0)));
         setMode(static_cast<Mode>(r.read("mode", 0)));
         setSidechainHPF(r.read("scHpf", false), static_cast<T>(r.read("scHpfFreq", 80.0f)));
         setRmsWindow(static_cast<T>(r.read("rmsWindow", 10.0f)));
@@ -930,28 +966,83 @@ protected:
                              && detTypeEff == DetectorType::Peak;
 
         const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
+        const bool decoupled = useDecoupled(charType, topoEff);
+        syncDecoupledState(decoupled);
 
         // Lookahead breaks causal logic in Feedback mode, so it is strictly
         // disabled there.
         int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : lookaheadSamples_;
 
+        // Fully linked channels share one gain computer: every channel reads
+        // the same linked level into the same state, so computing it once per
+        // frame gives the same gain (the per-channel path differs only in the
+        // rounding of level + 1 * (linked - level)). SplitPolarity's adaptive
+        // release reads each channel's own output, so it keeps the
+        // per-channel path.
+        const bool shared = (sLink >= T(1)) && !splitAdaptive && nCh > 1;
+
+        // Settled parameter smoothers: read once per block instead of a call
+        // per sample (a settled smoother returns its target either way).
+        const bool paramsMoving = thresholdSmooth_.isSmoothing() || ratioSmooth_.isSmoothing()
+                               || kneeSmooth_.isSmoothing() || makeupSmooth_.isSmoothing()
+                               || mixSmooth_.isSmoothing() || colorSmooth_.isSmoothing();
+        T thresh   = thresholdSmooth_.getCurrentValue();
+        T ratio    = ratioSmooth_.getCurrentValue();
+        T knee     = kneeSmooth_.getCurrentValue();
+        T mkupBase = makeupSmooth_.getCurrentValue();
+        T mixVal   = mixSmooth_.getCurrentValue();
+        T colorAmt = colorSmooth_.getCurrentValue();
+        const bool staticMakeup = autoMkup == AutoMakeupMode::Static && modeType == Mode::Downward;
+        const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
+        syncAdaptiveMakeup(adaptiveMakeup);
+        T staticMakeupDb = staticMakeup
+            ? computeGain(T(0), thresh, ratio, knee, charType, Mode::Downward, T(0)) * T(-0.5)
+            : T(0);
+
+        const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
+                                   feedbackDetectorDelay(detTypeEff) };
+
+        // Feed-forward: the detector never reads the output, so the block
+        // runs in passes (see processFeedForward). Feedback loops stay per
+        // sample.
+        if (topoEff == Topology::FeedForward)
+        {
+            const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
+                                         activeLookahead, scHpf, shared, decoupled,
+                                         splitAdaptive, staticMakeup, adaptiveMakeup,
+                                         paramsMoving };
+            const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal, staticMakeupDb };
+            processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
+            return;
+        }
+
         for (int i = 0; i < nS; ++i)
         {
-            T thresh   = thresholdSmooth_.getNextValue();
-            T ratio    = ratioSmooth_.getNextValue();
-            T knee     = kneeSmooth_.getNextValue();
-            T mkupGain = makeupSmooth_.getNextValue();
-            T mixVal   = mixSmooth_.getNextValue();
-            T colorAmt = colorSmooth_.getNextValue();
-            T linkedLevel = T(-200);
+            if (paramsMoving)
+            {
+                thresh   = thresholdSmooth_.getNextValue();
+                ratio    = ratioSmooth_.getNextValue();
+                knee     = kneeSmooth_.getNextValue();
+                mkupBase = makeupSmooth_.getNextValue();
+                mixVal   = mixSmooth_.getNextValue();
+                colorAmt = colorSmooth_.getNextValue();
+                // Static auto makeup follows the smoothed curve parameters, so
+                // it stays click-free through threshold/ratio/knee automation.
+                if (staticMakeup)
+                    staticMakeupDb = computeGain(T(0), thresh, ratio, knee, charType,
+                                                 Mode::Downward, T(0)) * T(-0.5);
+            }
 
-            // Static auto makeup follows the smoothed curve parameters, so it
-            // stays click-free through threshold/ratio/knee automation.
-            if (autoMkup == AutoMakeupMode::Static && modeType == Mode::Downward)
-                mkupGain += computeGain(T(0), thresh, ratio, knee, charType,
-                                        Mode::Downward, T(0)) * T(-0.5);
+            // Makeup: shared by every channel of the frame, and usually
+            // unchanged from the previous frame (the conversion is cached).
+            // The adaptive envelope is the one left by the previous frame.
+            T makeupDb = mkupBase + staticMakeupDb;
+            if (adaptiveMakeup)
+                makeupDb += -autoMakeupEnv_;
+            const T makeupLin = makeupToGain(makeupDb);
 
-            // 1. Detection Path (Per-Channel)
+            // 1. Detection path (per channel: every detector keeps its own state)
+            T linkedLin = T(0);
             for (int ch = 0; ch < nCh; ++ch)
             {
                 // Fallback to internal channel if sidechain buffer lacks channels
@@ -971,117 +1062,501 @@ protected:
                 detectorIn = detectorSafe(detectorIn);
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
 
-                T levelDb = detectLevel(detectorIn, ch, detTypeEff);
-
-                channelLevelDb_[ch] = levelDb;
-                if (levelDb > linkedLevel) linkedLevel = levelDb;
+                // dB is monotonic in the linear level, so the linked level is
+                // the dB of the largest linear level (one log per frame when
+                // the channels share the gain computer).
+                const T levelLin = detectLevelLinear(detectorIn, ch, detTypeEff);
+                linkedLin = std::max(linkedLin, levelLin);
+                if (!shared) channelLevelDb_[ch] = gainToDecibels(levelLin);
             }
 
-            // Makeup: shared by every channel of the frame, and usually
-            //    unchanged from the previous frame (the conversion is cached).
-            T makeupDb = mkupGain;
-            if (autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward)
-                makeupDb += -autoMakeupEnv_;
-            const T makeupLin = makeupToGain(makeupDb);
-
-            // 2. Stereo Linking & Gain Application
+            // 2. Stereo linking, static curve and character ballistics (log domain)
             T blockGR = T(0);
-            for (int ch = 0; ch < nCh; ++ch)
+            if (shared)
             {
-                T chLevel = channelLevelDb_[ch];
-                T inputDb = chLevel + sLink * (linkedLevel - chLevel);
-
-                // Sustained-level guard envelope for Upward mode: instant
-                // rise, constant 60 dB/s fall (peak hold with linear decay).
-                T guardDb = inputDb;
-                if (modeType == Mode::Upward)
-                {
-                    T& g = upwardGuardDb_[ch];
-                    g = std::max(inputDb, g - upwardGuardDecay_);
-                    guardDb = g;
-                }
-
-                // 3. Static curve + character ballistics (log domain)
-                T smoothedGR_Db;
-                if (fbImplicit)
-                {
-                    smoothedGR_Db = applyBallisticsFeedbackImplicit(inputDb, ch, charType,
-                                                                    thresh, ratio, knee);
-                }
-                else if (topoEff == Topology::FeedBack && modeType == Mode::Downward)
-                {
-                    // Explicit loop (detector with memory): calibrated element
-                    // law plus a per-sample stability floor on the ballistics.
-                    const auto law = computeGainFeedback(inputDb, thresh, ratio, knee, charType);
-                    const T targetGR_Db = applyHoldAndRange(law.target, ch);
-                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive, law.slope);
-                }
-                else if (topoEff == Topology::FeedBack)
-                {
-                    // Upward feedback: the element law inverted from the
-                    // output level, so the loop settles on the panel ratio.
-                    const auto law = computeGainFeedbackUpward(inputDb, thresh, ratio, knee, guardDb);
-                    const T targetGR_Db = applyHoldAndRange(law.target, ch);
-                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive, law.slope);
-                }
-                else
-                {
-                    T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, charType, modeType, guardDb);
-                    targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
-                    smoothedGR_Db = applyBallistics(targetGR_Db, ch, splitAdaptive);
-                }
+                blockGR = gainPath(gainToDecibels(linkedLin), 0, cfg, thresh, ratio, knee);
                 // (0 dB is the common case below threshold: skip the exp.)
-                T smoothedGainLinear = (smoothedGR_Db == T(0)) ? T(1) : decibelsToGain(smoothedGR_Db);
-
-                T input;
-                if (activeLookahead > 0)
+                const T gainLin = (blockGR == T(0)) ? T(1) : decibelsToGain(blockGR);
+                for (int ch = 0; ch < nCh; ++ch)
+                    applyGain(audio, ch, i, gainLin, blockGR, activeLookahead, charType,
+                              colorAmt, makeupLin, mixVal);
+            }
+            else
+            {
+                T linkedLevel = channelLevelDb_[0];
+                for (int ch = 1; ch < nCh; ++ch) linkedLevel = std::max(linkedLevel, channelLevelDb_[ch]);
+                for (int ch = 0; ch < nCh; ++ch)
                 {
-                    lookaheadBuffers_[ch].push(audio.getChannel(ch)[i]);
-                    input = lookaheadBuffers_[ch].read(activeLookahead);
+                    const T chLevel = channelLevelDb_[ch];
+                    const T inputDb = chLevel + sLink * (linkedLevel - chLevel);
+                    const T smoothedGR_Db = gainPath(inputDb, ch, cfg, thresh, ratio, knee);
+                    const T gainLin = (smoothedGR_Db == T(0)) ? T(1) : decibelsToGain(smoothedGR_Db);
+                    applyGain(audio, ch, i, gainLin, smoothedGR_Db, activeLookahead, charType,
+                              colorAmt, makeupLin, mixVal);
+                    if (ch == 0 || smoothedGR_Db < blockGR)
+                        blockGR = smoothedGR_Db; // Track worst-case GR for metering
                 }
-                else
-                {
-                    input = audio.getChannel(ch)[i];
-                }
-
-                T wet = input * smoothedGainLinear;
-                if (colorAmt > T(0) && charType == Character::FET)
-                {
-                    // 2nd-order FET channel modulation: the drain-source
-                    // resistance bends with the signal across it, so colour
-                    // only appears while the FET conducts (gain reduction
-                    // active); the squared term is AC-coupled like the
-                    // hardware's output transformer. Applied pre-makeup: the
-                    // line amp after the element is clean.
-                    const T sq = wet * wet;
-                    T& dc = fetDcState_[ch];
-                    if (std::isfinite(sq)) dc += fetDcCoeff_ * (sq - dc); // a non-finite sample would latch
-                    const T grDepth = std::clamp(-smoothedGR_Db * T(0.1), T(0), T(1));
-                    wet += colorAmt * kFetColorH2 * grDepth * (sq - dc);
-                }
-                // The feedback detector reads the compressed signal before
-                // makeup (makeup sits after the element; feeding it back
-                // would shift the static curve and run away with auto makeup).
-                fbLastOutput_[ch] = wet;
-                wet *= makeupLin;
-
-                // Parallel (New York) mix done inline: the dry reference is `input`,
-                // which carries the SAME lookahead delay as the wet, so dry and wet
-                // stay phase-aligned (the previous DryWetMixer captured the UNDELAYED
-                // input and comb-filtered when lookahead + mix<1 were combined).
-                audio.getChannel(ch)[i] = (mixVal < T(1))
-                    ? (input * (T(1) - mixVal) + wet * mixVal)
-                    : wet;
-
-                if (ch == 0 || smoothedGR_Db < blockGR)
-                    blockGR = smoothedGR_Db; // Track worst-case GR for metering
             }
 
             gainReductionDb_.store(blockGR, std::memory_order_relaxed);
 
             // Auto-makeup envelope tracks slowly (~300ms)
-            autoMakeupEnv_ = blockGR + autoMakeupCoeff_ * (autoMakeupEnv_ - blockGR);
+            if (adaptiveMakeup)
+                autoMakeupEnv_ = blockGR + autoMakeupCoeff_ * (autoMakeupEnv_ - blockGR);
         }
+
+        // The shared gain computer ran on channel 0's state: hand it to the
+        // other channels so a later unlinked block continues from it.
+        if (shared && nS > 0)
+        {
+            for (int ch = 1; ch < nCh; ++ch)
+            {
+                envFastDb_[ch] = envFastDb_[0];
+                envSlowDb_[ch] = envSlowDb_[0];
+                envHoldDb_[ch] = envHoldDb_[0];
+                upwardGuardDb_[ch] = upwardGuardDb_[0];
+                holdCounters_[ch] = holdCounters_[0];
+                heldGrDb_[ch] = heldGrDb_[0];
+            }
+        }
+    }
+
+    /** @brief Per-block routing of the gain path (see gainPath()). */
+    struct GainPathConfig
+    {
+        Character charType;
+        Mode modeType;
+        Topology topoEff;
+        bool fbImplicit;
+        bool splitAdaptive;
+        bool decoupled;
+        double loopDelay; ///< Detector delay seen by an explicit feedback loop (samples).
+    };
+
+    /** @brief Per-block routing of the feed-forward block path. */
+    struct FeedForwardConfig
+    {
+        DetectorType detType;
+        Character charType;
+        Mode modeType;
+        AutoMakeupMode autoMkup;
+        T sLink;
+        int lookahead;
+        bool scHpf;
+        bool shared;
+        bool decoupled;
+        bool splitAdaptive;
+        bool staticMakeup;
+        bool adaptiveMakeup;
+        bool paramsMoving;
+    };
+
+    /** @brief Parameter values of a block whose smoothers are settled. */
+    struct ChunkParams
+    {
+        T thresh, ratio, knee, makeup, mix, staticMakeup;
+    };
+
+    static constexpr int kChunk = 32; ///< Frames per pass of the feed-forward path.
+
+    /**
+     * @brief Feed-forward block path, run in passes over chunks of frames.
+     *
+     * In feed-forward the detector never reads the output, so detection, the
+     * level conversion, the gain recursion, the gain conversion and its
+     * application can run as separate passes. Only the ballistics recursion
+     * is then serial: the log, static curve and exp of different frames
+     * overlap freely, and the envelope state stays in registers. Each frame
+     * performs the same arithmetic as the per-sample path (processSample()
+     * on a mono stream is bit-identical).
+     */
+    void processFeedForward(AudioBufferView<T>& audio, AudioBufferView<T>& sidechain,
+                            int nCh, int nS, int scCh, const FeedForwardConfig& ff,
+                            const ChunkParams& constants) noexcept
+    {
+        T thr[kChunk], rat[kChunk], kn[kChunk], mk[kChunk], mixA[kChunk], stMk[kChunk];
+        T mkLin[kChunk];
+        T level[kMaxChannels][kChunk];   // linear level, then dB level, then linear gain
+        T gain[kMaxChannels][kChunk];    // smoothed gain change (dB)
+        T delayed[kMaxChannels][kChunk]; // lookahead-delayed input (the dry reference)
+        const int nGain = ff.shared ? 1 : nCh;
+
+        if (!ff.paramsMoving)
+        {
+            std::fill_n(thr, kChunk, constants.thresh);
+            std::fill_n(rat, kChunk, constants.ratio);
+            std::fill_n(kn, kChunk, constants.knee);
+            std::fill_n(mk, kChunk, constants.makeup);
+            std::fill_n(mixA, kChunk, constants.mix);
+            std::fill_n(stMk, kChunk, constants.staticMakeup);
+        }
+
+        T lastGr = T(0);
+        for (int o = 0; o < nS; o += kChunk)
+        {
+            const int m = std::min(kChunk, nS - o);
+
+            // A. Parameters (the colour smoother advances too: it only
+            //    applies to the FET character, which is always feedback).
+            if (ff.paramsMoving)
+            {
+                for (int k = 0; k < m; ++k)
+                {
+                    thr[k]  = thresholdSmooth_.getNextValue();
+                    rat[k]  = ratioSmooth_.getNextValue();
+                    kn[k]   = kneeSmooth_.getNextValue();
+                    mk[k]   = makeupSmooth_.getNextValue();
+                    mixA[k] = mixSmooth_.getNextValue();
+                    (void)colorSmooth_.getNextValue();
+                    stMk[k] = ff.staticMakeup
+                        ? computeGain(T(0), thr[k], rat[k], kn[k], ff.charType, Mode::Downward, T(0)) * T(-0.5)
+                        : T(0);
+                }
+            }
+
+            // B. Detection (each channel's detector keeps its own state).
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const T* src = ((scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))
+                                           : audio.getChannel(ch)) + o;
+                T* lv = level[ch];
+                if (ff.detType == DetectorType::Peak && !ff.scHpf)
+                {
+                    for (int k = 0; k < m; ++k) lv[k] = std::abs(detectorSafe(src[k]));
+                }
+                else
+                {
+                    for (int k = 0; k < m; ++k)
+                    {
+                        T d = detectorSafe(src[k]);
+                        if (ff.scHpf) d = applySidechainHPF(d, ch);
+                        lv[k] = detectLevelLinear(d, ch, ff.detType);
+                    }
+                }
+            }
+
+            // Lookahead: the delayed audio is the input the gain applies to.
+            if (ff.lookahead > 0)
+            {
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    const T* src = audio.getChannel(ch) + o;
+                    for (int k = 0; k < m; ++k)
+                    {
+                        lookaheadBuffers_[ch].push(src[k]);
+                        delayed[ch][k] = lookaheadBuffers_[ch].read(ff.lookahead);
+                    }
+                }
+            }
+
+            // C. Levels in dB and stereo linking. dB is monotonic in the
+            //    linear level, so the linked level is the largest channel's.
+            if (ff.shared)
+            {
+                for (int k = 0; k < m; ++k)
+                {
+                    T mx = level[0][k];
+                    for (int ch = 1; ch < nCh; ++ch) mx = std::max(mx, level[ch][k]);
+                    level[0][k] = gainToDecibels(mx);
+                }
+            }
+            else
+            {
+                for (int ch = 0; ch < nCh; ++ch)
+                    for (int k = 0; k < m; ++k) level[ch][k] = gainToDecibels(level[ch][k]);
+                if (nCh > 1 && ff.sLink > T(0))
+                {
+                    for (int k = 0; k < m; ++k)
+                    {
+                        T linked = level[0][k];
+                        for (int ch = 1; ch < nCh; ++ch) linked = std::max(linked, level[ch][k]);
+                        for (int ch = 0; ch < nCh; ++ch)
+                            level[ch][k] = level[ch][k] + ff.sLink * (linked - level[ch][k]);
+                    }
+                }
+            }
+
+            // D. Static curve, hold/range and ballistics: the serial part.
+            //    SplitPolarity's level-adaptive release reads the previous
+            //    frame's output, so its recursion also forms the linear gain
+            //    (written over the consumed dB level).
+            for (int g = 0; g < nGain; ++g)
+            {
+                const T* dryIn = (ff.lookahead > 0) ? delayed[g] : audio.getChannel(g) + o;
+                runGainRecursion(level[g], gain[g], m, g, ff, thr, rat, kn,
+                                 ff.splitAdaptive ? dryIn : nullptr);
+            }
+
+            // E. Metering, adaptive makeup (frame by frame, like the
+            //    per-sample path) and the linear gains.
+            if (ff.adaptiveMakeup)
+            {
+                T env = autoMakeupEnv_; // a local: the audio pointers may alias members
+                for (int k = 0; k < m; ++k)
+                {
+                    T blockGR = gain[0][k];
+                    for (int g = 1; g < nGain; ++g) blockGR = std::min(blockGR, gain[g][k]);
+                    mkLin[k] = makeupToGain(mk[k] + stMk[k] + -env);
+                    env = blockGR + autoMakeupCoeff_ * (env - blockGR);
+                }
+                autoMakeupEnv_ = env;
+            }
+            else
+            {
+                for (int k = 0; k < m; ++k) mkLin[k] = makeupToGain(mk[k] + stMk[k]);
+            }
+            lastGr = gain[0][m - 1];
+            for (int g = 1; g < nGain; ++g) lastGr = std::min(lastGr, gain[g][m - 1]);
+            if (!ff.splitAdaptive)
+            {
+                for (int g = 0; g < nGain; ++g)
+                {
+                    const T* gd = gain[g];
+                    T* gl = level[g];
+                    // (0 dB is the common case below threshold: skip the exp.)
+                    for (int k = 0; k < m; ++k) gl[k] = (gd[k] == T(0)) ? T(1) : decibelsToGain(gd[k]);
+                }
+            }
+
+            // F. Application: lookahead, makeup and the parallel mix. The dry
+            //    reference carries the same lookahead delay as the wet.
+            const bool plain = ff.lookahead == 0 && !ff.paramsMoving && constants.mix >= T(1);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* data = audio.getChannel(ch) + o;
+                const T* gl = level[ff.shared ? 0 : ch];
+                if (plain)
+                {
+                    // No lookahead and fully wet: one multiply chain per sample.
+                    fbLastOutput_[ch] = data[m - 1] * gl[m - 1]; // pre-makeup history
+                    for (int k = 0; k < m; ++k) data[k] = (data[k] * gl[k]) * mkLin[k];
+                    continue;
+                }
+                const T* dry = (ff.lookahead > 0) ? delayed[ch] : data;
+                T wet = T(0);
+                for (int k = 0; k < m; ++k)
+                {
+                    const T input = dry[k];
+                    wet = input * gl[k];
+                    const T out = wet * mkLin[k];
+                    data[k] = (mixA[k] < T(1)) ? (input * (T(1) - mixA[k]) + out * mixA[k]) : out;
+                }
+                // Feedback history (pre-makeup) for a later topology switch.
+                fbLastOutput_[ch] = wet;
+            }
+        }
+        if (nS > 0) gainReductionDb_.store(lastGr, std::memory_order_relaxed);
+
+        // The shared gain computer ran on channel 0's state: hand it to the
+        // other channels so a later unlinked block continues from it.
+        if (ff.shared && nS > 0) copyGainStateFromChannel0(nCh);
+    }
+
+    /** @brief Copies channel 0's gain-computer state to channels [1, nCh). */
+    void copyGainStateFromChannel0(int nCh) noexcept
+    {
+        for (int ch = 1; ch < nCh; ++ch)
+        {
+            envFastDb_[ch] = envFastDb_[0];
+            envSlowDb_[ch] = envSlowDb_[0];
+            envHoldDb_[ch] = envHoldDb_[0];
+            upwardGuardDb_[ch] = upwardGuardDb_[0];
+            holdCounters_[ch] = holdCounters_[0];
+            heldGrDb_[ch] = heldGrDb_[0];
+        }
+    }
+
+    /**
+     * @brief The serial part of the feed-forward path for one gain channel:
+     *        Upward guard, static curve, hold/range and ballistics over a
+     *        chunk, with the channel's state held in locals.
+     *
+     * @param inDb   Linked level per frame (dB).
+     * @param out    Smoothed gain change per frame (dB).
+     * @param m      Frames in the chunk.
+     * @param ch     Channel whose state is advanced.
+     * @param ff     Block routing.
+     * @param thr    Threshold per frame.
+     * @param rat    Ratio per frame.
+     * @param kn     Knee per frame.
+     * @param dryIn  SplitPolarity only: the (delayed) input the gain applies
+     *               to. The recursion then also writes the linear gain into
+     *               inDb (each frame's level is consumed before it is
+     *               overwritten). nullptr otherwise.
+     */
+    void runGainRecursion(T* inDb, T* out, int m, int ch, const FeedForwardConfig& ff,
+                          const T* thr, const T* rat, const T* kn, const T* dryIn) noexcept
+    {
+        double fast = envFastDb_[ch];
+        double slow = envSlowDb_[ch];
+        double hold = envHoldDb_[ch];
+        T guard = upwardGuardDb_[ch];
+        T held = heldGrDb_[ch];
+        int counter = holdCounters_[ch];
+        const T range = rangeDb_.load(std::memory_order_relaxed);
+        const int holdN = holdSamples_;
+        const bool upward = ff.modeType == Mode::Upward;
+
+        // Static curve first: no state, so the frames overlap freely (the
+        // Upward guard is a cheap recursion of its own).
+        T tgtA[kChunk];
+        if (upward)
+        {
+            for (int k = 0; k < m; ++k)
+            {
+                guard = std::max(inDb[k], guard - upwardGuardDecay_);
+                tgtA[k] = computeGainUpward(inDb[k], thr[k], rat[k], kn[k], guard);
+            }
+        }
+        else
+        {
+            for (int k = 0; k < m; ++k)
+                tgtA[k] = downwardCurve(inDb[k], thr[k], rat[k], kn[k], ff.charType);
+        }
+
+        if (dryIn != nullptr)
+        {
+            // Level-adaptive release (SplitPolarity): full-scale output
+            // halves the release time constant, as in applyBallistics().
+            T lastWet = fbLastOutput_[ch];
+            for (int k = 0; k < m; ++k)
+            {
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter);
+                const double lastOut = std::abs(static_cast<double>(lastWet));
+                const double outputLevel = (lastOut < 1.0) ? lastOut : 1.0;
+                double y;
+                if (ff.decoupled)
+                {
+                    const double c = decHoldCoeff_;
+                    y = decoupledStep(static_cast<double>(tgt), hold, fast, c + outputLevel * (c * c - c));
+                }
+                else
+                {
+                    const double c = charRelCoeff_;
+                    y = ballisticsStep(static_cast<double>(tgt), fast, slow, charAttCoeff_,
+                                       c + outputLevel * (c * c - c));
+                }
+                const T gr = static_cast<T>(y);
+                out[k] = gr;
+                const T gl = (gr == T(0)) ? T(1) : decibelsToGain(gr);
+                inDb[k] = gl;
+                lastWet = dryIn[k] * gl;
+            }
+        }
+        else
+        {
+            for (int k = 0; k < m; ++k)
+            {
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter);
+                const double y = ff.decoupled
+                    ? decoupledStep(static_cast<double>(tgt), hold, fast, decHoldCoeff_)
+                    : ballisticsStep(static_cast<double>(tgt), fast, slow, charAttCoeff_, charRelCoeff_);
+                out[k] = static_cast<T>(y);
+            }
+        }
+
+        envFastDb_[ch] = fast;
+        envSlowDb_[ch] = slow;
+        envHoldDb_[ch] = hold;
+        upwardGuardDb_[ch] = guard;
+        heldGrDb_[ch] = held;
+        holdCounters_[ch] = counter;
+    }
+
+    /**
+     * @brief Static curve plus character ballistics for one channel's state.
+     *
+     * Runs the Upward guard, the topology's gain law, hold/range and the
+     * ballistics on channel `ch`'s state, and returns the smoothed gain
+     * change in dB.
+     *
+     * @param inputDb Detected (linked) level in dB.
+     * @param ch      Channel whose state is advanced.
+     * @param cfg     Routing derived once per block.
+     * @param thresh  Threshold in dB.
+     * @param ratio   Ratio.
+     * @param knee    Knee width in dB.
+     */
+    [[nodiscard]] T gainPath(T inputDb, int ch, const GainPathConfig& cfg,
+                             T thresh, T ratio, T knee) noexcept
+    {
+        // Sustained-level guard envelope for Upward mode: instant rise,
+        // constant 60 dB/s fall (peak hold with linear decay).
+        T guardDb = inputDb;
+        if (cfg.modeType == Mode::Upward)
+        {
+            T& g = upwardGuardDb_[ch];
+            g = std::max(inputDb, g - upwardGuardDecay_);
+            guardDb = g;
+        }
+
+        if (cfg.fbImplicit)
+            return applyBallisticsFeedbackImplicit(inputDb, ch, cfg.charType, thresh, ratio, knee);
+
+        if (cfg.topoEff == Topology::FeedBack)
+        {
+            // Explicit loop (detector with memory): calibrated element law
+            // plus a per-sample stability floor on the ballistics. Upward
+            // feedback inverts the law from the output level, so the loop
+            // settles on the panel ratio too.
+            const auto law = (cfg.modeType == Mode::Downward)
+                ? computeGainFeedback(inputDb, thresh, ratio, knee, cfg.charType)
+                : computeGainFeedbackUpward(inputDb, thresh, ratio, knee, guardDb);
+            const T targetGR_Db = applyHoldAndRange(law.target, ch);
+            return applyBallistics(targetGR_Db, ch, cfg.splitAdaptive, law.slope, cfg.loopDelay);
+        }
+
+        T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, cfg.charType, cfg.modeType, guardDb);
+        targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
+        return cfg.decoupled ? applyBallisticsDecoupled(targetGR_Db, ch, cfg.splitAdaptive)
+                             : applyBallistics(targetGR_Db, ch, cfg.splitAdaptive);
+    }
+
+    /**
+     * @brief Applies the frame's gain to one channel: lookahead, FET colour,
+     *        feedback history, makeup and the parallel mix.
+     */
+    void applyGain(AudioBufferView<T>& audio, int ch, int i, T gainLin, T grDb,
+                   int activeLookahead, Character charType, T colorAmt, T makeupLin,
+                   T mixVal) noexcept
+    {
+        T* data = audio.getChannel(ch);
+        T input;
+        if (activeLookahead > 0)
+        {
+            lookaheadBuffers_[ch].push(data[i]);
+            input = lookaheadBuffers_[ch].read(activeLookahead);
+        }
+        else
+        {
+            input = data[i];
+        }
+
+        T wet = input * gainLin;
+        if (colorAmt > T(0) && charType == Character::FET)
+        {
+            // 2nd-order FET channel modulation: the drain-source resistance
+            // bends with the signal across it, so colour only appears while
+            // the FET conducts (gain reduction active); the squared term is
+            // AC-coupled like the hardware's output transformer. Applied
+            // pre-makeup: the line amp after the element is clean.
+            const T sq = wet * wet;
+            T& dc = fetDcState_[ch];
+            if (std::isfinite(sq)) dc += fetDcCoeff_ * (sq - dc); // a non-finite sample would latch
+            const T grDepth = std::clamp(-grDb * T(0.1), T(0), T(1));
+            wet += colorAmt * kFetColorH2 * grDepth * (sq - dc);
+        }
+        // The feedback detector reads the compressed signal before makeup
+        // (makeup sits after the element; feeding it back would shift the
+        // static curve and run away with auto makeup).
+        fbLastOutput_[ch] = wet;
+        wet *= makeupLin;
+
+        // Parallel (New York) mix done inline: the dry reference is `input`,
+        // which carries the SAME lookahead delay as the wet, so dry and wet
+        // stay phase-aligned (the previous DryWetMixer captured the UNDELAYED
+        // input and comb-filtered when lookahead + mix<1 were combined).
+        data[i] = (mixVal < T(1)) ? (input * (T(1) - mixVal) + wet * mixVal) : wet;
     }
 
     /** 
@@ -1114,6 +1589,17 @@ protected:
                 charSlowRelCoeff_ = charRelCoeff_;
                 charChargeCoeff_  = charAttCoeff_;
                 charFastWeight_   = T(1); // single envelope
+                {
+                    // Decoupled detector (Clean, feed-forward): the smoothing
+                    // pole's release side is a tenth of the release (never
+                    // faster than the attack, never slower than half the
+                    // release); the hold stage takes the rest of the release
+                    // so the series t63 lands on the knob.
+                    const T smoothMs = std::min(std::max(relMs * T(0.1), attMs), relMs * T(0.5));
+                    decSmoothCoeff_ = tc(smoothMs);
+                    decHoldCoeff_ = tc(static_cast<T>(decoupledHoldTau(
+                        static_cast<double>(relMs), static_cast<double>(smoothMs))));
+                }
                 break;
 
             case Character::Opto:
@@ -1212,17 +1698,29 @@ protected:
      */
     [[nodiscard]] T applyHoldAndRange(T targetGR_Db, int ch) noexcept
     {
-        const T range = rangeDb_.load(std::memory_order_relaxed);
+        return holdAndRange(targetGR_Db, rangeDb_.load(std::memory_order_relaxed), holdSamples_,
+                            heldGrDb_[ch], holdCounters_[ch]);
+    }
+
+    /**
+     * @brief Hold and range on explicit state (shared by both block paths).
+     * @param targetGR_Db Static gain change target in dB.
+     * @param range       Maximum |gain change| in dB.
+     * @param holdSamples Hold length in samples (0 = off).
+     * @param held        Held gain change (state).
+     * @param counter     Remaining hold samples (state).
+     */
+    [[nodiscard]] static T holdAndRange(T targetGR_Db, T range, int holdSamples,
+                                        T& held, int& counter) noexcept
+    {
         targetGR_Db = std::clamp(targetGR_Db, -range, range);
 
-        if (holdSamples_ > 0)
+        if (holdSamples > 0)
         {
-            T& held = heldGrDb_[ch];
-            int& counter = holdCounters_[ch];
             if (std::abs(targetGR_Db) >= std::abs(held))
             {
                 held = targetGR_Db;          // deeper action: re-arm the hold
-                counter = holdSamples_;
+                counter = holdSamples;
             }
             else if (counter > 0)
             {
@@ -1258,7 +1756,12 @@ protected:
 
     /** @brief A non-finite sample reads as silence in the detector: it would
      *  otherwise latch in the recursive detector, filter and envelope state. */
-    [[nodiscard]] static T detectorSafe(T x) noexcept { return std::isfinite(x) ? x : T(0); }
+    [[nodiscard]] static T detectorSafe(T x) noexcept
+    {
+        // |x| <= max is false for NaN and both infinities: the same test as
+        // std::isfinite, as one compare (MSVC calls a library routine for it).
+        return (std::abs(x) <= std::numeric_limits<T>::max()) ? x : T(0);
+    }
 
     /**
      * @brief Computes level detection in Decibels.
@@ -1268,6 +1771,18 @@ protected:
      * @return Decibel representation of detected level.
      */
     [[nodiscard]] T detectLevel(T sample, int ch, DetectorType detType) noexcept
+    {
+        return gainToDecibels(detectLevelLinear(sample, ch, detType));
+    }
+
+    /**
+     * @brief Computes the detected level as a linear magnitude (>= 0).
+     * @param sample Input sample.
+     * @param ch Channel index (for state tracking).
+     * @param detType Selected detector methodology.
+     * @return Linear detected level.
+     */
+    [[nodiscard]] T detectLevelLinear(T sample, int ch, DetectorType detType) noexcept
     {
         T level = std::abs(sample);
         switch (detType)
@@ -1335,7 +1850,7 @@ protected:
                 break;
             }
         }
-        return gainToDecibels(level);
+        return level;
     }
 
     // ---- Gain curves ----
@@ -1381,29 +1896,32 @@ protected:
     {
         if (modeType == Mode::Upward)
             return computeGainUpward(inputDb, thresh, ratio, knee, guardDb);
+        return downwardCurve(inputDb, thresh, ratio, knee, charType);
+    }
 
+    /**
+     * @brief Downward static curve with the character's knee floor and ratio
+     *        law (see computeGain).
+     */
+    [[nodiscard]] static T downwardCurve(T inputDb, T thresh, T ratio, T knee, Character charType) noexcept
+    {
         const T effectiveRatio = effectiveRatioFor(charType, ratio, inputDb - thresh);
         const T effectiveKnee = effectiveKneeFor(charType, knee);
+        const T slope = T(1) - T(1) / effectiveRatio;
 
+        // Branch-free pieces (the level crosses the threshold at random on
+        // dense programme, where a branch per sample mispredicts): below the
+        // threshold the linear piece is positive and min() returns 0.
         if (effectiveKnee <= T(0))
-        {
-            // Hard knee
-            if (inputDb <= thresh) return T(0);
-            return (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
-        }
-        else
-        {
-            // Soft knee interpolation
-            T halfKnee = effectiveKnee / T(2);
-            T lower = thresh - halfKnee;
-            T upper = thresh + halfKnee;
+            return std::min(thresh - inputDb, T(0)) * slope;
 
-            if (inputDb <= lower) return T(0);
-            if (inputDb >= upper) return (thresh - inputDb) * (T(1) - T(1) / effectiveRatio);
-
-            T x = inputDb - lower;
-            return (T(1) - T(1) / effectiveRatio) * x * x / (T(2) * effectiveKnee) * T(-1);
-        }
+        // Soft knee: the quadratic below the knee top never exceeds the
+        // linear piece, and with x clamped to the knee width it is the larger
+        // one above it, so min() picks the right piece on every side.
+        const T halfKnee = effectiveKnee / T(2);
+        const T x = std::clamp(inputDb - (thresh - halfKnee), T(0), effectiveKnee);
+        const T quad = T(0) - slope * x * x / (T(2) * effectiveKnee);
+        return std::min((thresh - inputDb) * slope, quad);
     }
 
     /**
@@ -1707,12 +2225,13 @@ protected:
     /**
      * @brief Smooths the static gain target with the active character's ballistics.
      *
-     * Operates on the gain change in dB. Clean/Varimu run a smoothed branching
-     * one-pole (attack while the gain moves away from unity, release while it
-     * recovers). Opto/FET blend a fast envelope with a slow one that charges
-     * with compression history, producing the two-stage program-dependent
-     * release of the modeled hardware: brief peaks release fast because the
-     * slow stage never charged, sustained compression leaves a long tail.
+     * Operates on the gain change in dB. Varimu, and Clean with Branching
+     * ballistics or in feedback, run a branching one-pole (attack while the
+     * gain moves away from unity, release while it recovers). Opto/FET blend
+     * a fast envelope with a slow one that charges with compression history,
+     * producing the two-stage program-dependent release of the modeled
+     * hardware: brief peaks release fast because the slow stage never
+     * charged, sustained compression leaves a long tail.
      *
      * @param targetGrDb Static gain change target in dB (negative = reduction).
      * @param ch Channel index.
@@ -1723,11 +2242,20 @@ protected:
      *        detector with memory (explicit loop): both coefficients get a
      *        stability floor, which caps the per-sample loop advance at 0.5
      *        and keeps the one-sample-delay iteration from ringing at extreme
-     *        ratio/time combinations. 0 = no loop (default).
+     *        ratio/time combinations. It applies at any slope, 0 included:
+     *        below the knee the loop is flat, but a release faster than the
+     *        detector's delay still overshoots the settled gain. Negative =
+     *        no loop (default).
+     * @param loopDelay Delay of the detector inside that loop, in samples
+     *        (see feedbackDetectorDelay()). A loop that advances faster than
+     *        its detector can report the result overshoots and rings, so the
+     *        floor also caps the release advance at 1 / (e (1 + delay)), the
+     *        critically damped limit of a first-order loop around a delay,
+     *        and the attack advance at twice that.
      * @return The smoothed gain change in dB to apply.
      */
     [[nodiscard]] T applyBallistics(T targetGrDb, int ch, bool splitAdaptive,
-                                    T loopSlope = T(0)) noexcept
+                                    T loopSlope = T(-1), double loopDelay = 0.0) noexcept
     {
         // Level-adaptive release for the SplitPolarity detector: full-scale
         // output halves the release time constant. Halving tau squares the
@@ -1743,39 +2271,212 @@ protected:
             const double outputLevel = (lastOut < 1.0) ? lastOut : 1.0;
             relCoeff += outputLevel * (relCoeff * relCoeff - relCoeff);
         }
-        if (loopSlope > T(0))
+        if (loopSlope >= T(0))
         {
             // Cap the per-sample loop advance at 0.5 (half-deadbeat): the
             // one-sample delay then converges monotonically instead of
             // sustaining a marginal dance on the detector's residual ripple.
-            const double floorCoeff = 1.0 - 0.5 / (1.0 + static_cast<double>(loopSlope));
-            attCoeff = std::max(attCoeff, floorCoeff);
-            relCoeff = std::max(relCoeff, floorCoeff);
+            // A detector with a delay (the RMS window) lowers the cap to the
+            // critically damped advance of a loop around that delay. On a
+            // level fall the window's mean square stays up until the old
+            // loud samples leave it (a full window of delay); on a rise the
+            // new loud samples dominate it within a fraction of the window,
+            // so the attack side tolerates twice the advance (measured: no
+            // over-compression at 2x, 0.07 dB at 2.5x).
+            const double lim = (loopDelay > 0.0) ? 1.0 / (std::numbers::e * (1.0 + loopDelay)) : 0.5;
+            const double attAdvance = std::min(0.5, 2.0 * lim);
+            const double relAdvance = std::min(0.5, lim);
+            const double loop = 1.0 + static_cast<double>(loopSlope);
+            attCoeff = std::max(attCoeff, 1.0 - attAdvance / loop);
+            relCoeff = std::max(relCoeff, 1.0 - relAdvance / loop);
         }
 
-        // Attack acts while the gain FALLS (louder signal: deeper reduction,
-        // or less upward boost); release acts while it recovers upward. A
-        // magnitude comparison would invert the two in Upward mode and make
-        // the envelope chase the huge boosts of the waveform's zero crossings.
-        double& fast = envFastDb_[ch];
-        const double tgt = static_cast<double>(targetGrDb);
-        const bool engaging = tgt < fast;
-        fast = tgt + (engaging ? attCoeff : relCoeff) * (fast - tgt);
+        return static_cast<T>(ballisticsStep(static_cast<double>(targetGrDb), envFastDb_[ch],
+                                             envSlowDb_[ch], attCoeff, relCoeff));
+    }
+
+    /**
+     * @brief Branch-free branching one-pole step toward `tgt`: coefficient
+     *        `cDown` while the state is above the target (the gain falls),
+     *        `cUp` otherwise.
+     *
+     * The two candidate steps are ordered by the coefficients: with
+     * cDown <= cUp the falling step is the smaller one when the state is
+     * above the target and the rising step the smaller one when it is below,
+     * so min() selects the right branch (max() when cDown > cUp). Same value
+     * as the branch, without a data-dependent jump per sample.
+     */
+    [[nodiscard]] static double branchingStep(double y, double tgt, double cDown, double cUp) noexcept
+    {
+        const double d = y - tgt;
+        const double down = tgt + cDown * d;
+        const double up = tgt + cUp * d;
+        return (cDown <= cUp) ? std::min(down, up) : std::max(down, up);
+    }
+
+    /**
+     * @brief Branching ballistics on explicit state (shared by both block
+     *        paths): the fast envelope, plus the Opto/FET memory stage.
+     *
+     * Attack acts while the gain FALLS (louder signal: deeper reduction, or
+     * less upward boost); release acts while it recovers upward. A magnitude
+     * comparison would invert the two in Upward mode and make the envelope
+     * chase the huge boosts of the waveform's zero crossings.
+     */
+    [[nodiscard]] double ballisticsStep(double tgt, double& fast, double& slow,
+                                        double attCoeff, double relCoeff) const noexcept
+    {
+        fast = branchingStep(fast, tgt, attCoeff, relCoeff);
         if (std::abs(fast) < 1e-4) fast = 0.0; // kill the asymptotic dB tail
 
         if (charFastWeight_ >= T(1)) // Clean / Varimu: single envelope
-            return static_cast<T>(fast);
+            return fast;
 
         // Opto / FET memory stage: charges toward the target over the history
         // time constant and discharges with the slow release, so its level
         // encodes how long (and how deep) the compressor has been working.
-        double& slow = envSlowDb_[ch];
-        const bool charging = tgt < slow;
-        slow = tgt + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - tgt);
+        slow = branchingStep(slow, tgt, charChargeCoeff_, charSlowRelCoeff_);
         if (std::abs(slow) < 1e-4) slow = 0.0;
 
         const double w = static_cast<double>(charFastWeight_);
-        return static_cast<T>(w * fast + (1.0 - w) * slow);
+        return w * fast + (1.0 - w) * slow;
+    }
+
+    /**
+     * @brief The adaptive makeup envelope only runs while adaptive makeup is
+     *        active; when it engages it starts from the current gain change
+     *        (the settled value of a tracker that had kept running). Audio
+     *        thread only.
+     */
+    void syncAdaptiveMakeup(bool adaptive) noexcept
+    {
+        if (adaptive && !adaptiveMakeupActive_)
+            autoMakeupEnv_ = gainReductionDb_.load(std::memory_order_relaxed);
+        adaptiveMakeupActive_ = adaptive;
+    }
+
+    /**
+     * @brief Delay of the detector as an explicit feedback loop sees it, in
+     *        samples: the RMS window (its reading of a level step completes
+     *        one window later). The other detectors respond within a few
+     *        samples, which the base cap of the loop advance already covers.
+     */
+    [[nodiscard]] double feedbackDetectorDelay(DetectorType detType) const noexcept
+    {
+        return (detType == DetectorType::Rms) ? static_cast<double>(rmsWindowSamples_) : 0.0;
+    }
+
+    /** @brief The Clean character in feed-forward runs the decoupled detector
+     *  when setCleanBallistics() selected it. */
+    [[nodiscard]] bool useDecoupled(Character charType, Topology topoEff) const noexcept
+    {
+        return charType == Character::Clean && topoEff == Topology::FeedForward
+            && cleanBallistics_.load(std::memory_order_relaxed) == CleanBallistics::Decoupled;
+    }
+
+    /**
+     * @brief Seats the decoupled hold stage on the current gain when the
+     *        decoupled path engages (character or topology change), so the
+     *        switch does not replay a stale hold value. Audio thread only.
+     */
+    void syncDecoupledState(bool decoupled) noexcept
+    {
+        if (decoupled && !decoupledActive_)
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+                envHoldDb_[static_cast<size_t>(ch)] = envFastDb_[static_cast<size_t>(ch)];
+        decoupledActive_ = decoupled;
+    }
+
+    /**
+     * @brief Decoupled ballistics for the Clean character in feed-forward
+     *        operation (after the smooth decoupled peak detector of
+     *        Giannoulis, Massberg and Reiss, JAES 2012).
+     *
+     * A hold stage follows a deeper target at once and releases toward a
+     * shallower one; a smoothing stage then follows the held envelope with
+     * the attack pole while it deepens and a release-side pole (a tenth of
+     * the release, see updateTimeConstants) while it recovers. Branching
+     * ballistics release toward every dip of a rectified waveform (each zero
+     * crossing of a tone), so the gain rides the waveform; here the dips
+     * only shave the held level by its slow release, and the smoothing stage
+     * filters that small sawtooth in both directions. A 1 kHz tone 14 dB
+     * over a 4:1 threshold: THD+N -65.5 dB branching against -102 dB here
+     * at 5/100 ms (-54 against -80 dB at 1/30 ms, -57 against -84 dB at
+     * 0.1/50 ms), and the gain sits on the peak-referenced static curve
+     * instead of up to 0.8 dB above it.
+     *
+     * Timing contract: the attack is the attack pole alone (the hold stage
+     * is instant), so its t63 is the knob. On release the two stages are in
+     * series; updateTimeConstants() solves the hold stage's time constant so
+     * the series release still passes t63 at the release knob. The series
+     * rounds the first part of the release (at 5/100 ms the curve stays
+     * within 0.8 dB of the exponential on a 12 dB release). When the attack
+     * is longer than half the release, the release-side pole is capped at
+     * half the release, so a release can still be shorter than the attack.
+     *
+     * @param targetGrDb Static gain change target in dB (negative = reduction).
+     * @param ch Channel index.
+     * @param splitAdaptive True when the effective detector is SplitPolarity
+     *        (its level-adaptive release then shortens the hold stage).
+     * @return The smoothed gain change in dB to apply.
+     */
+    [[nodiscard]] T applyBallisticsDecoupled(T targetGrDb, int ch, bool splitAdaptive) noexcept
+    {
+        double holdCoeff = decHoldCoeff_;
+        if (splitAdaptive)
+        {
+            const double lastOut = std::abs(static_cast<double>(fbLastOutput_[ch]));
+            const double outputLevel = (lastOut < 1.0) ? lastOut : 1.0;
+            holdCoeff += outputLevel * (holdCoeff * holdCoeff - holdCoeff);
+        }
+
+        return static_cast<T>(decoupledStep(static_cast<double>(targetGrDb), envHoldDb_[ch],
+                                            envFastDb_[ch], holdCoeff));
+    }
+
+    /** @brief One decoupled step on explicit state (see applyBallisticsDecoupled). */
+    [[nodiscard]] double decoupledStep(double tgt, double& hold, double& fast,
+                                       double holdCoeff) const noexcept
+    {
+        // Hold stage: a deeper (lower) target is taken at once; otherwise
+        // release toward the target. Same direction rule as the branching
+        // ballistics: a falling gain is the attack side in both modes.
+        hold = std::min(tgt, tgt + holdCoeff * (hold - tgt));
+        if (std::abs(hold) < 1e-4) hold = 0.0; // kill the asymptotic dB tail
+
+        // Smoothing stage: the attack pole while the held gain is below the
+        // output (deepening), the release-side pole otherwise (never slower
+        // than the attack, see updateTimeConstants).
+        fast = branchingStep(fast, hold, charAttCoeff_, decSmoothCoeff_);
+        if (std::abs(fast) < 1e-4) fast = 0.0;
+        return fast;
+    }
+
+    /**
+     * @brief Time constant of the decoupled hold stage (ms) so that the series
+     *        release of the hold stage and the smoothing pole passes t63 at
+     *        `releaseMs`.
+     *
+     * Series step-down response of two one-poles tau1, tau2:
+     * (tau1 e^(-t/tau1) - tau2 e^(-t/tau2)) / (tau1 - tau2), increasing in
+     * tau1; bisected (setup rate, not per sample).
+     */
+    [[nodiscard]] static double decoupledHoldTau(double releaseMs, double smoothMs) noexcept
+    {
+        const double target = std::exp(-1.0);
+        auto remaining = [&](double tau1) {
+            const double t = releaseMs, t2 = smoothMs;
+            if (std::abs(tau1 - t2) < 1e-9 * t)
+                return (1.0 + t / t2) * std::exp(-t / t2);
+            return (tau1 * std::exp(-t / tau1) - t2 * std::exp(-t / t2)) / (tau1 - t2);
+        };
+        double lo = 1e-6 * releaseMs, hi = releaseMs;
+        for (int it = 0; it < 48; ++it)
+        {
+            const double mid = 0.5 * (lo + hi);
+            if (remaining(mid) < target) lo = mid; else hi = mid;
+        }
+        return 0.5 * (lo + hi);
     }
 
     // ---- Sidechain HPF ----
@@ -1867,6 +2568,7 @@ protected:
     std::atomic<DetectorType> detectorType_ { DetectorType::Peak }; ///< Selected detection method.
     std::atomic<Topology> topology_ { Topology::FeedForward };      ///< Selected topology.
     std::atomic<Character> character_ { Character::Clean };         ///< Selected ballistics.
+    std::atomic<CleanBallistics> cleanBallistics_ { CleanBallistics::Branching }; ///< Clean feed-forward ballistics.
     std::atomic<Mode> mode_ { Mode::Downward };                     ///< Selected compression mode.
 
     // Internal DSP Coefficients & State
@@ -1903,6 +2605,11 @@ protected:
     // at 192 kHz parked 0.57 dB short of its target.
     std::array<double, kMaxChannels> envFastDb_ {}; ///< Fast gain envelope per channel (dB).
     std::array<double, kMaxChannels> envSlowDb_ {}; ///< Slow memory envelope per channel (dB).
+    std::array<double, kMaxChannels> envHoldDb_ {}; ///< Decoupled hold stage per channel (dB).
+    double decHoldCoeff_   = 0.0;  ///< Decoupled hold-stage release coefficient.
+    double decSmoothCoeff_ = 0.0;  ///< Decoupled smoothing pole, release side.
+    bool decoupledActive_ = false; ///< The decoupled path ran last (audio thread).
+    bool adaptiveMakeupActive_ = false; ///< Adaptive makeup ran last (audio thread).
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).
     std::array<T, kMaxChannels> fbLastOutput_ {};   ///< Feedback topology history buffer.

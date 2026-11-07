@@ -50,6 +50,27 @@ template <FloatType T> class OnsetPeakPicker final
     [[nodiscard]] bool accept(std::size_t index, std::size_t count, Value value, Windows windows,
                               T delta)
     {
+        return accept(index, count, value, windows, delta, T(1), [](std::size_t, T) { return true; });
+    }
+    /**
+     * @brief accept() with the moving mean scaled and a final veto. The veto
+     * is consulted only for a candidate that passed the maximum and mean
+     * tests; a vetoed candidate does not start the wait window, exactly as
+     * one that failed them. A scale of one is the plain picker above.
+     * @param index     Candidate index, increasing between calls.
+     * @param count     Length of the novelty sequence.
+     * @param value     Accessor returning the novelty at an index.
+     * @param windows   Maximum, average and wait windows.
+     * @param delta     Margin above the scaled moving mean.
+     * @param meanScale Factor on the moving mean.
+     * @param gate      Callable taking the index and the candidate's margin
+     *                  over the threshold; false rejects the candidate.
+     * @return True when the candidate is selected.
+     */
+    template <typename Value, typename Gate>
+    [[nodiscard]] bool accept(std::size_t index, std::size_t count, Value value, Windows windows,
+                              T delta, T meanScale, Gate gate)
+    {
         if (index >= count || (hasLast_ && (index <= last_ || index - last_ <= windows.wait)))
             return false;
         const T current = value(index);
@@ -64,7 +85,8 @@ template <FloatType T> class OnsetPeakPicker final
         for (auto j = fromAvg; j <= toAvg; ++j)
             sum += value(j);
         const T mean = sum / static_cast<T>(toAvg - fromAvg + 1);
-        if (current < mean + delta)
+        const T threshold = meanScale * mean + delta;
+        if (current < threshold || !gate(index, current - threshold))
             return false;
         last_ = index;
         hasLast_ = true;

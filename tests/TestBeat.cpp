@@ -1822,3 +1822,127 @@ DSPARK_TEST(Beat_positions_stay_in_the_file_and_tempo_in_the_range)
     }
     EXPECT_TRUE(highest <= 118.0f);
 }
+
+namespace {
+
+void addSweptKick(std::vector<float>& x, int64_t at, double amp)
+{
+    double ph = 0.0;
+    for (int i = 0; i < static_cast<int>(0.12 * kFs); ++i)
+    {
+        const int64_t j = at + i;
+        if (j < 0 || j >= static_cast<int64_t>(x.size())) break;
+        const double t = i / kFs;
+        ph += twoPi<double> * (50.0 + 90.0 * std::exp(-t * 30.0)) / kFs;
+        x[static_cast<size_t>(j)] += static_cast<float>(amp * std::exp(-t * 18.0) * std::sin(ph));
+    }
+}
+
+void addNoiseHit(std::vector<float>& x, int64_t at, double amp, double decay, double hp)
+{
+    double lp = 0.0;
+    for (int i = 0; i < static_cast<int>(0.25 * kFs); ++i)
+    {
+        const int64_t j = at + i;
+        if (j < 0 || j >= static_cast<int64_t>(x.size())) break;
+        const double n = nrand();
+        const double h = n - lp;
+        lp += hp * (n - lp);
+        x[static_cast<size_t>(j)] += static_cast<float>(amp * std::exp(-i / kFs * decay) * h);
+    }
+}
+
+void addHarmonicTone(std::vector<float>& x, int64_t at, double f, double amp, double dur)
+{
+    for (int i = 0; i < static_cast<int>(dur * kFs); ++i)
+    {
+        const int64_t j = at + i;
+        if (j < 0 || j >= static_cast<int64_t>(x.size())) break;
+        const double t = i / kFs;
+        const double e = std::min(1.0, t / 0.003) * std::exp(-t * 5.0) * std::min(1.0, (dur - t) / 0.01);
+        double v = 0.0;
+        for (int h = 1; h <= 5; ++h) v += std::sin(twoPi<double> * f * h * t) / h;
+        x[static_cast<size_t>(j)] += static_cast<float>(amp * e * v);
+    }
+}
+
+// A syncopated groove: a kick on every other beat and on the off-beat of
+// every beat, a snare on the backbeat, hats on every eighth and short
+// mid-register tones on the off-beats. The eighths carry as much onset mass
+// as the beats, so the beat level holds a tenth of the coherence the eighth
+// level does; what names the beat is that the pattern repeats every beat.
+Corpus syncopatedGroove(double bpm, double seconds, uint32_t seed)
+{
+    rngState = seed;
+    Corpus c;
+    c.bpm = bpm;
+    c.x.assign(static_cast<size_t>(seconds * kFs), 0.0f);
+    const double p = 60.0 / bpm;
+    const double roots[4] = { 55.0, 65.41, 49.0, 73.42 };
+    int b = 0;
+    for (double t = 0.25; t < seconds - 1.0; t += p, ++b)
+    {
+        const int64_t at = static_cast<int64_t>(t * kFs);
+        c.beats.push_back(at);
+        if (b % 2 == 0) addSweptKick(c.x, at, 0.7);
+        if (b % 2 == 1) addNoiseHit(c.x, at, 0.35, 28.0, 0.35);
+        addNoiseHit(c.x, at, 0.08, 90.0, 0.85);
+        addNoiseHit(c.x, static_cast<int64_t>((t + 0.5 * p) * kFs), 0.08, 90.0, 0.85);
+        const double f = roots[(b / 8) % 4];
+        addHarmonicTone(c.x, static_cast<int64_t>((t + 0.75 * p) * kFs), 2.0 * f, 0.1, 0.6 * p);
+        addHarmonicTone(c.x, static_cast<int64_t>((t + 0.5 * p) * kFs), 3.0 * f, 0.1, 0.4 * p);
+        addSweptKick(c.x, static_cast<int64_t>((t + 1.5 * p) * kFs), 0.5);
+        if (b % 4 == 0)
+            for (const double m : { 4.0, 5.0, 6.0 })
+                addHarmonicTone(c.x, at, f * m, 0.06, 1.8 * p);
+    }
+    for (auto& v : c.x) v += static_cast<float>(3e-4 * nrand());
+    return c;
+}
+
+} // namespace
+
+// The causal beats on syncopated grooves: the beat clock must follow the
+// beat, not the eighth level that carries the onset mass in phase. F-measure
+// at +/-70 ms on the beats after the first 10 s. The coherence bank alone
+// followed the eighths or wandered between levels: F 0.649, 0.391 and 0.803.
+// The beat clock's own tempo readout must name the same level, and a click
+// train, whose events are all alike, must keep the beats at its own rate up
+// to the top of the default range, where a comb alone would halve it.
+DSPARK_TEST(Beat_causal_beats_follow_the_beat_of_a_syncopated_groove)
+{
+    double worst = 1.0;
+    for (const double bpm : { 100.0, 124.0, 140.0 })
+    {
+        const Corpus c = syncopatedGroove(bpm, 40.0, static_cast<uint32_t>(bpm) + 7u);
+        const CausalTrace tr = runCausal(c, 512);
+        std::vector<int64_t> ref, est;
+        for (const int64_t v : c.beats) if (v >= static_cast<int64_t>(10.0 * kFs)) ref.push_back(v);
+        for (const int64_t v : tr.beatSamples) if (v >= static_cast<int64_t>(10.0 * kFs)) est.push_back(v);
+        const BeatScore s = scoreBeats(ref, est, 70.0);
+        std::cout << "  syncopated groove at " << bpm << " BPM: causal beat F " << s.f
+                  << " (" << s.matched << " of " << s.nRef << " beats, " << s.nEst << " announced)\n";
+        worst = std::min(worst, s.f);
+
+        BeatTracker<float> bt;
+        bt.prepare(AudioSpec{ kFs, 512, 1 });
+        bt.pushSamples(std::span<const float>(c.x.data(), c.x.size()));
+        std::cout << "    beat clock tempo " << static_cast<double>(bt.getBeatTempoBpm())
+                  << ", running tempo " << static_cast<double>(bt.getRunningTempoBpm()) << "\n";
+        EXPECT_NEAR(static_cast<double>(bt.getBeatTempoBpm()), bpm, 0.04 * bpm);
+    }
+    EXPECT_GT(worst, 0.9);
+
+    for (const double bpm : { 200.0, 240.0 })
+    {
+        const Corpus c = clickTrain(bpm, 30.0);
+        const CausalTrace tr = runCausal(c, 512);
+        std::vector<int64_t> ref, est;
+        for (const int64_t v : c.beats) if (v >= static_cast<int64_t>(10.0 * kFs)) ref.push_back(v);
+        for (const int64_t v : tr.beatSamples)
+            if (v >= static_cast<int64_t>(10.0 * kFs) && v <= c.beats.back()) est.push_back(v);
+        const BeatScore s = scoreBeats(ref, est, 70.0);
+        std::cout << "  clicks at " << bpm << " BPM: causal beat F " << s.f << "\n";
+        EXPECT_GT(s.f, 0.95);
+    }
+}

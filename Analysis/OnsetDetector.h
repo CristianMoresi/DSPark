@@ -37,24 +37,35 @@
  * on that corpus under the defaults is 8 of 8 at EVERY rate (7 of 8 at the
  * former default delta of 0.03, where one soft F#1 stayed below it).
  *
- * Default sensitivity. The default delta is 0.015 on the band-averaged ODF.
- * It was chosen on a synthetic note corpus (six kinds: 1 ms, 30 ms and 60 ms
- * attacks, sharp attacks under vibrato, sharp attacks over a noise bed, and
- * 20 ms attacks on sustained notes with +/-3 dB 5 Hz tremolo and vibrato;
- * F-measure at +/-50 ms, offline picker), as the value with the best mean
- * F-measure over the six kinds on six files per kind among the values
- * that keep this file's acceptance beds free of false positives; on 24
- * further files per kind it gives a mean of 0.767, against 0.625 at the
- * former 0.03, and 0.798 against 0.698 pooled over all onsets. Per kind
- * (held-out): 1 ms attacks 0.978 (0.936 before), 30 ms 0.788 (0.428),
- * 60 ms 0.603 (0.214), vibrato 0.968 (0.894), over a bed 0.930 (0.813), with
- * no false positive on any of the five. The cost is the tremolo kind: 1.85
- * false onsets per second against 0.21 (F 0.337 against 0.463), because a
- * maximum filter across frequency suppresses vibrato and not amplitude
- * modulation. Raise the delta for heavily amplitude-modulated sustained
- * material. A smaller delta recalls slower attacks still (0.004: 30 ms
- * attacks 0.977, 60 ms 0.934) but also reports the 10 ms releases of
- * full-level bass notes in this file's acceptance beds.
+ * Default sensitivity. The default picker is Picker::Gated with a delta of
+ * 0.0035 on the band-averaged ODF: a peak must clear twice the moving mean
+ * plus the delta, and the frame energy around it must not show a note
+ * release (see setPicker()). A plain picker cannot get there: the delta low
+ * enough for 60 ms attacks also reports note releases and the fluctuations
+ * of a noise bed. Measured on a synthetic corpus of eleven kinds (1, 30 and
+ * 60 ms attacks; sharp attacks under vibrato, over a quiet noise bed, and on
+ * sustained notes with +/-3 dB tremolo; full-level notes ended by 5 to 20 ms
+ * releases into silence, in two registers; dense percussion with quiet hits
+ * inside loud decays; clicks over pink noise at 0 dB; slow attacks 12 to 24
+ * dB over pink noise), F-measure at +/-50 ms, offline picker, the
+ * parameters chosen on six files per kind and reported on 24 others:
+ *
+ *   kind               gated 0.0035   plain 0.015   plain 0.004
+ *   1 ms attacks        0.998          0.978         0.997
+ *   30 ms attacks       0.966          0.788         0.977
+ *   60 ms attacks       0.909          0.603         0.934
+ *   releases, bass      0.999 / 0.00   0.980 / 0.06  0.806 / 0.66
+ *   releases, slow      1.000 / 0.00   0.923 / 0.23  0.773 / 0.82
+ *   percussion          0.965          0.948         0.980
+ *   clicks in noise     0.995 / 0.02   1.000 / 0.00  0.450 / 4.65
+ *   slow in noise       0.621          0.471         0.500 / 3.24
+ *
+ * (F, and false onsets per second where there are any). The vibrato, bed
+ * and tremolo kinds stay at 0.978 to 0.995 with no false onset. The same
+ * rule at 48 and 96 kHz gives the same figures within 0.03. Lower the delta
+ * for still more recall of slow attacks (0.0025: 30 ms 0.971, 60 ms 0.922,
+ * with 0.01 bass releases and 0.03 noise clicks per second); Picker::Plain
+ * with setThreshold(0.015) restores the former default exactly.
  *
  * Latency (ONE definition). Frame N (Hann; automatic by default), hop =
  * round(fs/200) (221 samples at 44.1 kHz, 240 at 48 kHz; ~5 ms). The detector
@@ -95,10 +106,12 @@
  *   is the envelope readout for the component that is itself driving
  *   pushSamples() and therefore knows when a frame boundary passed; any other
  *   thread must use the atomic onset readouts above.
- * - setMethod() / setThreshold() / setAdaptiveWhitening(): control thread
+ * - setMethod() / setThreshold() / setAdaptiveWhitening() / setPicker():
+ *   control thread
  *   (independent single-word relaxed atomics; non-finite thresholds are
  *   ignored).
- * - getMethod() / getThreshold() / getAdaptiveWhitening(): any thread,
+ * - getMethod() / getThreshold() / getAdaptiveWhitening() / getPicker():
+ *   any thread,
  *   lock-free (the same relaxed atomics the setters write).
  * - detectOffline() / detectOfflineOnsets() and the incremental session
  *   beginOffline() / pushOffline() / finishOffline() / finishOfflineOnsets():
@@ -109,13 +122,15 @@
  * Embedded/wasm: compiles under -fno-exceptions -fno-rtti (no throw on any
  * path); no file I/O, so it is unaffected by DSPARK_NO_FILE_IO.
  *
- * Dependencies: DspMath.h, detail/OnsetFeatures.h, AudioBuffer.h, AudioSpec.h.
+ * Dependencies: DspMath.h, detail/OnsetFeatures.h, AudioBuffer.h, AudioSpec.h,
+ * SimdOps.h.
  */
 
 #include "../Core/DspMath.h"
 #include "detail/OnsetFeatures.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/SimdOps.h"
 
 #include <algorithm>
 #include <array>
@@ -146,6 +161,15 @@ class OnsetDetector final
 public:
     /** @brief Onset-detection function family. Default SuperFlux. */
     enum class Method { SpectralFlux, ComplexDomain, SuperFlux };
+
+    /**
+     * @brief Peak-picking rule. Default Gated.
+     *
+     * Plain: a peak must clear the moving mean plus the delta (Boeck, Krebs
+     * and Schedl, ISMIR 2012). Gated: it must clear twice the moving mean
+     * plus the delta, and then pass the release test of setPicker().
+     */
+    enum class Picker { Gated, Plain };
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -293,6 +317,19 @@ public:
         odfHistLen_ = std::max(preAvgFrames_, preMaxFrames_) + 4;
         odfHist_.assign(static_cast<size_t>(odfHistLen_), T(0));
 
+        // Release test spans, in frames, as fractions of the analysis frame
+        // (see setPicker()). The look-ahead always fits inside the
+        // fixed latency L: a candidate is reported at reference + L, which is
+        // 0.84 * fftSize + hop after its frame, and the test needs only
+        // 0.43 * fftSize of it.
+        energyBack_ = std::max(1, static_cast<int>(std::lround(kEnergyLookBack
+            * static_cast<double>(fftSize_) / static_cast<double>(hop_))));
+        energyAhead_ = std::max(1, static_cast<int>(std::lround(kEnergyLookAhead
+            * static_cast<double>(fftSize_) / static_cast<double>(hop_))));
+        energyHistLen_ = energyAhead_ + 4 * energyBack_ + 2;
+        energyHist_.assign(static_cast<size_t>(energyHistLen_), 0.0);
+        candidates_.assign(static_cast<size_t>(energyAhead_ + 2), Candidate{});
+
         // Pending-onset ring: onsets are held from detection until their
         // release sample (reference + L). At most ceil(L/hop)+2 can be
         // in flight; size generously to a power-of-two-ish bound.
@@ -315,8 +352,9 @@ public:
      * Non-finite values are ignored; negative values are clamped to 0.
      * The delta is read against the frame-invariant ODF scale (see
      * prepare()), so one value selects the same sensitivity at every rate
-     * and frame length. Default 0.015; see the file header for how it was
-     * chosen and what a smaller or larger value trades.
+     * and frame length. Default 0.0035 under the default Picker::Gated, whose
+     * threshold is twice the moving mean plus this delta; see the file header
+     * for how it was chosen and what a smaller or larger value trades.
      */
     void setThreshold(T deltaAboveMean) noexcept
     {
@@ -328,6 +366,52 @@ public:
     void setAdaptiveWhitening(bool on) noexcept
     {
         whitening_.store(on, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Selects the peak-picking rule. Lock-free.
+     *
+     * Gated (the default) is what lets the default delta be low enough for
+     * slow attacks. Two things go wrong when a plain picker's delta is
+     * lowered, and the gated rule answers each with a measurement the flux
+     * does not carry:
+     *
+     * - NOISE. Under a noise bed the flux has a high floor and fluctuates
+     *   in proportion to it, so a fixed margin over the mean is crossed by
+     *   the fluctuations. The gated threshold is twice the moving mean plus
+     *   the delta: the margin grows with the floor and stays at the delta
+     *   where the floor is near zero, between notes.
+     * - RELEASES. A fast note-off raises the log-band flux it ends:
+     *   shortening a partial inside the analysis window widens its
+     *   spectrum, and a hundred bands each gaining a little read, through
+     *   the log compression, as one broadband rise. The frame energy says
+     *   which way the sound went, so a peak is kept only when the energy
+     *   0.43 analysis frames after it has not fallen more than 2 dB below
+     *   the energy 0.2 frames before it, and has not fallen at all for a
+     *   peak within 0.0045 of its threshold (a low note whose partials beat
+     *   inside one band crosses a low threshold at a steady energy). A decay
+     *   already under way before the peak (its slope over the 0.4 frames
+     *   before that, extrapolated over the same span) is the previous sound
+     *   and is not counted against it, so a quiet hit inside a louder hit's
+     *   decay is kept.
+     *
+     * Offline and causal pickers use the same rule. The causal look-ahead
+     * fits inside the fixed reporting latency L, which does not change: a
+     * peak is reported 0.84 analysis frames plus one hop after its frame and
+     * the test needs 0.43 of them.
+     *
+     * Plain with setThreshold(0.015f) is exactly the former default.
+     * @param picker Rule to use.
+     */
+    void setPicker(Picker picker) noexcept
+    {
+        picker_.store(picker, std::memory_order_relaxed);
+    }
+
+    /** @brief Peak-picking rule in force. */
+    [[nodiscard]] Picker getPicker() const noexcept
+    {
+        return picker_.load(std::memory_order_relaxed);
     }
 
     /** @brief ODF family in force. */
@@ -605,7 +689,8 @@ public:
      * audio.
      *
      * Resets the streaming state and latches the method and whitening in force
-     * for the whole session; the threshold is read when the session finishes.
+     * for the whole session; the threshold and the picker are read when the
+     * session finishes.
      * @param expectedSamples Optional length hint, used only to reserve the
      *        envelope up front.
      */
@@ -613,6 +698,7 @@ public:
     {
         offOdf_.clear();
         offRef_.clear();
+        offEnergy_.clear();
         offlineOpen_ = false;
         if (!prepared_) return;
         if (expectedSamples > 0)
@@ -620,6 +706,7 @@ public:
             const size_t frames = static_cast<size_t>(expectedSamples / std::max(1, hop_) + 2);
             offOdf_.reserve(frames);
             offRef_.reserve(frames);
+            offEnergy_.reserve(frames);
         }
         resetState();
         offMethod_ = method_.load(std::memory_order_relaxed);
@@ -645,6 +732,7 @@ public:
                 offHop_ = 0;
                 offOdf_.push_back(computeOdf(offMethod_, offWhiten_));
                 offRef_.push_back(referenceSample(offTotal_));
+                offEnergy_.push_back(curEnergy_);
             }
         }
     }
@@ -672,14 +760,25 @@ public:
             static_cast<size_t>(preAvgFrames_), static_cast<size_t>(postAvgFrames_),
             static_cast<size_t>(waitFrames_)
         };
+        const bool gated = picker_.load(std::memory_order_relaxed) == Picker::Gated;
+        const int64_t last = static_cast<int64_t>(offEnergy_.size()) - 1;
+        const auto energyAt = [&](int64_t i) {
+            return offEnergy_[static_cast<size_t>(std::clamp<int64_t>(i, 0, last))];
+        };
         for (size_t f = static_cast<size_t>(primeFrames_); f < odf.size(); ++f)
         {
-            if (picker.accept(f, odf.size(), [&](size_t i) { return odf[i]; }, windows, delta))
+            if (picker.accept(f, odf.size(), [&](size_t i) { return odf[i]; }, windows, delta,
+                              gated ? T(kGatedMeanScale) : T(1),
+                              [&](size_t i, T margin) {
+                                  return !gated || keepsEnergy(static_cast<int64_t>(i), energyAt,
+                                                               margin < T(kWeakMargin));
+                              }))
                 out.push_back(Onset { offRef_[f], odf[f] });
         }
 
         offOdf_.clear();
         offRef_.clear();
+        offEnergy_.clear();
         resetState();
         return out;
     }
@@ -707,9 +806,32 @@ private:
     /// Automatic-frame policy: the span 2048 samples cover at 48 kHz, resolved
     /// inside [512, 16384] (covers 8 kHz .. 384 kHz without hitting a clamp).
     static constexpr int64_t kBig = int64_t(1) << 60;
-    static constexpr T kDefaultDelta = T(0.015);
+    static constexpr T kDefaultDelta = T(0.0035);
+    /// Gated picker (setPicker()): the factor on the moving mean, and where
+    /// the release test reads the energy, as
+    /// fractions of the analysis frame before and after the candidate, and
+    /// the largest fall it tolerates.
+    static constexpr double kGatedMeanScale = 2.0;
+    static constexpr double kEnergyLookBack = 0.2;
+    static constexpr double kEnergyLookAhead = 0.43;
+    static constexpr double kReleaseFallDb = -2.0;
+    /// A peak within this much of the threshold must show no fall at all:
+    /// a stationary low note whose partials beat inside one band crosses a
+    /// low threshold at a steady energy, and only a rise sets it apart.
+    static constexpr double kWeakMargin = 0.0045;
+    static constexpr double kWeakFallDb = 0.0;
+    static constexpr double kEnergyFloor = 1e-30;
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).
     static constexpr int kPhaseRestartFrames = 3; ///< Frames phase prediction needs after a restart.
+
+    /// A picked causal peak waiting for the frames its release test reads.
+    struct Candidate
+    {
+        int64_t frame = 0;           ///< 1-based frame number of the peak.
+        int64_t referenceSample = 0; ///< Its frame-centre reference.
+        T strength = T(0);
+        bool weak = false;           ///< Within kWeakMargin of the threshold.
+    };
 
     struct PendingOnset
     {
@@ -751,6 +873,11 @@ private:
         }
         binPhases_ = phases;
         spectrum_.compute(&ring_[static_cast<size_t>(writePos_)], phases);
+        // Frame energy for the release test, from the raw magnitudes: the
+        // whitening below rewrites them in place.
+        const auto mags = spectrum_.magnitudes();
+        curEnergy_ = static_cast<double>(
+            simd::sumOfSquares(mags.data(), static_cast<int>(mags.size())));
         using FeatureMethod = typename detail::OnsetNovelty<T>::Method;
         const auto selected = method == Method::SpectralFlux ? FeatureMethod::SpectralFlux
                             : method == Method::ComplexDomain ? FeatureMethod::ComplexDomain
@@ -773,6 +900,7 @@ private:
         odfHist_[static_cast<size_t>(odfWrite_)] = value;
         odfWrite_ = (odfWrite_ + 1) % odfHistLen_;
         ++frameIndex_;
+        energyHist_[static_cast<size_t>(frameIndex_ % energyHistLen_)] = curEnergy_;
 
         // Envelope readout for the stream owner (see getLastOdfFrame()). The
         // frame fired at totalSamples_, so it localises exactly where an onset
@@ -784,7 +912,7 @@ private:
         // Causal peak-pick with a single-frame confirmation: we decide whether
         // the PREVIOUS frame was a maximum now that we have the current one.
         // This one-hop confirmation is exactly the +hop term of L.
-        if (frameIndex_ < 2) { lastConfirmOdf_ = value; return; }
+        if (frameIndex_ < 2) { lastConfirmOdf_ = value; decideCandidates(); return; }
 
         const T prev = odfAt(1);      // previous frame's ODF (candidate)
         const T curr = value;         // current frame (confirmation)
@@ -799,7 +927,7 @@ private:
             }
         }
 
-        if (isMax)
+        if (!isMax) { decideCandidates(); return; }
         {
             // (2) prev exceeds the backward moving mean + delta.
             T sum = T(0); int cnt = 0;
@@ -809,20 +937,81 @@ private:
             }
             const T mean = (cnt > 0) ? sum / static_cast<T>(cnt) : T(0);
             const T delta = threshold_.load(std::memory_order_relaxed);
+            const T scale = picker_.load(std::memory_order_relaxed) == Picker::Gated
+                          ? T(kGatedMeanScale) : T(1);
 
             // (3) combination width since the last onset, and past warm-up.
             const int64_t candFrame = frameIndex_ - 1;
-            if (candFrame >= primeFrames_ && prev >= mean + delta
-                && candFrame - lastOnsetFrame_ > waitFrames_)
+            if (candFrame >= primeFrames_ && prev >= scale * mean + delta
+                && candFrame - lastOnsetFrame_ > waitFrames_
+                && candidateCount_ < static_cast<int>(candidates_.size()))
             {
                 // The candidate is the previous frame; its fire position was
                 // totalSamples_ - hop (one hop before the current frame's fire).
+                // It waits for the frames its release test reads; the
+                // decision still lands well before its reporting sample.
                 const int64_t candFirePos = totalSamples_ - hop_;
-                const int64_t ref = referenceSample(candFirePos);
-                scheduleOnset(ref, prev);
-                lastOnsetFrame_ = candFrame;
+                const int tail = (candidateHead_ + candidateCount_)
+                               % static_cast<int>(candidates_.size());
+                candidates_[static_cast<size_t>(tail)] = Candidate {
+                    candFrame, referenceSample(candFirePos), prev,
+                    prev - (scale * mean + delta) < T(kWeakMargin) };
+                ++candidateCount_;
             }
         }
+        decideCandidates();
+    }
+
+    /** @brief Decides, in order, the causal candidates whose release-test
+     *  frames have all been computed. */
+    void decideCandidates() noexcept
+    {
+        const bool gated = picker_.load(std::memory_order_relaxed) == Picker::Gated;
+        const auto energyAt = [&](int64_t k) {
+            const int64_t oldest = std::max<int64_t>(1, frameIndex_ - energyHistLen_ + 1);
+            const int64_t at = std::clamp(k, oldest, frameIndex_);
+            return energyHist_[static_cast<size_t>(at % energyHistLen_)];
+        };
+        while (candidateCount_ > 0)
+        {
+            const Candidate c = candidates_[static_cast<size_t>(candidateHead_)];
+            if (c.frame + energyAhead_ > frameIndex_) break;
+            candidateHead_ = (candidateHead_ + 1) % static_cast<int>(candidates_.size());
+            --candidateCount_;
+            if (c.frame - lastOnsetFrame_ > waitFrames_
+                && (!gated || keepsEnergy(c.frame, energyAt, c.weak)))
+            {
+                scheduleOnset(c.referenceSample, c.strength);
+                lastOnsetFrame_ = c.frame;
+            }
+        }
+    }
+
+    /**
+     * @brief The release test of setPicker(), on frame energies.
+     * @param f        Frame of the candidate peak.
+     * @param energyAt Accessor from a frame number to its energy.
+     * @param weak     The peak cleared the threshold by less than
+     *                 kWeakMargin; it must then show no fall at all.
+     * @return True when the peak is kept.
+     *
+     * The rise from energyBack_ frames before the peak to energyAhead_ after
+     * it, less the slope over the four energyBack_ frames before that, where
+     * it falls, extrapolated over the same span: a decay already in progress
+     * belongs to the previous sound, not to the new event.
+     */
+    template <typename Energy>
+    [[nodiscard]] bool keepsEnergy(int64_t f, Energy energyAt, bool weak) const noexcept
+    {
+        const auto dB = [](double a, double b) {
+            return 10.0 * std::log10((a + kEnergyFloor) / (b + kEnergyFloor));
+        };
+        const int64_t b = energyBack_, a = energyAhead_;
+        const double before = dB(energyAt(f - 2 * b), energyAt(f - 4 * b));
+        const double rise = dB(energyAt(f + a), energyAt(f - b))
+                          - static_cast<double>(a + b) / static_cast<double>(2 * b)
+                            * std::min(0.0, before);
+        return rise >= (weak ? kWeakFallDb : kReleaseFallDb);
     }
 
     /** @brief ODF value j frames back (j>=1) from the most recent write. */
@@ -865,6 +1054,10 @@ private:
         binPhases_ = true;
         pendingHead_ = 0;
         pendingCount_ = 0;
+        candidateHead_ = 0;
+        candidateCount_ = 0;
+        curEnergy_ = 0.0;
+        std::fill(energyHist_.begin(), energyHist_.end(), 0.0);
 
         onsetLatched_.store(false, std::memory_order_relaxed);
         onsetStrength_.store(T(0), std::memory_order_relaxed);
@@ -910,10 +1103,20 @@ private:
     int pendingHead_ = 0;
     int pendingCount_ = 0;
 
+    // Release test: frame energies and the causal peaks awaiting them.
+    int energyBack_ = 2, energyAhead_ = 4;
+    int energyHistLen_ = 12;
+    std::vector<double> energyHist_;
+    double curEnergy_ = 0.0;   ///< Energy of the frame computeOdf() last ran.
+    std::vector<Candidate> candidates_;
+    int candidateHead_ = 0;
+    int candidateCount_ = 0;
+
     // Atomic parameters / readouts.
     std::atomic<Method> method_ { Method::SuperFlux };
     std::atomic<T> threshold_ { kDefaultDelta };
     std::atomic<bool> whitening_ { false };
+    std::atomic<Picker> picker_ { Picker::Gated };
     std::atomic<bool> onsetLatched_ { false };
     std::atomic<T> onsetStrength_ { T(0) };
     std::atomic<int64_t> lastOnsetSample_ { -1 };
@@ -922,6 +1125,7 @@ private:
     // Offline session (beginOffline() .. finishOffline()).
     std::vector<T> offOdf_;
     std::vector<int64_t> offRef_;
+    std::vector<double> offEnergy_;
     int64_t offTotal_ = 0;
     int offHop_ = 0;
     Method offMethod_ = Method::SuperFlux;

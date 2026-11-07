@@ -565,6 +565,12 @@ the mass it is measured against decay together, so the confidence HOLDS its
 last value through silence instead of falling. A caller that needs to tell
 "steady" from "nothing playing" reads level separately.
 
+The running tempo names the pulse that carries the onset mass in phase. On a
+syncopated groove, where the off-beats carry as much of it as the beats, the
+beats follow the level at which the pattern repeats instead, and the two can
+differ by a factor of two; `getBeatTempoBpm()` is the rate the beats are
+announced at.
+
 `BeatTracker` consumes `OnsetDetector`'s onset-strength envelope, so if you
 want onsets too, take them from `getOnsetDetector()` rather than running a
 second copy of the same analysis.

@@ -105,7 +105,8 @@
  *
  * with a = 0.9 and W a log-Gaussian over [tau / 2, 2 tau], and the next beat is
  * the strongest point of C continued one period ahead with no further onsets.
- * No backtracking, no future context.
+ * No backtracking, no future context. The period the score follows is the
+ * metrical level described below.
  *
  * Why the beats are not read from the resonator's phase, which would be free:
  * that phase is the circular mean of the onset mass, which is what the
@@ -119,15 +120,45 @@
  * score within 5% of each other the score cannot say which is the beat, and
  * the beat falls back to the phase turn: at 0.7 of the beat's level, 3/4
  * through it, 120 BPM (the one case), that keeps 30 of 31 beats within 70
- * ms, as the phase turn alone did. An off-beat at the beat's own level is the same pulse at two
- * phases, and neither placement finds the annotated one. A different metrical
- * level must also keep outscoring the one in force for four of its beats
- * before the beat clock follows it, so a level that flickers for a frame does
- * not restart the interval the clock is continuing. On the ISMIR 2004 ballroom
- * collection plus its additional excerpts (698 recordings) the causal beat
- * F-measure (+/-70 ms, beats after the first 5 s) goes from 0.611 to 0.625 on
- * one half of the recording groups and from 0.629 to 0.647 on the other, and
- * on the first 30 s of the Salsa Dataset (122) from 0.257 to 0.286.
+ * ms, as the phase turn alone did. An off-beat at the beat's own level is the
+ * same pulse at two phases, and neither placement finds the annotated one.
+ *
+ * Which METRICAL LEVEL the beat clock follows is a third question, and the
+ * bank's coherence is the wrong measure for it on syncopated material: where
+ * the off-beats carry as much onset mass as the beats, the beat level holds a
+ * tenth of the coherence the off-beat level does (0.05 to 0.16 against 0.92
+ * on a groove with the kick on the off-beats and the snare on the backbeat),
+ * and the bank follows the off-beats. What still names the beat there is that
+ * the envelope REPEATS at it. So the level comes from a comb-filter stage
+ * after Davies and Plumbley, "Context-dependent beat tracking of musical
+ * audio", IEEE TASLP 15(3), 2007: every kCombUpdateFrames the last six seconds
+ * of the envelope are autocorrelated (by FFT), each candidate period is scored
+ * by the mean of the correlation at its first four multiples under a Rayleigh
+ * prior peaking at 0.45 s, and successive estimates are linked by a Gaussian
+ * transition on log period. A comb reads repetition, which a pulse train
+ * shows at every multiple of its period, so its choice is moved down to a
+ * subharmonic that coherence shows to carry the onset mass in phase
+ * (foldToFundamental()): a slow click train is not followed at twice its
+ * rate. The prior pulls the other way above it: a 200 BPM click train
+ * repeats at 100 BPM as well as at 200, so the comb's half is overruled when
+ * every register repeats at the bank's period as well as at twice it
+ * (sameEventsAtHalfPeriod()) -- alike events, not a groove whose off-beats
+ * are other instruments. Until the comb has six seconds' worth, a bank level
+ * held for four of its beats steers the clock.
+ *
+ * The published tempo stays the bank's winner, the pulse that carries the
+ * onset mass in phase; getBeatTempoBpm() names the level the beats follow.
+ * The two agree on most material and differ by a metrical factor exactly on
+ * the syncopated case above. Measured, causal beat F-measure (+/-70 ms,
+ * beats after the first 5 s): ISMIR 2004 ballroom collection plus its
+ * additional excerpts (698 recordings), 0.625 to 0.706 on the half of the
+ * recording groups the prior was chosen on and 0.647 to 0.728 on the other;
+ * first 30 s of the Salsa Dataset (122, not used for any choice), 0.286 to
+ * 0.326; three syncopated grooves at 100, 124 and 140 BPM, 0.649, 0.377 and
+ * 0.814 to 0.980, 0.984 and 0.986; click trains from 40 to 240 BPM and the
+ * off-beat sweep above unchanged. Cost: 1.38 to 1.69 ms of CPU per second of
+ * audio; every 32 frames the estimate is a burst of two 4096-point
+ * transforms and some 10^4 to 10^5 multiplies, allocation free.
  *
  * COHERENCE, and what the confidence number means. For a candidate period tau
  * the tracker measures
@@ -271,6 +302,7 @@
  * - prepare(): setup thread (allocates; not concurrent with anything else).
  * - processBlock() / pushSamples(): audio thread, stream owner. Allocation
  *   free, lock free, no throw.
+ * - getBeatTempoBpm(): any thread, lock free, one word.
  * - getRunningTempoBpm() / getConfidence(): any thread, lock free. The two
  *   travel as ONE packed 64-bit word because they are a set: a confidence
  *   belongs to the tempo it was measured at, and a caller that gates on
@@ -308,12 +340,13 @@
  * Embedded/wasm: compiles under -fno-exceptions -fno-rtti (no throw on any
  * path); no file I/O, so it is unaffected by DSPARK_NO_FILE_IO.
  *
- * Dependencies: DspMath.h, AudioBuffer.h, AudioSpec.h, OnsetDetector.h.
+ * Dependencies: DspMath.h, AudioBuffer.h, AudioSpec.h, FFT.h, OnsetDetector.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/FFT.h"
 #include "../Core/detail/AccountedAllocator.h"
 #include "OnsetDetector.h"
 
@@ -324,6 +357,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -358,7 +392,10 @@ public:
                              &bankLevelRatio_, &env_, &envBal_, &local_, &cumScore_,
                              &acf_, &scratchA_, &kernel_, &localPeriod_, &sweepA_,
                              &sweepB_, &candScore_, &candExplains_, &beatScore_,
-                             &beatScratch_, &beatAhead_, &beatLogLag_, &beatWeightTable_})
+                             &beatScratch_, &beatAhead_, &beatLogLag_, &beatWeightTable_,
+                             &combRing_, &combSum_, &combTime_, &combSpec_, &combAcf_,
+                             &combDelta_, &combNext_, &combStep_, &combPrior_, &combKernel_,
+                             &regRing_})
             *values = WorkVector<double>(doubles);
         for (auto& values : envReg_) values = WorkVector<double>(doubles);
         envRef_ = WorkVector<int64_t>(detail::AccountedAllocator<int64_t>(&allocationAccount_));
@@ -414,6 +451,7 @@ public:
                               std::memory_order_relaxed);
 
         buildBank();
+        buildComb();
         applyTempoRange();
 
         // Offline scratch that does not depend on the signal length.
@@ -710,6 +748,22 @@ public:
     }
 
     // -- Readout (lock-free) -------------------------------------------------
+
+    /**
+     * @brief Tempo the causal beat clock runs at, in BPM; 0 before it has
+     *        one. Lock-free.
+     *
+     * The beats follow the metrical level of the comb stage (see the file
+     * header), which reads how the envelope repeats; getRunningTempoBpm()
+     * reports the pulse that carries the most onset mass in phase. They
+     * agree on most material and differ by a metrical factor where an
+     * off-beat carries as much onset mass as the beat: then this one names
+     * the rate the beats are announced at.
+     */
+    [[nodiscard]] T getBeatTempoBpm() const noexcept
+    {
+        return static_cast<T>(beatTempo_.load(std::memory_order_relaxed));
+    }
 
     /** @brief Running tempo estimate in BPM, 0 before the first frame. */
     [[nodiscard]] T getRunningTempoBpm() const noexcept
@@ -1217,6 +1271,8 @@ private:
                   "audio-thread stores must not lock");
     static_assert(std::atomic<bool>::is_always_lock_free,
                   "audio-thread stores must not lock");
+    static_assert(std::atomic<float>::is_always_lock_free,
+                  "audio-thread stores must not lock");
     static_assert(std::atomic<double>::is_always_lock_free,
                   "audio-thread stores must not lock");
 
@@ -1384,6 +1440,8 @@ private:
         // The beat score is recursive over the envelope itself, so it is
         // updated on every frame, before the period that steers it is chosen.
         updateBeatScore(o);
+        updateComb(o);
+        pushRegisters(f);
 
         int iLo = 0, iHi = 0;
         unpackRange(activeRange_.load(std::memory_order_relaxed), iLo, iHi);
@@ -1407,9 +1465,22 @@ private:
             // period it already has.
             return advanceBeatClock();
         }
-        // The beat clock follows a held level; the published reading stays
-        // the frame's own winner.
-        const int follow = holdMetricalLevel(best, bestScore, iLo, iHi);
+        // The beat clock follows the comb's metrical level once it has one,
+        // and a held bank level before that; the published reading stays the
+        // frame's own winner.
+        int follow = holdMetricalLevel(best, bestScore, iLo, iHi);
+        if (combBin_ >= 0)
+        {
+            // Re-decided on the frames the comb re-estimates; the test of
+            // alike events reads the register history and is the costly part.
+            if (combFresh_)
+            {
+                combFollow_ = foldToFundamental(combBin_, iLo, iHi);
+                combAlike_ = sameEventsAtHalfPeriod(combFollow_, best);
+                combFresh_ = false;
+            }
+            follow = combAlike_ ? best : std::clamp(combFollow_, iLo, iHi);
+        }
 
         // The runner-up at a different metrical level, and how nearly it
         // explained the envelope as well as the winner did. Same discount the
@@ -1468,7 +1539,264 @@ private:
         resonatorLead_ = p - sinceBeat;
         beatPeriod_ = (held == best) ? period : refinePeriod(held);
         haveBeatPeriod_ = true;
+        beatTempo_.store(std::clamp(static_cast<float>(periodToBpm(beatPeriod_)), rangeLo, rangeHi),
+                         std::memory_order_relaxed);
         return advanceBeatClock();
+    }
+
+    // -- Causal metrical level: comb-filter periodicity ----------------------
+
+    /**
+     * @brief Sizes the comb stage for the frame rate in force. Causal path
+     *        only; prepare() calls it after the bank exists.
+     *
+     * Davies and Plumbley, "Context-dependent beat tracking of musical
+     * audio", IEEE TASLP 15(3), 2007: the autocorrelation of the last few
+     * seconds of the envelope, each candidate period scored by the mean of
+     * its first four multiples, a Rayleigh prior on the lag and a Gaussian
+     * transition between successive estimates. The coherence of the bank
+     * asks how much onset mass lands in phase with one pulse; the comb asks
+     * how strongly the envelope REPEATS at the period, which is what still
+     * names the beat where an off-beat carries as much mass as the beat.
+     */
+    void buildComb()
+    {
+        combLength_ = std::max(64, static_cast<int>(std::lround(kCombSeconds * frameRate_)));
+        int size = 64;
+        while (size < 2 * combLength_) size <<= 1;
+        combFftSize_ = size;
+        combFft_ = std::make_unique<FFTReal<double>>(static_cast<size_t>(size));
+        combRing_.assign(static_cast<size_t>(combLength_), 0.0);
+        combSum_.assign(static_cast<size_t>(combLength_) + 1, 0.0);
+        combTime_.assign(static_cast<size_t>(size), 0.0);
+        combSpec_.assign(static_cast<size_t>(size) + 2, 0.0);
+        combAcf_.assign(static_cast<size_t>(size), 0.0);
+        combDelta_.assign(static_cast<size_t>(bankSize_), 0.0);
+        combNext_.assign(static_cast<size_t>(bankSize_), 0.0);
+        combStep_.assign(static_cast<size_t>(bankSize_), 0.0);
+        combPrior_.assign(static_cast<size_t>(bankSize_), 0.0);
+        const double beta = kCombPriorSeconds * frameRate_;
+        for (int i = 0; i < bankSize_; ++i)
+        {
+            const double l = bankPeriod_[static_cast<size_t>(i)];
+            combPrior_[static_cast<size_t>(i)] = l / (beta * beta) * std::exp(-0.5 * l * l / (beta * beta));
+        }
+        const double sigma = kCombTransitionOctaves * static_cast<double>(kBinsPerOctave);
+        combSpan_ = static_cast<int>(std::ceil(3.0 * sigma));
+        combKernel_.assign(static_cast<size_t>(2 * combSpan_ + 1), 0.0);
+        regRing_.assign(static_cast<size_t>(kRegisters) * static_cast<size_t>(combLength_), 0.0);
+        for (int d = -combSpan_; d <= combSpan_; ++d)
+        {
+            const double u = static_cast<double>(d) / sigma;
+            combKernel_[static_cast<size_t>(d + combSpan_)] = std::exp(-0.5 * u * u);
+        }
+    }
+
+    /**
+     * @brief One frame of the comb stage: stores the envelope value and,
+     *        every kCombUpdateFrames frames, re-estimates the level.
+     * @param o Conditioned envelope value of this frame.
+     *
+     * Allocation free. The estimate runs on the last kCombSeconds of the
+     * envelope with a local mean (kCombThresholdSeconds each side) removed
+     * and negative values clipped, which keeps the correlation on the onsets
+     * rather than on the envelope's slow swell. The autocorrelation is the
+     * inverse transform of the power spectrum, zero-padded to twice the span
+     * so it is linear, not circular, and unbiased for the overlap.
+     */
+    void updateComb(double o) noexcept
+    {
+        if (!combFft_) return;
+        const int n = combLength_;
+        combRing_[static_cast<size_t>(combWrite_ % n)] = o;
+        ++combWrite_;
+        if (--combCountdown_ > 0 || combWrite_ < static_cast<int64_t>(n / 2)) return;
+        combCountdown_ = kCombUpdateFrames;
+
+        const int m = static_cast<int>(std::min<int64_t>(combWrite_, n));
+        for (int i = 0; i < m; ++i)
+            combSum_[static_cast<size_t>(i) + 1] = combSum_[static_cast<size_t>(i)]
+                + combRing_[static_cast<size_t>((combWrite_ - m + i) % n)];
+        const int half = std::max(1, static_cast<int>(std::lround(kCombThresholdSeconds * frameRate_)));
+        std::fill(combTime_.begin(), combTime_.end(), 0.0);
+        for (int i = 0; i < m; ++i)
+        {
+            const int a = std::max(0, i - half), b = std::min(m - 1, i + half);
+            const double mean = (combSum_[static_cast<size_t>(b) + 1] - combSum_[static_cast<size_t>(a)])
+                              / static_cast<double>(b - a + 1);
+            combTime_[static_cast<size_t>(i)] = std::max(0.0, combRing_[static_cast<size_t>((combWrite_ - m + i) % n)] - mean);
+        }
+        combFft_->forward(combTime_.data(), combSpec_.data());
+        for (int k = 0; k <= combFftSize_ / 2; ++k)
+        {
+            const double re = combSpec_[static_cast<size_t>(2 * k)];
+            const double im = combSpec_[static_cast<size_t>(2 * k + 1)];
+            combSpec_[static_cast<size_t>(2 * k)] = re * re + im * im;
+            combSpec_[static_cast<size_t>(2 * k + 1)] = 0.0;
+        }
+        combFft_->inverse(combSpec_.data(), combAcf_.data());
+        for (int l = 0; l < m; ++l) combAcf_[static_cast<size_t>(l)] /= static_cast<double>(m - l);
+
+        int iLo = 0, iHi = 0;
+        unpackRange(activeRange_.load(std::memory_order_relaxed), iLo, iHi);
+        iLo = std::clamp(iLo, 0, bankSize_ - 1);
+        iHi = std::clamp(iHi, iLo, bankSize_ - 1);
+
+        // Each multiple a of the period is read as the mean of the lags within
+        // (a - 1) * kCombWidthSeconds of it: an expressive beat drifts, and
+        // the further multiples have drifted further.
+        double total = 0.0;
+        for (int i = iLo; i <= iHi; ++i)
+        {
+            const double lag = bankPeriod_[static_cast<size_t>(i)];
+            double v = 0.0;
+            for (int a = 1; a <= kCombMultiples; ++a)
+            {
+                const int w = static_cast<int>(std::lround(static_cast<double>(a - 1) * kCombWidthSeconds * frameRate_));
+                const int c = static_cast<int>(std::lround(static_cast<double>(a) * lag));
+                double sum = 0.0;
+                for (int b = c - w; b <= c + w; ++b)
+                    if (b >= 0 && b < m) sum += combAcf_[static_cast<size_t>(b)];
+                v += sum / static_cast<double>(2 * w + 1);
+            }
+            combNext_[static_cast<size_t>(i)] = std::max(0.0, v) * combPrior_[static_cast<size_t>(i)];
+            total += combNext_[static_cast<size_t>(i)];
+        }
+        if (!(total > 0.0)) return;
+
+        // Transition: the best predecessor under a Gaussian on log period,
+        // times this estimate's normalised evidence. The first estimate has
+        // no predecessor and takes the evidence alone.
+        const bool first = combBin_ < 0;
+        double bestV = 0.0, norm = 0.0;
+        int bestI = -1;
+        for (int j = iLo; j <= iHi; ++j)
+        {
+            double carry = first ? 1.0 : 0.0;
+            if (!first)
+                for (int i = std::max(iLo, j - combSpan_); i <= std::min(iHi, j + combSpan_); ++i)
+                    carry = std::max(carry, combDelta_[static_cast<size_t>(i)]
+                                            * combKernel_[static_cast<size_t>(i - j + combSpan_)]);
+            const double v = carry * combNext_[static_cast<size_t>(j)] / total;
+            combStep_[static_cast<size_t>(j)] = v;
+            norm += v;
+            if (v > bestV) { bestV = v; bestI = j; }
+        }
+        if (!(norm > 0.0) || bestI < 0) return;
+        std::fill(combDelta_.begin(), combDelta_.end(), 0.0);
+        for (int j = iLo; j <= iHi; ++j)
+            combDelta_[static_cast<size_t>(j)] = combStep_[static_cast<size_t>(j)] / norm;
+        combBin_ = bestI;
+        combFresh_ = true;
+    }
+
+    /**
+     * @brief The comb's choice, moved down to the slower pulse it is a
+     *        multiple of when that pulse is as coherent as the choice.
+     * @param i  Bank index the comb chose.
+     * @param iLo First bank index searched.
+     * @param iHi Last bank index searched.
+     * @return The bank index the beat clock follows.
+     *
+     * The comb reads repetition, and a pulse train repeats at every multiple
+     * of its period just as well; its Rayleigh prior then prefers the
+     * multiple nearest 0.45 s, which on a slow click train is twice the true
+     * rate. Coherence settles that direction exactly as in scoreAt(): a
+     * candidate whose subharmonic carries the onset mass in phase is a
+     * harmonic of it. Only a subharmonic holding at least kCombFoldFloor of
+     * the mass, and kCombFoldRatio of the candidate's own, moves the choice.
+     */
+    [[nodiscard]] int foldToFundamental(int i, int iLo, int iHi) const noexcept
+    {
+        int j = std::clamp(i, iLo, iHi);
+        for (int guard = 0; guard < kNumHarmonics; ++guard)
+        {
+            bool moved = false;
+            for (int k = 0; k < kNumHarmonics && !moved; ++k)
+            {
+                const int sub = j + harmonicOffset_[k];
+                if (sub > iHi) continue;
+                int peak = sub;
+                for (int q = std::max(0, sub - 3); q <= std::min(bankSize_ - 1, sub + 3); ++q)
+                    if (bankCoherence_[static_cast<size_t>(q)] > bankCoherence_[static_cast<size_t>(peak)])
+                        peak = q;
+                const double c = bankCoherence_[static_cast<size_t>(peak)];
+                if (c > kCombFoldFloor && c >= kCombFoldRatio * bankCoherence_[static_cast<size_t>(j)])
+                {
+                    j = std::clamp(peak, iLo, iHi);
+                    moved = true;
+                }
+            }
+            if (!moved) break;
+        }
+        return j;
+    }
+
+    /// Stores this frame's register envelopes, baseline-removed as the
+    /// envelope is, for sameEventsAtHalfPeriod().
+    void pushRegisters(const typename OnsetDetector<T>::OdfFrame& f) noexcept
+    {
+        if (regRing_.empty()) return;
+        const int n = combLength_;
+        for (int g = 0; g < kRegisters; ++g)
+        {
+            const T r = f.registers[static_cast<size_t>(g)];
+            const double v = (std::isfinite(r) && r > T(0)) ? static_cast<double>(r) : 0.0;
+            regBaseline_[static_cast<size_t>(g)] += (v - regBaseline_[static_cast<size_t>(g)]) * baselineCoef_;
+            regRing_[static_cast<size_t>(g) * static_cast<size_t>(n) + static_cast<size_t>((combWrite_ - 1) % n)]
+                = std::max(0.0, v - regBaseline_[static_cast<size_t>(g)]);
+        }
+    }
+
+    /**
+     * @brief True when the comb's level is twice the bank's period and every
+     *        register repeats at the bank's period as well as at twice it.
+     * @param level Bank index the comb stage chose.
+     * @param fast  Bank index of the bank's coherence winner.
+     *
+     * A pulse train whose events are all alike repeats at its own period and
+     * at every multiple, so the comb's Rayleigh prior alone would take a
+     * 200 BPM click train to 100. A syncopated groove is told apart by its
+     * registers: there the low and middle registers repeat at the beat and
+     * not at the off-beat, because the events on the off-beats are other
+     * instruments. Kept to the one relation that occurs, twice the period.
+     */
+    [[nodiscard]] bool sameEventsAtHalfPeriod(int level, int fast) const noexcept
+    {
+        if (regRing_.empty() || level < 0 || fast < 0) return false;
+        const double ratio = bankPeriod_[static_cast<size_t>(level)]
+                           / bankPeriod_[static_cast<size_t>(fast)];
+        if (std::abs(std::log2(ratio) - 1.0) > 0.125) return false;
+        const int n = combLength_;
+        const int m = static_cast<int>(std::min<int64_t>(combWrite_, n));
+        const int lag = static_cast<int>(std::lround(bankPeriod_[static_cast<size_t>(fast)]));
+        if (2 * lag + 2 >= m) return false;
+        double worst = 1.0;
+        bool any = false;
+        for (int g = 0; g < kRegisters; ++g)
+        {
+            const double* x = &regRing_[static_cast<size_t>(g) * static_cast<size_t>(n)];
+            const auto at = [&](int i) { return x[static_cast<size_t>((combWrite_ - m + i) % n)]; };
+            const auto repetition = [&](int l) {
+                double best = 0.0;
+                for (int q = l - 2; q <= l + 2; ++q)
+                {
+                    double xy = 0.0, xx = 0.0, yy = 0.0;
+                    for (int i = 0; i + q < m; ++i)
+                    {
+                        const double a = at(i), b = at(i + q);
+                        xy += a * b; xx += a * a; yy += b * b;
+                    }
+                    if (xx > 0.0 && yy > 0.0) best = std::max(best, xy / std::sqrt(xx * yy));
+                }
+                return best;
+            };
+            const double slow = repetition(2 * lag);
+            if (!(slow > kIsochronyFloor)) continue;
+            any = true;
+            worst = std::min(worst, repetition(lag) / slow);
+        }
+        return any && worst >= kIsochronyRatio;
     }
 
     /// Steps from a bank index onto the coherence peak of its own level, at
@@ -2964,10 +3292,21 @@ private:
         pendingBeatRef_ = 0;
         heldLevel_ = -1;
         levelChallengeFrames_ = 0;
+        std::fill(combRing_.begin(), combRing_.end(), 0.0);
+        std::fill(combDelta_.begin(), combDelta_.end(), 0.0);
+        combWrite_ = 0;
+        combCountdown_ = kCombUpdateFrames;
+        combBin_ = -1;
+        combFollow_ = -1;
+        combFresh_ = false;
+        combAlike_ = false;
+        std::fill(regRing_.begin(), regRing_.end(), 0.0);
+        regBaseline_.fill(0.0);
 
         tempoAndConfidence_.store(packTempo(0.0f, 0.0f), std::memory_order_relaxed);
         beatLatched_.store(false, std::memory_order_relaxed);
         lastBeatSample_.store(-1, std::memory_order_relaxed);
+        beatTempo_.store(0.0f, std::memory_order_relaxed);
     }
 
     /// Feedback of the cumulative beat score (the paper's alpha).
@@ -2986,6 +3325,25 @@ private:
     /// Beats, of its own period, that a different metrical level must keep
     /// outscoring the one in force before the beat clock follows it.
     static constexpr double kLevelHoldBeats = 4.0;
+    /// Comb stage (buildComb()): seconds of envelope it correlates, frames
+    /// between estimates, multiples of the period it reads, the lag the
+    /// Rayleigh prior peaks at, the transition width, the local mean removed
+    /// before the correlation, how far the multiples may drift, and when a
+    /// coherent subharmonic takes the choice over (foldToFundamental()).
+    static constexpr double kCombSeconds = 6.0;
+    static constexpr int kCombUpdateFrames = 32;
+    static constexpr int kCombMultiples = 4;
+    static constexpr double kCombPriorSeconds = 0.45;
+    static constexpr double kCombTransitionOctaves = 0.19;
+    static constexpr double kCombThresholdSeconds = 0.081;
+    static constexpr double kCombWidthSeconds = 0.0116;
+    static constexpr double kCombFoldFloor = 0.5;
+    static constexpr double kCombFoldRatio = 0.8;
+    /// sameEventsAtHalfPeriod(): least repetition at twice the period for a
+    /// register to count, and the share of it every counted register must
+    /// reach at the period.
+    static constexpr double kIsochronyFloor = 0.2;
+    static constexpr double kIsochronyRatio = 0.8;
     /// Entries of the interval weight's table.
     static constexpr int kBeatTableSize = 2048;
     /// ln 2 plus rounding room: the interval weight's table span on ln(d / tau).
@@ -3038,6 +3396,21 @@ private:
     int64_t pendingBeatRef_ = 0;
     int heldLevel_ = -1;
     int levelChallengeFrames_ = 0;
+    // Comb stage (audio thread only; sized at prepare).
+    std::unique_ptr<FFTReal<double>> combFft_;
+    WorkVector<double> combRing_, combSum_, combTime_, combSpec_, combAcf_;
+    WorkVector<double> combDelta_, combNext_, combStep_, combPrior_, combKernel_;
+    int combLength_ = 0;
+    int combFftSize_ = 0;
+    int combSpan_ = 0;
+    int64_t combWrite_ = 0;
+    int combCountdown_ = kCombUpdateFrames;
+    int combBin_ = -1;
+    int combFollow_ = -1;
+    bool combFresh_ = false;
+    bool combAlike_ = false;
+    WorkVector<double> regRing_;   ///< Register envelopes, kRegisters rows of combLength_.
+    std::array<double, OnsetDetector<T>::kNumRegisters> regBaseline_ {};
 
     // Offline scratch (analyze() and the offline session only).
     int64_t offlinePushed_ = 0;
@@ -3067,6 +3440,7 @@ private:
     std::atomic<double> tightness_ { kDefaultTightness };
     std::atomic<bool> beatLatched_ { false };
     std::atomic<std::int64_t> lastBeatSample_ { -1 };
+    std::atomic<float> beatTempo_ { 0.0f };
     std::atomic<std::int64_t> latencySamples_ { 549 };
 };
 

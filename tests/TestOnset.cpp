@@ -305,9 +305,9 @@ DSPARK_TEST(Onset_OA4_soft_onsets_over_bed)
 
 // ===========================================================================
 // Default sensitivity: 30 ms attacks across six octaves and 24 dB of level,
-// with releases slow enough to be no transient at all. The default delta must
-// recall most of them without a single false positive (17 of 22); the former
-// default of 0.03 recalled 10 of 22.
+// with releases slow enough to be no transient at all. The default picker must
+// recall most of them without a single false positive (22 of 22; 17 of 22 at
+// the former plain 0.015 default, 10 of 22 at 0.03).
 // ===========================================================================
 DSPARK_TEST(Onset_default_delta_recalls_soft_attacks)
 {
@@ -563,8 +563,9 @@ DSPARK_TEST(Onset_default_frame_holds_the_span_across_rates)
 // at roughly double the reference sensitivity and recalled a note the 44.1/48
 // kHz reference never did. With the ODF scale now frame-invariant, 96 kHz
 // reads exactly like 48 kHz, and the honest recall of this corpus is 7 of 8
-// AT EVERY RATE: the soft F#1 at t = 1.0 s sits below the default delta
-// everywhere, and always did at the shipped 44.1/48 kHz reference. A bare
+// AT EVERY RATE: the soft F#1 at t = 1.0 s sat below the default delta
+// everywhere, and always did at the shipped 44.1/48 kHz reference (the gated
+// picker now recalls it too, 8 of 8 at every rate; the floor stays). A bare
 // absolute recall at one rate is what let the artifact in, so the successor
 // asserts INVARIANCE on an equal-fs/N pair (48 kHz/2048 and 96 kHz/4096, both
 // 23.44 Hz bins, identical 135-band filterbank): identical event lists in
@@ -926,4 +927,126 @@ DSPARK_TEST(Onset_phases_are_computed_only_for_complex_domain)
     od.pushSamples(std::span<const float>(x.data(), x.size()));
     EXPECT_TRUE(readsBinPhases(od));
     EXPECT_GT(od.getLastOdfFrame().value, 0.0f);
+}
+// ===========================================================================
+// The default picker against the two things a low delta used to cost: note
+// releases and noise. Slow attacks (30 and 60 ms) on full-level notes across
+// six octaves, each ended by a 10 ms release into silence -- the release
+// widens the spectrum of the note it ends and reads as a broadband rise in
+// the log-band flux. Every attack must be recalled and no release reported,
+// offline and causally. The former default (plain picker, delta 0.015)
+// recalled all 24 attacks and reported 5 releases with them, and still does
+// when asked for.
+// ===========================================================================
+DSPARK_TEST(Onset_default_picker_recalls_slow_attacks_and_ignores_releases)
+{
+    const double fs = 44100.0;
+    const int n = static_cast<int>(fs * 16.0);
+    std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+    std::vector<int64_t> truth;
+    uint32_t state = 2024u;
+    auto uniform = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<double>(state >> 8) / 16777216.0;
+    };
+    double t = 0.3;
+    for (int k = 0; k < 24; ++k)
+    {
+        const int64_t at = static_cast<int64_t>(fs * t);
+        const double f0 = 440.0 * std::exp2((28.0 + 56.0 * uniform() - 69.0) / 12.0);
+        const double amp = std::pow(10.0, (-18.0 + 18.0 * uniform()) / 20.0);
+        const int att = static_cast<int>(((k % 2) ? 0.060 : 0.030) * fs);
+        const int dur = static_cast<int>((0.3 + 0.2 * uniform()) * fs);
+        const int rel = static_cast<int>(0.010 * fs);
+        for (int i = 0; i < dur; ++i)
+        {
+            const int64_t j = at + i;
+            if (j >= n) break;
+            double env = std::min(1.0, static_cast<double>(i) / att);
+            if (i > dur - rel) env *= static_cast<double>(dur - i) / rel;
+            double s = 0.0;
+            for (int h = 1; h <= 6; ++h)
+                s += std::sin(dspark::twoPi<double> * f0 * h * static_cast<double>(i) / fs) / h;
+            sig[static_cast<size_t>(j)] += static_cast<float>(amp * env * s);
+        }
+        truth.push_back(at);
+        t += static_cast<double>(dur) / fs + 0.15 + 0.15 * uniform();
+    }
+
+    auto offline = runOffline(sig, fs, OnsetDetector<float>::Method::SuperFlux);
+    PRF a = scoreOnsets(offline, truth, fs, 50.0);
+
+    OnsetDetector<float> live;
+    live.prepare(AudioSpec{ fs, 256, 1 });
+    std::vector<int64_t> causal;
+    for (int i = 0; i < n; i += 256)
+    {
+        const int len = std::min(256, n - i);
+        live.pushSamples(std::span<const float>(sig.data() + i, static_cast<size_t>(len)));
+        if (live.onsetDetected()) causal.push_back(live.getLastOnsetSample());
+    }
+    PRF c = scoreOnsets(causal, truth, fs, 50.0);
+    std::cout << "  [picker] slow attacks with fast releases: offline tp=" << a.tp
+              << " fp=" << a.fp << ", causal tp=" << c.tp << " fp=" << c.fp
+              << " of " << truth.size() << "\n";
+    EXPECT_EQ(a.fp, 0);
+    EXPECT_EQ(c.fp, 0);
+    EXPECT_GT(a.tp, 22);
+    EXPECT_GT(c.tp, 22);
+
+    OnsetDetector<float> former;
+    former.prepare(AudioSpec{ fs, 512, 1 });
+    former.setPicker(OnsetDetector<float>::Picker::Plain);
+    former.setThreshold(0.015f);
+    EXPECT_TRUE(former.getPicker() == OnsetDetector<float>::Picker::Plain);
+    float* ptr = sig.data();
+    PRF f = scoreOnsets(former.detectOffline(AudioBufferView<float>(&ptr, 1, n)), truth, fs, 50.0);
+    std::cout << "  [picker] former default on the same bed: tp=" << f.tp << " fp=" << f.fp << "\n";
+    EXPECT_EQ(f.tp, 24);
+    EXPECT_EQ(f.fp, 5);
+}
+
+// Slow attacks inside the decay of louder notes: 60 ms attacks over 24 dB of
+// level and four octaves, each note starting while earlier ones still sound.
+// The former default recalled 13 of 32 here.
+DSPARK_TEST(Onset_default_picker_recalls_slow_attacks_inside_decays)
+{
+    const double fs = 44100.0;
+    const int n = static_cast<int>(fs * 16.0);
+    std::vector<float> sig(static_cast<size_t>(n), 0.0f);
+    std::vector<int64_t> truth;
+    uint32_t state = 77u;
+    auto uniform = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<double>(state >> 8) / 16777216.0;
+    };
+    double t = 0.3;
+    while (t < 15.0)
+    {
+        const int64_t at = static_cast<int64_t>(fs * t);
+        const double f0 = 440.0 * std::exp2((36.0 + 48.0 * uniform() - 69.0) / 12.0);
+        const double amp = std::pow(10.0, (-30.0 + 24.0 * uniform()) / 20.0);
+        const int att = static_cast<int>(0.060 * fs);
+        const int dur = static_cast<int>((0.2 + 0.6 * uniform()) * fs);
+        const int rel = static_cast<int>(0.020 * fs);
+        for (int i = 0; i < dur; ++i)
+        {
+            const int64_t j = at + i;
+            if (j >= n) break;
+            const double u = static_cast<double>(i) / fs;
+            double env = std::min(1.0, static_cast<double>(i) / att) * std::exp(-3.0 * u);
+            if (i > dur - rel) env *= static_cast<double>(dur - i) / rel;
+            double s = 0.0;
+            for (int h = 1; h <= 6; ++h) s += std::sin(dspark::twoPi<double> * f0 * h * u) / h;
+            sig[static_cast<size_t>(j)] += static_cast<float>(amp * env * s);
+        }
+        truth.push_back(at);
+        t += 0.15 + 0.55 * uniform();
+    }
+    auto det = runOffline(sig, fs, OnsetDetector<float>::Method::SuperFlux);
+    PRF s = scoreOnsets(det, truth, fs, 50.0);
+    std::cout << "  [picker] 60 ms attacks inside decays: tp=" << s.tp << " fp=" << s.fp
+              << " of " << truth.size() << "\n";
+    EXPECT_EQ(s.fp, 0);
+    EXPECT_GT(s.r, 0.85);
 }

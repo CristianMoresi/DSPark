@@ -20,6 +20,9 @@ All notable user-facing changes to DSPark are documented here.
   FirstOrder are bit-identical; the latency is still one base sample. Cost
   at 2x, stereo float: Tape 510 against 300 ns per frame, MultiStage 820
   against 410, Exciter 150 against 37.
+- `OnsetDetector::setPicker(Picker)` with `Picker::Gated` (default) and
+  `Picker::Plain`; `BeatTracker::getBeatTempoBpm()`, the tempo the causal
+  beats are announced at.
 - `LadderFilter::setSaturation(Saturation::Stages)` (opt-in, default
   `Feedback` unchanged and bit-identical): every stage saturates and the
   delay-free loop is solved implicitly (clipped Newton in double, 2.1 steps
@@ -252,6 +255,33 @@ All notable user-facing changes to DSPark are documented here.
   14.7 against 30 ns per sample for the pair in an RC clipper, 11.9 against
   26.6 ns for the single diode. The output moves by rounding only (at most
   4e-16 relative against 50-digit roots).
+- `OnsetDetector` default picker is gated, default delta 0.03 to 0.0035
+  (analysis readout; no audio). The figures below are measured against an
+  intermediate development default (plain picker, delta 0.015); the released
+  delta 0.03 recalled fewer soft attacks still (30 ms attacks 0.428, 60 ms
+  0.214 on an earlier version of the corpus). The threshold is twice the
+  moving mean plus the delta, and a peak is kept only when the frame energy
+  0.43 analysis frames after it has not fallen 2 dB below the energy 0.2
+  frames before it
+  (no fall at all within 0.0045 of the threshold), a decay already under way
+  excused. On 24 held-out files per kind (F at +/-50 ms, false onsets per
+  second): 30 ms attacks 0.788 to 0.966, 60 ms 0.603 to 0.909, note releases
+  into silence 0.06/0.23 to 0.00/0.00 false per second, percussion with quiet
+  hits inside loud decays 0.948 to 0.965, slow attacks over pink noise 0.471
+  to 0.621, clicks over 0 dB pink noise 1.000 to 0.995 (0.02 per second).
+  Causal latency unchanged. `setPicker(Picker::Plain)` with
+  `setThreshold(0.03f)` restores the released output. A tremolo false-onset
+  rate measured during development (1.85 per second) came from a corpus whose
+  vibrato swept by up to 57%; with the phase integrated the tremolo kind
+  reports none at either setting.
+- `BeatTracker` causal beats follow the metrical level of a comb-filter
+  stage (autocorrelation of the last 6 s of the envelope, mean of four
+  multiples, Rayleigh prior at 0.45 s, Gaussian transition) folded onto a
+  coherent subharmonic; the published tempo and confidence are unchanged.
+  Causal beat F: syncopated grooves at 100/124/140 BPM 0.649/0.377/0.814 to
+  0.980/0.984/0.986; ballroom 0.625 to 0.706 and 0.647 to 0.728 on the two
+  halves of 698 recordings; Salsa 0.286 to 0.326; click trains 40 to 240 BPM
+  unchanged. CPU 1.38 to 1.69 ms per second of audio.
 - `FilterEngine` glides (default audio changes while a cutoff, Q or gain
   moves; settled output is bit-identical): the cutoff follows a monotonic
   cubic in log frequency that arrives exactly 165 ms after a change (10-90%
@@ -401,12 +431,6 @@ All notable user-facing changes to DSPark are documented here.
   ms early before). Causal beat F-measure: 0.611 to 0.625 and 0.629 to 0.647
   on the two halves of 698 ballroom recordings, 0.257 to 0.286 on Salsa.
   Tempo and confidence readings are unchanged.
-- `OnsetDetector` default peak-pick delta 0.03 to 0.015. On a held-out
-  synthetic note set the mean F-measure over six kinds goes from 0.625 to
-  0.767 (30 ms attacks 0.428 to 0.788, 60 ms 0.214 to 0.603) with no false
-  positive added on five of them; sustained notes under +/-3 dB tremolo gain
-  false onsets (0.21 to 1.85 per second). `setThreshold(0.03f)` restores the
-  former sensitivity.
 - `MidiFile::read()` counts each track's events in an allocation-free pass
   and then reserves exactly that many: a 1.9 M-event file parses in 33 ms
   instead of 65, with peak memory 83 MB instead of 132 (commit 80 MB instead

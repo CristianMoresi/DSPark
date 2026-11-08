@@ -106,7 +106,12 @@
  * with a = 0.9 and W a log-Gaussian over [tau / 2, 2 tau], and the next beat is
  * the strongest point of C continued one period ahead with no further onsets.
  * No backtracking, no future context. The period the score follows is the
- * metrical level described below.
+ * metrical level described below. The score reads o as the sum of two
+ * functions of the front end, each conditioned the same way and divided by its
+ * own running peak (10 s of memory): the log-band envelope, where every
+ * register owns its share, and the linear-magnitude flux of the same spectrum
+ * (OdfFrame::linear), where the loudest sound does. On syncopated material the
+ * busiest sound is often on the off-beats and the loudest on the beat.
  *
  * Why the beats are not read from the resonator's phase, which would be free:
  * that phase is the circular mean of the onset mass, which is what the
@@ -114,13 +119,12 @@
  * regular off-beat by the off-beat's share of the mass. On swung, dotted and
  * syncopated clicks (off-beat at 0.6, 2/3 and 3/4 of the beat, 0.15 to 0.7 of
  * its level, 96 and 120 BPM) the phase turn put the beats a mean 11 to 105 ms
- * early and 374 of 672 within 70 ms; with the beat score 659 of 660 are
- * within 70 ms, at a mean of 2.6 to 4.0 ms late in all but one case. Where
- * two pulse trains of the same period
- * score within 5% of each other the score cannot say which is the beat, and
- * the beat falls back to the phase turn: at 0.7 of the beat's level, 3/4
- * through it, 120 BPM (the one case), that keeps 30 of 31 beats within 70
- * ms, as the phase turn alone did. An off-beat at the beat's own level is the
+ * early and 374 of 672 within 70 ms; with the beat score all 660 are within
+ * 70 ms, at a mean of 1.2 to 2.0 ms late. Where two pulse trains of the same
+ * period score within 5% of each other the score cannot say which is the
+ * beat, and the beat falls back to the phase turn: at 0.7 of the beat's
+ * level, 3/4 through it, 120 BPM, that keeps 31 of 31 beats within 70 ms
+ * (30 with the envelope alone in the score). An off-beat at the beat's own level is the
  * same pulse at two phases, and neither placement finds the annotated one.
  *
  * Which METRICAL LEVEL the beat clock follows is a third question, and the
@@ -133,9 +137,13 @@
  * after Davies and Plumbley, "Context-dependent beat tracking of musical
  * audio", IEEE TASLP 15(3), 2007: every kCombUpdateFrames the last six seconds
  * of the envelope are autocorrelated (by FFT), each candidate period is scored
- * by the mean of the correlation at its first four multiples under a Rayleigh
- * prior peaking at 0.45 s, and successive estimates are linked by a Gaussian
- * transition on log period. A comb reads repetition, which a pulse train
+ * by the mean of the correlation at its first four multiples, plus half the
+ * correlation at half the period, under a Rayleigh prior peaking at 0.40 s,
+ * and successive estimates are linked by a Gaussian transition on log period.
+ * The half period is the subdivision of a binary level: a tresillo or clave
+ * (3-3-2 eighths) repeats strongly at three eighths, a level that has no
+ * subdivision on the grid, and without it the comb took that level, four
+ * thirds of the annotated beat on 31 of the 122 Salsa recordings (3 now). A comb reads repetition, which a pulse train
  * shows at every multiple of its period, so its choice is moved down to a
  * subharmonic that coherence shows to carry the onset mass in phase
  * (foldToFundamental()): a slow click train is not followed at twice its
@@ -151,14 +159,21 @@
  * The two agree on most material and differ by a metrical factor exactly on
  * the syncopated case above. Measured, causal beat F-measure (+/-70 ms,
  * beats after the first 5 s): ISMIR 2004 ballroom collection plus its
- * additional excerpts (698 recordings), 0.625 to 0.706 on the half of the
- * recording groups the prior was chosen on and 0.647 to 0.728 on the other;
- * first 30 s of the Salsa Dataset (122, not used for any choice), 0.286 to
- * 0.326; three syncopated grooves at 100, 124 and 140 BPM, 0.649, 0.377 and
- * 0.814 to 0.980, 0.984 and 0.986; click trains from 40 to 240 BPM and the
- * off-beat sweep above unchanged. Cost: 1.38 to 1.69 ms of CPU per second of
- * audio; every 32 frames the estimate is a burst of two 4096-point
- * transforms and some 10^4 to 10^5 multiplies, allocation free.
+ * additional excerpts (698 recordings), 0.740 and 0.757 on the two halves of
+ * the recording groups (0.706 and 0.728 with the envelope alone in the score
+ * and the comb without the half period, at a 0.45 s prior); first 30 s of the
+ * Salsa Dataset (122 recordings, the odd ones used for the choices), 0.399 and
+ * 0.420 on the two halves (0.321 and 0.331 before); three syncopated grooves
+ * at 100, 124 and 140 BPM, 0.980, 0.984 and 0.986; click trains from 40 to 240
+ * BPM unchanged. On the off-beat sweep above, 660 beats within 70 ms against
+ * 659 before, at a mean of 1.2 to 2.0 ms late (2.6 to 4.0 before). A
+ * syncopated groove swept from 88 to
+ * 152 BPM in 2 BPM steps over three seeds reads 0.916 to 0.918 against 0.908
+ * to 0.909 (98 BPM goes from double tempo to the beat; 118 to 120 BPM, where
+ * both lose the beat's phase part of the time, reads 0.77 to 0.83 against
+ * 0.77 to 0.87). Cost: 1.78 ms of CPU per second of audio on the Salsa
+ * recordings (1.69 before); every 32 frames the estimate is a burst of two
+ * 4096-point transforms and some 10^4 to 10^5 multiplies, allocation free.
  *
  * COHERENCE, and what the confidence number means. For a candidate period tau
  * the tracker measures
@@ -401,6 +416,7 @@ public:
         envRef_ = WorkVector<int64_t>(detail::AccountedAllocator<int64_t>(&allocationAccount_));
         backlink_ = WorkVector<int>(detail::AccountedAllocator<int>(&allocationAccount_));
         candidates_ = WorkVector<int>(detail::AccountedAllocator<int>(&allocationAccount_));
+        onset_.setLinearFlux(true); // the beat score reads OdfFrame::linear
     }
 
     /** @brief What analyze() returns: one tempo, one grid, one number saying
@@ -445,9 +461,10 @@ public:
         if (hop_ < 1) hop_ = 1;
         frameRate_ = sampleRate_ / static_cast<double>(hop_);
         baselineCoef_ = 1.0 - std::exp(-1.0 / std::max(1.0, kBaselineSeconds * frameRate_));
+        peakDecay_ = std::exp(-1.0 / std::max(1.0, kScorePeakSeconds * frameRate_));
 
         latencySamples_.store(static_cast<int64_t>(onset_.getEnvelopeLatencySamples())
-                                  + static_cast<int64_t>(hop_),
+                                  + 2 * static_cast<int64_t>(hop_),
                               std::memory_order_relaxed);
 
         buildBank();
@@ -866,9 +883,10 @@ public:
      * @brief Delay between a beat and the call in which it is announced.
      *
      * Half the analysis frame less the front end's group-delay compensation,
-     * plus one hop: a beat is announced on the frame after the one it is
-     * placed on. Fixed for a
-     * given sample rate and independent of block size.
+     * plus two hops: a beat is announced on the frame after the one it is
+     * placed on and attributed one hop before that frame (see
+     * advanceBeatClock()). Fixed for a given sample rate and independent of
+     * block size: 770 samples at 44.1 kHz.
      */
     [[nodiscard]] int getLatencySamples() const noexcept
     {
@@ -1419,6 +1437,21 @@ private:
         baseline_ += (raw - baseline_) * baselineCoef_;
         const double o = std::max(0.0, raw - baseline_);
 
+        // The beat score reads both of the front end's onset functions,
+        // each conditioned the same way and over its own running peak: the
+        // log-compressed flux, where every register owns its share, and the
+        // linear flux, where the loudest sound in the mix does. On
+        // syncopated material the off-beats are often the busier sound and
+        // the beat the louder one.
+        const double rawLinear = (std::isfinite(f.linear) && f.linear > T(0))
+                                     ? static_cast<double>(f.linear) : 0.0;
+        linearBaseline_ += (rawLinear - linearBaseline_) * baselineCoef_;
+        const double oLinear = std::max(0.0, rawLinear - linearBaseline_);
+        scorePeak_ = std::max(o, scorePeak_ * peakDecay_);
+        scorePeakLinear_ = std::max(oLinear, scorePeakLinear_ * peakDecay_);
+        const double oBeat = o / std::max(kMassFloor, scorePeak_)
+                           + oLinear / std::max(kMassFloor, scorePeakLinear_);
+
         for (int i = 0; i < bankSize_; ++i)
         {
             const size_t u = static_cast<size_t>(i);
@@ -1439,7 +1472,7 @@ private:
 
         // The beat score is recursive over the envelope itself, so it is
         // updated on every frame, before the period that steers it is chosen.
-        updateBeatScore(o);
+        updateBeatScore(oBeat);
         updateComb(o);
         pushRegisters(f);
 
@@ -1659,6 +1692,17 @@ private:
                     if (b >= 0 && b < m) sum += combAcf_[static_cast<size_t>(b)];
                 v += sum / static_cast<double>(2 * w + 1);
             }
+            // Half the period: the beat's subdivision is on the grid of a
+            // binary level, and on no grid of a level three quarters or
+            // three halves of it (a clave or tresillo repeats there).
+            {
+                const double h = 0.5 * lag;
+                const int c0 = static_cast<int>(h);
+                const double fr = h - static_cast<double>(c0);
+                if (c0 + 1 < m)
+                    v += kCombHalfWeight * ((1.0 - fr) * combAcf_[static_cast<size_t>(c0)]
+                                            + fr * combAcf_[static_cast<size_t>(c0) + 1]);
+            }
             combNext_[static_cast<size_t>(i)] = std::max(0.0, v) * combPrior_[static_cast<size_t>(i)];
             total += combNext_[static_cast<size_t>(i)];
         }
@@ -1700,7 +1744,7 @@ private:
      *
      * The comb reads repetition, and a pulse train repeats at every multiple
      * of its period just as well; its Rayleigh prior then prefers the
-     * multiple nearest 0.45 s, which on a slow click train is twice the true
+     * multiple nearest 0.40 s, which on a slow click train is twice the true
      * rate. Coherence settles that direction exactly as in scoreAt(): a
      * candidate whose subharmonic carries the onset mass in phase is a
      * harmonic of it. Only a subharmonic holding at least kCombFoldFloor of
@@ -2032,8 +2076,14 @@ private:
      * @return true if a beat was reported on this frame.
      *
      * A beat is announced on the frame after the one it is placed on and is
-     * attributed to that frame's position: the one hop of getLatencySamples()
-     * that follows the analysis frame.
+     * attributed one hop before that frame's position. The beat score adds
+     * the linear flux to the log-band envelope, and on a transient the linear
+     * flux peaks about one hop later (the loud part of the attack enters the
+     * window after the first of it): measured, the attribution to the frame
+     * itself put the beats a median 7.0 ms late on clean clicks and a mean
+     * 8.3 ms after the annotated beat on ballroom recordings, against 3.6 and
+     * 4.3 ms with the envelope alone; one hop earlier gives 2.1 and 3.7 ms.
+     * Those two hops are the hop terms of getLatencySamples().
      */
     bool advanceBeatClock() noexcept
     {
@@ -2053,7 +2103,7 @@ private:
         if (beatCountdown_ > 0 && --beatCountdown_ == 0)
         {
             beatPending_ = true;
-            pendingBeatRef_ = lastFrameRef_;
+            pendingBeatRef_ = lastFrameRef_ - static_cast<int64_t>(hop_);
         }
         if (--framesToPrediction_ <= 0) predictNextBeat();
         return beat;
@@ -3280,6 +3330,9 @@ private:
         frameIndex_ = 0;
         lastFrameRef_ = 0;
         baseline_ = 0.0;
+        linearBaseline_ = 0.0;
+        scorePeak_ = 0.0;
+        scorePeakLinear_ = 0.0;
         std::fill(beatScore_.begin(), beatScore_.end(), 0.0);
         beatScoreWrite_ = 0;
         beatScoreFrames_ = 0;
@@ -3333,7 +3386,10 @@ private:
     static constexpr double kCombSeconds = 6.0;
     static constexpr int kCombUpdateFrames = 32;
     static constexpr int kCombMultiples = 4;
-    static constexpr double kCombPriorSeconds = 0.45;
+    static constexpr double kCombPriorSeconds = 0.40;
+    static constexpr double kCombHalfWeight = 0.5; ///< Weight of the half-period lag.
+    /// Memory of the running peaks the beat score normalises by.
+    static constexpr double kScorePeakSeconds = 10.0;
     static constexpr double kCombTransitionOctaves = 0.19;
     static constexpr double kCombThresholdSeconds = 0.081;
     static constexpr double kCombWidthSeconds = 0.0116;
@@ -3381,6 +3437,10 @@ private:
     int64_t frameIndex_ = 0;
     int64_t lastFrameRef_ = 0;
     double baseline_ = 0.0;
+    double linearBaseline_ = 0.0;  ///< Trailing mean of the linear flux.
+    double scorePeak_ = 0.0;       ///< Running peaks of the two conditioned
+    double scorePeakLinear_ = 0.0; ///< functions the beat score reads.
+    double peakDecay_ = 0.9995;    ///< Per-frame decay of those peaks.
     double baselineCoef_ = 0.005;
     // Causal beat clock (audio thread only; sized at prepare).
     int beatScoreLen_ = 64;
@@ -3441,7 +3501,7 @@ private:
     std::atomic<bool> beatLatched_ { false };
     std::atomic<std::int64_t> lastBeatSample_ { -1 };
     std::atomic<float> beatTempo_ { 0.0f };
-    std::atomic<std::int64_t> latencySamples_ { 549 };
+    std::atomic<std::int64_t> latencySamples_ { 770 };
 };
 
 } // namespace dspark

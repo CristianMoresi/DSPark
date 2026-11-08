@@ -1050,3 +1050,178 @@ DSPARK_TEST(Onset_default_picker_recalls_slow_attacks_inside_decays)
     EXPECT_EQ(s.fp, 0);
     EXPECT_GT(s.r, 0.85);
 }
+
+namespace {
+
+// Notes on a quiet floor: 60 ms attacks inside the decays of earlier notes
+// (heldBass false), or held bass notes with 10 ms attacks and releases, each
+// sounding alone (heldBass true), 16 s per seed.
+void notesOnFloor(double fs, uint32_t seed, bool heldBass, std::vector<float>& sig,
+                  std::vector<int64_t>& truth)
+{
+    const int n = static_cast<int>(fs * 16.0);
+    sig.assign(static_cast<size_t>(n), 0.0f);
+    truth.clear();
+    uint32_t state = seed;
+    auto uniform = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<double>(state >> 8) / 16777216.0;
+    };
+    double t = 0.3;
+    while (t < 15.0)
+    {
+        const int64_t at = static_cast<int64_t>(fs * t);
+        const double midi = heldBass ? 24.0 + 36.0 * uniform() : 36.0 + 48.0 * uniform();
+        const double f0 = 440.0 * std::exp2((midi - 69.0) / 12.0);
+        const double amp = heldBass ? std::pow(10.0, (-12.0 + 12.0 * uniform()) / 20.0)
+                                    : std::pow(10.0, (-30.0 + 24.0 * uniform()) / 20.0);
+        const int att = static_cast<int>((heldBass ? 0.010 : 0.060) * fs);
+        const int dur = static_cast<int>((heldBass ? 0.25 + 0.4 * uniform() : 0.2 + 0.6 * uniform()) * fs);
+        const int rel = static_cast<int>((heldBass ? 0.010 : 0.020) * fs);
+        const double decay = heldBass ? 0.3 : 3.0;
+        for (int i = 0; i < dur; ++i)
+        {
+            const int64_t j = at + i;
+            if (j >= n) break;
+            const double u = static_cast<double>(i) / fs;
+            double env = std::min(1.0, static_cast<double>(i) / att) * std::exp(-decay * u);
+            if (i > dur - rel) env *= static_cast<double>(dur - i) / rel;
+            double s = 0.0;
+            for (int h = 1; h <= 6; ++h) s += std::sin(dspark::twoPi<double> * f0 * h * u) / h;
+            sig[static_cast<size_t>(j)] += static_cast<float>(amp * env * s);
+        }
+        truth.push_back(at);
+        t += heldBass ? static_cast<double>(dur) / fs + 0.08 + 0.3 * uniform() : 0.15 + 0.55 * uniform();
+    }
+}
+
+struct OfflineAndCausal { PRF offline, causal; };
+
+OfflineAndCausal detectBoth(std::vector<float>& sig, const std::vector<int64_t>& truth, double fs)
+{
+    OnsetDetector<float> od;
+    od.prepare(AudioSpec{ fs, 512, 1 });
+    float* ptr = sig.data();
+    const PRF offline = scoreOnsets(od.detectOffline(AudioBufferView<float>(&ptr, 1, static_cast<int>(sig.size()))),
+                                    truth, fs, 50.0);
+    OnsetDetector<float> live;
+    live.prepare(AudioSpec{ fs, 256, 1 });
+    std::vector<int64_t> causal;
+    for (size_t i = 0; i < sig.size(); i += 256)
+    {
+        const size_t len = std::min<size_t>(256, sig.size() - i);
+        live.pushSamples(std::span<const float>(sig.data() + i, len));
+        if (live.onsetDetected()) causal.push_back(live.getLastOnsetSample());
+    }
+    return { offline, scoreOnsets(causal, truth, fs, 50.0) };
+}
+
+} // namespace
+
+// ===========================================================================
+// 60 ms attacks inside the decays of louder notes, four 16 s files, at 44.1,
+// 48 and 96 kHz. The gated picker reads the flux to the frame a quarter of the
+// analysis frame back, so a slow attack's rise counts twice. Before, the
+// offline picker recalled 121, 123 and 123 of the 140 attacks and the causal
+// one 126 to 127; now 133 and 132 to 134, with no false onset.
+// ===========================================================================
+DSPARK_TEST(Onset_gated_picker_reads_slow_attacks_on_the_quarter_frame_flux)
+{
+    for (const double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        int offTp = 0, offFp = 0, liveTp = 0, liveFp = 0, total = 0;
+        for (const uint32_t seed : { 77u, 101u, 202u, 303u })
+        {
+            std::vector<float> sig;
+            std::vector<int64_t> truth;
+            notesOnFloor(fs, seed, false, sig, truth);
+            const OfflineAndCausal r = detectBoth(sig, truth, fs);
+            offTp += r.offline.tp; offFp += r.offline.fp;
+            liveTp += r.causal.tp; liveFp += r.causal.fp;
+            total += static_cast<int>(truth.size());
+        }
+        std::cout << "  [picker] 60 ms attacks at " << fs << " Hz: offline tp=" << offTp
+                  << " fp=" << offFp << ", causal tp=" << liveTp << " fp=" << liveFp
+                  << " of " << total << "\n";
+        EXPECT_EQ(total, 140);
+        EXPECT_TRUE(offTp >= 130);
+        EXPECT_TRUE(liveTp >= 130);
+        EXPECT_EQ(offFp, 0);
+        EXPECT_EQ(liveFp, 0);
+    }
+}
+
+// Held bass notes alone on a silent floor, 10 ms attacks and releases. Low
+// partials share the bins of one band and their level oscillates at the
+// partials' spacing; without the persistence test against the largest of the
+// bands over the span, the causal picker reported 11 of those oscillations at
+// 48 and 96 kHz. Every attack is recalled; offline reports nothing else, the
+// causal picker at most two releases (both at 44.1 kHz).
+DSPARK_TEST(Onset_gated_picker_ignores_beating_partials_of_held_bass)
+{
+    for (const double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        int offTp = 0, offFp = 0, liveTp = 0, liveFp = 0, total = 0;
+        for (const uint32_t seed : { 77u, 101u, 202u, 303u })
+        {
+            std::vector<float> sig;
+            std::vector<int64_t> truth;
+            notesOnFloor(fs, seed, true, sig, truth);
+            const OfflineAndCausal r = detectBoth(sig, truth, fs);
+            offTp += r.offline.tp; offFp += r.offline.fp;
+            liveTp += r.causal.tp; liveFp += r.causal.fp;
+            total += static_cast<int>(truth.size());
+        }
+        std::cout << "  [picker] held bass at " << fs << " Hz: offline tp=" << offTp
+                  << " fp=" << offFp << ", causal tp=" << liveTp << " fp=" << liveFp
+                  << " of " << total << "\n";
+        EXPECT_EQ(offTp, total);
+        EXPECT_EQ(liveTp, total);
+        EXPECT_EQ(offFp, 0);
+        EXPECT_TRUE(liveFp <= 2);
+    }
+}
+
+// OdfFrame::linear is the SpectralFlux method's own value on the same
+// spectrum (summed in another order), and asking for it changes nothing else:
+// the envelope and the onsets are bit-identical with it off.
+DSPARK_TEST(Onset_linear_flux_readout_matches_the_spectral_flux_method)
+{
+    const double fs = 48000.0;
+    std::vector<float> sig;
+    std::vector<int64_t> truth;
+    notesOnFloor(fs, 77u, false, sig, truth);
+    sig.resize(static_cast<size_t>(fs * 4.0));
+    OnsetDetector<float> with, without, spectral;
+    with.setLinearFlux(true);
+    spectral.setMethod(OnsetDetector<float>::Method::SpectralFlux);
+    for (auto* d : { &with, &without, &spectral }) d->prepare(AudioSpec{ fs, 256, 1 });
+    EXPECT_TRUE(with.getLinearFlux());
+    EXPECT_FALSE(without.getLinearFlux());
+    const int hop = with.getHopSize();
+    int frames = 0, onsetsWith = 0, onsetsWithout = 0;
+    double worstDiff = 0.0, peak = 0.0;
+    bool identical = true, offIsZero = true;
+    for (size_t i = 0; i + static_cast<size_t>(hop) <= sig.size(); i += static_cast<size_t>(hop))
+    {
+        const std::span<const float> block(sig.data() + i, static_cast<size_t>(hop));
+        with.pushSamples(block);
+        without.pushSamples(block);
+        spectral.pushSamples(block);
+        const auto a = with.getLastOdfFrame(), b = without.getLastOdfFrame(), c = spectral.getLastOdfFrame();
+        identical = identical && a.value == b.value && a.registers == b.registers;
+        offIsZero = offIsZero && b.linear == 0.0f;
+        worstDiff = std::max(worstDiff, std::abs(static_cast<double>(a.linear) - static_cast<double>(c.value)));
+        peak = std::max(peak, static_cast<double>(c.value));
+        onsetsWith += with.onsetDetected() ? 1 : 0;
+        onsetsWithout += without.onsetDetected() ? 1 : 0;
+        ++frames;
+    }
+    EXPECT_GT(frames, 700);
+    EXPECT_TRUE(identical);
+    EXPECT_TRUE(offIsZero);
+    EXPECT_EQ(onsetsWith, onsetsWithout);
+    EXPECT_GT(onsetsWith, 5);
+    EXPECT_GT(peak, 0.0);
+    EXPECT_LT(worstDiff, 1e-5 * peak);
+}

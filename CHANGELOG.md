@@ -29,6 +29,12 @@ All notable user-facing changes to DSPark are documented here.
   `getTailSeconds()` after parameter motion notifies the `TailTime`
   listeners on the main thread, and an initialize that moves the latency or
   the tail notifies both properties.
+- `OnsetDetector::setLinearFlux(bool)` / `getLinearFlux()` and
+  `OdfFrame::linear`: the linear-magnitude spectral flux of the same frame as
+  the envelope, for a consumer that wants the loudest sound as well as every
+  register's share (default off; `BeatTracker` turns it on). The envelope and
+  the onsets are bit-identical either way; about 0.1 ms of CPU per second of
+  audio when on.
 - `Limiter::setHoldMode(HoldMode::EveryPeak)` (opt-in, default `Deepest`
   unchanged and bit-identical): every peak's reduction is held for the hold
   time after it has passed (an exact sliding minimum over lookahead plus
@@ -309,6 +315,43 @@ All notable user-facing changes to DSPark are documented here.
   model's error against the dense point circuit, which is unchanged; the
   blocking figures are unchanged. 1x and 4x and above are bit-identical;
   the Clamp default is untouched.
+- `OnsetDetector` gated picker (the default; analysis readout, no audio):
+  it picks the SuperFlux compared with the frame a quarter of the analysis
+  frame back (two hops under the automatic frame, as the published method
+  derives it from the window) instead of the previous frame; the envelope of
+  `getLastOdfFrame()` and `Picker::Plain` are unchanged, bit for bit. A peak
+  within 0.0045 of its threshold must also show a new sound: its band rise
+  across the release test's span, against the largest of the bands over the
+  0.43 frames before, must be 2.1 times its moving mean, with a 2 dB rise of
+  the frame energy unless the ratio reaches 3. The release test excuses a
+  fall of the frame energy when one register doubles its energy (by 3% of the
+  frame's), and the causal moving mean extends over the frames that test
+  waits for (latency unchanged). On 24 held-out files per kind at 44.1 kHz,
+  offline (F at +/-50 ms): 60 ms attacks 0.909 to 0.946 (0.952 at 48 and 96
+  kHz; causal 0.918 to 0.951, 0.952 and 0.955), 30 ms 0.966 to 0.981, slow
+  attacks over pink noise 0.621 to 0.803, sharp attacks over a quiet noise bed
+  0.978 to 0.989, note releases 0.999 to 1.000 with no false onset, clicks
+  over 0 dB pink noise 0.995 (0.02 per second) unchanged, percussion 0.965 to
+  0.964. `getOnsetStrength()` reports the picked function's value. The
+  OnsetDetector costs 0.82 instead of 0.78 ms of CPU per second of audio
+  (its flux loops are now branch free).
+- `BeatTracker` causal beats (the published tempo and confidence and the
+  offline path are unchanged): the beat score reads the log-band envelope
+  and the linear spectral flux, each over its own running peak, and the comb
+  stage also reads the correlation at half the period, under a Rayleigh prior
+  at 0.40 s (0.45 before). Beats are attributed one hop before the frame
+  they are placed on, where the linear flux puts the transient, so
+  `getLatencySamples()` grows by one hop (549 to 770 samples at 44.1 kHz).
+  Causal beat F (+/-70 ms after 5 s): ballroom 0.706 to 0.740 and 0.728 to
+  0.757 on the two halves of 698 recordings; first 30 s of the Salsa Dataset
+  0.326 to 0.410 (0.399 and 0.420 on its halves; the four-thirds metrical
+  error on a tresillo falls from 31 of 122 recordings to 3); the three
+  syncopated grooves (0.980, 0.984, 0.986) and click trains from 40 to 240 BPM
+  unchanged; the off-beat sweep keeps all 660 beats within 70 ms (659
+  before), a mean 1.2 to 2.0 ms late (2.6 to 4.0); beat placement on clean
+  clicks median 2.1 ms, worst 6.3 ms (3.6 and 6.7); mean offset from the
+  annotated beat on 200 ballroom recordings 3.7 ms (4.3). CPU 1.69 to 1.78 ms
+  per second of audio.
 - `Limiter` true-peak mode reads every sample interval with a 64-tap 4x
   reconstruction refined to its local maxima, maxed with the BS.1770 Annex 2
   estimate it used alone before (which under-reads peaks built from content

@@ -1946,3 +1946,65 @@ DSPARK_TEST(Beat_causal_beats_follow_the_beat_of_a_syncopated_groove)
         EXPECT_GT(s.f, 0.95);
     }
 }
+
+namespace {
+
+// A Latin-style groove in eighths, the annotated beat on the half note (slots
+// 0 and 4 of a bar of eight): a bass on slots 3 and 6, conga tones on 3 and
+// 7, a cowbell on the quarters, a woodblock tresillo (3-3-2: slots 0, 3, 6)
+// and a shaker on every eighth. The tresillo repeats at three eighths, which
+// is four thirds of the beat and no binary level of it.
+Corpus tresilloGroove(double halfBpm, double seconds, uint32_t seed)
+{
+    rngState = seed;
+    Corpus c;
+    c.bpm = halfBpm;
+    c.x.assign(static_cast<size_t>(seconds * kFs), 0.0f);
+    const double e = 60.0 / halfBpm / 4.0;
+    const double roots[4] = { 55.0, 61.74, 49.0, 65.41 };
+    for (int bar = 0;; ++bar)
+    {
+        const double t0 = 0.3 + 8.0 * e * bar;
+        if (t0 + 8.0 * e > seconds - 0.5) break;
+        c.beats.push_back(static_cast<int64_t>(t0 * kFs));
+        c.beats.push_back(static_cast<int64_t>((t0 + 4.0 * e) * kFs));
+        const auto at = [&](double slot) { return static_cast<int64_t>((t0 + slot * e) * kFs); };
+        const double f = roots[bar % 4];
+        addHarmonicTone(c.x, at(3), f, 0.35, 2.5 * e);
+        addHarmonicTone(c.x, at(6), 1.5 * f, 0.35, 2.0 * e);
+        addHarmonicTone(c.x, at(3), 196.0, 0.10, e);
+        addHarmonicTone(c.x, at(7), 196.0, 0.12, e);
+        for (int q = 0; q < 4; ++q) addHarmonicTone(c.x, at(2 * q), 820.0, q % 2 ? 0.05 : 0.08, 0.06);
+        for (const double s : { 0.0, 3.0, 6.0 }) addHarmonicTone(c.x, at(s), 1250.0, 0.07, 0.03);
+        for (int s = 0; s < 8; ++s) addNoiseHit(c.x, at(s), s % 2 ? 0.05 : 0.03, 70.0, 0.9);
+    }
+    for (auto& v : c.x) v += static_cast<float>(2e-4 * nrand());
+    return c;
+}
+
+} // namespace
+
+// The causal beat clock under a tresillo. Repetition at three eighths is as
+// strong as at the beat, and the comb read it as the level: the beat clock
+// ran at four thirds of the half-note beat (113 BPM for a half note at 84,
+// and four thirds at every tempo tried from 84 to 108).
+// The comb also reads the correlation at half the period, which only a binary
+// level has on the grid, and the clock now runs at the quarter or the half.
+DSPARK_TEST(Beat_causal_level_under_a_tresillo_is_binary)
+{
+    for (const double halfBpm : { 84.0, 92.0, 100.0 })
+    {
+        const Corpus c = tresilloGroove(halfBpm, 30.0, static_cast<uint32_t>(halfBpm) + 3u);
+        BeatTracker<float> bt;
+        bt.prepare(AudioSpec{ kFs, 512, 1 });
+        for (size_t i = 0; i + 512 <= c.x.size(); i += 512)
+            bt.pushSamples(std::span<const float>(c.x.data() + i, 512));
+        const double ratio = static_cast<double>(bt.getBeatTempoBpm()) / halfBpm;
+        std::cout << "  tresillo, half note at " << halfBpm << " BPM: beat clock at "
+                  << static_cast<double>(bt.getBeatTempoBpm()) << " BPM (" << ratio << " of the beat)\n";
+        const double octaves = std::log2(ratio);
+        EXPECT_LT(std::abs(octaves - std::round(octaves)), 0.06);
+        EXPECT_GT(ratio, 0.9);
+        EXPECT_LT(ratio, 2.2);
+    }
+}

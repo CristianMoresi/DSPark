@@ -233,6 +233,17 @@ template <FloatType T> class OnsetNovelty final
     {
         T value = T(0);        ///< Requested function; SuperFlux when BothFlux is requested.
         T spectralFlux = T(0); ///< Also returned by BothFlux, from the same spectrum.
+        /// SuperFlux to the frame pickLag back (prepare()); equal to value at
+        /// lag 1, and for the other functions.
+        T pick = T(0);
+        /// SuperFlux to the largest of the persistSpan frames that end
+        /// persistLag back (prepare()); zero when no persistence lag is
+        /// configured, and for the other functions.
+        T persist = T(0);
+        /// Linear-magnitude spectral flux of the same spectrum, accumulated in
+        /// four interleaved sums; computed for SuperFlux and BothFlux when
+        /// setLinearFlux(true), zero otherwise.
+        T linear = T(0);
         std::array<T, kNumRegisters> registers{};
         bool valid = false;
     };
@@ -243,8 +254,24 @@ template <FloatType T> class OnsetNovelty final
         return (3 * static_cast<std::size_t>(fftSize) + 4 + 4 * kBandCapacity) * sizeof(T) +
                5 * kBandCapacity * sizeof(int);
     }
-    /** @brief Allocates histories and the canonical quarter-tone filterbank. */
-    void prepare(double sampleRate, int fftSize, bool boundedWorkspace = false)
+    /**
+     * @brief Allocates histories and the canonical quarter-tone filterbank.
+     * @param sampleRate       Sample rate in Hz.
+     * @param fftSize          Power-of-two frame size.
+     * @param boundedWorkspace Reserve the filterbank's worst-case size up front.
+     * @param pickLag          Frames back the SuperFlux pick value compares
+     *                         with (1, the default, is the value itself and
+     *                         keeps no extra history).
+     * @param persistLag       Frames back the persistence value compares with
+     *                         (0, the default, disables it). Lags above 1 keep
+     *                         a ring of max-filtered band frames, allocated here.
+     * @param persistSpan      Frames, ending persistLag back, whose band-wise
+     *                         maximum the persistence value compares with: a
+     *                         partial whose level oscillates within the span
+     *                         does not read as a rise.
+     */
+    void prepare(double sampleRate, int fftSize, bool boundedWorkspace = false, int pickLag = 1,
+                 int persistLag = 0, int persistSpan = 1)
     {
         prepared_ = false;
         sampleRate_ = sampleRate;
@@ -259,6 +286,13 @@ template <FloatType T> class OnsetNovelty final
         bandCur_.assign(static_cast<size_t>(numBands_), T(0));
         bandPrev_.assign(static_cast<size_t>(numBands_), T(0));
         bandMaxPrev_.assign(static_cast<size_t>(numBands_), T(0));
+        pickLag_ = std::max(1, pickLag);
+        persistLag_ = std::max(0, persistLag);
+        persistSpan_ = std::max(1, persistSpan);
+        historyFrames_ = (pickLag_ > 1 || persistLag_ > 0)
+                             ? std::max(pickLag_, persistLag_ + persistSpan_ - 1) : 0;
+        maxHistory_.assign(static_cast<size_t>(historyFrames_) * static_cast<size_t>(numBands_), T(0));
+        spanMax_.assign(persistSpan_ > 1 ? static_cast<size_t>(numBands_) : size_t(0), T(0));
         reset();
         prepared_ = true;
     }
@@ -272,12 +306,22 @@ template <FloatType T> class OnsetNovelty final
         std::fill(whitenPeak_.begin(), whitenPeak_.end(), T(0));
         std::fill(bandPrev_.begin(), bandPrev_.end(), T(0));
         std::fill(bandMaxPrev_.begin(), bandMaxPrev_.end(), T(0));
+        std::fill(maxHistory_.begin(), maxHistory_.end(), T(0));
+        historyWrite_ = 0;
+        curPick_ = T(0);
+        curPersist_ = T(0);
         curRegisters_.fill(T(0));
         phaseHistoryValid_ = true;
     }
     [[nodiscard]] int getNumBands() const noexcept
     {
         return numBands_;
+    }
+    /** @brief Computes Frame::linear alongside SuperFlux. Allocation free.
+     *  @param on True to compute it. */
+    void setLinearFlux(bool on) noexcept
+    {
+        linearFlux_ = on;
     }
     /**
      * @brief Advances one frame; optional whitening modifies the supplied
@@ -310,8 +354,14 @@ template <FloatType T> class OnsetNovelty final
             [[fallthrough]];
         case Method::SuperFlux:
             result.value = computeSuperFlux(mag, whiten);
+            result.pick = curPick_;
+            result.persist = curPersist_;
+            if (linearFlux_)
+                result.linear = computeLinearFlux(mag);
             break;
         }
+        if (method != Method::SuperFlux && method != Method::BothFlux)
+            result.pick = result.value;
         if (!phase.empty())
         {
             std::copy(prevPhase_.begin(), prevPhase_.end(), prevPhase2_.begin());
@@ -337,6 +387,21 @@ template <FloatType T> class OnsetNovelty final
         }
         odf /= static_cast<T>(numBins_);
         return odf;
+    }
+    /// computeSpectralFlux() in four interleaved sums, so the additions do
+    /// not wait on each other; the order differs from it in rounding only.
+    T computeLinearFlux(std::span<const T> mag) const noexcept
+    {
+        T acc[4] = {T(0), T(0), T(0), T(0)};
+        const T *cur = mag.data();
+        const T *prev = prevMag_.data();
+        int k = 0;
+        for (; k + 4 <= numBins_; k += 4)
+            for (int j = 0; j < 4; ++j)
+                acc[j] += std::max(T(0), cur[k + j] - prev[k + j]);
+        for (; k < numBins_; ++k)
+            acc[0] += std::max(T(0), cur[k] - prev[k]);
+        return ((acc[0] + acc[1]) + (acc[2] + acc[3])) / static_cast<T>(numBins_);
     }
     T computeComplexFlux(std::span<const T> mag, std::span<const T> phase) const noexcept
     {
@@ -373,26 +438,67 @@ template <FloatType T> class OnsetNovelty final
         // the residual rate dependence documented at prepare().
         filterLogBands(mag, bandCur_, whiten ? T(1) : odfScale_);
         curRegisters_.fill(T(0));
-        for (int b = 0; b < numBands_; ++b)
+        // Branch free (a rise and a fall are equally likely band by band);
+        // adding the zero of a fall leaves both sums exactly as they were.
+        const int registered = std::min(numBands_, static_cast<int>(bandRegister_.size()));
+        for (int b = 0; b < registered; ++b)
         {
-            const T d = bandCur_[static_cast<size_t>(b)] - bandMaxPrev_[static_cast<size_t>(b)];
-            if (d > T(0))
-            {
-                odf += d;
-                if (b < static_cast<int>(bandRegister_.size()))
-                    curRegisters_[static_cast<size_t>(bandRegister_[static_cast<size_t>(b)])] += d;
-            }
+            const T d = std::max(T(0), bandCur_[static_cast<size_t>(b)] - bandMaxPrev_[static_cast<size_t>(b)]);
+            odf += d;
+            curRegisters_[static_cast<size_t>(bandRegister_[static_cast<size_t>(b)])] += d;
         }
+        for (int b = registered; b < numBands_; ++b)
+            odf += std::max(T(0), bandCur_[static_cast<size_t>(b)] - bandMaxPrev_[static_cast<size_t>(b)]);
         odf /= static_cast<T>(numBands_);
         for (int g = 0; g < kNumRegisters; ++g)
             if (registerBands_[static_cast<size_t>(g)] > 0)
                 curRegisters_[static_cast<size_t>(g)] /=
                     static_cast<T>(registerBands_[static_cast<size_t>(g)]);
+        curPick_ = pickLag_ > 1 ? fluxTo(pickLag_, 1) : odf;
+        curPersist_ = persistLag_ > 0 ? fluxTo(persistLag_, persistSpan_) : T(0);
         // Rotate: previous <- current, and rebuild the max-filtered
         // reference from the (new) previous frame.
         bandPrev_ = bandCur_;
         maxFilterFreq(bandPrev_, bandMaxPrev_);
+        if (historyFrames_ > 0)
+        {
+            std::copy(bandMaxPrev_.begin(), bandMaxPrev_.end(),
+                      maxHistory_.begin() + static_cast<std::ptrdiff_t>(
+                          static_cast<size_t>(historyWrite_) * static_cast<size_t>(numBands_)));
+            historyWrite_ = (historyWrite_ + 1) % historyFrames_;
+        }
         return odf;
+    }
+    /// Mean rectified rise of the current bands over the band-wise maximum
+    /// of the max-filtered bands of the span frames ending lag back
+    /// (lag + span - 1 <= historyFrames_, or lag and span 1).
+    [[nodiscard]] T fluxTo(int lag, int span) noexcept
+    {
+        const auto frameAt = [&](int back) {
+            const int slot = ((historyWrite_ - back) % historyFrames_ + historyFrames_) % historyFrames_;
+            return &maxHistory_[static_cast<size_t>(slot) * static_cast<size_t>(numBands_)];
+        };
+        const T *ref = bandMaxPrev_.data();
+        if (span > 1)
+        {
+            const T *first = frameAt(lag);
+            std::copy(first, first + numBands_, spanMax_.begin());
+            for (int q = 1; q < span; ++q)
+            {
+                const T *f = frameAt(lag + q);
+                for (int b = 0; b < numBands_; ++b)
+                    spanMax_[static_cast<size_t>(b)] = std::max(spanMax_[static_cast<size_t>(b)], f[b]);
+            }
+            ref = spanMax_.data();
+        }
+        else if (lag > 1)
+            ref = frameAt(lag);
+        // Branch free: a rise and a fall are equally likely band by band.
+        // Adding the zero of a fall leaves the sum exactly as it was.
+        T sum = T(0);
+        for (int b = 0; b < numBands_; ++b)
+            sum += std::max(T(0), bandCur_[static_cast<size_t>(b)] - ref[b]);
+        return sum / static_cast<T>(numBands_);
     }
     void applyWhitening(std::span<T> mag) noexcept
     {
@@ -540,6 +646,12 @@ template <FloatType T> class OnsetNovelty final
     std::vector<T> fbWeights_, bandCur_, bandPrev_, bandMaxPrev_;
     std::array<T, kNumRegisters> curRegisters_{};
     std::array<int, kNumRegisters> registerBands_{};
+    int pickLag_ = 1, persistLag_ = 0, persistSpan_ = 1;
+    bool linearFlux_ = false;
+    int historyFrames_ = 0, historyWrite_ = 0;
+    std::vector<T> maxHistory_; ///< Max-filtered band frames, historyFrames_ of them.
+    std::vector<T> spanMax_;    ///< Scratch: band-wise maximum over a span.
+    T curPick_ = T(0), curPersist_ = T(0);
 };
 
 } // namespace dspark::detail

@@ -550,7 +550,7 @@ BPM, this path once published five times the true tempo at 40, 42, 44 and 46
 BPM and nothing in the sweep could see it. `getLastBeatSample()` is where the
 beat happened in your own timeline;
 `getLatencySamples()` is how far in the past that is by the time you are told
-(549 samples, 12.4 ms, at 44.1 kHz). Use the former to align anything and the
+(770 samples, 17.5 ms, at 44.1 kHz). Use the former to align anything and the
 latter only to state your own delay.
 
 The order of those two calls is part of the contract, and the snippet above

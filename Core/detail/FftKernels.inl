@@ -48,6 +48,54 @@ struct ConjugatedSource
     }
 };
 
+/// The product of a spectrum with a real gain, its parts swapped: bin i reads
+/// (im[i & mask] gain[i], re[i & mask] gain[i]). Transforming a product's
+/// swapped parts forward is its inverse transform with the parts swapped; the
+/// mask repeats a spectrum of mask + 1 bins over the transform.
+template <typename T, int W>
+struct ScaledSwapSource
+{
+    using O = Vec<T, W>;
+    const T* re;
+    const T* im;
+    const T* gain;
+    size_t mask;
+    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
+    {
+        const typename O::V g = O::load(gain + i);
+        r = O::mul(O::load(im + (i & mask)), g);
+        m = O::mul(O::load(re + (i & mask)), g);
+    }
+};
+
+/// ScaledSwapSource folded: bin i sums the products of bins i + f * stride
+/// for f < fold. A forward transform of that is the inverse of the product,
+/// read at every fold-th sample (the spectrum must hold nothing that the fold
+/// would alias).
+template <typename T, int W>
+struct FoldedScaledSwapSource
+{
+    using O = Vec<T, W>;
+    const T* re;
+    const T* im;
+    const T* gain;
+    size_t stride;
+    size_t fold;
+    void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
+    {
+        typename O::V g = O::load(gain + i);
+        r = O::mul(O::load(im + i), g);
+        m = O::mul(O::load(re + i), g);
+        for (size_t f = 1; f < fold; ++f)
+        {
+            const size_t j = i + f * stride;
+            g = O::load(gain + j);
+            r = O::add(r, O::mul(O::load(im + j), g));
+            m = O::add(m, O::mul(O::load(re + j), g));
+        }
+    }
+};
+
 template <typename T, int W>
 struct SplitSink
 {
@@ -317,6 +365,78 @@ size_t readInput(const Pass* passes, size_t passCount, size_t n, const T* twiddl
         firstPass<T, ConjugatedSource>(passes[0], twiddles, b.yr, b.yi, data);
     else
         firstPass<T, InterleavedSource>(passes[0], twiddles, b.yr, b.yi, data);
+    T* r = b.xr; b.xr = b.yr; b.yr = r;
+    T* m = b.xi; b.xi = b.yi; b.yi = m;
+    return 1;
+}
+
+/// Reads split input from outside the work buffers; returns the passes it ran.
+template <typename T>
+size_t readSplit(const Pass* passes, size_t passCount, size_t n, const T* twiddles,
+                 const T* re, const T* im, Buffers<T>& b) noexcept
+{
+    if (passCount < 2)
+    {
+        for (size_t i = 0; i < n; ++i)
+        {
+            b.xr[i] = re[i];
+            b.xi[i] = im[i];
+        }
+        return 0;
+    }
+    firstPass<T, SplitSource>(passes[0], twiddles, b.yr, b.yi, re, im);
+    T* r = b.xr; b.xr = b.yr; b.yr = r;
+    T* m = b.xi; b.xi = b.yi; b.yi = m;
+    return 1;
+}
+
+/// Reads a scaled, swapped spectrum product (ScaledSwapSource); returns the
+/// passes it ran.
+template <typename T>
+size_t readScaledSwap(const Pass* passes, size_t passCount, size_t n, const T* twiddles,
+                      const T* re, const T* im, const T* gain, size_t mask, Buffers<T>& b) noexcept
+{
+    if (passCount < 2)
+    {
+        for (size_t i = 0; i < n; ++i)
+        {
+            const T g = gain[i];
+            const T a = im[i & mask] * g, c = re[i & mask] * g;
+            b.xr[i] = a;
+            b.xi[i] = c;
+        }
+        return 0;
+    }
+    firstPass<T, ScaledSwapSource>(passes[0], twiddles, b.yr, b.yi, re, im, gain, mask);
+    T* r = b.xr; b.xr = b.yr; b.yr = r;
+    T* m = b.xi; b.xi = b.yi; b.yi = m;
+    return 1;
+}
+
+/// Reads a folded, scaled, swapped spectrum product (FoldedScaledSwapSource);
+/// returns the passes it ran.
+template <typename T>
+size_t readScaledSwapFolded(const Pass* passes, size_t passCount, size_t n, const T* twiddles,
+                            const T* re, const T* im, const T* gain, size_t fold, Buffers<T>& b) noexcept
+{
+    if (passCount < 2)
+    {
+        for (size_t i = 0; i < n; ++i)
+        {
+            T a = im[i] * gain[i], c = re[i] * gain[i];
+            for (size_t f = 1; f < fold; ++f)
+            {
+                const size_t j = i + f * n;
+                const T pa = im[j] * gain[j], pc = re[j] * gain[j];
+                a = a + pa;
+                c = c + pc;
+            }
+            b.xr[i] = a;
+            b.xi[i] = c;
+        }
+        return 0;
+    }
+    firstPass<T, FoldedScaledSwapSource>(passes[0], twiddles, b.yr, b.yi, re, im, gain, n, fold);
     T* r = b.xr; b.xr = b.yr; b.yr = r;
     T* m = b.xi; b.xi = b.yi; b.yi = m;
     return 1;

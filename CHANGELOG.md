@@ -193,11 +193,12 @@ All notable user-facing changes to DSPark are documented here.
   four with AVX2 (chosen at run time on x86-64). It returns `read()`'s values,
   operation for operation (bit for bit where the compiler does not contract
   multiply-adds). At 440 Hz with the level crossfade active, float, phase
-  accumulation included: 2.3 ns per sample with AVX2 and 3.0 ns with SSE2,
-  against 14 ns for `read()`; 4.1 ns with AVX2 when the frame position moves
-  every sample. On one level (no crossfade) 1.9 and 2.4 ns, against 2.5 ns
-  for a 4-point cubic reader of one table. The SSE2, NEON and AVX2 kernels
-  share one source over each instruction set's lane operations.
+  accumulation included: 1.8 ns per sample with AVX2 and 2.4 ns with SSE2,
+  against 14 ns for `read()` and 2.45 ns for a 4-point cubic reader of one
+  table (no crossfade); 3.2 ns with AVX2 when the frame position moves every
+  sample. On one level 1.5 and 1.9 ns. The SSE2, NEON and AVX2 kernels share
+  one source over each instruction set's lane operations, and derive each
+  group's table indices while the previous group is interpolated.
   `Synthesizer`'s wavetable engine reads through it: 28.7 to 14.7 ns per voice
   and frame (one oscillator), 153 to 52 (two oscillators, unison 4), output
   unchanged.
@@ -223,9 +224,12 @@ All notable user-facing changes to DSPark are documented here.
   passband edge, image and alias rejection and in-band tone residual, or
   improves them (Ultra, 96 to 44.1 kHz: alias of stopband tones -218 dB
   instead of -209). Double, ns per input sample once prepared, into caller
-  storage, Direct to TwoStage: Ultra 26.2 to 3.3 (96 to 44.1 kHz), 26.9 to
-  5.5 (48 to 44.1), 27.7 to 6.2 (44.1 to 48), 60.3 to 9.3 (44.1 to 96); High
-  16.4 to 3.0, 16.6 to 5.0, 20.4 to 5.4, 42.1 to 7.9. Both instantiations
+  storage, Direct to TwoStage: Ultra 26.2 to 2.8 (96 to 44.1 kHz), 26.9 to
+  4.7 (48 to 44.1), 27.7 to 5.5 (44.1 to 48), 60.3 to 8.5 (44.1 to 96); High
+  16.4 to 2.7, 16.6 to 4.5, 20.4 to 4.7, 42.1 to 7.0 (stage 1 reads a double
+  input in place and runs its filter product and inverse as one transform;
+  at 2:1, 96 to 48 kHz, the inverse runs at half length on the folded
+  spectrum: High 14.6 to 1.4, Ultra 23.9 to 1.6). Both instantiations
   compute in double, so float output is limited by its own rounding (48 to 96
   kHz High, 20 kHz tone: image residual -162.9 dB instead of -141.0). On
   in-band material the two engines agree to -152 dB (High) and -222 dB
@@ -239,14 +243,20 @@ All notable user-facing changes to DSPark are documented here.
 - `PitchDetector::setNoiseSuppression()` (opt-in, default off; the output is
   unchanged off): a steady window that reads unvoiced is read again with its
   noise floor removed by spectral subtraction (the floor estimated per band
-  from the window itself). Harmonic tones of 70 to 1000 Hz at 0 dB SNR, 400
-  tones, readings within 50 cents: white noise 77% right and 9% wrong (off:
-  unvoiced; the frame stage of the probabilistic-threshold method 29% and
-  71%), pink noise 75% and 3%; 5 and 10 dB unchanged or better. The reading
+  from the window itself). The cleaned window locates the period, the
+  input's own difference function next to its dip gives it (the subtraction
+  shifts partials by a few hertz), and the reading is kept only when the input
+  repeats at the period's multiples about as strongly as at the period, which
+  a narrow band of noise does not. Harmonic tones of 70 to 1000 Hz at 0 dB
+  SNR, 400 tones, readings within 50 cents: white noise 84.5% right and 0.2%
+  wrong (off: unvoiced; the frame stage of the probabilistic-threshold method
+  29% and 71%), pink noise 75.2% and 3.0%; 5 and 10 dB unchanged. The reading
   keeps the input's own confidence (about 0.5 at 0 dB), so a confidence gate
-  still ignores it. Band-limited noise alone reads voiced more often (a Q 2
-  band at 300 Hz 0% to 11% of windows, at confidence up to 0.61). CPU on
-  white noise 20 to 91 ns per sample; voiced windows are not read twice.
+  still ignores it. Band-limited noise alone stays near what the first reading
+  voices: a Q 5 band at 1 kHz 10.1% of windows (off 8.4%), a Q 2 band at
+  300 Hz 0.6% (off 0%). Periods below 67 Hz (automatic window, 48 kHz) are
+  not read through the noise. CPU on noise 20 to 95 ns per sample; voiced
+  windows are not read twice.
 - `MidiFile::read(path, MidiReadOptions)`: opt-in, per-defect recovery of
   malformed files (`MidiReadRecovery`: redundant VLQ bytes, data after the
   end-of-track event, a wrong track length or count, a missing end-of-track

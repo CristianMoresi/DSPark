@@ -42,12 +42,14 @@
  * double samples at a time on SSE2 and NEON and eight or four with AVX2
  * (chosen at run time on x86-64). It returns read()'s values, operation for
  * operation. Measured on x86-64 at 440 Hz with the level crossfade active,
- * float: read() 14 ns per sample, readBlock() 2.3 ns with AVX2 and 3.0 ns
- * with SSE2, phase accumulation included; 4.1 ns with AVX2 when the frame
- * position moves every sample. On one level (no crossfade) 1.9 and 2.4 ns,
- * against 2.5 ns for a 4-point cubic reader of one table in the same loop.
- * The SSE2, NEON and AVX2 kernels are one source, detail/WavetableKernels.inl,
- * over each instruction set's lane operations.
+ * float: read() 14 ns per sample, readBlock() 1.8 ns with AVX2 and 2.4 ns
+ * with SSE2, phase accumulation included, against 2.45 ns for a 4-point
+ * cubic reader of one table (no crossfade) in the same loop; 3.2 ns with
+ * AVX2 when the frame position moves every sample. On one level 1.5 and
+ * 1.9 ns. The SSE2, NEON and AVX2 kernels are one source,
+ * detail/WavetableKernels.inl, over each instruction set's lane operations;
+ * each group of samples derives its table indices while the previous one
+ * is interpolated, so its loads do not wait on that arithmetic.
  *
  * Storage is float whatever the reader's sample type, with guard samples
  * around every table so a read never wraps. A bank costs 229 KB per frame.
@@ -128,6 +130,14 @@ inline constexpr int kWavetableOneLevel = 0, kWavetableSameGrid = 1, kWavetableT
 
 } // namespace detail
 
+// The lane loops of the block kernels must be unrolled for the rows to stay in
+// registers; GCC does not always do it on its own at -O2.
+#if defined(__GNUC__)
+    #define DSPARK_WAVETABLE_UNROLL _Pragma("GCC unroll 8")
+#else
+    #define DSPARK_WAVETABLE_UNROLL
+#endif
+
 // Lane operations for the block kernels of detail/WavetableKernels.inl, one
 // pair of structs per instruction set: four float or two double lanes on SSE2
 // and NEON, eight or four with AVX2. The kernels are included once per set.
@@ -186,6 +196,7 @@ struct FloatLanes
     {
         const __m128d mx = _mm_set1_pd(maxPos), zero = _mm_setzero_pd();
         __m128 frac[2];
+        DSPARK_WAVETABLE_UNROLL
         for (int h = 0; h < 2; ++h)
         {
             const __m128d p = _mm_loadu_pd(pos + 2 * h);
@@ -212,6 +223,7 @@ struct FloatLanes
     template <bool Blend, class At, class Step, class Tl>
     static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int k = 0; k < 2; ++k)
         {
             const int l = 2 * k;
@@ -239,6 +251,7 @@ struct FloatLanes
     static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
                           const Tl& t, V w) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int k = 0; k < 2; ++k)
         {
             const int l = 2 * k;
@@ -339,6 +352,7 @@ struct DoubleLanes
     template <bool Blend, class At, class Step, class Tl>
     static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 2; ++l)
         {
             const float* const p = at(l);
@@ -359,6 +373,7 @@ struct DoubleLanes
     static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
                           const Tl& t, V w) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 2; ++l)
         {
             const float* const pa = atA(l);
@@ -384,6 +399,7 @@ struct DoubleLanes
 
     static void columns(const Rows& r, V* y) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int k = 0; k < 3; ++k)
         {
             y[2 * k]     = _mm_unpacklo_pd(r.r[0][k], r.r[1][k]);
@@ -436,6 +452,7 @@ struct FloatLanes
     static void frames(const double* pos, double maxPos, int32_t* f0, float* t) noexcept
     {
         float32x2_t frac[2];
+        DSPARK_WAVETABLE_UNROLL
         for (int h = 0; h < 2; ++h)
         {
             const float64x2_t p = vld1q_f64(pos + 2 * h);
@@ -458,6 +475,7 @@ struct FloatLanes
     template <bool Blend, class At, class Step, class Tl>
     static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int k = 0; k < 2; ++k)
         {
             const int l = 2 * k;
@@ -478,6 +496,7 @@ struct FloatLanes
     static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
                           const Tl& t, V w) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int k = 0; k < 2; ++k)
         {
             const int l = 2 * k;
@@ -569,6 +588,7 @@ struct DoubleLanes
     template <bool Blend, class At, class Step, class Tl>
     static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 2; ++l)
             for (int k = 0; k < 3; ++k)
             {
@@ -581,6 +601,7 @@ struct DoubleLanes
     static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
                           const Tl& t, V w) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 2; ++l)
             for (int k = 0; k < 3; ++k)
             {
@@ -597,6 +618,7 @@ struct DoubleLanes
 
     static void columns(const Rows& r, V* y) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int k = 0; k < 3; ++k)
         {
             y[2 * k]     = vzip1q_f64(r.r[0][k], r.r[1][k]);
@@ -664,6 +686,7 @@ struct FloatLanes
     static void frames(const double* pos, double maxPos, int32_t* f0, float* t) noexcept
     {
         const __m256d zero = _mm256_setzero_pd(), mx = _mm256_set1_pd(maxPos);
+        DSPARK_WAVETABLE_UNROLL
         for (int h = 0; h < 2; ++h)
         {
             const __m256d p = _mm256_loadu_pd(pos + 4 * h);
@@ -679,6 +702,7 @@ struct FloatLanes
     template <bool Blend, class At, class Step, class Tl>
     static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 8; ++l)
         {
             r.r[l] = _mm256_loadu_ps(at(l));
@@ -690,6 +714,7 @@ struct FloatLanes
     static void gatherMix(Rows& r, const AtA& atA, const StepA& stepA, const AtB& atB, const StepB& stepB,
                           const Tl& t, V w) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 8; ++l)
         {
             V a = _mm256_loadu_ps(atA(l)), b = _mm256_loadu_ps(atB(l));
@@ -782,6 +807,7 @@ struct DoubleLanes
     template <bool Blend, class At, class Step, class Tl>
     static void gather(Rows& r, const At& at, const Step& step, const Tl& t) noexcept
     {
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 4; ++l)
         {
             r.lo[l] = lo4(at(l));
@@ -799,6 +825,7 @@ struct DoubleLanes
                           const Tl& t, V w) noexcept
     {
         const __m128d w2 = _mm256_castpd256_pd128(w);
+        DSPARK_WAVETABLE_UNROLL
         for (int l = 0; l < 4; ++l)
         {
             V a = lo4(atA(l)), b = lo4(atB(l));
@@ -838,6 +865,8 @@ struct DoubleLanes
 } // namespace detail
 DSPARK_SIMD_EXACT_AVX2_END
 #endif
+
+#undef DSPARK_WAVETABLE_UNROLL
 
 /**
  * @class WavetableBank

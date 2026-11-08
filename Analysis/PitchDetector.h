@@ -28,8 +28,8 @@
  * down from 6.8% to 0; a clean-room port of the method's frame stage scores
  * 87.3% and 92.0% on the same tones. At 0 dB SNR the detector reads
  * unvoiced rather than guess (that frame stage is right 29% of the time
- * there and wrong 71%); setNoiseSuppression() (opt-in) reads those tones 77%
- * right and 9% wrong. Noisy readings report their honest confidence, about
+ * there and wrong 71%); setNoiseSuppression() (opt-in) reads those tones 84%
+ * right and 0.2% wrong. Noisy readings report their honest confidence, about
  * 0.76 at 5 dB, so a confidence gate keeps ignoring them. Steady clean tones
  * read exactly as before; on clean material the change is fewer octave
  * errors. Across a legato note change two notes can share a longer period
@@ -50,11 +50,12 @@
  *   values are ignored). setNoiseSuppression(): control thread (relaxed
  *   atomic, read once per detection).
  *
- * Dependencies: DspMath.h, FFT.h.
+ * Dependencies: DspMath.h, FFT.h, SimdOps.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/FFT.h"
+#include "../Core/SimdOps.h"
 
 #include <algorithm>
 #include <atomic>
@@ -183,6 +184,7 @@ public:
         cleanScratch_.assign(static_cast<size_t>(kFloorBins), T(0));
         yinClean_.assign(static_cast<size_t>(halfWindow_), T(0));
         rawClean_.assign(static_cast<size_t>(halfWindow_), T(0));
+        persistSq_.assign(static_cast<size_t>(windowSize_) + 1, 0.0);
         fftClean_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(windowSize_) * 2);
 
         writePos_ = 0;
@@ -313,21 +315,33 @@ public:
      * On: a steady window that reads unvoiced is read a second time with its
      * noise floor removed by spectral subtraction (the floor estimated per
      * band from the window itself, so white, pink and other smooth noises
-     * alike), and its period is kept when the cleaned window dips below the
-     * threshold. The reading's confidence stays the input's own dip at that
-     * period, about 0.5 at 0 dB SNR, so a confidence gate keeps ignoring it.
+     * alike). A dip of the cleaned window below the threshold locates the
+     * period; the period itself is then read from the input's own
+     * difference function next to that dip, since the subtraction shifts a
+     * partial's peak by a few hertz (which read tones near 100 Hz up to a
+     * semitone sharp). The reading is kept only when the input repeats at
+     * the multiples of that period about as strongly as at the period
+     * itself: a tone does, a narrow band of noise that the cleaning made
+     * look periodic does not. The reading's confidence stays the input's own
+     * dip at that period, about 0.5 at 0 dB SNR, so a confidence gate keeps
+     * ignoring it. Periods that leave no multiple to compare within the
+     * window (below 67 Hz at the automatic window and 48 kHz) are not read
+     * through the noise.
      *
      * Measured at 48 kHz on harmonic tones of 70 to 1000 Hz (random spectral
      * tilt), readings within 50 cents, 400 tones: in white noise at 0 dB
-     * SNR 77% right and 9% wrong (off: unvoiced; the frame stage of the
-     * probabilistic-threshold method 29% and 71%), in pink noise 75% and 3%;
-     * 5 and 10 dB readings are those of the first reading or better.
+     * SNR 84.5% right and 0.2% wrong (off: unvoiced; the frame stage of the
+     * probabilistic-threshold method 29% and 71%), in pink noise 75.2% and
+     * 3.0%; 5 and 10 dB readings are those of the first reading. Continuous
+     * notes at 2 dB SNR: 88.7% of detections right and none wrong, 86.8%
+     * and none with 50 cents of vibrato.
      *
-     * Noise alone: white and pink still read unvoiced, but band-limited noise
-     * reads voiced more often (a Q 2 band at 300 Hz 0% to 11% of windows, at
-     * confidence up to 0.61; a Q 5 band at 1 kHz 8% to 35%). The second read
-     * costs more than a detection: 20 to 91 ns per sample on white noise, the
-     * worst case; voiced windows are not read twice. Off, the output is
+     * Noise alone: white and pink still read unvoiced, and band-limited
+     * noise stays close to what the first reading alone voices: a Q 5 band
+     * at 1 kHz 10.1% of windows (off 8.4%), at 300 Hz 12.3% (off 10.1%), a
+     * Q 2 band at 300 Hz 0.6% (off 0%). The second read costs more than a
+     * detection: 75 to 95 ns per sample on noise and on noisy tones, against
+     * 20 off; voiced windows are not read twice. Off, the output is
      * unchanged. Control thread; relaxed atomic.
      */
     void setNoiseSuppression(bool on) noexcept
@@ -416,8 +430,11 @@ private:
         }
 
         // Noise floor suppression (opt-in): a steady window that reads
-        // unvoiced is read again with its broadband noise removed, and kept
-        // only for a dip below the threshold there.
+        // unvoiced is read again with its broadband noise removed. A dip
+        // below the threshold there locates the period, which is then taken
+        // from the input's own difference function next to it (the
+        // subtraction shifts the partials' peaks by a few hertz), and kept
+        // only when the input repeats at its multiples (periodPersists()).
         if (noiseSuppression_.load(std::memory_order_relaxed) && steady)
         {
             const T* clean = suppressNoise(currentWindow);
@@ -429,12 +446,16 @@ private:
                 const int tau = chooseDip(yinClean_.data(), unused, numUnused);
                 if (tau >= 0 && yinClean_[static_cast<size_t>(tau)] < threshold)
                 {
-                    // The confidence is the input's own dip at that period:
-                    // a reading taken through the noise stays a low-confidence
-                    // one (about 0.5 at 0 dB SNR).
-                    publish(parabolicInterp(rawClean_.data(), tau),
-                            std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tau)], T(0), T(1)));
-                    return;
+                    const int lag = inputDipNear(tau);
+                    const T period = parabolicInterp(rawDiff_.data(), lag);
+                    if (periodPersists(currentWindow, static_cast<double>(period)))
+                    {
+                        // The confidence is the input's own dip there: a
+                        // reading taken through the noise stays a
+                        // low-confidence one (about 0.5 at 0 dB SNR).
+                        publish(period, std::clamp(T(1) - yinBuffer_[static_cast<size_t>(lag)], T(0), T(1)));
+                        return;
+                    }
                 }
             }
         }
@@ -693,6 +714,74 @@ private:
     }
 
     /**
+     * @brief The lowest sample of the input's own difference function within
+     *        kRefineSpan of `tau` (the lag the cleaned window dipped at).
+     */
+    [[nodiscard]] int inputDipNear(int tau) const noexcept
+    {
+        const T* raw = rawDiff_.data();
+        const int lo = std::max(2, static_cast<int>(static_cast<double>(tau) * (1.0 - kRefineSpan)));
+        const int hi = std::min(halfWindow_ - 2, static_cast<int>(static_cast<double>(tau) * (1.0 + kRefineSpan)) + 1);
+        int best = std::clamp(tau, lo, hi);
+        for (int t = lo; t <= hi; ++t)
+            if (raw[t] < raw[best]) best = t;
+        return best;
+    }
+
+    /**
+     * @brief True when the input window repeats at the multiples of `period`
+     *        about as strongly as at `period` itself.
+     *
+     * A tone in noise repeats equally at every multiple of its period; a
+     * narrow band of noise that the cleaned window made look periodic
+     * decorrelates at each one (by exp(-pi / Q) per period at the band's
+     * centre). The test compares the periodic part of the window's
+     * correlation at 2, 3 .. kMaxMultiple periods with that at one period:
+     * each is the correlation's peak there (the best of the three lags
+     * around the multiple) above the mean of the lags half a period either
+     * side, so a smooth noise correlation, such as pink noise's, cancels.
+     * The mean of the multiples must reach kPersistRatio of the first. All
+     * the multiples that leave an eighth of the window to correlate over are
+     * used, over one common span; a period with no such multiple is not
+     * read through the noise.
+     */
+    [[nodiscard]] bool periodPersists(const T* x, double period) noexcept
+    {
+        const int n = windowSize_;
+        if (!(period >= 2.0)) return false;
+        const auto reach = [&](int k) noexcept {
+            return static_cast<int>(std::lround((static_cast<double>(k) + 0.5) * period)) + 2;
+        };
+        const int minSpan = n / 8;
+        int kmax = kMaxMultiple;
+        while (kmax >= 2 && n - reach(kmax) < minSpan) --kmax;
+        if (kmax < 2) return false;
+        const int span = n - reach(kmax);
+
+        // Energies from prefix sums; one dot product per lag.
+        double* sq = persistSq_.data();
+        sq[0] = 0.0;
+        for (int i = 0; i < n; ++i)
+            sq[i + 1] = sq[i] + static_cast<double>(x[i]) * static_cast<double>(x[i]);
+        const auto corr = [&](int lag) noexcept {
+            const double e = sq[span] + sq[lag + span] - sq[lag];
+            const double r = static_cast<double>(simd::dotProductT(x, x + lag, span));
+            return e > 0.0 ? 2.0 * r / e : 0.0;
+        };
+        const auto contrast = [&](int k) noexcept {
+            const int c = static_cast<int>(std::lround(static_cast<double>(k) * period));
+            const int h = static_cast<int>(std::lround(0.5 * period));
+            const double peak = std::max({ corr(c - 1), corr(c), corr(c + 1) });
+            return peak - 0.5 * (corr(c - h) + corr(c + h));
+        };
+        const double first = contrast(1);
+        if (!(first > 0.0)) return false;
+        double sum = 0.0;
+        for (int k = 2; k <= kmax; ++k) sum += contrast(k);
+        return sum >= kPersistRatio * first * static_cast<double>(kmax - 1);
+    }
+
+    /**
      * @brief Sub-sample period estimate around the selected dip.
      *
      * The parabola is fitted to the RAW difference function d(tau), not to
@@ -788,6 +877,15 @@ private:
     static constexpr double kStationaryRatio = 0.25;
     /// Partial periods a detection keeps for that test.
     static constexpr int kMaxPartials = 16;
+    /// Span, as a fraction of the lag, around a cleaned dip in which the
+    /// input's own difference function is searched for the period.
+    static constexpr double kRefineSpan = 0.06;
+    /// Most multiples of a period that periodPersists() correlates at.
+    static constexpr int kMaxMultiple = 8;
+    /// Least mean of the periodic correlation at the multiples, relative to
+    /// that at one period, for a reading taken through the noise (a narrow
+    /// band of Q 5 measures about 0.2, a tone about 1).
+    static constexpr double kPersistRatio = 0.6;
     /// Bins per band of the noise floor estimate (375 Hz at the automatic window).
     static constexpr int kFloorBins = 32;
     /// Over-subtraction of the noise floor: bins below twice the floor go to zero.
@@ -841,6 +939,7 @@ private:
     std::vector<T> cleanScratch_; // Size: kFloorBins
     std::vector<T> yinClean_;     // Size: halfWindow_
     std::vector<T> rawClean_;     // Size: halfWindow_
+    std::vector<double> persistSq_; // Size: windowSize_ + 1 (periodPersists())
 };
 
 } // namespace dspark

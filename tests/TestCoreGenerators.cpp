@@ -2547,7 +2547,8 @@ double wavetableBlockError(const WavetableBank& bank)
 } // namespace
 
 // readBlock() interpolates four or eight samples at a time instead of one call
-// per sample: 2.3 instead of 14 ns per float sample on AVX2 (3.0 on SSE2),
+// per sample, each group's table indices derived while the previous group is
+// interpolated: 1.8 instead of 14 ns per float sample on AVX2 (2.4 on SSE2),
 // operation for operation the same arithmetic. It matches read() exactly
 // where the compiler does not fuse the scalar multiply-adds; a contracting
 // build moves the last bit (1.8e-7 float, 3.3e-16 double measured).

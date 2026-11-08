@@ -55,6 +55,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <numbers>
 #include <type_traits>
 #include <utility>
@@ -228,6 +229,90 @@ public:
     }
 
     /**
+     * @brief Transforms N values read from two arrays of real and imaginary
+     *        parts, without first copying them into the input buffers.
+     * @param re     N real parts (outside this engine's buffers).
+     * @param im     N imaginary parts (outside this engine's buffers).
+     * @param outRe  Receives the pointer to the N output real parts.
+     * @param outIm  Receives the pointer to the N output imaginary parts.
+     */
+    void runFromSplit(const T* re, const T* im, const T*& outRe, const T*& outIm) noexcept
+    {
+        Buffers<T> b = buffers();
+        const size_t done = inputSplit(re, im, b);
+        passes(b, done, passes_.size());
+        outRe = b.xr;
+        outIm = b.xi;
+    }
+
+    /**
+     * @brief Transforms the spectrum product whose bin k is
+     *        (im[k & mask] gain[k], re[k & mask] gain[k]), read straight from
+     *        the arrays. Run on a product's swapped parts, a forward transform
+     *        is its inverse with the parts swapped back on the way out, so
+     *        this is a filter's multiply and inverse in one go. The product
+     *        is never stored, so a build that contracts multiply-adds may
+     *        fuse it into the first pass: one rounding fewer than writing it
+     *        to the input buffers first and calling run().
+     * @param re    Real parts, mask + 1 bins (may be this engine's last output).
+     * @param im    Imaginary parts, mask + 1 bins.
+     * @param gain  N real gains.
+     * @param mask  One less than a power of two that divides N: the spectrum
+     *              repeats every mask + 1 bins (N - 1 for none).
+     * @param outRe Receives the pointer to the N output real parts.
+     * @param outIm Receives the pointer to the N output imaginary parts.
+     */
+    void runScaledSwap(const T* re, const T* im, const T* gain, size_t mask,
+                       const T*& outRe, const T*& outIm) noexcept
+    {
+        Buffers<T> b = buffers();
+        // The first pass must not write over its own input: when that is the
+        // second work buffer, the passes start from it.
+        const std::less<const T*> before;
+        const T* const second = bufB_.data();
+        if (!before(re, second) && before(re, second + 2 * n_))
+        {
+            std::swap(b.xr, b.yr);
+            std::swap(b.xi, b.yi);
+        }
+        const size_t done = inputScaledSwap(re, im, gain, mask, b);
+        passes(b, done, passes_.size());
+        outRe = b.xr;
+        outIm = b.xi;
+    }
+
+    /**
+     * @brief runScaledSwap() of a spectrum fold times this engine's size,
+     *        folded: bin k sums the products of bins k + f N, f < fold. The
+     *        result is the inverse of the product at every fold-th sample,
+     *        exact when the product holds nothing the fold aliases (a filter
+     *        whose stopband starts at the decimated Nyquist).
+     * @param re    Real parts, fold * N bins (outside this engine's buffers).
+     * @param im    Imaginary parts, fold * N bins.
+     * @param gain  fold * N real gains.
+     * @param fold  Decimation factor, at least 1.
+     * @param outRe Receives the pointer to the N output real parts.
+     * @param outIm Receives the pointer to the N output imaginary parts.
+     */
+    void runScaledSwapFolded(const T* re, const T* im, const T* gain, size_t fold,
+                             const T*& outRe, const T*& outIm) noexcept
+    {
+        Buffers<T> b = buffers();
+        size_t done = 0;
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            done = avx2::readScaledSwapFolded(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im,
+                                              gain, fold, b);
+        else
+#endif
+            done = fft::readScaledSwapFolded(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im,
+                                             gain, fold, b);
+        passes(b, done, passes_.size());
+        outRe = b.xr;
+        outIm = b.xi;
+    }
+
+    /**
      * @brief Transforms the input buffers and writes interleaved output directly.
      * @param out     Receives N interleaved complex values.
      * @param scaleRe Factor applied to the real parts.
@@ -307,6 +392,25 @@ private:
 #endif
         return fft::readInput(passes_.data(), passes_.size(), n_, twiddles_.data(), data,
                               conjugate, b);
+    }
+
+    size_t inputSplit(const T* re, const T* im, Buffers<T>& b) const noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            return avx2::readSplit(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, b);
+#endif
+        return fft::readSplit(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, b);
+    }
+
+    size_t inputScaledSwap(const T* re, const T* im, const T* gain, size_t mask, Buffers<T>& b) const noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            return avx2::readScaledSwap(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, gain,
+                                        mask, b);
+#endif
+        return fft::readScaledSwap(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, gain, mask, b);
     }
 
     void close(const Buffers<T>& b, T* out, T scaleRe, T scaleIm) const noexcept

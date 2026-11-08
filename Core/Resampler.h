@@ -41,7 +41,7 @@
  * rate (or at twice it) does the sharp band-limiting, after which the
  * signal is oversampled enough for a short interpolation kernel (22 to 34
  * taps at High and Ultra) to change the rate. Its arithmetic is double for
- * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 8x faster than
+ * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 9x faster than
  * Direct (see setOfflineEngine()). process() also writes into caller
  * storage, which allocates nothing once the engine is designed.
  *
@@ -145,10 +145,14 @@ public:
      *
      * Measured against Direct (MSVC x64, AVX2 dispatch, double, ns per
      * input sample once prepared, into caller storage) at 96 -> 44.1 /
-     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 3.0 / 5.0 / 5.4 / 7.9
-     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 3.3 / 5.5 / 6.2 / 9.3
-     * instead of 26.2 / 26.9 / 27.7 / 60.3. The vector-returning process()
-     * adds the vector: Ultra 3.6 / 6.1 / 7.0 / 10.8. Passband edge, image
+     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 2.7 / 4.5 / 4.7 / 7.0
+     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 2.8 / 4.7 / 5.5 / 8.5
+     * instead of 26.2 / 26.9 / 27.7 / 60.3. Stage 1 reads a double input
+     * straight from the caller's buffer, and its filter product and inverse
+     * are one transform. At 2:1 (96 -> 48 kHz) the inverse runs at half
+     * the length on the folded spectrum: High 1.4, Ultra 1.6 instead of 14.6
+     * and 23.9. The vector-returning process() adds the vector:
+     * Ultra 3.2 / 5.4 / 6.5 / 10.8. Passband edge, image
      * and alias rejection and the residual of in-band tones are those of
      * Direct or better; on in-band material the two engines agree to -152 dB
      * at High and -222 dB at Ultra.
@@ -894,6 +898,7 @@ private:
         std::vector<int32_t> cycleOf2;   ///< Exact: cycle position of each phase.
         std::optional<detail::fft::SplitFFT<double>> engine;       ///< fftSize complex points.
         std::optional<detail::fft::SplitFFT<double>> engineHalf;   ///< fftSize / 2 (zero-stuffed input).
+        std::optional<detail::fft::SplitFFT<double>> engineDecim;  ///< fftSize / 2: the inverse at every second mid sample.
         std::vector<double> mid;
     };
 
@@ -968,6 +973,10 @@ private:
         // back as the real and imaginary parts of one inverse.
         p.engine.emplace(static_cast<size_t>(n));
         if (s.up == 2) p.engineHalf.emplace(static_cast<size_t>(n / 2));
+        // A 2:1 pick reads every second mid sample only: the inverse is taken
+        // at half the length on the folded spectrum (the kernel's stopband
+        // starts at the output Nyquist, so the fold aliases nothing).
+        if (s.pick && s.up == 1 && s.step2 == 2) p.engineDecim.emplace(static_cast<size_t>(n / 2));
 
         // Stage 2: exact phases when fs_out / fs_mid is a manageable fraction.
         const int64_t l = s.phases2, m = s.step2;
@@ -1041,35 +1050,51 @@ private:
             return;
         }
         detail::fft::SplitFFT<double>& first = (up == 1) ? *p.engine : *p.engineHalf;
-        const auto load = [&](double* frame, int64_t q) noexcept {
-            const int64_t a = std::clamp<int64_t>(-q, 0, frameInputs);
-            const int64_t b = std::clamp<int64_t>(inputLength - q, a, frameInputs);
-            std::fill(frame, frame + a, 0.0);
-            for (int64_t t = a; t < b; ++t) frame[t] = static_cast<double>(input[q + t]);
-            std::fill(frame + b, frame + frameInputs, 0.0);
-        };
-        load(first.inRe(), q0);
-        load(first.inIm(), q1);
         const double* zr = nullptr;
         const double* zi = nullptr;
-        first.run(zr, zi);
-
-        // The zero-stuffed frames' spectrum is the half-length one repeated,
-        // Z[k] = Zh[k mod n/2]. Each bin is read before it is written, so the
-        // engine may hand back its own input buffers.
-        const double* g = p.gain1.data();
-        double* ir = p.engine->inRe();
-        double* ii = p.engine->inIm();
-        const int mask = n / up - 1;
-        for (int k = 0; k < n; ++k)
+        bool direct = false;
+        if constexpr (std::is_same_v<T, double>)
         {
-            const double re = zr[k & mask], im = zi[k & mask];
-            ir[k] = im * g[k];
-            ii[k] = re * g[k];
+            // Both frames inside the input: the transform reads them there.
+            if (q0 >= 0 && q1 + frameInputs <= inputLength)
+            {
+                first.runFromSplit(input + q0, input + q1, zr, zi);
+                direct = true;
+            }
         }
+        if (!direct)
+        {
+            const auto load = [&](double* frame, int64_t q) noexcept {
+                const int64_t a = std::clamp<int64_t>(-q, 0, frameInputs);
+                const int64_t b = std::clamp<int64_t>(inputLength - q, a, frameInputs);
+                std::fill(frame, frame + a, 0.0);
+                for (int64_t t = a; t < b; ++t) frame[t] = static_cast<double>(input[q + t]);
+                std::fill(frame + b, frame + frameInputs, 0.0);
+            };
+            load(first.inRe(), q0);
+            load(first.inIm(), q1);
+            first.run(zr, zi);
+        }
+
+        // The filter's product and inverse in one transform. The zero-stuffed
+        // frames' spectrum is the half-length one repeated, Z[k] = Zh[k mod
+        // n/2].
         const double* wr = nullptr;
         const double* wi = nullptr;
-        p.engine->run(wr, wi);
+        if (p.engineDecim)
+        {
+            // Decimated sample u is frame sample 2u, mid sample s - half1 + 2u
+            // of the first frame (s + block - half1 + 2u of the second): the
+            // even mid samples, the only ones the pick reads.
+            p.engineDecim->runScaledSwapFolded(zr, zi, p.gain1.data(), 2, wr, wi);
+            for (int i = half1 & 1; i < block; i += 2)
+            {
+                dst[i] = wi[(i + half1) / 2];
+                dst[block + i] = wr[(i + half1) / 2];
+            }
+            return;
+        }
+        p.engine->runScaledSwap(zr, zi, p.gain1.data(), static_cast<size_t>(n / up - 1), wr, wi);
         std::copy(wi + half1, wi + half1 + block, dst);
         std::copy(wr + half1, wr + half1 + block, dst + block);
     }

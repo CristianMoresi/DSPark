@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 using namespace dspark;
@@ -336,6 +337,98 @@ DSPARK_TEST(FFTReal_inverse_in_steps_matches_inverse)
 {
     checkSteppedInverse<float>();
     checkSteppedInverse<double>();
+}
+
+// The engine's fused entry points (the resampler's stage 1 runs on them)
+// must write what their unfused forms write. runFromSplit() only reads its
+// input from elsewhere, so it matches filling the input buffers and run() bit
+// for bit. runScaledSwap() never stores the spectrum product with swapped
+// parts, which a build that contracts multiply-adds fuses into the first
+// pass: it matches writing the product to the input buffers and run() to a
+// few rounding steps (exactly where nothing is contracted). Every size (both
+// pass parities, so the engine's own output lies in either work buffer), a
+// repeated spectrum (mask), float and double.
+template <typename T>
+static void checkFusedSplitRuns()
+{
+    const double eps = static_cast<double>(std::numeric_limits<T>::epsilon());
+    // Largest difference between two transforms, relative to the second's peak.
+    const auto worstRelative = [](const T* ar, const T* ai, const T* br, const T* bi, size_t count) {
+        double worst = 0.0, peak = 0.0;
+        for (size_t k = 0; k < count; ++k)
+        {
+            worst = std::max({ worst, std::abs(static_cast<double>(ar[k]) - static_cast<double>(br[k])),
+                               std::abs(static_cast<double>(ai[k]) - static_cast<double>(bi[k])) });
+            peak = std::max({ peak, std::abs(static_cast<double>(br[k])), std::abs(static_cast<double>(bi[k])) });
+        }
+        return peak > 0.0 ? worst / peak : worst;
+    };
+    unsigned int rng = 4242u;
+    auto next = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+    };
+    for (size_t n = 4; n <= 8192; n *= 2)
+    {
+        std::vector<T> re(n), im(n), gain(n);
+        for (size_t i = 0; i < n; ++i) { re[i] = next(); im[i] = next(); gain[i] = next(); }
+        detail::fft::SplitFFT<T> fused(n), plain(n), half(n / 2);
+
+        const T* fr = nullptr;
+        const T* fi = nullptr;
+        const T* pr = nullptr;
+        const T* pi = nullptr;
+        fused.runFromSplit(re.data(), im.data(), fr, fi);
+        std::copy(re.begin(), re.end(), plain.inRe());
+        std::copy(im.begin(), im.end(), plain.inIm());
+        plain.run(pr, pi);
+        EXPECT_EQ(std::memcmp(fr, pr, n * sizeof(T)), 0);
+        EXPECT_EQ(std::memcmp(fi, pi, n * sizeof(T)), 0);
+
+        for (const size_t mask : { n - 1, n / 2 - 1 })
+        {
+            if (mask + 1 < 2) continue;
+            // The spectrum: this engine's own last output (full) or another's.
+            const T* sr = nullptr;
+            const T* si = nullptr;
+            detail::fft::SplitFFT<T>& from = (mask == n - 1) ? fused : half;
+            std::copy(re.begin(), re.begin() + static_cast<std::ptrdiff_t>(mask + 1), from.inRe());
+            std::copy(im.begin(), im.begin() + static_cast<std::ptrdiff_t>(mask + 1), from.inIm());
+            from.run(sr, si);
+            std::vector<T> keepRe(sr, sr + mask + 1), keepIm(si, si + mask + 1);
+            for (size_t k = 0; k < n; ++k)
+            {
+                plain.inRe()[k] = keepIm[k & mask] * gain[k];
+                plain.inIm()[k] = keepRe[k & mask] * gain[k];
+            }
+            plain.run(pr, pi);
+            fused.runScaledSwap(sr, si, gain.data(), mask, fr, fi);
+            EXPECT_LT(worstRelative(fr, fi, pr, pi, n), 16.0 * eps);
+        }
+
+        // The folded form on a half-length engine: bin k sums the products
+        // of bins k and k + n / 2 (a sum of products, which a contracting
+        // build may fuse on one side only: compared to a few ulps).
+        if (n >= 8)
+        {
+            detail::fft::SplitFFT<T> folded(n / 2), plainHalf(n / 2);
+            const size_t h = n / 2;
+            for (size_t k = 0; k < h; ++k)
+            {
+                plainHalf.inRe()[k] = im[k] * gain[k] + im[k + h] * gain[k + h];
+                plainHalf.inIm()[k] = re[k] * gain[k] + re[k + h] * gain[k + h];
+            }
+            plainHalf.run(pr, pi);
+            folded.runScaledSwapFolded(re.data(), im.data(), gain.data(), 2, fr, fi);
+            EXPECT_LT(worstRelative(fr, fi, pr, pi, h), 64.0 * eps);
+        }
+    }
+}
+
+DSPARK_TEST(FFT_fused_split_runs_match_their_unfused_forms)
+{
+    checkFusedSplitRuns<float>();
+    checkFusedSplitRuns<double>();
 }
 
 // ============================================================================
@@ -1195,7 +1288,7 @@ DSPARK_TEST(Resampler_two_stage_meets_the_tier_specification)
     using RD = Resampler<double>;
     const std::pair<double, double> pairs[] = {
         { 44100.0, 48000.0 }, { 48000.0, 44100.0 }, { 44100.0, 48000.0 * 1.0000371 },
-        { 48000.0, 96000.0 }, { 96000.0, 44100.0 },
+        { 48000.0, 96000.0 }, { 96000.0, 44100.0 }, { 96000.0, 48000.0 },
     };
     for (const auto& [src, dst] : pairs)
     {
@@ -1256,7 +1349,7 @@ DSPARK_TEST(Resampler_two_stage_agrees_with_direct_in_band)
     constexpr double kPi = 3.14159265358979323846;
     using RD = Resampler<double>;
     const std::pair<double, double> pairs[] = {
-        { 44100.0, 48000.0 }, { 96000.0, 44100.0 }, { 48000.0, 96000.0 },
+        { 44100.0, 48000.0 }, { 96000.0, 44100.0 }, { 48000.0, 96000.0 }, { 96000.0, 48000.0 },
     };
     for (const auto& [src, dst] : pairs)
         for (const auto q : { RD::Quality::High, RD::Quality::Ultra })
@@ -1303,6 +1396,7 @@ DSPARK_TEST(Resampler_two_stage_spans_agree_and_vanish_outside_reach)
         { 96000.0, 44100.0, RD::Quality::Ultra },
         { 44100.0, 48000.0, RD::Quality::High },
         { 48000.0, 96000.0, RD::Quality::Normal },
+        { 96000.0, 48000.0, RD::Quality::Ultra },
     };
     uint32_t s = 99u;
     auto next = [&s]() { s = s * 1664525u + 1013904223u; return s >> 8; };

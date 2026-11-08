@@ -1382,8 +1382,9 @@ DSPARK_TEST(PitchDetector_legato_change_reads_no_shared_period)
 // above any voicing ceiling: the detector reads unvoiced, and a frame stage
 // that always reads is wrong two times in three there. With noise floor
 // suppression a steady window that reads unvoiced is read again with its
-// noise removed: 31 of these 40 tones read right (76% of 400 measured, 10%
-// wrong), at the input's own confidence, about 0.5. Off, nothing changes.
+// noise removed, the period taken from the input next to the cleaned dip:
+// 37 of these 40 tones read right and none wrong (84.5% and 0.2% of 400
+// measured), at the input's own confidence, about 0.5. Off, nothing changes.
 DSPARK_TEST(PitchDetector_noise_suppression_reads_through_0_db_noise)
 {
     const NoisyToneScore off = scoreNoisyTones(0.0, false);
@@ -1391,8 +1392,8 @@ DSPARK_TEST(PitchDetector_noise_suppression_reads_through_0_db_noise)
     std::cout << "  [pitch noise] 0 dB SNR: off " << off.voiced << " voiced, on "
               << on.correct << "/40 correct, " << on.voiced - on.correct << " wrong\n";
     EXPECT_EQ(off.voiced, 0);
-    EXPECT_GT(on.correct, 24);
-    EXPECT_LT(on.voiced - on.correct, 7);
+    EXPECT_GT(on.correct, 33);
+    EXPECT_LT(on.voiced - on.correct, 3);
     EXPECT_EQ(on.confidentWrong, 0);
     // 5 dB readings stay those of the first reading or better.
     EXPECT_TRUE(scoreNoisyTones(5.0, true).correct >= scoreNoisyTones(5.0, false).correct);
@@ -1421,6 +1422,58 @@ DSPARK_TEST(PitchDetector_noise_suppression_reads_through_0_db_noise)
         }
         EXPECT_EQ(voiced, 0);
     }
+}
+
+namespace {
+
+/// Windows of 2 s of band-pass noise (constant-peak band-pass biquad on
+/// white noise) that read voiced at 48 kHz.
+int bandNoiseVoicedWindows(double centreHz, double q, bool suppression, uint64_t seed)
+{
+    const double fs = 48000.0, w0 = 2.0 * pi<double> * centreHz / fs, alpha = std::sin(w0) / (2.0 * q);
+    const double a0 = 1.0 + alpha, b0 = alpha / a0, b2 = -alpha / a0;
+    const double a1 = -2.0 * std::cos(w0) / a0, a2 = (1.0 - alpha) / a0;
+    NoiseSource rng { seed };
+    std::vector<float> x(96000);
+    double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+    for (int i = 0; i < 4000 + 96000; ++i)
+    {
+        const double w = rng.gauss();
+        const double y = b0 * w + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = w; y2 = y1; y1 = y;
+        if (i >= 4000) x[static_cast<size_t>(i - 4000)] = static_cast<float>(0.3 * y);
+    }
+    PitchDetector<float> pd;
+    pd.prepare(fs);
+    pd.setNoiseSuppression(suppression);
+    int voiced = 0;
+    for (size_t at = 0; at + 512 <= x.size(); at += 512)
+    {
+        pd.pushSamples(std::span<const float>(x.data() + at, 512));
+        if (at >= 4096 && pd.getFrequencyHz() > 0.0f) ++voiced;
+    }
+    return voiced;
+}
+
+} // namespace
+
+// The cleaned window of a narrow band of noise can dip like a period's: the
+// subtraction keeps its strongest bins, a few hertz apart. A tone repeats at
+// every multiple of its period; such a band decorrelates at each one, so the
+// suppression path now keeps a reading only when the input's periodic
+// correlation at the multiples holds up. Of 179 windows of a Q 5 band at
+// 1 kHz, 67 read voiced through the second read and 5 by the first alone;
+// now 8. A Q 2 band at 300 Hz: 16, against 0, now 6.
+DSPARK_TEST(PitchDetector_noise_suppression_ignores_narrow_band_noise)
+{
+    const int q5Off = bandNoiseVoicedWindows(1000.0, 5.0, false, 6u);
+    const int q5On = bandNoiseVoicedWindows(1000.0, 5.0, true, 6u);
+    const int q2Off = bandNoiseVoicedWindows(300.0, 2.0, false, 6u);
+    const int q2On = bandNoiseVoicedWindows(300.0, 2.0, true, 6u);
+    std::cout << "  [pitch noise] band noise voiced windows of 179: Q 5 at 1 kHz off " << q5Off
+              << " on " << q5On << ", Q 2 at 300 Hz off " << q2Off << " on " << q2On << "\n";
+    EXPECT_LT(q5On, q5Off + 15);
+    EXPECT_LT(q2On, q2Off + 11);
 }
 
 DSPARK_TEST(PitchFollower_tracks_glide_without_jumps)

@@ -52,6 +52,11 @@ inline typename L::V interpolateLanes(const typename L::V* y, typename L::V x) n
  * @brief Samples N at a time for one level layout while the phases stay in
  *        [0, 1); returns how many were written (a multiple of N), stopping
  *        before the first group holding an out-of-range phase.
+ *
+ * Software-pipelined: each group's table indices, fractions and frame rows
+ * are derived while the previous group is interpolated, so its table loads
+ * do not wait on that arithmetic.
+ *
  * @tparam Layout    kWavetableOneLevel, kWavetableSameGrid or kWavetableTwoGrids.
  * @tparam PerSample A frame position per sample (else `fixed` for the block).
  * @tparam Blend     The fixed position blends two frames (t not 0).
@@ -63,6 +68,7 @@ int readLanes(const WavetableRows& s, const double* phases, const double* positi
     using S = typename L::S;
     using V = typename L::V;
     constexpr int N = L::N;
+    if (n < N || !L::inRange(phases)) return 0;
     const V wv = L::set1(w);
     const double sizeA = s.sizeA, sizeB = s.sizeB;
     const size_t strideA = s.strideA, strideB = s.strideB;
@@ -73,25 +79,38 @@ int readLanes(const WavetableRows& s, const double* phases, const double* positi
     const size_t fixedStepA = fixed.step * strideA, fixedStepB = fixed.step * strideB;
     [[maybe_unused]] const double maxPos = static_cast<double>(s.numFrames - 1);
     [[maybe_unused]] const int32_t lastFrame = s.numFrames - 1;
-    [[maybe_unused]] alignas(32) S ta[N];
     const S fixedT = static_cast<S>(fixed.t);
-    // The frame blend of lane l: one value for the block, or one per lane.
-    const auto tAt = [&](int l) noexcept -> S {
-        if constexpr (PerSample) return ta[l];
-        else { (void)l; return fixedT; }
-    };
-    int j = 0;
-    for (; j + N <= n; j += N)
-    {
-        if (!L::inRange(phases + j)) return j;
-        alignas(32) uint32_t ia[N];
-        [[maybe_unused]] alignas(32) uint32_t ib[N];
-        [[maybe_unused]] alignas(32) int32_t fa[N];
-        const V xa = L::grid(phases + j, sizeA, ia);
-        V xb = xa;
-        if constexpr (Layout == kWavetableTwoGrids) xb = L::grid(phases + j, sizeB, ib);
-        if constexpr (PerSample) L::frames(positions + j, maxPos, fa, ta);
 
+    // Two groups' grids: the one being read and the next one.
+    alignas(32) uint32_t idxA[2][N];
+    [[maybe_unused]] alignas(32) uint32_t idxB[2][N];
+    [[maybe_unused]] alignas(32) int32_t rowF[2][N];
+    [[maybe_unused]] alignas(32) S rowT[2][N];
+    V xa[2], xb[2];
+    const auto prepare = [&](int g, const double* ph, const double* pos) noexcept {
+        xa[g] = L::grid(ph, sizeA, idxA[g]);
+        if constexpr (Layout == kWavetableTwoGrids) xb[g] = L::grid(ph, sizeB, idxB[g]);
+        else xb[g] = xa[g];
+        if constexpr (PerSample) L::frames(pos, maxPos, rowF[g], rowT[g]);
+        else (void)pos;
+    };
+    prepare(0, phases, positions);
+
+    int j = 0;
+    for (int g = 0;; g ^= 1)
+    {
+        const bool more = j + 2 * N <= n && L::inRange(phases + j + N);
+        if (more) prepare(g ^ 1, phases + j + N, PerSample ? positions + j + N : nullptr);
+
+        const uint32_t* const ia = idxA[g];
+        [[maybe_unused]] const uint32_t* const ib = idxB[g];
+        [[maybe_unused]] const int32_t* const fa = rowF[g];
+        [[maybe_unused]] const S* const ta = rowT[g];
+        // The frame blend of lane l: one value for the block, or one per lane.
+        const auto tAt = [&](int l) noexcept -> S {
+            if constexpr (PerSample) return ta[l];
+            else { (void)l; return fixedT; }
+        };
         // Lane l's six samples start at at*(l), its next frame's step*(l)
         // samples later.
         const auto atA = [&](int l) noexcept -> const float* {
@@ -121,14 +140,14 @@ int readLanes(const WavetableRows& s, const double* phases, const double* positi
         {
             L::template gather<kLerp>(ra, atA, stepA, tAt);
             L::columns(ra, y);
-            L::store(out + j, interpolateLanes<L>(y, xa));
+            L::store(out + j, interpolateLanes<L>(y, xa[g]));
         }
         else if constexpr (Layout == kWavetableSameGrid)
         {
             // Same grid: blend the samples, interpolate once.
             L::template gatherMix<kLerp>(ra, atA, stepA, atB, stepB, tAt, wv);
             L::columns(ra, y);
-            L::store(out + j, interpolateLanes<L>(y, xa));
+            L::store(out + j, interpolateLanes<L>(y, xa[g]));
         }
         else
         {
@@ -136,14 +155,16 @@ int readLanes(const WavetableRows& s, const double* phases, const double* positi
             L::template gather<kLerp>(ra, atA, stepA, tAt);
             L::template gather<kLerp>(rb, atB, stepB, tAt);
             L::columns(ra, y);
-            const V sa = interpolateLanes<L>(y, xa);
+            const V sa = interpolateLanes<L>(y, xa[g]);
             L::columns(rb, y);
-            const V sb = interpolateLanes<L>(y, xb);
+            const V sb = interpolateLanes<L>(y, xb[g]);
             L::store(out + j, L::add(sb, L::mul(wv, L::sub(sa, sb))));
         }
+        j += N;
+        if (!more) return j;
     }
-    return j;
 }
+
 
 /**
  * @brief readLanes() for the block's layout, frame mode and blend: the loop

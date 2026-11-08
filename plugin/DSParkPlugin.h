@@ -42,7 +42,9 @@
  * below and docs/plugins.md):
  *   - reset / getLatency / getTailSeconds / getState / setState
  *   - processBlock(io, sidechain)      -> a host-routable sidechain bus
- *   - handleMidiEvent(const MidiEvent&) -> note/CC/pitch-bend input
+ *   - handleMidiEvent(const MidiEvent&) -> note/CC/pitch-bend input, plus
+ *     per-voice expressions and perVoice() parameter modulation (CLAP)
+ *   - isVoiceActive(channel, key, noteId) -> when a voice really ends
  *   - setTransport(const TransportInfo&) -> host tempo & timeline, per block
  *   - setOfflineRendering(bool)        -> realtime vs bounce quality switch
  *   - channels (ChannelSupport)        -> mono/stereo bus configurations
@@ -138,6 +140,7 @@ struct Param
     const char* unit = "";     ///< Display unit ("dB", "Hz", "%", ...).
     int steps        = 0;      ///< 0 continuous, 1 toggle, N discrete.
     const char* const* labels = nullptr;   ///< steps+1 position names, or null.
+    bool perVoice    = false;  ///< Host may modulate it per voice (see perVoice()).
 };
 
 /** @brief Continuous parameter helper. */
@@ -187,6 +190,22 @@ constexpr Param choice(const char* id, const char* name,
                                                             : defaultIndex);
     return Param { id, name, 0.0f, static_cast<float>(N - 1), static_cast<float>(def),
                    "", static_cast<int>(N - 1), labels };
+}
+
+/**
+ * @brief Marks a parameter as modulatable per voice:
+ * `params(perVoice(param("cutoff", "Cutoff", 20.0f, 20000.0f, 1000.0f, "Hz")), ...)`.
+ *
+ * A host that modulates parameters polyphonically (CLAP per-note, per-key,
+ * per-channel and per-port modulation) then targets single voices, and the
+ * plugin receives each voice's value as a MidiEvent of type NoteModulation
+ * (see MidiEvent). Requires handleMidiEvent - only a plugin with a note input
+ * has voices. Formats without per-voice modulation ignore the mark.
+ */
+constexpr Param perVoice(Param p) noexcept
+{
+    p.perVoice = true;
+    return p;
 }
 
 /** @brief True for an on/off parameter (two unnamed positions). */
@@ -377,10 +396,10 @@ constexpr uint64_t hash64(const char* s, uint64_t salt) noexcept
 
 /**
  * @brief Compile-time guarantee that every parameter id hashes uniquely and
- * collides with no id the wrappers reserve: the state ids 'PRGM' and 'BYPS',
- * and the 0x4D44xxxx range the VST3 backend uses for its hidden MIDI
- * controller parameters. A collision would silently cross-wire automation
- * and state, so the backends refuse to build:
+ * collides with no id the wrappers reserve: the state ids 'PRGM', 'BYPS',
+ * 'EDSW' and 'EDSH', and the 0x4D44xxxx range the VST3 backend uses for its
+ * hidden MIDI controller parameters. A collision would silently cross-wire
+ * automation and state, so the backends refuse to build:
  * `static_assert(paramIdsUnique<MyPlugin>());`.
  */
 template <typename P>
@@ -391,6 +410,7 @@ constexpr bool paramIdsUnique() noexcept
     {
         const uint32_t h = hash32(P::parameters[i].id);
         if (h == 0x5052474Du || h == 0x42595053u) return false; // 'PRGM'/'BYPS'
+        if (h == 0x45445357u || h == 0x45445348u) return false; // 'EDSW'/'EDSH'
         if ((h & 0xFFFF0000u) == 0x4D440000u) return false;     // VST3 MIDI proxies
         for (size_t j = i + 1; j < n; ++j)
             if (hash32(P::parameters[j].id) == h) return false;
@@ -417,6 +437,27 @@ constexpr int paramIndexOf(uint32_t id) noexcept
         if (paramIdTable<P>[i] == id) return static_cast<int>(i);
     return -1;
 }
+
+/** @brief Number of parameters of @p P marked with perVoice(). */
+template <typename P>
+constexpr size_t perVoiceParamCount() noexcept
+{
+    size_t count = 0;
+    for (size_t i = 0; i < P::parameters.size(); ++i)
+        if (P::parameters[i].perVoice) ++count;
+    return count;
+}
+
+/** @brief For every parameter of @p P, its position among the perVoice()
+ *  parameters (table order), or -1 for a parameter without the mark. */
+template <typename P>
+inline constexpr auto perVoiceSlotTable = [] {
+    std::array<int, P::parameters.size()> slots {};
+    int next = 0;
+    for (size_t i = 0; i < P::parameters.size(); ++i)
+        slots[i] = P::parameters[i].perVoice ? next++ : -1;
+    return slots;
+}();
 
 /**
  * @brief Deterministic 16-byte class UID from the stable productId. Each
@@ -560,6 +601,25 @@ concept HasTransport = requires(P p, const TransportInfo& t) {
  * release phase (a CLAP NOTE_CHOKE, sent by hosts for choke groups such as
  * an open hi-hat cut by a closed one). It is still a NoteOff, so a plugin
  * that never reads the flag releases the voice exactly as before.
+ *
+ * Two event types address ONE voice, by its channel, key and `noteId`
+ * (the id the host gave the voice's NoteOn, -1 when it gave none): the
+ * wrapper resolves the host's wildcards (every voice of a key, of a
+ * channel, of the port) against the voices it delivered, so the plugin
+ * always sees an exact voice.
+ *  - NoteExpression: a per-voice expression, `expression` (an
+ *    ExpressionType) says which and
+ *    `value` carries it - Volume a linear gain 0..4, Pan 0..1 (0.5 centre),
+ *    Tuning semitones -120..+120, the others 0..1. A statement of value,
+ *    not an increment; a voice starts from its neutral value (gain 1, pan
+ *    0.5, tuning 0) until one arrives.
+ *  - NoteModulation: a perVoice() parameter's value for this voice, in
+ *    PLAIN units, clamped and snapped like any value - the parameter's
+ *    value plus the host's modulation of this voice (which replaces the
+ *    global modulation setParameter carries). Delivered again whenever the
+ *    parameter itself moves. `param` is the parameter index.
+ * Both come from CLAP hosts; ignore the types you do not use (a `default:`
+ * in the switch keeps working as types are added).
  */
 struct MidiEvent
 {
@@ -570,7 +630,21 @@ struct MidiEvent
         PitchBend,         ///< value = bend -1..+1 (note unused).
         ControlChange,     ///< note = controller number, value = 0..1.
         ChannelPressure,   ///< value = pressure 0..1 (note unused).
-        PolyPressure       ///< note = key, value = pressure 0..1.
+        PolyPressure,      ///< note = key, value = pressure 0..1.
+        NoteExpression,    ///< One voice: `expression`, value (see above).
+        NoteModulation     ///< One voice: parameters[param] heard, plain units.
+    };
+
+    /** @brief The per-voice expressions of Type::NoteExpression. */
+    enum class ExpressionType : uint8_t
+    {
+        Volume,       ///< Linear gain 0..4 (1 = unchanged).
+        Pan,          ///< 0 left, 0.5 centre, 1 right.
+        Tuning,       ///< Semitones, -120..+120.
+        Vibrato,      ///< 0..1.
+        Expression,   ///< 0..1 (a generic per-note intensity).
+        Brightness,   ///< 0..1.
+        Pressure      ///< 0..1.
     };
 
     Type    type = Type::NoteOn;
@@ -579,6 +653,24 @@ struct MidiEvent
     float   value = 0.0f;     ///< Velocity / CC / pressure 0..1; bend -1..+1.
     int     sampleOffset = 0; ///< Frames into the NEXT processBlock call.
     bool    choke = false;    ///< NoteOff only: end the voice now, no release.
+    ExpressionType expression = ExpressionType::Volume;   ///< NoteExpression only.
+    int16_t param = -1;       ///< NoteModulation only: the parameter index.
+    int32_t noteId = -1;      ///< Host voice id of the note (-1: none given).
+};
+
+/**
+ * @brief Optional voice query: `bool isVoiceActive(int channel, int key,
+ * int32_t noteId) const noexcept` - true while the voice that NoteOn
+ * started still sounds (its release tail included). With perVoice()
+ * parameters a CLAP host keeps a modulator per voice and the wrapper tells
+ * it when a voice is over (CLAP NOTE_END): with this query, when the voice
+ * actually falls silent; without it, at its NoteOff. Called on the audio
+ * thread after each processed block; answer from the voice array, never
+ * allocate or lock. `noteId` is -1 when the host gave the note none.
+ */
+template <typename P>
+concept HasVoiceQuery = requires(const P p, int channel, int key, int32_t noteId) {
+    { p.isVoiceActive(channel, key, noteId) } -> std::convertible_to<bool>;
 };
 
 /**
@@ -789,6 +881,12 @@ struct BlockEvent
     double   value = 0.0;       ///< Normalized value / modulation amount / bypass >= 0.5.
     MidiEvent midi {};          ///< Kind::Midi payload.
     uint32_t order = 0;         ///< Arrival order: the tie-break of the sort.
+    /// Kind::Midi voice events (NoteExpression, NoteModulation): the host's
+    /// voice address, each part -1 for "any", resolved when applied.
+    int32_t  targetNoteId = -1;
+    int16_t  targetPort = -1;
+    int16_t  targetChannel = -1;
+    int16_t  targetKey = -1;
 };
 
 /** @brief Insertion sort by (offset, arrival order) - tiny N,
@@ -850,6 +948,7 @@ public:
     {
         BlockEvent ev = event;
         ev.order = nextOrder_++;
+        // MIDI and voice events are never superseded: each one counts.
         const bool isPoint = ev.kind != BlockEvent::Kind::Midi;
         // A modulation amount and a value of one parameter are separate
         // points: neither supersedes the other.
@@ -1015,6 +1114,14 @@ public:
         if (!valid(channel, key)) return;
         on_[static_cast<size_t>(channel)][static_cast<size_t>(key) >> 6]
             &= ~(uint64_t { 1 } << (key & 63));
+    }
+
+    /** The host note id the note at (@p channel, @p key) last started with
+     *  (-1 when none, or for an address out of range). */
+    [[nodiscard]] int32_t noteIdOf(int channel, int key) const noexcept
+    {
+        return valid(channel, key)
+             ? id_[static_cast<size_t>(channel)][static_cast<size_t>(key)] : -1;
     }
 
     /** Calls @p off(channel, key) for every sounding note matching the
@@ -1277,6 +1384,69 @@ constexpr void constrainEditorSize(double& width, double& height, double scale) 
            : (height > kEditorMaxPixels ? kEditorMaxPixels : height);
 }
 
+/**
+ * @brief The editor size the user last left, in logical pixels, kept by each
+ * backend across editor re-opens and saved in the state container (the
+ * reserved 'EDSW' / 'EDSH' entries), so a session reopens its editor at that
+ * size - in every format, since the size is logical. Only a resizable editor
+ * (EditorResize Free or KeepAspect) persists a size; a Fixed one always opens
+ * at editorSize. A remembered size is re-checked against the policy, so a
+ * later version with another size or policy never opens out of bounds.
+ *
+ * One packed atomic word: the host's UI thread writes it, and state saves
+ * (which some hosts run on another thread) read it without tearing.
+ */
+template <typename P>
+class EditorSizeMemory
+{
+public:
+    /** True when @p P has a resizable editor, i.e. a size worth keeping. */
+    static constexpr bool kPersists =
+        HasEditor<P> && editorResizeOf<P>() != EditorResize::Fixed;
+
+    /** Records the size the editor now has (logical pixels; constrained). */
+    void remember(double logicalWidth, double logicalHeight) noexcept
+    {
+        if constexpr (kPersists)
+        {
+            double w = logicalWidth;
+            double h = logicalHeight;
+            constrainEditorSize<P>(w, h, 1.0);
+            const uint32_t pw = static_cast<uint32_t>(
+                toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels)));
+            const uint32_t ph = static_cast<uint32_t>(
+                toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels)));
+            packed_.store((pw << 16) | ph, std::memory_order_relaxed);
+        }
+        else
+        {
+            (void) logicalWidth;
+            (void) logicalHeight;
+        }
+    }
+
+    /** The remembered size into @p out; false when none was recorded. */
+    bool remembered(EditorSize& out) const noexcept
+    {
+        const uint32_t p = packed_.load(std::memory_order_relaxed);
+        if (p == 0u) return false;
+        out.width  = static_cast<int>(p >> 16);
+        out.height = static_cast<int>(p & 0xFFFFu);
+        return true;
+    }
+
+    /** The size to open the editor at: the remembered one, else editorSize. */
+    [[nodiscard]] EditorSize current() const noexcept
+    {
+        EditorSize size = editorSizeOf<P>();
+        (void) remembered(size);
+        return size;
+    }
+
+private:
+    std::atomic<uint32_t> packed_ { 0u };   ///< width << 16 | height, 0 = none
+};
+
 /** @brief Optional `static constexpr bool editorDebug = true;` - enables the
  *  browser DevTools in the editor (WebView2; development builds only). */
 template <typename P>
@@ -1312,7 +1482,7 @@ concept HasEditorDevFile = requires {
  * and `parameters` have no safe default - plus `prepare`, `setParameter`
  * and `processBlock`.
  *
- * Three capabilities have no default here on purpose, because their mere
+ * Four capabilities have no default here on purpose, because their mere
  * presence changes what the host sees:
  *  - a sidechain input: define `void processBlock(AudioBufferView<float> io,
  *    AudioBufferView<float> sidechain) noexcept` INSTEAD of the
@@ -1322,7 +1492,10 @@ concept HasEditorDevFile = requires {
  *    and every format grows a note/event input (see HasMidi);
  *  - factory presets: declare `static constexpr auto factoryPresets =
  *    presets(...)` and every format publishes a host-browsable program
- *    list (see HasFactoryPresets).
+ *    list (see HasFactoryPresets);
+ *  - the voice query: define `bool isVoiceActive(int channel, int key,
+ *    int32_t noteId) const noexcept` and a host modulating voices learns
+ *    when each one really ends (see HasVoiceQuery).
  * Channel support is declarative too (`static constexpr auto channels`) and
  * already defaults to mono+stereo without any member here.
  */
@@ -1424,10 +1597,23 @@ inline constexpr uint32_t kProgramStateId = 0x5052474Du;
  *  other. Older builds skip it (unknown id). */
 inline constexpr uint32_t kBypassStateId = 0x42595053u;
 
+/** @brief Reserved entry ids persisting the editor size the user left
+ *  ('EDSW' / 'EDSH', logical pixels; see EditorSizeMemory). Older builds
+ *  skip them (unknown ids). */
+inline constexpr uint32_t kEditorWidthStateId  = 0x45445357u;
+inline constexpr uint32_t kEditorHeightStateId = 0x45445348u;
+
+/**
+ * @brief Serialises the plugin state: every parameter (normalized), the
+ * active factory preset (@p programIndex, -1 for none), the host bypass
+ * (@p bypassState, -1 for none), the editor size the user left
+ * (@p editorSize, null for none) and the user's own getState() section.
+ */
 template <typename P>
 inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
                                        size_t numParams, int programIndex = -1,
-                                       int bypassState = -1)
+                                       int bypassState = -1,
+                                       const EditorSize* editorSize = nullptr)
 {
     auto push32 = [](std::vector<uint8_t>& v, uint32_t x) {
         v.push_back(static_cast<uint8_t>(x));
@@ -1442,11 +1628,13 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
         push32(v, static_cast<uint32_t>(bits));
         push32(v, static_cast<uint32_t>(bits >> 32));
     };
+    const bool withSize = editorSize != nullptr && editorSize->width > 0
+                       && editorSize->height > 0;
     std::vector<uint8_t> blob;
     push32(blob, kStateMagic);
     push32(blob, kStateVersion);
     push32(blob, static_cast<uint32_t>(numParams) + (programIndex >= 0 ? 1u : 0u)
-                     + (bypassState >= 0 ? 1u : 0u));
+                     + (bypassState >= 0 ? 1u : 0u) + (withSize ? 2u : 0u));
     for (size_t i = 0; i < numParams; ++i)
     {
         push32(blob, hash32(P::parameters[i].id));
@@ -1463,6 +1651,13 @@ inline std::vector<uint8_t> buildState(const P& user, const double* normalized,
     {
         push32(blob, kBypassStateId);
         pushValue(blob, bypassState > 0 ? 1.0 : 0.0);
+    }
+    if (withSize)
+    {
+        push32(blob, kEditorWidthStateId);
+        pushValue(blob, static_cast<double>(editorSize->width));
+        push32(blob, kEditorHeightStateId);
+        pushValue(blob, static_cast<double>(editorSize->height));
     }
     if constexpr (HasGetState<P>)
     {
@@ -1487,12 +1682,15 @@ inline void loadDefaultNormalized(double* normalized) noexcept
 }
 
 /** @brief Parses a state blob; fills `normalized` (defaults pre-loaded by the
- *  caller, see loadDefaultNormalized), reports a persisted program index / bypass through
- *  @p programIndex and @p bypassState (left untouched when absent) and
- *  forwards the user section. Returns false on a foreign blob. */
+ *  caller, see loadDefaultNormalized), reports a persisted program index,
+ *  bypass and editor size through @p programIndex, @p bypassState and
+ *  @p editorSize (each left untouched when absent; the size only when both
+ *  of its entries are present) and forwards the user section. Returns false
+ *  on a foreign blob. */
 template <typename P>
 inline bool applyState(P& user, const uint8_t* data, size_t size, double* normalized,
-                       int* programIndex = nullptr, int* bypassState = nullptr)
+                       int* programIndex = nullptr, int* bypassState = nullptr,
+                       EditorSize* editorSize = nullptr)
 {
     auto read32 = [&](size_t& pos, uint32_t& out) {
         if (pos + 4 > size) return false;
@@ -1510,6 +1708,7 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
     if (!read32(pos, count)) return false;
 
     constexpr size_t numParams = P::parameters.size();
+    int editorWidth = 0, editorHeight = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
         uint32_t id = 0, lo = 0, hi = 0;
@@ -1546,6 +1745,13 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
                 *bypassState = v >= 0.5 ? 1 : 0;
             continue;
         }
+        if (id == kEditorWidthStateId || id == kEditorHeightStateId)
+        {
+            // Any value a project file carries: bounded before the conversion.
+            const int px = toBoundedInt(v + 0.5, 0, static_cast<int>(kEditorMaxPixels));
+            (id == kEditorWidthStateId ? editorWidth : editorHeight) = px;
+            continue;
+        }
         for (size_t k = 0; k < numParams; ++k)
             if (hash32(P::parameters[k].id) == id)
             {
@@ -1554,6 +1760,8 @@ inline bool applyState(P& user, const uint8_t* data, size_t size, double* normal
             }
         // Unknown ids are skipped: forward-compatible by construction.
     }
+    if (editorSize != nullptr && editorWidth > 0 && editorHeight > 0)
+        *editorSize = EditorSize { editorWidth, editorHeight };
 
     uint32_t userSize = 0;
     // Subtraction form: pos <= size is guaranteed after read32, and on

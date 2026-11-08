@@ -175,7 +175,9 @@ virtual; nothing else is required.**
 | `std::vector<uint8_t> getState() const` + `bool setState(const uint8_t*, size_t)` | VST3 `IComponent::get/setState`, CLAP `clap.state`, AU `ClassInfo` (extra section) | you have state **beyond the parameters**: learned noise profiles, loaded IRs, editor layout. The wrapper *always* saves/restores your parameter values by itself - most plugins need neither method. DSPark's `StateBlob` is the natural serializer here. |
 | `void processBlock(AudioBufferView<float> io, AudioBufferView<float> sidechain) noexcept` - *instead of* the single-buffer form | a second input named "Sidechain": VST3 **aux bus**, CLAP **non-main port**, AU **input element** | the detector should follow a host-routed key signal: duckers, externally-keyed gates and de-essers. The shape matches DSPark's own dynamics, so `comp_.processBlock(io, sidechain)` forwards 1:1. The key view always mirrors the main width (mono main, mono key) and the wrapper hands you frame-aligned **silence when nothing is routed** - never branch on availability, and treat the sidechain as read-only. Reference plugin: `examples/plugin_ducker/`. |
 | `void setTransport(const TransportInfo&) noexcept` | VST3 `ProcessContext`, CLAP transport event, AU host callbacks | anything in your plugin follows the song: tempo-synced delays, LFOs, gates, arpeggiators. Delivered on the audio thread before each `processBlock` whenever the host supplied timeline data - check the `*Valid` flags. `TransportInfo::samplesPerBeat(sampleRate)` is the conversion you usually want. |
-| `void handleMidiEvent(const MidiEvent&) noexcept` | VST3 event bus + `IMidiMapping` proxies, CLAP note port (CLAP + raw MIDI dialects), AU MusicDevice selectors | notes drive the plugin: instruments, vocoders, MIDI-gated effects. One normalised struct covers note on/off, pitch bend, CC, channel/poly pressure. Events arrive time-ordered right before the block that contains them, with `sampleOffset` for sample-accurate voice starts. Required for `Category::Instrument`. |
+| `void handleMidiEvent(const MidiEvent&) noexcept` | VST3 event bus + `IMidiMapping` proxies, CLAP note port (CLAP + raw MIDI dialects), AU MusicDevice selectors | notes drive the plugin: instruments, vocoders, MIDI-gated effects. One normalised struct covers note on/off, pitch bend, CC, channel/poly pressure, and (CLAP) per-voice expressions and per-voice parameter values. Events arrive time-ordered right before the block that contains them, with `sampleOffset` for sample-accurate voice starts. Required for `Category::Instrument`. |
+| `perVoice(param(...))` in the parameter table | CLAP per-note-id, per-key, per-channel and per-port modulation | a host should modulate a parameter voice by voice (a filter cutoff per note). Each voice receives its own value as a `NoteModulation` event - see "Instruments & MIDI". Needs `handleMidiEvent`. |
+| `bool isVoiceActive(int channel, int key, int32_t noteId) const noexcept` | CLAP `NOTE_END` | your voices ring past their note-off (release tails) and a host modulates them per voice: the host keeps each voice's modulators alive until this turns false. Without it a voice ends, for the host, at its note-off. |
 | `void setOfflineRendering(bool) noexcept` | VST3 `kOffline` process mode, CLAP `clap.render`, AU `OfflineRender` | quality should rise when there is no realtime pressure: switch to higher oversampling or longer lookahead during bounces. Called outside the audio thread, before processing (re)starts. |
 | `static constexpr auto channels` (`ChannelSupport`) | VST3 `setBusArrangements`, CLAP `audio-ports-config`, AU `SupportedNumChannels` | **the default is already mono+stereo** - declare it only to restrict: `StereoOnly` for inherently stereo DSP (M/S wideners), `MonoOnly` for metering utilities. All buses of an instance run the same width. |
 | `static constexpr auto factoryPresets` | VST3 program list, CLAP preset-load + preset-discovery, AU factory presets | you ship starting points. Built with `presets(preset("Name", v0, v1, ...))` - one PLAIN value per parameter, in table order, checked at compile time. The host's own preset browser offers them in every format. |
@@ -200,8 +202,9 @@ virtual; nothing else is required.**
   modulator's amount (plain units) is added to the value `setParameter`
   receives, clamped and snapped like any value and placed as accurately
   as automation; the parameter's own value - what the host displays,
-  automates and saves - stays unmodulated. Only the global signal is
-  offered, not per-note modulation.
+  automates and saves - stays unmodulated. A `perVoice()` parameter is
+  also offered per note id, key, channel and port: the wrapper resolves
+  each address to the voices it matches and hands every one its value.
 - **Sample-accurate automation**: every timestamped event the host sends -
   parameter points, bypass, MIDI - lands in one time-ordered stream and
   processing splits at 32-frame quantum boundaries, so fast automation
@@ -214,7 +217,9 @@ virtual; nothing else is required.**
   `getLatency()` and notifies the host through the native channel
   (`restartComponent(kLatencyChanged)`, `clap_host_latency`, the AU
   `Latency` property listeners) so projects re-compensate - always from the
-  host's main/UI thread, as every format requires. CLAP allows
+  host's main/UI thread, as every format requires. The AU build tells its
+  `TailTime` listeners about a changed `getTailSeconds()` the same way,
+  and both properties are announced again when an initialize moves them. CLAP allows
   `clap_host_latency.changed` only inside `activate()`, so a CLAP plugin
   that is active asks the host for a restart and reports the new value
   from the next activation. A change detected in the
@@ -233,6 +238,13 @@ virtual; nothing else is required.**
   cannot parse refused rather than guessed. Factory metadata.
 - **Denormals**: `process()`/`render()` run under DSPark's `DenormalGuard`
   (FTZ/DAZ), so your own DSP is protected even in hosts that don't set it.
+- **The AU host contract**: render notifications run before and after
+  every slice (hosts schedule parameters and meter there); parameters are
+  flagged high-resolution; a non-finite value, a render of another output
+  element and a host buffer shorter than the slice are refused, as the
+  format requires; a scheduled value reads back at once; Reset drops the
+  MIDI queued before it; the saved state carries the preset's name and a
+  preset of another unit is refused.
 - **Entry points** per platform and format, from the macros.
 
 ### Threading model
@@ -242,7 +254,7 @@ virtual; nothing else is required.**
 | `prepare` | main (host setup) - allocation allowed |
 | `processBlock` | audio - real-time rules apply |
 | `setParameter` | audio while the host processes (UI edits, state loads and presets are handed over and applied at the next block); main otherwise - never both at once |
-| `setTransport` / `handleMidiEvent` | audio - real-time rules apply |
+| `setTransport` / `handleMidiEvent` / `isVoiceActive` | audio - real-time rules apply |
 | `setOfflineRendering` | main (before processing restarts) |
 | `getState`/`setState` | main - and the formats allow it **while the audio thread processes** (autosave, preset recall): guard any user state that `processBlock` also reads |
 
@@ -272,6 +284,24 @@ void handleMidiEvent(const dspark::plugin::MidiEvent& ev) noexcept
     }
 }
 ```
+
+**Per-voice signals (CLAP).** Two more event types address ONE voice by its
+`channel`, key (`note`) and `noteId` - the id the host gave its NoteOn,
+also on `NoteOn`/`NoteOff` (-1 when the host gave none). The host may
+address many voices at once (every voice of a key, of a channel, of the
+port); the wrapper delivers one event per voice it matches:
+
+```cpp
+case Type::NoteExpression:   // ev.expression: Volume (gain 0..4), Pan (0..1),
+    break;                   // Tuning (semitones), Vibrato, Expression,
+                             // Brightness, Pressure (0..1)
+case Type::NoteModulation:   // parameters[ev.param] as THIS voice hears it,
+    break;                   // plain units: re-sent when the parameter moves
+```
+
+`NoteModulation` comes only for parameters marked `perVoice(...)` in the
+table; implement `isVoiceActive(channel, key, noteId)` when your voices
+ring on after their note-off, so the host keeps modulating the release.
 
 The wrapper translates every format's native scheme into that one struct:
 VST3 delivers notes as events and every controller - CC 0-127, channel
@@ -417,6 +447,10 @@ call order during HiDPI negotiation), and `EditorResize` picks the policy:
 
 Make the page fluid (flexbox/grid, percentage sizes) and any of the three
 modes looks right; `examples/plugin_webview_editor/` uses `KeepAspect`.
+A resizable editor reopens at the size the user left it, and that size is
+saved with the session (in logical pixels, so a VST3 session's size opens
+the CLAP and AU builds at the same size); a Fixed editor always opens at
+`editorSize`.
 
 ### Developing a UI
 

@@ -5,10 +5,15 @@
 // asks it for the editor NSView, verifies the embedded WKWebView completes
 // the JS bridge handshake (through the DSPARK_WEBVIEW_LOG diagnostic trace),
 // then tears down in BOTH orders - view before AudioUnit and AudioUnit
-// before view. Plugins without an editor are checked to NOT announce one,
-// and to keep their slice size and stream format fixed while initialized.
-// Exit code 0 means every step behaved. Companion to vst3/clap_smoke_host;
-// auval remains the format-conformance gate.
+// before view - and checks that a resized editor reopens at its size, also
+// in a new instance that loads the saved state. Plugins without an editor
+// are checked to NOT announce one, to keep their slice size and stream
+// format fixed while initialized, and to honour the render-time host
+// contract: render notifications around each slice, high-resolution
+// parameters, refused non-finite values, other output elements and short
+// buffers, scheduled values that read back at once, and the preset name in
+// the saved state. Exit code 0 means every step behaved. Companion to
+// vst3/clap_smoke_host; auval remains the format-conformance gate.
 //
 //   au_editor_smoke <type4> <subtype4> <manu4> --expect-editor <W>x<H>
 //   au_editor_smoke <type4> <subtype4> <manu4> --expect-no-editor
@@ -33,6 +38,7 @@ int main()
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -133,6 +139,36 @@ OSType fourCC(const char* s)
          |  static_cast<OSType>(static_cast<unsigned char>(s[3]));
 }
 
+struct NotifyCounts
+{
+    int pre = 0, post = 0;
+};
+
+OSStatus countNotify(void* refCon, AudioUnitRenderActionFlags* flags, const AudioTimeStamp*,
+                     UInt32, UInt32, AudioBufferList*)
+{
+    auto* counts = static_cast<NotifyCounts*>(refCon);
+    if ((*flags & kAudioUnitRenderAction_PreRender) != 0) ++counts->pre;
+    if ((*flags & kAudioUnitRenderAction_PostRender) != 0) ++counts->post;
+    return noErr;
+}
+
+OSStatus silentInput(void*, AudioUnitRenderActionFlags*, const AudioTimeStamp*, UInt32,
+                     UInt32 frames, AudioBufferList* data)
+{
+    for (UInt32 b = 0; b < data->mNumberBuffers; ++b)
+        if (data->mBuffers[b].mData != nullptr)
+            std::memset(data->mBuffers[b].mData, 0, frames * sizeof(float));
+    return noErr;
+}
+
+/** Room for two deinterleaved buffers (AudioBufferList declares one). */
+struct StereoList
+{
+    UInt32 mNumberBuffers;
+    AudioBuffer mBuffers[2];
+};
+
 ObjId makeView(ObjId factory, AudioUnit au)
 {
     using Fn = ObjId (*)(ObjId, SEL, AudioUnit, CgSize);
@@ -230,6 +266,98 @@ int main(int argc, char** argv)
                                     kAudioUnitScope_Output, 0, &format, sizeof(format))
                    == noErr,
                "same stream format accepted while initialized");
+
+        // --- render-time host contract -------------------------------------------
+        AURenderCallbackStruct input { &silentInput, nullptr };
+        AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback,
+                             kAudioUnitScope_Input, 0, &input, sizeof(input));
+        float left[512] {}, right[512] {};
+        StereoList list {};
+        list.mNumberBuffers = format.mChannelsPerFrame < 2 ? 1 : 2;
+        auto bufferList = [&](UInt32 frames) {
+            list.mBuffers[0] = AudioBuffer { 1, frames * 4, left };
+            list.mBuffers[1] = AudioBuffer { 1, frames * 4, right };
+            return reinterpret_cast<AudioBufferList*>(&list);
+        };
+        AudioTimeStamp stamp {};
+        stamp.mFlags = kAudioTimeStampSampleTimeValid;
+        AudioUnitRenderActionFlags renderFlags = 0;
+
+        NotifyCounts counts;
+        expect(AudioUnitAddRenderNotify(au, &countNotify, &counts) == noErr,
+               "render notification added");
+        expect(AudioUnitRender(au, &renderFlags, &stamp, 0, 256, bufferList(256)) == noErr,
+               "render a slice");
+        expect(counts.pre == 1 && counts.post == 1,
+               "render notifications run before and after the slice");
+        AudioUnitRemoveRenderNotify(au, &countNotify, &counts);
+        stamp.mSampleTime += 256;
+        AudioUnitRender(au, &renderFlags, &stamp, 0, 256, bufferList(256));
+        expect(counts.pre == 1 && counts.post == 1, "a removed notification stops");
+        expect(AudioUnitRender(au, &renderFlags, &stamp, 1, 256, bufferList(256))
+                   == kAudioUnitErr_InvalidElement,
+               "a render of another output element is refused");
+        AudioBufferList* shortList = bufferList(256);
+        list.mBuffers[0].mDataByteSize = 128 * 4;
+        list.mBuffers[1].mDataByteSize = 128 * 4;
+        expect(AudioUnitRender(au, &renderFlags, &stamp, 0, 256, shortList) == kAudio_ParamError,
+               "a host buffer shorter than the slice is refused");
+
+        UInt32 listSize = 0;
+        AudioUnitGetPropertyInfo(au, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global,
+                                 0, &listSize, nullptr);
+        AudioUnitParameterID ids[64] {};
+        listSize = listSize < sizeof(ids) ? listSize : static_cast<UInt32>(sizeof(ids));
+        expect(listSize >= sizeof(AudioUnitParameterID)
+                   && AudioUnitGetProperty(au, kAudioUnitProperty_ParameterList,
+                                           kAudioUnitScope_Global, 0, ids, &listSize) == noErr,
+               "parameter list read");
+        AudioUnitParameterInfo paramInfo {};
+        UInt32 infoBytes = sizeof(paramInfo);
+        expect(AudioUnitGetProperty(au, kAudioUnitProperty_ParameterInfo, kAudioUnitScope_Global,
+                                    ids[0], &paramInfo, &infoBytes) == noErr
+                   && (paramInfo.flags & kAudioUnitParameterFlag_IsHighResolution) != 0,
+               "parameters are flagged high-resolution");
+        if ((paramInfo.flags & kAudioUnitParameterFlag_CFNameRelease) != 0
+            && paramInfo.cfNameString != nullptr)
+            CFRelease(paramInfo.cfNameString);
+        AudioUnitParameterValue before = 0, after = 0;
+        AudioUnitGetParameter(au, ids[0], kAudioUnitScope_Global, 0, &before);
+        expect(AudioUnitSetParameter(au, ids[0], kAudioUnitScope_Global, 0, NAN, 0)
+                   == kAudioUnitErr_InvalidParameterValue,
+               "a NaN parameter value is refused");
+        AudioUnitGetParameter(au, ids[0], kAudioUnitScope_Global, 0, &after);
+        expect(after == before, "a refused value leaves the parameter as it was");
+        AudioUnitParameterEvent event {};
+        event.scope = kAudioUnitScope_Global;
+        event.parameter = ids[0];
+        event.eventType = kParameterEvent_Immediate;
+        event.eventValues.immediate.bufferOffset = 64;
+        event.eventValues.immediate.value = 0.5f * (paramInfo.minValue + paramInfo.maxValue);
+        expect(AudioUnitScheduleParameters(au, &event, 1) == noErr, "schedule a parameter");
+        AudioUnitGetParameter(au, ids[0], kAudioUnitScope_Global, 0, &after);
+        expect(after == event.eventValues.immediate.value,
+               "a scheduled value reads back before the slice renders");
+        stamp.mSampleTime += 256;
+        AudioUnitRender(au, &renderFlags, &stamp, 0, 256, bufferList(256));
+
+        AUPreset named { -1, CFSTR("Smoke Preset") };
+        AudioUnitSetProperty(au, kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0,
+                             &named, sizeof(named));
+        CFPropertyListRef saved = nullptr;
+        UInt32 savedSize = sizeof(saved);
+        char savedName[64] {};
+        if (AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0,
+                                 &saved, &savedSize) == noErr && saved != nullptr)
+        {
+            const auto* name = static_cast<CFStringRef>(
+                CFDictionaryGetValue(static_cast<CFDictionaryRef>(saved), CFSTR("name")));
+            if (name != nullptr)
+                CFStringGetCString(name, savedName, sizeof(savedName), kCFStringEncodingUTF8);
+            CFRelease(saved);
+        }
+        expect(std::strcmp(savedName, "Smoke Preset") == 0,
+               "the saved state carries the preset's name");
         expect(AudioUnitUninitialize(au) == noErr, "uninitialize");
         expect(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
                                     kAudioUnitScope_Global, 0, &larger, sizeof(larger))
@@ -325,6 +453,19 @@ int main(int argc, char** argv)
     }
     expect(handshake, "JS bridge handshake completed");
 
+    // The host resizes the editor (KeepAspect plugin: 1.5x keeps the ratio):
+    // it must reopen at that size, and the saved state carries it.
+    const CgSize bigger { frame.w * 1.5, frame.h * 1.5 };
+    using SetFrameSize = void (*)(ObjId, SEL, CgSize);
+    reinterpret_cast<SetFrameSize>(&objc_msgSend)(view, sel_registerName("setFrameSize:"),
+                                                  bigger);
+    CFPropertyListRef sessionState = nullptr;
+    UInt32 sessionSize = sizeof(sessionState);
+    expect(AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0,
+                                &sessionState, &sessionSize) == noErr
+               && sessionState != nullptr,
+           "ClassInfo read with the editor resized");
+
     // --- teardown order A: host releases the view, editor must re-create ----------
     pool = poolPush();
     call<void>(view, "release");
@@ -336,6 +477,13 @@ int main(int argc, char** argv)
     if (view2 != nullptr) call<void>(view2, "retain");
     poolDrain(pool);
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+    if (view2 != nullptr)
+    {
+        const CgRect reopened = callRect(view2, "frame");
+        std::printf("    reopened: %.0fx%.0f\n", reopened.w, reopened.h);
+        expect(reopened.w == bigger.width && reopened.h == bigger.height,
+               "the editor reopens at the size the host left it");
+    }
 
     // --- teardown order B: AudioUnit dies first, view follows ----------------------
     expect(AudioComponentInstanceDispose(au) == noErr,
@@ -347,6 +495,36 @@ int main(int argc, char** argv)
         poolDrain(pool);
     }
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
+
+    // --- the next session: a new instance loads the state, opens at its size -------
+    AudioUnit next = nullptr;
+    expect(AudioComponentInstanceNew(component, &next) == noErr && next != nullptr,
+           "second instance created");
+    if (next != nullptr && sessionState != nullptr)
+    {
+        expect(AudioUnitSetProperty(next, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global,
+                                    0, &sessionState, sizeof(sessionState)) == noErr,
+               "ClassInfo restored in the second instance");
+        pool = poolPush();
+        ObjId view3 = makeView(factory, next);
+        if (view3 != nullptr) call<void>(view3, "retain");
+        poolDrain(pool);
+        if (view3 != nullptr)
+        {
+            const CgRect restored = callRect(view3, "frame");
+            std::printf("    next session: %.0fx%.0f\n", restored.w, restored.h);
+            expect(restored.w == bigger.width && restored.h == bigger.height,
+                   "the next session opens the editor at the saved size");
+            pool = poolPush();
+            call<void>(view3, "release");
+            poolDrain(pool);
+        }
+        else
+            expect(false, "the second instance creates its editor");
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
+    }
+    if (next != nullptr) AudioComponentInstanceDispose(next);
+    if (sessionState != nullptr) CFRelease(sessionState);
 
     CFRelease(viewInfo.mCocoaAUViewBundleLocation);
     CFRelease(viewInfo.mCocoaAUViewClass[0]);

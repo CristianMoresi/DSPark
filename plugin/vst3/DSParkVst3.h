@@ -60,7 +60,9 @@
  * - **Editor**: when plugin/webview/DSParkWebViewEditor.h is included before
  *   this header and the class declares `hasEditor = true`, createView returns
  *   an IPlugView embedding the WebView editor (with content-scale support);
- *   otherwise hosts show their generic parameter UI.
+ *   otherwise hosts show their generic parameter UI. A resizable editor
+ *   reopens at the size the user left, also in the next session (the size
+ *   rides in the state).
  */
 
 #define DSPARK_PLUGIN_VST3_INCLUDED 1
@@ -490,8 +492,8 @@ struct Plugin
                   "no audio input to process");
     static_assert(paramIdsUnique<P>(),
                   "two parameter ids share a hash32 (or collide with the "
-                  "reserved PRGM/BYPS state ids): automation and state would "
-                  "cross-wire. Rename one id.");
+                  "reserved PRGM/BYPS/EDSW/EDSH state ids): automation and state "
+                  "would cross-wire. Rename one id.");
 
     // COM lenses - consecutive vtable pointers; queryInterface returns the
     // address of the matching slot. Standard layout is asserted below. The
@@ -525,6 +527,9 @@ struct Plugin
     std::vector<float> dryL, dryR;     // pre-process copy for the bypass blend
     std::vector<float> silence;        // stand-in sidechain when not connected
     DryDelay dryDelay;                 // latency-aligned dry path of the bypass
+    /// The editor size the user left (kept without the editor layer too, so
+    /// a session saved where the editor ran keeps its size here).
+    EditorSizeMemory<P> editorMemory;
 
     // Atomic pointer: refreshLatency() reads it from the audio thread while
     // setComponentHandler writes it from the main thread. Per the VST3
@@ -888,6 +893,8 @@ struct Plugin
                     midi.note = static_cast<uint8_t>(
                         raw.Steinberg_Vst_Event_noteOn.pitch & 0x7F);
                     midi.value = raw.Steinberg_Vst_Event_noteOn.velocity;
+                    midi.noteId = raw.Steinberg_Vst_Event_noteOn.noteId >= 0
+                                ? raw.Steinberg_Vst_Event_noteOn.noteId : -1;
                 }
                 else if (raw.type == Steinberg_Vst_Event_EventTypes_kNoteOffEvent)
                 {
@@ -897,6 +904,8 @@ struct Plugin
                     midi.note = static_cast<uint8_t>(
                         raw.Steinberg_Vst_Event_noteOff.pitch & 0x7F);
                     midi.value = raw.Steinberg_Vst_Event_noteOff.velocity;
+                    midi.noteId = raw.Steinberg_Vst_Event_noteOff.noteId >= 0
+                                ? raw.Steinberg_Vst_Event_noteOff.noteId : -1;
                 }
                 else if (raw.type == Steinberg_Vst_Event_EventTypes_kPolyPressureEvent)
                 {
@@ -1137,8 +1146,9 @@ struct Plugin
         loadDefaultNormalized<P>(norm);
         int program = -1;
         int bypassState = -1;
+        EditorSize editorSize { 0, 0 };
         if (!applyState(p->user, blob.data(), blob.size(), norm, &program,
-                        &bypassState))
+                        &bypassState, &editorSize))
             return Steinberg_kResultFalse;
         for (size_t i = 0; i < kNumParams; ++i)
             p->applyFromUi(static_cast<int>(i), norm[i]);
@@ -1146,6 +1156,10 @@ struct Plugin
             p->currentProgram.store(program, std::memory_order_relaxed);
         if (bypassState >= 0)
             p->bypass.store(bypassState != 0, std::memory_order_relaxed);
+        // The editor size the session left: the next view opens at it (a
+        // state without one keeps the size this instance has).
+        if (editorSize.width > 0)
+            p->editorMemory.remember(editorSize.width, editorSize.height);
         p->refreshLatency();   // restored state may imply a new lookahead
         return Steinberg_kResultOk;
     }
@@ -1159,10 +1173,13 @@ struct Plugin
         double norm[kNumParams == 0 ? 1 : kNumParams];
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = p->shadow[i].load(std::memory_order_relaxed);
+        EditorSize editorSize {};
+        const bool withSize = p->editorMemory.remembered(editorSize);
         const std::vector<uint8_t> blob = buildState(
             p->user, norm, kNumParams,
             kNumPresets > 0 ? p->currentProgram.load(std::memory_order_relaxed) : -1,
-            p->bypass.load(std::memory_order_relaxed) ? 1 : 0);
+            p->bypass.load(std::memory_order_relaxed) ? 1 : 0,
+            withSize ? &editorSize : nullptr);
         return streamWrite(state, blob.data(), static_cast<Steinberg_int32>(blob.size()))
              ? Steinberg_kResultOk : Steinberg_kResultFalse;
     }
@@ -2068,7 +2085,9 @@ struct View
         timerVtbl = &kTimerVtbl;
 #endif
         owner->addRefImpl();
-        const EditorSize logical = editorSizeOf<P>();
+        // The size the user left the editor at (this session or a saved
+        // one), else the declared size; the content scale rescales it later.
+        const EditorSize logical = owner->editorMemory.current();
         width  = logical.width;
         height = logical.height;
     }
@@ -2292,6 +2311,16 @@ struct View
 #if defined(__linux__)
         view->stopTimer();
 #endif
+        // Keep the size the editor is closed at: some hosts resize their
+        // window without an onSize, and the window still exists here.
+        int parentW = 0, parentH = 0;
+        if (view->editor.created() && view->editor.queryParentSize(parentW, parentH))
+        {
+            double w = parentW;
+            double h = parentH;
+            constrainEditorSize<P>(w, h, view->scale);
+            view->owner->editorMemory.remember(w / view->scale, h / view->scale);
+        }
         view->editor.destroy();
         return Steinberg_kResultOk;
     }
@@ -2340,6 +2369,10 @@ struct View
         view->width  = toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         view->height = toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         view->editor.setBounds(view->width, view->height);
+        // The user's size, in logical pixels: the next view opens at it, and
+        // the state saves it for the next session.
+        view->owner->editorMemory.remember(view->width / view->scale,
+                                           view->height / view->scale);
         if (!view->correctingSize && view->frame != nullptr
             && (view->width - proposedW > 1.0 || proposedW - view->width > 1.0
                 || view->height - proposedH > 1.0 || proposedH - view->height > 1.0))

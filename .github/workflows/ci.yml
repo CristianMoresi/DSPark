@@ -383,6 +383,7 @@ jobs:
             -lobjc -o au_editor_smoke
           ./au_editor_smoke aufx DSst DSpk --expect-no-editor
           ./au_editor_smoke aufx DSwg DSpk --expect-editor 300x360
+          ./au_editor_smoke aumu DSsy DSpk --expect-no-editor
 
       - name: Official validators (pluginval + clap-validator)
         if: matrix.name == 'Windows MSVC x64' || matrix.name == 'Linux GCC x64' || matrix.name == 'macOS Clang arm64'
@@ -637,7 +638,7 @@ jobs:
 
       # Concurrency claims come from the named threaded tests printed by this
       # exact run; executing a single-threaded case under TSan is not presented
-      # as proof of a hand-off. The ordinary suite authority is currently 1514
+      # as proof of a hand-off. The ordinary suite authority is currently 1519
       # named cases. The separate Reverb publication executable also runs here.
       # The allocation injector is synchronous: its exhaustive failure sweep
       # runs unchanged in every native job and both ASan/UBSan jobs. Repeating

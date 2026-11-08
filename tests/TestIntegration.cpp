@@ -22,12 +22,15 @@
 #include "dspark_test.h"
 #include "TestSignals.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -956,6 +959,7 @@ struct ClapEvents
     std::vector<clap_event_midi_t> midi;
     std::vector<clap_event_param_value_t> values;
     std::vector<clap_event_param_mod_t> mods;
+    std::vector<clap_event_note_expression_t> expressions;
     std::vector<const clap_event_header_t*> order;
     static uint32_t size(const clap_input_events_t* l)
     { return static_cast<uint32_t>(static_cast<const ClapEvents*>(l->ctx)->order.size()); }
@@ -970,6 +974,7 @@ struct ClapEvents
         midi.reserve(16);
         values.reserve(512);
         mods.reserve(16);
+        expressions.reserve(16);
     }
     void note(uint16_t type, int16_t channel, int16_t key, uint32_t time)
     {
@@ -1012,6 +1017,38 @@ struct ClapEvents
         values.push_back(ev);
         order.push_back(&values.back().header);
     }
+    /// A note event with an explicit host note id.
+    void noteWithId(uint16_t type, int16_t channel, int16_t key, int32_t noteId, uint32_t time)
+    {
+        note(type, channel, key, time);
+        notes.back().note_id = noteId;
+    }
+    /// A modulation amount addressed to (note id, port, channel, key), -1 = any.
+    void modAt(clap_id id, double amount, uint32_t time, int32_t noteId, int16_t port,
+               int16_t channel, int16_t key)
+    {
+        mod(id, amount, time, noteId);
+        mods.back().port_index = port;
+        mods.back().channel = channel;
+        mods.back().key = key;
+    }
+    void expression(clap_note_expression which, double value, uint32_t time, int32_t noteId,
+                    int16_t channel, int16_t key)
+    {
+        clap_event_note_expression_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_NOTE_EXPRESSION;
+        ev.expression_id = which;
+        ev.note_id = noteId;
+        ev.port_index = -1;
+        ev.channel = channel;
+        ev.key = key;
+        ev.value = value;
+        expressions.push_back(ev);
+        order.push_back(&expressions.back().header);
+    }
     void mod(clap_id id, double amount, uint32_t time, int32_t noteId = -1)
     {
         clap_event_param_mod_t ev {};
@@ -1031,12 +1068,32 @@ struct ClapEvents
         midi.clear();
         values.clear();
         mods.clear();
+        expressions.clear();
         order.clear();
     }
 };
 
+/** Collects what a plugin pushes to the host (NOTE_END among them). */
+struct ClapOut
+{
+    clap_output_events_t iface {};
+    std::vector<clap_event_note_t> noteEnds;
+    static bool push(const clap_output_events_t* l, const clap_event_header_t* ev)
+    {
+        auto* self = static_cast<ClapOut*>(l->ctx);
+        if (ev->type == CLAP_EVENT_NOTE_END)
+            self->noteEnds.push_back(*reinterpret_cast<const clap_event_note_t*>(ev));
+        return true;
+    }
+    ClapOut()
+    {
+        iface.ctx = this;
+        iface.try_push = &push;
+    }
+};
+
 template <typename Wrap>
-void processClap(Wrap* s, ClapEvents& events, uint32_t frames)
+void processClap(Wrap* s, ClapEvents& events, uint32_t frames, ClapOut* outEvents = nullptr)
 {
     std::vector<float> l(frames), r(frames);
     float* out[2] = { l.data(), r.data() };
@@ -1049,6 +1106,7 @@ void processClap(Wrap* s, ClapEvents& events, uint32_t frames)
     proc.audio_outputs = &outBuf;
     proc.audio_outputs_count = 1;
     proc.in_events = &events.iface;
+    proc.out_events = outEvents != nullptr ? &outEvents->iface : nullptr;
     s->plugin.process(&s->plugin, &proc);
     events.clear();
 }
@@ -1284,4 +1342,370 @@ DSPARK_TEST(PluginClap_modulation_adds_to_the_heard_value)
 
     cp->deactivate(cp);
     cp->destroy(cp);
+}
+
+namespace {
+
+// A polyphonic plugin: "cut" may be modulated per voice, "vol" may not. It
+// logs every MIDI event; a voice counts as sounding from its NoteOn until
+// its NoteOff (no release tail), which isVoiceActive reports.
+struct PolyPlug
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "Poly", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.poly", .version = "1.0.0",
+        .category = dspark::plugin::Category::Instrument,
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::perVoice(dspark::plugin::param("cut", "Cut", 0.0f, 100.0f, 50.0f, "")),
+        dspark::plugin::param("vol", "Vol", 0.0f, 1.0f, 1.0f, ""));
+
+    std::vector<dspark::plugin::MidiEvent> log;
+    std::array<bool, 128> held {};
+    float heard[2] = { 50.0f, 1.0f };
+
+    PolyPlug() { log.reserve(64); }
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int index, float plain) noexcept { heard[index] = plain; }
+    void processBlock(dspark::AudioBufferView<float>) noexcept {}
+    void handleMidiEvent(const dspark::plugin::MidiEvent& e) noexcept
+    {
+        using Type = dspark::plugin::MidiEvent::Type;
+        if (e.type == Type::NoteOn) held[e.note] = true;
+        if (e.type == Type::NoteOff) held[e.note] = false;
+        if (log.size() < log.capacity()) log.push_back(e);
+    }
+    [[nodiscard]] bool isVoiceActive(int, int key, int32_t) const noexcept
+    {
+        return key >= 0 && key < 128 && held[static_cast<size_t>(key)];
+    }
+};
+
+// The same voice model without the voice query.
+struct PolyNoQueryPlug
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "PolyNQ", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.polynq", .version = "1.0.0",
+        .category = dspark::plugin::Category::Instrument,
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::perVoice(dspark::plugin::param("cut", "Cut", 0.0f, 100.0f, 50.0f, "")));
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int, float) noexcept {}
+    void processBlock(dspark::AudioBufferView<float>) noexcept {}
+    void handleMidiEvent(const dspark::plugin::MidiEvent&) noexcept {}
+};
+
+/** The voice events of @p log, as "channel:key:noteId=value" triples. */
+std::vector<std::string> voiceEvents(const std::vector<dspark::plugin::MidiEvent>& log,
+                                     dspark::plugin::MidiEvent::Type type)
+{
+    std::vector<std::string> out;
+    for (const auto& e : log)
+        if (e.type == type)
+        {
+            char text[64];
+            std::snprintf(text, sizeof(text), "%d:%d:%d=%.2f", e.channel, e.note,
+                          static_cast<int>(e.noteId), static_cast<double>(e.value));
+            out.emplace_back(text);
+        }
+    return out;
+}
+
+bool hasAll(const std::vector<std::string>& got, std::initializer_list<const char*> want)
+{
+    if (got.size() != want.size()) return false;
+    for (const char* w : want)
+    {
+        bool found = false;
+        for (const auto& g : got) found = found || g == w;
+        if (!found) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+DSPARK_TEST(PluginClap_per_voice_modulation_reaches_each_matching_voice)
+{
+    // A perVoice() parameter declares every CLAP per-voice modulation form,
+    // and an addressed PARAM_MOD reaches the plugin as one NoteModulation
+    // per voice its (note id, port, channel, key) address matches, carrying
+    // that voice's plain value. The old wrapper declared global modulation
+    // only and dropped every addressed event: none of these voices moved.
+    using Wrap = dspark::plugin::clap_backend::Plugin<PolyPlug>;
+    using Type = dspark::plugin::MidiEvent::Type;
+    constexpr uint32_t kPerVoice = CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID
+                                 | CLAP_PARAM_IS_MODULATABLE_PER_KEY
+                                 | CLAP_PARAM_IS_MODULATABLE_PER_CHANNEL
+                                 | CLAP_PARAM_IS_MODULATABLE_PER_PORT;
+    clap_param_info_t info {};
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 0, &info));
+    EXPECT_EQ(info.flags & kPerVoice, kPerVoice);
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 1, &info));
+    EXPECT_EQ(info.flags & kPerVoice, 0u);
+
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    const clap_id cut = dspark::plugin::hash32("cut");
+    const clap_id vol = dspark::plugin::hash32("vol");
+    ClapEvents events;
+    ClapOut out;
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 60, 11, 0);
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 64, 12, 0);
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 1, 60, 13, 0);
+    processClap(s, events, 256, &out);
+    EXPECT_EQ(static_cast<int>(s->user.log.size()), 3);
+    if (s->user.log.size() == 3)
+        EXPECT_EQ(static_cast<int>(s->user.log[1].noteId), 12);   // the NoteOn carries the id
+    auto modulated = [&] { return voiceEvents(s->user.log, Type::NoteModulation); };
+
+    s->user.log.clear();
+    events.modAt(cut, 10.0, 0, 12, -1, -1, -1);     // by note id
+    processClap(s, events, 256, &out);
+    EXPECT_TRUE(hasAll(modulated(), { "0:64:12=60.00" }));
+
+    s->user.log.clear();
+    events.modAt(cut, -20.0, 0, -1, -1, -1, 60);    // by key: both channels
+    processClap(s, events, 256, &out);
+    EXPECT_TRUE(hasAll(modulated(), { "0:60:11=30.00", "1:60:13=30.00" }));
+
+    s->user.log.clear();
+    events.modAt(cut, 5.0, 0, -1, -1, 1, -1);       // by channel
+    processClap(s, events, 256, &out);
+    EXPECT_TRUE(hasAll(modulated(), { "1:60:13=55.00" }));
+
+    s->user.log.clear();
+    events.modAt(cut, 1.0, 0, -1, 0, -1, -1);       // by port: every voice
+    events.modAt(cut, 1.0, 0, -1, 1, -1, -1);       // a port this plugin lacks: none
+    events.modAt(vol, -0.5, 0, 12, -1, -1, -1);     // not perVoice: ignored
+    processClap(s, events, 256, &out);
+    EXPECT_TRUE(hasAll(modulated(), { "0:60:11=51.00", "0:64:12=51.00", "1:60:13=51.00" }));
+    EXPECT_NEAR(s->user.heard[1], 1.0f, 1e-6f);
+
+    // The parameter moves: each modulated voice hears its new value. A
+    // global amount still reaches setParameter and no voice event.
+    s->user.log.clear();
+    events.value(cut, 80.0, 0);
+    events.mod(cut, 3.0, 64);
+    processClap(s, events, 256, &out);
+    EXPECT_TRUE(hasAll(modulated(), { "0:60:11=81.00", "0:64:12=81.00", "1:60:13=81.00" }));
+    EXPECT_NEAR(s->user.heard[0], 83.0f, 1e-6f);
+
+    // A voice that falls silent is reported to the host (NOTE_END with its
+    // id) once the plugin says so; the others keep sounding.
+    events.noteWithId(CLAP_EVENT_NOTE_OFF, 0, 64, 12, 0);
+    processClap(s, events, 256, &out);
+    EXPECT_EQ(static_cast<int>(out.noteEnds.size()), 1);
+    if (out.noteEnds.size() == 1)
+    {
+        EXPECT_EQ(static_cast<int>(out.noteEnds[0].note_id), 12);
+        EXPECT_EQ(static_cast<int>(out.noteEnds[0].key), 64);
+    }
+    s->user.log.clear();
+    events.modAt(cut, 2.0, 0, 12, -1, -1, -1);      // an ended voice: nothing
+    processClap(s, events, 256, &out);
+    EXPECT_EQ(static_cast<int>(modulated().size()), 0);
+
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+DSPARK_TEST(PluginClap_note_expressions_reach_the_matching_voices)
+{
+    // CLAP note expressions arrive as MidiEvent::Type::NoteExpression, one
+    // per voice the address matches, with the CLAP value. The old wrapper
+    // dropped every one of them.
+    using Wrap = dspark::plugin::clap_backend::Plugin<PolyPlug>;
+    using Type = dspark::plugin::MidiEvent::Type;
+    using Expr = dspark::plugin::MidiEvent::ExpressionType;
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    ClapEvents events;
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 60, 21, 0);
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 67, 22, 0);
+    processClap(s, events, 256);
+    s->user.log.clear();
+    events.expression(CLAP_NOTE_EXPRESSION_TUNING, 2.5, 10, -1, 0, 67);
+    events.expression(CLAP_NOTE_EXPRESSION_VOLUME, 0.5, 20, 21, -1, -1);
+    events.expression(CLAP_NOTE_EXPRESSION_PRESSURE, 0.75, 30, -1, -1, -1);   // every voice
+    events.expression(99, 1.0, 40, -1, -1, -1);                               // unknown: dropped
+    processClap(s, events, 256);
+    const auto& log = s->user.log;
+    EXPECT_EQ(static_cast<int>(log.size()), 4);
+    if (log.size() == 4)
+    {
+        EXPECT_TRUE(log[0].type == Type::NoteExpression && log[0].expression == Expr::Tuning);
+        EXPECT_EQ(static_cast<int>(log[0].note), 67);
+        EXPECT_EQ(static_cast<int>(log[0].noteId), 22);
+        EXPECT_NEAR(log[0].value, 2.5f, 1e-6f);
+        EXPECT_EQ(log[0].sampleOffset, 10);
+        EXPECT_TRUE(log[1].expression == Expr::Volume);
+        EXPECT_EQ(static_cast<int>(log[1].note), 60);
+        EXPECT_NEAR(log[1].value, 0.5f, 1e-6f);
+        EXPECT_TRUE(log[2].expression == Expr::Pressure && log[3].expression == Expr::Pressure);
+        EXPECT_TRUE(log[2].note != log[3].note);
+    }
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+DSPARK_TEST(PluginClap_voices_end_at_the_noteoff_without_the_voice_query)
+{
+    // Without isVoiceActive a voice ends, for the host, at its NoteOff (or
+    // its choke): the NOTE_END goes out in that block, so the host retires
+    // the voice's modulators.
+    using Wrap = dspark::plugin::clap_backend::Plugin<PolyNoQueryPlug>;
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    ClapEvents events;
+    ClapOut out;
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 60, 31, 0);
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 62, 32, 0);
+    processClap(s, events, 256, &out);
+    EXPECT_EQ(static_cast<int>(out.noteEnds.size()), 0);
+    events.noteWithId(CLAP_EVENT_NOTE_OFF, 0, 60, 31, 5);
+    events.noteWithId(CLAP_EVENT_NOTE_CHOKE, 0, 62, 32, 9);
+    processClap(s, events, 256, &out);
+    EXPECT_EQ(static_cast<int>(out.noteEnds.size()), 2);
+    if (out.noteEnds.size() == 2)
+    {
+        EXPECT_EQ(static_cast<int>(out.noteEnds[0].note_id), 31);
+        EXPECT_EQ(static_cast<int>(out.noteEnds[1].note_id), 32);
+    }
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+DSPARK_TEST(PluginClap_nan_parameter_values_are_ignored)
+{
+    // A NaN CLAP_EVENT_PARAM_VALUE is ignored like a NaN modulation amount.
+    // The old wrapper mapped it to the bottom of the range: gain 0.
+    using Wrap = dspark::plugin::clap_backend::Plugin<ModLogPlug>;
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    ClapEvents events;
+    events.value(dspark::plugin::hash32("gain"), std::numeric_limits<double>::quiet_NaN(), 0);
+    processClap(s, events, 64);
+    double v = -1.0;
+    Wrap::kParams.get_value(cp, dspark::plugin::hash32("gain"), &v);
+    EXPECT_NEAR(v, 5.0, 1e-9);
+    EXPECT_NEAR(s->user.heard[0], 5.0f, 1e-6f);
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+namespace {
+
+struct ResizablePlug
+{
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "Resizable", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.resizable", .version = "1.0.0",
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("gain", "Gain", 0.0f, 1.0f, 0.5f, ""));
+    static constexpr bool hasEditor = true;
+    static constexpr dspark::plugin::EditorSize editorSize { 400, 300 };
+    static constexpr auto editorResize = dspark::plugin::EditorResize::KeepAspect;
+    static const char* editorHtml() { return "<html></html>"; }
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int, float) noexcept {}
+    void processBlock(dspark::AudioBufferView<float>) noexcept {}
+};
+
+struct FixedEditorPlug : ResizablePlug
+{
+    static constexpr auto editorResize = dspark::plugin::EditorResize::Fixed;
+};
+
+} // namespace
+
+DSPARK_TEST(PluginLayer_editor_size_persists_through_the_state)
+{
+    // The editor size the user left rides in the state container, so the
+    // next session opens the editor at it - in the format that saved it and
+    // in the others (the size is logical). The old wrappers always reopened
+    // at the declared size. A Fixed editor keeps no size; a remembered one
+    // is re-checked against the policy (aspect, 0.5x..3x).
+    using namespace dspark::plugin;
+    using Vst3 = vst3::Plugin<ResizablePlug>;
+    using Clap = clap_backend::Plugin<ResizablePlug>;
+
+    auto* v = new Vst3();
+    EditorSize size {};
+    EXPECT_TRUE(!v->editorMemory.remembered(size));
+    v->editorMemory.remember(600.0, 450.0);
+    MockStream saved;
+    EXPECT_EQ(v->kComponentVtbl.getState(v->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved)),
+              Steinberg_kResultOk);
+    auto* w = new Vst3();
+    saved.pos = 0;
+    EXPECT_EQ(w->kComponentVtbl.setState(w->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved)),
+              Steinberg_kResultOk);
+    EXPECT_EQ(w->editorMemory.current().width, 600);
+    EXPECT_EQ(w->editorMemory.current().height, 450);
+
+    // The same bytes load in the CLAP build.
+    const clap_plugin_t* cp = Clap::create(nullptr);
+    auto* c = static_cast<Clap*>(cp->plugin_data);
+    cp->init(cp);
+    struct In
+    {
+        clap_istream_t iface {};
+        const std::vector<uint8_t>* bytes = nullptr;
+        size_t pos = 0;
+        static int64_t read(const clap_istream_t* st, void* dst, uint64_t n)
+        {
+            auto* self = static_cast<In*>(st->ctx);
+            const size_t left = self->bytes->size() - self->pos;
+            const size_t take = left < n ? left : static_cast<size_t>(n);
+            if (take > 0) std::memcpy(dst, self->bytes->data() + self->pos, take);
+            self->pos += take;
+            return static_cast<int64_t>(take);
+        }
+    } in;
+    in.iface.ctx = &in;
+    in.iface.read = &In::read;
+    in.bytes = &saved.bytes;
+    EXPECT_TRUE(Clap::kState.load(cp, &in.iface));
+    EXPECT_EQ(c->editorMemory.current().width, 600);
+    EXPECT_EQ(c->editorMemory.current().height, 450);
+
+    // A state without a size keeps the size the instance has.
+    double norm[1] = { 0.5 };
+    const std::vector<uint8_t> plain = buildState(c->user, norm, 1);
+    in.bytes = &plain;
+    in.pos = 0;
+    EXPECT_TRUE(Clap::kState.load(cp, &in.iface));
+    EXPECT_EQ(c->editorMemory.current().width, 600);
+
+    // A hostile size is bounded by the policy (3x the declared width at
+    // most, the declared ratio kept).
+    const EditorSize huge { 30000, 30000 };
+    const std::vector<uint8_t> evil = buildState(c->user, norm, 1, -1, -1, &huge);
+    in.bytes = &evil;
+    in.pos = 0;
+    EXPECT_TRUE(Clap::kState.load(cp, &in.iface));
+    EXPECT_EQ(c->editorMemory.current().width, 1200);
+    EXPECT_EQ(c->editorMemory.current().height, 900);
+    cp->destroy(cp);
+
+    // A Fixed editor remembers nothing and writes no size entry.
+    EditorSizeMemory<FixedEditorPlug> fixed;
+    fixed.remember(800.0, 600.0);
+    EXPECT_TRUE(!fixed.remembered(size));
+    EXPECT_EQ(fixed.current().width, 400);
+
+    w->releaseImpl();
+    v->releaseImpl();
 }

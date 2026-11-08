@@ -6,6 +6,29 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Plugin layer, CLAP per-voice signals: `perVoice(param(...))` marks a
+  parameter the host may modulate voice by voice. It declares per-note-id,
+  per-key, per-channel and per-port modulation, and each addressed
+  modulation reaches `handleMidiEvent` as one `MidiEvent::Type::NoteModulation`
+  per voice it matches, carrying that voice's plain value (re-sent when the
+  parameter moves). Note expressions (volume, pan, tuning, vibrato,
+  expression, brightness, pressure) arrive as `MidiEvent::Type::NoteExpression`
+  per matching voice; `MidiEvent::noteId` carries the host's note id on
+  NoteOn/NoteOff too. The optional `isVoiceActive(channel, key, noteId)`
+  tells the host when a voice really ends (CLAP NOTE_END); without it a
+  voice ends at its note-off. Before, every addressed modulation and every
+  note expression was dropped.
+- Plugin layer: a resizable editor (`EditorResize::Free` / `KeepAspect`)
+  reopens at the size the user left it, and the size is saved with the
+  session in every format (logical pixels in the shared state container,
+  reserved entries `EDSW` / `EDSH`; older builds skip them). Before, every
+  open used the declared `editorSize`.
+- AU: render notifications (`AudioUnitAddRenderNotify`) run before and after
+  every slice with the pre/post-render flags, and with the error flag on a
+  refused call; the selectors used to accept and drop them. A change of
+  `getTailSeconds()` after parameter motion notifies the `TailTime`
+  listeners on the main thread, and an initialize that moves the latency or
+  the tail notifies both properties.
 - `Limiter::setHoldMode(HoldMode::EveryPeak)` (opt-in, default `Deepest`
   unchanged and bit-identical): every peak's reduction is held for the hold
   time after it has passed (an exact sliding minimum over lookahead plus
@@ -537,6 +560,26 @@ All notable user-facing changes to DSPark are documented here.
   delay lines of the previous run.
 
 ### Fixed
+
+- AU host contract: every parameter is flagged high-resolution (a host
+  that limits control resolution now gives it the highest it has); a NaN or
+  infinite value from `AudioUnitSetParameter` or `AudioUnitScheduleParameters`
+  is refused with `kAudioUnitErr_InvalidParameterValue` instead of moving the
+  parameter to an end of its range; a render of another output element is
+  refused (it ran the DSP twice per cycle) and so is a host buffer shorter
+  than the slice (512 samples were written into a 256-sample buffer); an
+  immediate scheduled value reads back at once; the scheduled events of a
+  slice that is not rendered no longer replay in the next one (a refused
+  slice's ramp applied 8 stale points); `Reset` drops the MIDI queued before
+  it; the saved state's `name` is the preset's (it was the plugin's), is
+  restored with the state and announced to PresentPreset listeners; a preset
+  of another unit (subtype or manufacturer) is refused instead of feeding
+  this plugin its user section; a bypass moved through the bypass parameter
+  (automation, a state load) notifies the `BypassEffect` listeners, and one
+  set through the property notifies the parameter's listeners, so the host's
+  button and its automation lane agree (neither was notified before).
+- CLAP: a NaN `CLAP_EVENT_PARAM_VALUE` is ignored; it moved the parameter to
+  its minimum.
 
 - `Phaser`: a stereo spread change jumped the right LFO phase in one sample;
   its second difference reached 1311 times the effect's steady value. The

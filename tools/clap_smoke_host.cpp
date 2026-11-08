@@ -105,9 +105,21 @@ struct SmokeHost
     inline static const clap_host_preset_load_t kPresetLoad = {
         &sPresetOnError, &sPresetLoaded
     };
+    // Timer support: the Linux editor needs a host run loop to create at all
+    // (the gui contract below runs without a window, so no tick is needed).
+    static bool sRegisterTimer(const clap_host_t*, uint32_t, clap_id* id)
+    {
+        if (id != nullptr) *id = 1;
+        return true;
+    }
+    static bool sUnregisterTimer(const clap_host_t*, clap_id) { return true; }
+    inline static const clap_host_timer_support_t kTimer = {
+        &sRegisterTimer, &sUnregisterTimer
+    };
 
     static const void* sGetExtension(const clap_host_t*, const char* id)
     {
+        if (std::strcmp(id, CLAP_EXT_TIMER_SUPPORT) == 0) return &kTimer;
         if (std::strcmp(id, CLAP_EXT_LATENCY) == 0) return &kLatency;
         if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) return &kParams;
         if (std::strcmp(id, CLAP_EXT_PRESET_LOAD) == 0
@@ -238,6 +250,53 @@ struct EventList
         ev.velocity = 0.0;
         push(ev);
     }
+    void noteOnWithId(int16_t key, double velocity, uint32_t time, int32_t noteId)
+    {
+        clap_event_note_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_NOTE_ON;
+        ev.note_id = noteId;
+        ev.port_index = 0;
+        ev.channel = 0;
+        ev.key = key;
+        ev.velocity = velocity;
+        push(ev);
+    }
+    /// A modulation amount for one voice, addressed by its note id.
+    void voiceMod(uint32_t paramId, double amount, uint32_t time, int32_t noteId)
+    {
+        clap_event_param_mod_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_PARAM_MOD;
+        ev.param_id = paramId;
+        ev.note_id = noteId;
+        ev.port_index = -1;
+        ev.channel = -1;
+        ev.key = -1;
+        ev.amount = amount;
+        push(ev);
+    }
+    /// A note expression addressed by (channel, key).
+    void expression(clap_note_expression which, double value, uint32_t time,
+                    int16_t channel, int16_t key)
+    {
+        clap_event_note_expression_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_NOTE_EXPRESSION;
+        ev.expression_id = which;
+        ev.note_id = -1;
+        ev.port_index = -1;
+        ev.channel = channel;
+        ev.key = key;
+        ev.value = value;
+        push(ev);
+    }
     void midi(uint8_t b0, uint8_t b1, uint8_t b2, uint32_t time)
     {
         clap_event_midi_t ev {};
@@ -253,7 +312,15 @@ struct EventList
     }
 };
 
-bool outTryPush(const clap_output_events_t*, const clap_event_header_t*) { return true; }
+// The plugin's output events: NOTE_END ones are kept (voice ends).
+std::vector<clap_event_note_t> g_noteEnds;
+bool outTryPush(const clap_output_events_t*, const clap_event_header_t* ev)
+{
+    if (ev != nullptr && ev->space_id == CLAP_CORE_EVENT_SPACE_ID
+        && ev->type == CLAP_EVENT_NOTE_END)
+        g_noteEnds.push_back(*reinterpret_cast<const clap_event_note_t*>(ev));
+    return true;
+}
 const clap_output_events_t kOutEvents = { nullptr, &outTryPush };
 
 // -- byte-vector streams ------------------------------------------------------------
@@ -1013,6 +1080,55 @@ int main(int argc, char** argv)
             processOnce();
         }
         proc.transport = nullptr;
+
+        // 18) Per-voice signals: "gain" declares per-voice modulation; a
+        //     modulation addressed to the voice's note id and a Volume note
+        //     expression each scale the voice, and its end reaches the host
+        //     as NOTE_END with the note id.
+        {
+            uint32_t perVoiceFlags = 0;
+            for (uint32_t i = 0; i < numParams; ++i)
+            {
+                clap_param_info_t pi {};
+                if (params->get_info(plugin, i, &pi) && pi.id == gainId)
+                    perVoiceFlags = pi.flags & (CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID
+                                                | CLAP_PARAM_IS_MODULATABLE_PER_KEY
+                                                | CLAP_PARAM_IS_MODULATABLE_PER_CHANNEL
+                                                | CLAP_PARAM_IS_MODULATABLE_PER_PORT);
+            }
+            expect(perVoiceFlags == (CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID
+                                     | CLAP_PARAM_IS_MODULATABLE_PER_KEY
+                                     | CLAP_PARAM_IS_MODULATABLE_PER_CHANNEL
+                                     | CLAP_PARAM_IS_MODULATABLE_PER_PORT),
+                   "a perVoice parameter declares every per-voice modulation form");
+            auto voicePeak = [&]() {
+                processOnce();   // let the change settle a block
+                processOnce();
+                float peak = 0.0f;
+                for (int i = 0; i < 512; ++i)
+                    peak = std::fmax(peak, std::fabs(outL[static_cast<size_t>(i)]));
+                return peak;
+            };
+            fillInput(0.0f);
+            events.paramValue(gainId, 1.0, 0);
+            events.noteOnWithId(69, 0.5, 0, 7);
+            const float plainVoice = voicePeak();
+            events.voiceMod(gainId, -0.5, 0, 7);
+            const float modulated = voicePeak();
+            events.expression(CLAP_NOTE_EXPRESSION_VOLUME, 0.5, 0, 0, 69);
+            const float expressed = voicePeak();
+            g_noteEnds.clear();
+            events.noteOff(69, 0);
+            processOnce();
+            std::printf("      voice peak %.3f -> per-voice gain %.3f -> volume expression %.3f\n",
+                        plainVoice, modulated, expressed);
+            expect(std::fabs(plainVoice - 0.5f) < 0.01f && std::fabs(modulated - 0.25f) < 0.01f
+                       && std::fabs(expressed - 0.125f) < 0.01f,
+                   "per-voice modulation and a note expression reach the voice");
+            expect(g_noteEnds.size() == 1 && g_noteEnds[0].note_id == 7
+                       && g_noteEnds[0].key == 69,
+                   "the voice's end reaches the host (NOTE_END with its note id)");
+        }
     }
 
     // --- state round-trip ---------------------------------------------------------
@@ -1079,6 +1195,48 @@ int main(int argc, char** argv)
         uint32_t adjW = width, adjH = height;
         expect(gui->adjust_size(plugin, &adjW, &adjH) && adjW == width && adjH == height,
                "adjust_size accepts the reported size");
+
+        // A resizable editor reopens at the size the user left, and a new
+        // instance loading the saved state (the next session) opens there.
+        if (gui->can_resize(plugin))
+        {
+            uint32_t bigW = width + width / 2, bigH = height + height / 2;
+            gui->adjust_size(plugin, &bigW, &bigH);
+            expect(gui->set_size(plugin, bigW, bigH), "gui set_size to a larger size");
+            gui->destroy(plugin);
+            expect(gui->create(plugin, api, false), "gui create again");
+            uint32_t againW = 0, againH = 0;
+            gui->get_size(plugin, &againW, &againH);
+            expect(againW == bigW && againH == bigH,
+                   "the editor reopens at the size the user left");
+            ByteOStream session;
+            expect(state->save(plugin, &session.iface), "state save with the editor size");
+            const clap_plugin_t* next = factory->create_plugin(factory, &smokeHost.host,
+                                                               desc->id);
+            expect(next != nullptr && next->init(next), "a second instance");
+            if (next != nullptr)
+            {
+                const auto* nextState = static_cast<const clap_plugin_state_t*>(
+                    next->get_extension(next, CLAP_EXT_STATE));
+                const auto* nextGui = static_cast<const clap_plugin_gui_t*>(
+                    next->get_extension(next, CLAP_EXT_GUI));
+                ByteIStream sessionIn;
+                sessionIn.bytes = session.bytes;
+                uint32_t nextW = 0, nextH = 0;
+                if (nextState != nullptr && nextGui != nullptr
+                    && nextState->load(next, &sessionIn.iface)
+                    && nextGui->create(next, api, false))
+                {
+                    nextGui->get_size(next, &nextW, &nextH);
+                    nextGui->destroy(next);
+                }
+                std::printf("      editor reopens at %u x %u in the next session\n",
+                            nextW, nextH);
+                expect(nextW == bigW && nextH == bigH,
+                       "the next session opens the editor at the saved size");
+                next->destroy(next);
+            }
+        }
         gui->destroy(plugin);
     }
     else

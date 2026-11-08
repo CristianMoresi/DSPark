@@ -35,7 +35,15 @@
  *   the plugin's setParameter receives, clamped and snapped like any other
  *   value, sample-accurately like automation. The parameter's own value
  *   (get_value, state, the editor) stays unmodulated, as CLAP requires.
- *   Per-note, key, channel and port modulation is not offered.
+ * - perVoice() parameters also declare per-note-id, per-key, per-channel
+ *   and per-port modulation. Each addressed modulation reaches the plugin
+ *   as one MidiEvent::Type::NoteModulation per voice it matches, carrying
+ *   that voice's plain value (re-sent when the parameter moves), and the
+ *   host hears when each voice ends (NOTE_END): when isVoiceActive() turns
+ *   false, or at the voice's NoteOff without that query.
+ * - Note expressions (volume, pan, tuning, vibrato, expression, brightness,
+ *   pressure) reach the plugin as MidiEvent::Type::NoteExpression, one per
+ *   matching voice; NoteOn/NoteOff carry the host's note id.
  * - start_processing() clears the processing history through the plugin's
  *   reset(), so a host that stops and restarts processing (a sleeping
  *   device waking up, a transport restart) never hears a stale tail.
@@ -64,7 +72,9 @@
  *   embeds the WebView editor (otherwise hosts show their generic editor).
  *   Editor edits reach the host as gesture begin/end plus
  *   CLAP_EVENT_PARAM_VALUE through a lock-free queue drained by
- *   process()/flush(), so automation recording works.
+ *   process()/flush(), so automation recording works. A resizable editor
+ *   reopens at the size the user left, also in the next session (the size
+ *   rides in the state).
  */
 
 #define DSPARK_PLUGIN_CLAP_INCLUDED 1
@@ -80,6 +90,7 @@
 #undef max
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -91,6 +102,95 @@ namespace dspark::plugin::clap_backend {
 
 inline constexpr uint32_t kBypassParamId = 0x42595053u;   // matches the VST3 backend
 inline constexpr int      kBypassRampSamples = 256;
+
+/**
+ * @brief The voices this backend started (one per NoteOn it delivered), with
+ * the host's modulation amount of every perVoice() parameter for each one.
+ *
+ * CLAP addresses voices by (port, channel, key, note id), any part -1 for
+ * "any". MidiEvent names one voice, so the backend resolves each per-voice
+ * event (note expression, polyphonic modulation) against this table and
+ * delivers it once per matching voice - which also covers the per-key,
+ * per-channel and per-port forms. Audio thread only; fixed capacity, no
+ * allocation. A voice past the capacity simply receives no per-voice event
+ * through a wildcard (an exact channel + key address still reaches it).
+ */
+template <size_t NumPerVoice>
+class VoiceTable
+{
+public:
+    static constexpr int kCapacity = 128;
+
+    struct Voice
+    {
+        int16_t channel = 0;
+        int16_t key = 0;
+        int32_t noteId = -1;
+        bool    used = false;
+        bool    held = false;   ///< false once its NoteOff arrived
+        std::array<double, NumPerVoice == 0 ? 1 : NumPerVoice> amount {};
+        std::array<bool, NumPerVoice == 0 ? 1 : NumPerVoice> modulated {};
+    };
+
+    void clear() noexcept
+    {
+        for (auto& voice : voices_) voice.used = false;
+        end_ = 0;
+    }
+
+    /** Starts a voice; returns its slot, or -1 when every slot is in use. */
+    int start(int channel, int key, int32_t noteId) noexcept
+    {
+        for (int i = 0; i < kCapacity; ++i)
+        {
+            Voice& voice = voices_[static_cast<size_t>(i)];
+            if (voice.used) continue;
+            voice = Voice {};
+            voice.channel = static_cast<int16_t>(channel);
+            voice.key = static_cast<int16_t>(key);
+            voice.noteId = noteId;
+            voice.used = true;
+            voice.held = true;
+            if (i >= end_) end_ = i + 1;
+            return i;
+        }
+        return -1;
+    }
+
+    /** One past the highest slot in use (scans stop there). */
+    [[nodiscard]] int end() const noexcept { return end_; }
+
+    /** Calls @p fn(slot) for every voice the address matches (each part -1
+     *  for "any"; the one note port has index 0). */
+    template <typename Fn>
+    void forEachMatching(int port, int channel, int key, int32_t noteId, Fn&& fn) noexcept
+    {
+        if (port > 0) return;
+        for (int i = 0; i < end_; ++i)
+        {
+            const Voice& voice = voices_[static_cast<size_t>(i)];
+            if (!voice.used
+                || (channel >= 0 && voice.channel != channel)
+                || (key >= 0 && voice.key != key)
+                || (noteId >= 0 && voice.noteId != noteId))
+                continue;
+            fn(i);
+        }
+    }
+
+    Voice& operator[](int slot) noexcept { return voices_[static_cast<size_t>(slot)]; }
+
+    /** Frees voice @p slot. */
+    void release(int slot) noexcept
+    {
+        voices_[static_cast<size_t>(slot)].used = false;
+        while (end_ > 0 && !voices_[static_cast<size_t>(end_ - 1)].used) --end_;
+    }
+
+private:
+    std::array<Voice, kCapacity> voices_ {};
+    int end_ = 0;   // one past the highest slot in use
+};
 
 template <typename P>
 struct Plugin
@@ -107,8 +207,13 @@ struct Plugin
                   "no audio input to process");
     static_assert(paramIdsUnique<P>(),
                   "two parameter ids share a hash32 (or collide with the "
-                  "reserved PRGM/BYPS state ids): automation and state would "
-                  "cross-wire. Rename one id.");
+                  "reserved PRGM/BYPS/EDSW/EDSH state ids): automation and state "
+                  "would cross-wire. Rename one id.");
+    static constexpr size_t kNumPerVoice = perVoiceParamCount<P>();
+    static constexpr bool kHasPerVoice = kNumPerVoice > 0;
+    static_assert(!kHasPerVoice || HasMidi<P>,
+                  "a perVoice() parameter needs handleMidiEvent (see HasMidi): "
+                  "only a plugin with a note input has voices to modulate");
 
     clap_plugin_t plugin {};            // the C-facing object (plugin_data = this)
     const clap_host_t* host = nullptr;
@@ -142,6 +247,20 @@ struct Plugin
     BlockEventList blockEvents;          // one block of host events (audio thread)
     ActiveNotes sounding;                // for CLAP's wildcard note-off / choke
 
+    /// The voices delivered so far, for per-voice events (audio thread).
+    VoiceTable<kNumPerVoice> voices;
+    /// Voices that ended this block; reported to the host as NOTE_END when the
+    /// plugin has perVoice() parameters (the host then retires the voice's
+    /// modulators).
+    struct EndedVoice
+    {
+        int16_t channel;
+        int16_t key;
+        int32_t noteId;
+    };
+    EndedVoice endedVoices[VoiceTable<kNumPerVoice>::kCapacity] {};
+    int endedCount = 0;
+
     std::atomic<double> shadow[kNumParams == 0 ? 1 : kNumParams] {};
     /// Host modulation amount per parameter, plain units (audio thread).
     double modulation[kNumParams == 0 ? 1 : kNumParams] {};
@@ -151,6 +270,9 @@ struct Plugin
     std::vector<float> dryL, dryR;
     std::vector<float> silence;   // stand-in sidechain when not connected
     DryDelay dryDelay;            // latency-aligned dry path of the bypass
+    /// The editor size the user left (also without the editor layer, so a
+    /// session saved where the editor ran keeps its size here).
+    EditorSizeMemory<P> editorMemory;
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     // --- editor state + UI -> host event queue (single producer: main thread;
@@ -240,7 +362,187 @@ struct Plugin
         return pending.drain([this](int i) {
             user.setParameter(i, static_cast<float>(heardPlain(
                 i, shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
+            resendVoiceModulation(i, 0);
         });
+    }
+
+    // --- per-voice events (polyphonic modulation, note expressions) -------------
+
+    /** The plain value one voice hears for perVoice() parameter @p index: the
+     *  parameter's value plus the voice's own modulation @p amount (which
+     *  already includes the global signal, as CLAP defines it), clamped and
+     *  snapped like any value. */
+    double voiceHeardPlain(int index, double amount) const noexcept
+    {
+        const auto& spec = P::parameters[static_cast<size_t>(index)];
+        const double value = toPlain(spec, shadow[static_cast<size_t>(index)]
+                                               .load(std::memory_order_relaxed));
+        return toPlain(spec, toNormalized(spec, value + amount));
+    }
+
+    /** One per-voice event to the plugin, addressed to the exact voice
+     *  (@p channel, @p key, @p noteId). */
+    void deliverToVoice(MidiEvent midi, int channel, int key, int32_t noteId) noexcept
+    {
+        if constexpr (HasMidi<P>)
+        {
+            midi.channel = static_cast<uint8_t>(channel & 0x0F);
+            midi.note = static_cast<uint8_t>(key & 0x7F);
+            midi.noteId = noteId;
+            user.handleMidiEvent(midi);
+        }
+        else
+        {
+            (void) midi;
+            (void) channel;
+            (void) key;
+            (void) noteId;
+        }
+    }
+
+    /** A perVoice() parameter moved: every voice the host modulates hears its
+     *  value plus that voice's amount, so each one is told its new value. */
+    void resendVoiceModulation(int index, int sampleOffset) noexcept
+    {
+        if constexpr (kHasPerVoice)
+        {
+            const int slot = perVoiceSlotTable<P>[static_cast<size_t>(index)];
+            if (slot < 0) return;
+            for (int v = 0; v < voices.end(); ++v)
+            {
+                auto& voice = voices[v];
+                if (!voice.used || !voice.modulated[static_cast<size_t>(slot)]) continue;
+                MidiEvent midi {};
+                midi.type = MidiEvent::Type::NoteModulation;
+                midi.param = static_cast<int16_t>(index);
+                midi.sampleOffset = sampleOffset;
+                midi.value = static_cast<float>(
+                    voiceHeardPlain(index, voice.amount[static_cast<size_t>(slot)]));
+                deliverToVoice(midi, voice.channel, voice.key, voice.noteId);
+            }
+        }
+        else
+        {
+            (void) index;
+            (void) sampleOffset;
+        }
+    }
+
+    /** Retires voice @p slot; with perVoice() parameters the host hears of it
+     *  (NOTE_END) at the end of the block. */
+    void endVoice(int slot) noexcept
+    {
+        if constexpr (kHasPerVoice)
+        {
+            if (endedCount < VoiceTable<kNumPerVoice>::kCapacity)
+            {
+                const auto& voice = voices[slot];
+                endedVoices[endedCount++] = EndedVoice { voice.channel, voice.key,
+                                                         voice.noteId };
+            }
+        }
+        voices.release(slot);
+    }
+
+    /** Voice bookkeeping for a NoteOn / NoteOff the plugin just received. */
+    void trackVoice(const MidiEvent& midi) noexcept
+    {
+        if (midi.type == MidiEvent::Type::NoteOn)
+        {
+            (void) voices.start(midi.channel, midi.note, midi.noteId);
+            return;
+        }
+        if (midi.type != MidiEvent::Type::NoteOff) return;
+        voices.forEachMatching(-1, midi.channel, midi.note, midi.noteId, [&](int slot) {
+            // A choke ends the voice now. A release ends it when the plugin
+            // says it fell silent (isVoiceActive) - or, without that query,
+            // at the release itself.
+            if constexpr (HasVoiceQuery<P>)
+            {
+                if (!midi.choke)
+                {
+                    voices[slot].held = false;
+                    return;
+                }
+            }
+            endVoice(slot);
+        });
+    }
+
+    /** Applies one per-voice event (NoteExpression / NoteModulation) to every
+     *  voice its host address matches. An exact channel + key address the
+     *  table does not hold (a voice started before activation, or past the
+     *  table's capacity) is still delivered once. */
+    void applyVoiceEvent(const BlockEvent& ev, MidiEvent midi) noexcept
+    {
+        const bool isModulation = midi.type == MidiEvent::Type::NoteModulation;
+        const int index = midi.param;
+        const int slot = isModulation ? perVoiceSlotTable<P>[static_cast<size_t>(index)] : -1;
+        if (isModulation && slot < 0) return;
+        bool delivered = false;
+        voices.forEachMatching(ev.targetPort, ev.targetChannel, ev.targetKey,
+                               ev.targetNoteId, [&](int v) {
+            auto& voice = voices[v];
+            if (isModulation)
+            {
+                voice.amount[static_cast<size_t>(slot)] = ev.value;
+                voice.modulated[static_cast<size_t>(slot)] = true;
+                midi.value = static_cast<float>(voiceHeardPlain(index, ev.value));
+            }
+            deliverToVoice(midi, voice.channel, voice.key, voice.noteId);
+            delivered = true;
+        });
+        if (!delivered && ev.targetPort <= 0 && ev.targetChannel >= 0 && ev.targetKey >= 0)
+        {
+            if (isModulation)
+                midi.value = static_cast<float>(voiceHeardPlain(index, ev.value));
+            deliverToVoice(midi, ev.targetChannel, ev.targetKey, ev.targetNoteId);
+        }
+    }
+
+    /** After a processed block: voices the plugin reports silent end (with
+     *  perVoice() parameters and the voice query). */
+    void pollVoices() noexcept
+    {
+        if constexpr (kHasPerVoice && HasVoiceQuery<P>)
+        {
+            for (int v = voices.end() - 1; v >= 0; --v)   // ending shrinks end()
+            {
+                const auto& voice = voices[v];
+                if (voice.used
+                    && !static_cast<bool>(user.isVoiceActive(voice.channel, voice.key,
+                                                             voice.noteId)))
+                    endVoice(v);
+            }
+        }
+    }
+
+    /** Reports this block's ended voices to the host as NOTE_END events. */
+    void flushEndedVoices(const clap_output_events_t* out, uint32_t time) noexcept
+    {
+        if constexpr (kHasPerVoice)
+        {
+            for (int i = 0; out != nullptr && out->try_push != nullptr && i < endedCount; ++i)
+            {
+                clap_event_note_t ev {};
+                ev.header.size = sizeof(ev);
+                ev.header.time = time;
+                ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                ev.header.type = CLAP_EVENT_NOTE_END;
+                ev.note_id = endedVoices[i].noteId;
+                ev.port_index = 0;
+                ev.channel = endedVoices[i].channel;
+                ev.key = endedVoices[i].key;
+                ev.velocity = 0.0;
+                out->try_push(out, &ev.header);
+            }
+        }
+        else
+        {
+            (void) out;
+            (void) time;
+        }
+        endedCount = 0;
     }
 
     /** Asks the host for a process()/flush() so deferred values land even
@@ -302,6 +604,10 @@ struct Plugin
         if (ev->type == CLAP_EVENT_PARAM_VALUE)
         {
             const auto* pv = reinterpret_cast<const clap_event_param_value_t*>(ev);
+            // A NaN value is ignored like a NaN modulation amount: the plain
+            // -> normalized mapping sends NaN to 0, so the old code moved the
+            // parameter to its minimum.
+            if (pv->value != pv->value) return;
             if (pv->param_id == kBypassParamId)
             {
                 out.kind = BlockEvent::Kind::Bypass;
@@ -320,14 +626,32 @@ struct Plugin
         }
         else if (ev->type == CLAP_EVENT_PARAM_MOD)
         {
-            // The global (monophonic) signal only: no parameter declares
-            // per-note, key, channel or port modulation. A NaN amount from
-            // the host is ignored like a NaN value.
+            // The global signal (every address part -1) is added to the value
+            // setParameter receives. An addressed one - per note id, key,
+            // channel or port - modulates single voices: only a perVoice()
+            // parameter declares that, and it becomes one NoteModulation per
+            // matching voice when applied. A NaN amount is ignored.
             const auto* pm = reinterpret_cast<const clap_event_param_mod_t*>(ev);
-            if (pm->note_id >= 0 || pm->key >= 0 || pm->channel >= 0 || pm->port_index >= 0)
-                return;
             if (pm->amount != pm->amount) return;
-            if (indexOfParamId(pm->param_id) < 0) return;
+            const int idx = indexOfParamId(pm->param_id);
+            if (idx < 0) return;
+            if (pm->note_id >= 0 || pm->key >= 0 || pm->channel >= 0 || pm->port_index >= 0)
+            {
+                if constexpr (HasMidi<P>)
+                {
+                    if (!P::parameters[static_cast<size_t>(idx)].perVoice) return;
+                    out.kind = BlockEvent::Kind::Midi;
+                    out.midi.type = MidiEvent::Type::NoteModulation;
+                    out.midi.param = static_cast<int16_t>(idx);
+                    out.value = pm->amount;
+                    out.targetNoteId = pm->note_id;
+                    out.targetPort = pm->port_index;
+                    out.targetChannel = pm->channel;
+                    out.targetKey = pm->key;
+                    events.add(out);
+                }
+                return;
+            }
             out.kind = BlockEvent::Kind::ParamMod;
             out.paramId = pm->param_id;
             out.value = pm->amount;
@@ -347,6 +671,7 @@ struct Plugin
                     out.midi.channel = static_cast<uint8_t>(ch);
                     out.midi.note = static_cast<uint8_t>(note->key);
                     out.midi.value = static_cast<float>(note->velocity);
+                    out.midi.noteId = note->note_id >= 0 ? note->note_id : -1;
                     sounding.noteOn(ch, note->key, note->note_id);
                 }
                 else
@@ -372,6 +697,7 @@ struct Plugin
                         out.midi.channel = static_cast<uint8_t>(note->channel & 0x0F);
                         out.midi.note = static_cast<uint8_t>(note->key & 0x7F);
                         out.midi.value = velocity;
+                        out.midi.noteId = note->note_id >= 0 ? note->note_id : -1;
                     }
                     else
                     {
@@ -382,11 +708,31 @@ struct Plugin
                                 off.midi.channel = static_cast<uint8_t>(c);
                                 off.midi.note = static_cast<uint8_t>(k);
                                 off.midi.value = velocity;
+                                off.midi.noteId = sounding.noteIdOf(c, k);
                                 events.add(off);
                             });
                         return;
                     }
                 }
+            }
+            else if (ev->type == CLAP_EVENT_NOTE_EXPRESSION)
+            {
+                // Per-voice expressions (CLAP numbers them in ExpressionType
+                // order). Resolved against the delivered voices when applied;
+                // the old code dropped every one of them.
+                const auto* ne = reinterpret_cast<const clap_event_note_expression_t*>(ev);
+                if ((ne->expression_id < CLAP_NOTE_EXPRESSION_VOLUME)
+                    || (ne->expression_id > CLAP_NOTE_EXPRESSION_PRESSURE)
+                    || ne->value != ne->value)
+                    return;
+                out.midi.type = MidiEvent::Type::NoteExpression;
+                out.midi.expression =
+                    static_cast<MidiEvent::ExpressionType>(ne->expression_id);
+                out.midi.value = static_cast<float>(ne->value);
+                out.targetNoteId = ne->note_id;
+                out.targetPort = ne->port_index;
+                out.targetChannel = ne->channel;
+                out.targetKey = ne->key;
             }
             else if (ev->type == CLAP_EVENT_MIDI)
             {
@@ -471,7 +817,14 @@ struct Plugin
                 MidiEvent midi = ev.midi;
                 midi.sampleOffset = ev.offset - blockStart;
                 if (midi.sampleOffset < 0) midi.sampleOffset = 0;
-                user.handleMidiEvent(midi);
+                if (midi.type == MidiEvent::Type::NoteExpression
+                    || midi.type == MidiEvent::Type::NoteModulation)
+                    applyVoiceEvent(ev, midi);
+                else
+                {
+                    user.handleMidiEvent(midi);
+                    trackVoice(midi);
+                }
             }
             return false;
         case BlockEvent::Kind::ParamMod:
@@ -488,6 +841,8 @@ struct Plugin
             if (const int idx = indexOfParamId(ev.paramId); idx >= 0)
             {
                 applyNormalized(idx, ev.value);
+                const int offset = ev.offset - blockStart;
+                resendVoiceModulation(idx, offset < 0 ? 0 : offset);
                 return true;
             }
             return false;
@@ -631,6 +986,8 @@ struct Plugin
             s->silence.assign(maxFrames, 0.0f);
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         s->sounding.clear();
+        s->voices.clear();
+        s->endedCount = 0;
         if constexpr (HasLatency<P>)
         {
             const int latency = s->user.getLatency();
@@ -654,6 +1011,8 @@ struct Plugin
     {
         auto* s = self(p);
         s->active.store(false, std::memory_order_release);
+        s->voices.clear();   // the host retires its voices with the activation
+        s->endedCount = 0;
         s->drainPending();   // no process()/flush() can run now (main thread)
     }
 
@@ -674,6 +1033,8 @@ struct Plugin
             s->user.reset();
         s->dryDelay.reset();
         s->sounding.clear();
+        s->voices.clear();   // reset kills every voice (CLAP reset contract)
+        s->endedCount = 0;
         s->bypassMix = s->bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
     }
 
@@ -744,6 +1105,7 @@ struct Plugin
             for (int i = 0; i < eventCount; ++i)
                 paramsChanged |= s->applyBlockEvent(events[i], events[i].offset);
             if (paramsChanged) s->refreshLatency();
+            s->flushEndedVoices(process->out_events, 0);
             return CLAP_PROCESS_CONTINUE;
         }
 
@@ -876,6 +1238,8 @@ struct Plugin
             paramsChanged |= s->applyBlockEvent(events[evIdx], total);
 
         if (paramsChanged) s->refreshLatency();
+        s->pollVoices();
+        s->flushEndedVoices(process->out_events, n - 1);
         return CLAP_PROCESS_CONTINUE;
     }
 
@@ -1179,6 +1543,13 @@ struct Plugin
         // made a 5-position 0..1 control offer two positions.
         if (spec.steps > 0 && isIntegerGrid(spec)) info->flags |= CLAP_PARAM_IS_STEPPED;
         if (spec.labels != nullptr) info->flags |= CLAP_PARAM_IS_ENUM;
+        // perVoice(): every addressing form CLAP defines - the wrapper
+        // resolves each one to the voices it matches.
+        if (HasMidi<P> && spec.perVoice)
+            info->flags |= CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID
+                         | CLAP_PARAM_IS_MODULATABLE_PER_KEY
+                         | CLAP_PARAM_IS_MODULATABLE_PER_CHANNEL
+                         | CLAP_PARAM_IS_MODULATABLE_PER_PORT;
         info->min_value = spec.minValue;
         info->max_value = spec.maxValue;
         info->default_value = spec.defValue;
@@ -1250,10 +1621,9 @@ struct Plugin
         for (int i = 0; i < events.size(); ++i)
             paramsChanged |= s->applyBlockEvent(events[i], events[i].offset);
         if (paramsChanged) s->refreshLatency();
+        s->flushEndedVoices(out, 0);
 #if defined(DSPARK_PLUGIN_WEBVIEW)
         s->drainUiEvents(out);
-#else
-        (void) out;
 #endif
     }
 
@@ -1270,10 +1640,13 @@ struct Plugin
         double norm[kNumParams == 0 ? 1 : kNumParams];
         for (size_t i = 0; i < kNumParams; ++i)
             norm[i] = s->shadow[i].load(std::memory_order_relaxed);
+        EditorSize editorSize {};
+        const bool withSize = s->editorMemory.remembered(editorSize);
         const std::vector<uint8_t> blob = buildState(
             s->user, norm, kNumParams,
             kNumPresets > 0 ? s->currentProgram.load(std::memory_order_relaxed) : -1,
-            s->bypass.load(std::memory_order_relaxed) ? 1 : 0);
+            s->bypass.load(std::memory_order_relaxed) ? 1 : 0,
+            withSize ? &editorSize : nullptr);
         size_t pos = 0;
         while (pos < blob.size())
         {
@@ -1306,8 +1679,9 @@ struct Plugin
         loadDefaultNormalized<P>(norm);
         int program = -1;
         int bypassState = -1;
+        EditorSize editorSize { 0, 0 };
         if (!applyState(s->user, blob.data(), blob.size(), norm, &program,
-                        &bypassState))
+                        &bypassState, &editorSize))
             return false;
         bool direct = true;
         for (size_t i = 0; i < kNumParams; ++i)
@@ -1316,6 +1690,10 @@ struct Plugin
             s->currentProgram.store(program, std::memory_order_relaxed);
         if (bypassState >= 0)
             s->bypass.store(bypassState != 0, std::memory_order_relaxed);
+        // The editor size the session left: the editor opens at it next time
+        // (a state without one keeps the size this instance has).
+        if (editorSize.width > 0)
+            s->editorMemory.remember(editorSize.width, editorSize.height);
         if (direct)
             s->refreshLatency();   // restored state may imply a new lookahead
         else
@@ -1453,7 +1831,9 @@ struct Plugin
             return false;
         }
 #endif
-        const EditorSize logical = editorSizeOf<P>();
+        // The size the user left the editor at (this session or a saved
+        // one), else the declared size.
+        const EditorSize logical = s->editorMemory.current();
         s->guiWidth  = toBoundedInt(logical.width * s->guiScale + 0.5,
                                     1, static_cast<int>(kEditorMaxPixels));
         s->guiHeight = toBoundedInt(logical.height * s->guiScale + 0.5,
@@ -1473,6 +1853,16 @@ struct Plugin
         s->hostTimer = nullptr;
         s->guiTimerId = CLAP_INVALID_ID;
 #endif
+        // Keep the size the editor is closed at: some hosts resize their
+        // window without a set_size, and the window still exists here.
+        int parentW = 0, parentH = 0;
+        if (s->guiEditor.created() && s->guiEditor.queryParentSize(parentW, parentH))
+        {
+            double w = parentW;
+            double h = parentH;
+            constrainEditorSize<P>(w, h, s->guiScale);
+            s->editorMemory.remember(w / s->guiScale, h / s->guiScale);
+        }
         s->guiEditor.destroy();
         s->guiActive = false;
     }
@@ -1555,6 +1945,9 @@ struct Plugin
         s->guiWidth  = toBoundedInt(w + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         s->guiHeight = toBoundedInt(h + 0.5, 1, static_cast<int>(kEditorMaxPixels));
         s->guiEditor.setBounds(s->guiWidth, s->guiHeight);
+        // The user's size, in logical pixels: the editor reopens at it, and
+        // the state saves it for the next session.
+        s->editorMemory.remember(s->guiWidth / s->guiScale, s->guiHeight / s->guiScale);
         return true;
     }
 

@@ -1289,6 +1289,61 @@ int main(int argc, char** argv)
                    == Steinberg_kResultTrue,
                "checkSizeConstraint accepts the reported size");
 
+        // A resizable editor reopens at the size the user left, and a new
+        // instance loading the saved state (the next session) opens there.
+        if (view->lpVtbl->canResize(view) == Steinberg_kResultTrue)
+        {
+            const Steinberg_int32 w = rect.right - rect.left;
+            const Steinberg_int32 h = rect.bottom - rect.top;
+            Steinberg_ViewRect bigger { 0, 0, w + w / 2, h + h / 2 };
+            view->lpVtbl->checkSizeConstraint(view, &bigger);
+            expect(view->lpVtbl->onSize(view, &bigger) == Steinberg_kResultOk,
+                   "onSize to a larger size");
+            Steinberg_ViewRect again {};
+            if (Steinberg_IPlugView* reopened = ctrl->lpVtbl->createView(ctrl, "editor"))
+            {
+                reopened->lpVtbl->getSize(reopened, &again);
+                reopened->lpVtbl->release(reopened);
+            }
+            expect(again.right == bigger.right && again.bottom == bigger.bottom,
+                   "the editor reopens at the size the user left");
+            MemoryStream session;
+            expect(comp->lpVtbl->getState(comp,
+                       reinterpret_cast<Steinberg_IBStream*>(&session)) == Steinberg_kResultOk,
+                   "getState with the editor size");
+            void* rawNext = nullptr;
+            factory->lpVtbl->createInstance(factory, cls.cid,
+                reinterpret_cast<Steinberg_FIDString>(
+                    const_cast<Steinberg_int8*>(Steinberg_Vst_IComponent_iid)),
+                &rawNext);
+            Steinberg_ViewRect nextSize {};
+            if (auto* next = static_cast<Steinberg_Vst_IComponent*>(rawNext))
+            {
+                next->lpVtbl->initialize(next, nullptr);
+                session.pos = 0;
+                void* rawNextCtrl = nullptr;
+                if (next->lpVtbl->setState(next,
+                        reinterpret_cast<Steinberg_IBStream*>(&session)) == Steinberg_kResultOk
+                    && next->lpVtbl->queryInterface(next, Steinberg_Vst_IEditController_iid,
+                                                    &rawNextCtrl) == Steinberg_kResultOk)
+                {
+                    auto* nextCtrl = static_cast<Steinberg_Vst_IEditController*>(rawNextCtrl);
+                    if (Steinberg_IPlugView* nextView = nextCtrl->lpVtbl->createView(nextCtrl, "editor"))
+                    {
+                        nextView->lpVtbl->getSize(nextView, &nextSize);
+                        nextView->lpVtbl->release(nextView);
+                    }
+                    nextCtrl->lpVtbl->release(nextCtrl);
+                }
+                next->lpVtbl->terminate(next);
+                next->lpVtbl->release(next);
+            }
+            std::printf("      editor reopens at %d x %d in the next session\n",
+                        nextSize.right - nextSize.left, nextSize.bottom - nextSize.top);
+            expect(nextSize.right == bigger.right && nextSize.bottom == bigger.bottom,
+                   "the next session opens the editor at the saved size");
+        }
+
         void* sameView = nullptr;
         expect(view->lpVtbl->queryInterface(view, Steinberg_IPlugView_iid, &sameView)
                    == Steinberg_kResultOk && sameView == view,

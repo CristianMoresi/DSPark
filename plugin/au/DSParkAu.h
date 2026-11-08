@@ -26,6 +26,10 @@
  * Mapping notes:
  * - Parameter IDs are the same FNV-1a hashes of the stable text ids used by
  *   the VST3/CLAP backends; values travel in PLAIN units (AU convention).
+ *   Every parameter is flagged high-resolution, and a non-finite value
+ *   from the host is refused (kAudioUnitErr_InvalidParameterValue). An
+ *   immediate scheduled value reads back at once; the DSP hears it at its
+ *   offset in the next slice.
  * - The component type follows the class: Category::Instrument is an
  *   `aumu` music device (no input elements; MIDI drives it), a HasMidi
  *   effect is an `aumf` music effect, anything else stays `aufx`. The
@@ -46,11 +50,24 @@
  *   current value is accepted.
  * - State (kAudioUnitProperty_ClassInfo) wraps the shared format-agnostic
  *   container in the standard aupreset dictionary, so presets remain
- *   portable across all three backends. factoryPresets publish through
- *   kAudioUnitProperty_FactoryPresets and PresentPreset; a latency change
- *   after parameter motion notifies kAudioUnitProperty_Latency listeners.
+ *   portable across all three backends; its "name" is the current preset's
+ *   name, restored with the state (PresentPreset listeners hear of it),
+ *   and a preset of another unit (subtype / manufacturer) is refused.
+ *   factoryPresets publish through kAudioUnitProperty_FactoryPresets and
+ *   PresentPreset. A latency or tail change after parameter motion - or at
+ *   initialize - notifies the kAudioUnitProperty_Latency / TailTime
+ *   listeners on the main thread.
+ * - Render notifications (AudioUnitAddRenderNotify) run before and after
+ *   every render, with the pre/post-render flags (and the error flag on a
+ *   refused call), as the format's reference implementation runs them. A
+ *   render of another output element, or into a host buffer shorter than
+ *   the slice, is refused.
+ * - Reset clears the plugin's history and drops the MIDI queued before it.
  * - Host bypass maps to kAudioUnitProperty_BypassEffect with the same
- *   crossfade as the other backends.
+ *   crossfade as the other backends. The bypass is also a parameter: a
+ *   change through the parameter (automation, a state load) notifies the
+ *   property's listeners, and one through the property notifies the
+ *   parameter's, so the host's button and its automation lane agree.
  * - Threading: while initialized, the render thread is the only caller of
  *   the user's setParameter; AudioUnitSetParameter from another thread, the
  *   editor, ClassInfo and preset loads update the shadow and are applied at
@@ -63,7 +80,9 @@
  *   this header and the class declares `hasEditor = true`, the AU publishes
  *   kAudioUnitProperty_CocoaUI - hosts load a runtime-registered view
  *   factory from this bundle and get the same WKWebView editor as the
- *   VST3/CLAP backends; otherwise they show their generic parameter UI.
+ *   VST3/CLAP backends; otherwise they show their generic parameter UI. A
+ *   resizable editor reopens at the size the host left it (the container
+ *   view records every setFrameSize:), also in the next session.
  */
 
 #define DSPARK_PLUGIN_AU_INCLUDED 1
@@ -89,6 +108,7 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <new>
 #include <thread>
@@ -151,6 +171,8 @@ struct EditorViewSink
 {
     void (*onDealloc)(void* context) = nullptr;
     void* context = nullptr;
+    /// The host resized the container (logical points).
+    void (*onResize)(void* context, double width, double height) = nullptr;
 };
 
 inline Class editorContainerClass() noexcept;
@@ -174,6 +196,25 @@ inline void editorContainerDealloc(void* self, SEL) noexcept
         &super, sel_registerName("dealloc"));
 }
 
+/** @brief setFrameSize: of the container: NSView's own, then the owning
+ *  wrapper hears the new size (every host-driven resize passes here, whether
+ *  the host sets the frame or the window autoresizes the view). */
+inline void editorContainerSetFrameSize(void* self, SEL selector, ViewSize size) noexcept
+{
+    Class cls = editorContainerClass();
+    if (cls == nullptr) return;
+    objc_super super { static_cast<id>(self), class_getSuperclass(cls) };
+    reinterpret_cast<void (*)(objc_super*, SEL, ViewSize)>(&objc_msgSendSuper)(
+        &super, selector, size);
+    if (Ivar ivar = class_getInstanceVariable(cls, "dsparkSink"))
+    {
+        auto* sink = reinterpret_cast<EditorViewSink*>(
+            object_getIvar(static_cast<id>(self), ivar));
+        if (sink != nullptr && sink->onResize != nullptr)
+            sink->onResize(sink->context, size.width, size.height);
+    }
+}
+
 /** @brief The NSView subclass hosting the editor. Returns null when AppKit is
  *  not loaded (a faceless host like auval - which never asks for views). */
 inline Class editorContainerClass() noexcept
@@ -194,6 +235,9 @@ inline Class editorContainerClass() noexcept
         class_addIvar(c, "dsparkSink", sizeof(void*), alignof(void*) == 8 ? 3 : 2, "^v");
         class_addMethod(c, sel_registerName("dealloc"),
                         reinterpret_cast<IMP>(&editorContainerDealloc), "v@:");
+        class_addMethod(c, sel_registerName("setFrameSize:"),
+                        reinterpret_cast<IMP>(&editorContainerSetFrameSize),
+                        "v@:{CGSize=dd}");
         objc_registerClassPair(c);
         return c;
     }();
@@ -283,8 +327,8 @@ struct Plugin
                   "no audio input to process");
     static_assert(paramIdsUnique<P>(),
                   "two parameter ids share a hash32 (or collide with the "
-                  "reserved PRGM/BYPS state ids): automation and state would "
-                  "cross-wire. Rename one id.");
+                  "reserved PRGM/BYPS/EDSW/EDSH state ids): automation and state "
+                  "would cross-wire. Rename one id.");
 
     /** Component type implied by the class: aumu / aumf / aufx. */
     static OSType expectedType() noexcept
@@ -335,6 +379,33 @@ struct Plugin
     static constexpr uint32_t kMidiRingSize = 256;   // power of two
     MidiEvent midiRing[HasMidi<P> ? kMidiRingSize : 1] {};
     std::atomic<uint32_t> midiHead { 0 }, midiTail { 0 };
+    // Reset discards the MIDI queued before it (a transport stop must not
+    // replay notes into the next run): it records the ring position, the
+    // render thread skips up to it.
+    std::atomic<uint32_t> midiDiscardTo { 0 };
+    std::atomic<bool>     midiDiscard { false };
+
+    // Render notifications (AudioUnitAddRenderNotify): host callbacks run
+    // before and after every render - hosts schedule parameters from the
+    // pre-render one and meter from the post-render one. Add/remove arrive
+    // on a control thread and reach the render thread through a
+    // single-producer queue; the render thread owns the list it calls.
+    struct RenderNotify
+    {
+        AURenderCallback proc = nullptr;
+        void* refCon = nullptr;
+    };
+    static constexpr int kMaxRenderNotifies = 16;
+    RenderNotify renderNotifies[kMaxRenderNotifies] {};
+    int renderNotifyCount = 0;
+    struct NotifyCommand
+    {
+        RenderNotify target {};
+        bool add = false;
+    };
+    static constexpr uint32_t kNotifyQueueSize = 64;   // power of two
+    NotifyCommand notifyQueue[kNotifyQueueSize] {};
+    std::atomic<uint32_t> notifyHead { 0 }, notifyTail { 0 };
 
     // Sample-accurate parameter events (kAudioUnitScheduleParametersSelect
     // arrives on the render thread, right before the matching render call).
@@ -376,6 +447,14 @@ struct Plugin
     std::vector<Listener> listeners;
     CFStringRef presetName = nullptr;
 
+    /// Tail in seconds, as last reported to the host (see refreshReported).
+    std::atomic<double> cachedTail { 0.0 };
+    /// Latency in seconds the host learned at the last initialize().
+    double latencySecondsAtInit = 0.0;
+    /// The editor size the user left (kept without the editor layer too, so
+    /// a session saved where the editor ran keeps its size here).
+    EditorSizeMemory<P> editorMemory;
+
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     webview_ui::Editor<P> editor;
     void* editorContainer = nullptr;   // NSView* the HOST owns; weak here
@@ -385,7 +464,7 @@ struct Plugin
 
     ~Plugin() noexcept
     {
-        stopLatencyTick(false);   // disposing: no listener call from here
+        stopTick(false);   // disposing: no listener call from here
 #if defined(DSPARK_PLUGIN_WEBVIEW)
         teardownEditor();
 #endif
@@ -409,71 +488,128 @@ struct Plugin
             (void) idx;
     }
 
-    /** Re-reads the plugin latency after parameter motion; on a change,
-     *  updates the cache and tells kAudioUnitProperty_Latency listeners -
-     *  on the main thread. A change detected in render() (automation moved
-     *  a lookahead) only raises a flag; the main-queue tick below calls the
-     *  host's listeners, which must never run on the render thread. */
-    void refreshLatency() noexcept
+    /** Tail in seconds as the TailTime property reports it (a negative or
+     *  NaN answer from the plugin is no tail). */
+    double tailSecondsNow() const noexcept
     {
+        if constexpr (HasTail<P>)
+        {
+            const double tail = user.getTailSeconds();
+            return tail > 0.0 ? tail : 0.0;
+        }
+        else
+            return 0.0;
+    }
+
+    /** Re-reads the plugin latency and tail after parameter motion; on a
+     *  change, updates the cache and tells the kAudioUnitProperty_Latency /
+     *  TailTime listeners - on the main thread. A change detected in
+     *  render() (automation moved a lookahead or a decay) only raises a bit;
+     *  the main-queue tick below calls the host's listeners, which must
+     *  never run on the render thread. The old code never told the host
+     *  about a tail change. */
+    void refreshReported() noexcept
+    {
+        uint32_t bits = 0;
         if constexpr (HasLatency<P>)
         {
             const int now = user.getLatency();
             if (initialized && now != cachedLatency.load(std::memory_order_relaxed))
             {
                 cachedLatency.store(now, std::memory_order_relaxed);
-                if (pthread_main_np() != 0
-                    || !latencyTickRunning.load(std::memory_order_acquire))
-                    notifyProperty(kAudioUnitProperty_Latency,
-                                   kAudioUnitScope_Global, 0);
-                else
-                    latencyNotifyPending.store(true, std::memory_order_release);
+                bits |= kNotifyLatency;
             }
         }
+        if constexpr (HasTail<P>)
+        {
+            const double now = tailSecondsNow();
+            if (initialized && now != cachedTail.load(std::memory_order_relaxed))
+            {
+                cachedTail.store(now, std::memory_order_relaxed);
+                bits |= kNotifyTail;
+            }
+        }
+        if (bits != 0) announce(bits);
     }
 
-    // --- main-queue latency tick (~30 Hz, main thread) ---------------------------------
+    // --- property notifications (main thread; ~30 Hz main-queue tick) ------------------
 
-    std::atomic<bool> latencyNotifyPending { false };
-    std::atomic<bool> latencyTickRunning { false };
-    dispatch_source_t latencyTick = nullptr;
+    enum : uint32_t { kNotifyLatency = 1u, kNotifyTail = 2u, kNotifyBypass = 4u };
+    std::atomic<uint32_t> notifyPending { 0u };
+    std::atomic<bool> tickRunning { false };
+    dispatch_source_t tick = nullptr;
 
-    static void onLatencyTick(void* self)
+    /** Tells the host that the latency, the tail or the bypass changed: at
+     *  once on the main thread (or when no tick runs), else at the next tick. */
+    void announce(uint32_t bits) noexcept
+    {
+        if (pthread_main_np() != 0 || !tickRunning.load(std::memory_order_acquire))
+            deliverNotifications(bits);
+        else
+            notifyPending.fetch_or(bits, std::memory_order_release);
+    }
+
+    void deliverNotifications(uint32_t bits) noexcept
+    {
+        if ((bits & kNotifyLatency) != 0u)
+            notifyProperty(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
+        if ((bits & kNotifyTail) != 0u)
+            notifyProperty(kAudioUnitProperty_TailTime, kAudioUnitScope_Global, 0);
+        // The host's bypass button follows the property, not the bypass
+        // parameter the host itself moved (automation, a state load).
+        if ((bits & kNotifyBypass) != 0u)
+            notifyProperty(kAudioUnitProperty_BypassEffect, kAudioUnitScope_Global, 0);
+    }
+
+    static void onTick(void* self)
     {
         auto* plugin = static_cast<Plugin*>(self);
-        if (plugin->latencyNotifyPending.exchange(false, std::memory_order_acq_rel))
-            plugin->notifyProperty(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
+        const uint32_t bits = plugin->notifyPending.exchange(0u, std::memory_order_acq_rel);
+        if (bits != 0u) plugin->deliverNotifications(bits);
     }
 
-    void startLatencyTick() noexcept
+    void startTick() noexcept
     {
-        if constexpr (HasLatency<P>)
-        {
-            if (latencyTick != nullptr) return;
-            latencyTick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                                 dispatch_get_main_queue());
-            if (latencyTick == nullptr) return;
-            dispatch_set_context(latencyTick, this);
-            dispatch_source_set_event_handler_f(latencyTick, &onLatencyTick);
-            dispatch_source_set_timer(latencyTick,
-                                      dispatch_time(DISPATCH_TIME_NOW, 33 * 1000000),
-                                      33u * 1000000u, 5u * 1000000u);
-            dispatch_resume(latencyTick);
-            latencyTickRunning.store(true, std::memory_order_release);
-        }
+        if (tick != nullptr) return;
+        tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                      dispatch_get_main_queue());
+        if (tick == nullptr) return;
+        dispatch_set_context(tick, this);
+        dispatch_source_set_event_handler_f(tick, &onTick);
+        dispatch_source_set_timer(tick, dispatch_time(DISPATCH_TIME_NOW, 33 * 1000000),
+                                  33u * 1000000u, 5u * 1000000u);
+        dispatch_resume(tick);
+        tickRunning.store(true, std::memory_order_release);
     }
 
     /** Main thread (uninitialize/close): no tick runs after this returns;
-     *  a still-pending change is delivered first when @p flush is set. */
-    void stopLatencyTick(bool flush = true) noexcept
+     *  still-pending notifications are delivered first when @p flush is set. */
+    void stopTick(bool flush = true) noexcept
     {
-        if (latencyTick == nullptr) return;
-        latencyTickRunning.store(false, std::memory_order_release);
-        dispatch_source_cancel(latencyTick);
-        dispatch_release(latencyTick);
-        latencyTick = nullptr;
-        if (latencyNotifyPending.exchange(false, std::memory_order_acq_rel) && flush)
-            notifyProperty(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
+        if (tick == nullptr) return;
+        tickRunning.store(false, std::memory_order_release);
+        dispatch_source_cancel(tick);
+        dispatch_release(tick);
+        tick = nullptr;
+        const uint32_t bits = notifyPending.exchange(0u, std::memory_order_acq_rel);
+        if (bits != 0u && flush) deliverNotifications(bits);
+    }
+
+    /** Tells AU parameter listeners that one parameter moved. */
+    void notifyParameterChanged(AudioUnitParameterID id) noexcept
+    {
+        AudioUnitParameter parameter {};
+        parameter.mAudioUnit = instance;
+        parameter.mParameterID = id;
+        parameter.mScope = kAudioUnitScope_Global;
+        parameter.mElement = 0;
+        AUParameterListenerNotify(nullptr, nullptr, &parameter);
+    }
+
+    /** Sets the host bypass; true when it changed. */
+    bool setBypass(bool on) noexcept
+    {
+        return bypass.exchange(on, std::memory_order_relaxed) != on;
     }
 
     void notifyProperty(AudioUnitPropertyID id, AudioUnitScope scope,
@@ -535,6 +671,20 @@ struct Plugin
                 P::parameters[static_cast<size_t>(i)],
                 shadow[static_cast<size_t>(i)].load(std::memory_order_relaxed))));
         });
+    }
+
+    /** The current preset's name (caller releases): the one set through
+     *  PresentPreset or restored with the state, else the active factory
+     *  preset's, else "Untitled" (the format's default name). */
+    CFStringRef copyPresetName() const noexcept
+    {
+        if (presetName != nullptr)
+            return static_cast<CFStringRef>(CFRetain(presetName));
+        const char* name = "Untitled";
+        if constexpr (kNumPresets > 0)
+            if (currentPresetNumber >= 0 && currentPresetNumber < kNumPresets)
+                name = P::factoryPresets[static_cast<size_t>(currentPresetNumber)].name;
+        return CFStringCreateWithCString(nullptr, name, kCFStringEncodingUTF8);
     }
 
     /** Tells AU parameter listeners (host automation lanes, generic views)
@@ -615,6 +765,13 @@ struct Plugin
         self->editor.destroy();
     }
 
+    /** The host resized the container: keep the size (logical points) so the
+     *  next view, and the next session, open at it. */
+    static void sOnContainerResize(void* context, double width, double height) noexcept
+    {
+        static_cast<Plugin*>(context)->editorMemory.remember(width, height);
+    }
+
     /** Plugin dies first (or the host asks for a fresh view): disconnect the
      *  container so its later dealloc no longer calls back, then tear down. */
     void teardownEditor() noexcept
@@ -638,15 +795,16 @@ struct Plugin
     /** Builds the container NSView + embedded web engine. Returns the view
      *  AUTORELEASED (Cocoa factory convention: the host retains it), or null
      *  so the host falls back to its generic UI. The host's preferred size is
-     *  advisory (often 0x0); the declared editorSize wins, like the other
-     *  backends. */
+     *  advisory (often 0x0); the size the user last left the editor at (this
+     *  session or a saved one) wins, else the declared editorSize, like the
+     *  other backends. */
     void* createEditorView(double, double) noexcept
     {
         namespace og = webview_ui::objc_glue;
         teardownEditor();   // hosts may ask again without releasing the first view
         Class cls = editorContainerClass();
         if (cls == nullptr) return nullptr;   // AppKit absent: faceless host
-        const EditorSize logical = editorSizeOf<P>();
+        const EditorSize logical = editorMemory.current();
         const og::Rect frame { 0.0, 0.0, static_cast<double>(logical.width),
                                static_cast<double>(logical.height) };
         og::ObjId view = og::call(og::call(reinterpret_cast<og::ObjId>(cls), "alloc"),
@@ -660,7 +818,7 @@ struct Plugin
             og::call<void>(view, "release");
             return nullptr;
         }
-        editorSink = { &sOnContainerDealloc, this };
+        editorSink = { &sOnContainerDealloc, this, &sOnContainerResize };
         if (Ivar ivar = class_getInstanceVariable(cls, "dsparkSink"))
             object_setIvar(static_cast<id>(view),
                            ivar, reinterpret_cast<id>(&editorSink));
@@ -680,6 +838,7 @@ struct Plugin
     {
         dspark::AudioSpec spec { sampleRate, static_cast<int>(maxFrames),
                                  currentChannels };
+        const double tailBefore = cachedTail.load(std::memory_order_relaxed);
         user.prepare(spec);
         if constexpr (HasOfflineMode<P>)
             user.setOfflineRendering(offlineRender != 0);
@@ -694,18 +853,41 @@ struct Plugin
             scR.assign(maxFrames, 0.0f);
         }
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        uint32_t changed = 0;
         if constexpr (HasLatency<P>)
         {
             const int latency = user.getLatency();
             cachedLatency.store(latency, std::memory_order_relaxed);
             dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity),
                              static_cast<int>(maxFrames));
+            // The property is in seconds: a new latency or a new rate moves
+            // it. Listeners hear of it here; the old code only updated the
+            // cache, so a host that read it before initializing kept 0.
+            const double seconds = sampleRate > 0.0 ? latency / sampleRate : 0.0;
+            if (seconds != latencySecondsAtInit) changed |= kNotifyLatency;
+            latencySecondsAtInit = seconds;
         }
+        if constexpr (HasTail<P>)
+        {
+            const double tail = tailSecondsNow();
+            cachedTail.store(tail, std::memory_order_relaxed);
+            if (tail != tailBefore) changed |= kNotifyTail;
+        }
+        else
+            (void) tailBefore;
         blockEvents.clear();
         rampCount = 0;
+        if constexpr (HasMidi<P>)   // MIDI queued while uninitialized is stale
+        {
+            midiHead.store(midiTail.load(std::memory_order_acquire),
+                           std::memory_order_release);
+            midiDiscard.store(false, std::memory_order_relaxed);
+        }
+        applyNotifyCommands();   // no render runs before `initialized` below
         renderThread.store(std::thread::id {}, std::memory_order_relaxed);
-        startLatencyTick();
+        startTick();
         initialized = true;
+        if (changed != 0u) deliverNotifications(changed);   // main thread
         return noErr;
     }
 
@@ -713,17 +895,120 @@ struct Plugin
     {
         initialized = false;
         drainPending();   // no render can run now: hand edits over directly
-        stopLatencyTick();
+        stopTick();
         return noErr;
     }
 
+    /** Clears the processing history. MIDI queued before the call is
+     *  dropped (the render thread skips it), as a stop or locate requires:
+     *  the old code replayed those notes into the next run. */
     OSStatus reset() noexcept
     {
         if constexpr (HasReset<P>)
             user.reset();
         dryDelay.reset();
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        if constexpr (HasMidi<P>)
+        {
+            midiDiscardTo.store(midiTail.load(std::memory_order_acquire),
+                                std::memory_order_relaxed);
+            midiDiscard.store(true, std::memory_order_release);
+        }
         return noErr;
+    }
+
+    // --- render notifications -------------------------------------------------------
+
+    /** Adds or removes a render notification (any control thread). While
+     *  uninitialized no render runs, so the list is updated at once;
+     *  otherwise the render thread applies the change at its next call. */
+    OSStatus queueRenderNotify(AURenderCallback proc, void* refCon, bool add) noexcept
+    {
+        if (proc == nullptr) return kAudio_ParamError;
+        if (!initialized)
+        {
+            applyNotifyCommands();
+            applyNotifyCommand(RenderNotify { proc, refCon }, add);
+            return noErr;
+        }
+        const uint32_t tail = notifyTail.load(std::memory_order_relaxed);
+        const uint32_t next = (tail + 1) & (kNotifyQueueSize - 1);
+        if (next == notifyHead.load(std::memory_order_acquire))
+            return kAudio_MemFullError;   // 63 changes with no render in between
+        notifyQueue[tail] = NotifyCommand { RenderNotify { proc, refCon }, add };
+        notifyTail.store(next, std::memory_order_release);
+        return noErr;
+    }
+
+    void applyNotifyCommand(RenderNotify target, bool add) noexcept
+    {
+        int found = -1;
+        for (int i = 0; i < renderNotifyCount; ++i)
+            if (renderNotifies[i].proc == target.proc
+                && renderNotifies[i].refCon == target.refCon)
+                found = i;
+        if (add)
+        {
+            // A second add of the same pair is a no-op, as the format defines.
+            if (found < 0 && renderNotifyCount < kMaxRenderNotifies)
+                renderNotifies[renderNotifyCount++] = target;
+        }
+        else if (found >= 0)
+        {
+            for (int i = found; i + 1 < renderNotifyCount; ++i)
+                renderNotifies[i] = renderNotifies[i + 1];
+            --renderNotifyCount;
+        }
+    }
+
+    /** The queued add/remove requests, applied by the list's owner. */
+    void applyNotifyCommands() noexcept
+    {
+        uint32_t head = notifyHead.load(std::memory_order_relaxed);
+        const uint32_t tail = notifyTail.load(std::memory_order_acquire);
+        while (head != tail)
+        {
+            applyNotifyCommand(notifyQueue[head].target, notifyQueue[head].add);
+            head = (head + 1) & (kNotifyQueueSize - 1);
+        }
+        notifyHead.store(head, std::memory_order_release);
+    }
+
+    void callRenderNotifies(AudioUnitRenderActionFlags flags,
+                            const AudioTimeStamp* timeStamp, UInt32 busNumber,
+                            UInt32 frames, AudioBufferList* ioData) noexcept
+    {
+        for (int i = 0; i < renderNotifyCount; ++i)
+            renderNotifies[i].proc(renderNotifies[i].refCon, &flags, timeStamp,
+                                   busNumber, frames, ioData);
+    }
+
+    /** A slice the unit does not render: its scheduled values still take
+     *  effect (as scheduled values do in the format's reference implementation - they are
+     *  already in the shadow and reach the DSP at the next render), its
+     *  ramps are dropped. The old code left both in the list, and the next
+     *  slice replayed them at stale offsets. */
+    void discardSlice() noexcept
+    {
+        for (int i = 0; i < blockEvents.size(); ++i)
+        {
+            const BlockEvent& ev = blockEvents[i];
+            if (ev.kind == BlockEvent::Kind::Bypass)
+            {
+                if (setBypass(ev.value >= 0.5)) announce(kNotifyBypass);
+            }
+            else if (ev.kind == BlockEvent::Kind::Param)
+            {
+                if (const int idx = indexOfParamId(ev.paramId); idx >= 0)
+                {
+                    shadow[static_cast<size_t>(idx)].store(ev.value,
+                                                           std::memory_order_relaxed);
+                    pending.mark(static_cast<size_t>(idx));
+                }
+            }
+        }
+        blockEvents.clear();
+        rampCount = 0;
     }
 
     // --- stream format helpers -----------------------------------------------------
@@ -972,10 +1257,14 @@ struct Plugin
                 return kAudioUnitErr_InvalidPropertyValue;
             auto* info = static_cast<AudioUnitParameterInfo*>(outData);
             std::memset(info, 0, sizeof(*info));
+            // IsHighResolution: a host that limits the control resolution of
+            // parameters (automation, control surfaces) gives these the
+            // highest it has; the old code left every parameter without it.
             info->flags = kAudioUnitParameterFlag_IsReadable
                         | kAudioUnitParameterFlag_IsWritable
                         | kAudioUnitParameterFlag_HasCFNameString
-                        | kAudioUnitParameterFlag_CFNameRelease;
+                        | kAudioUnitParameterFlag_CFNameRelease
+                        | kAudioUnitParameterFlag_IsHighResolution;
             if (element == kBypassParamId)
             {
                 std::snprintf(info->name, sizeof(info->name), "Bypass");
@@ -1083,10 +1372,7 @@ struct Plugin
         case kAudioUnitProperty_TailTime:
         {
             if (*ioSize < sizeof(Float64)) return kAudioUnitErr_InvalidPropertyValue;
-            double tail = 0.0;
-            if constexpr (HasTail<P>)
-                tail = user.getTailSeconds();
-            *static_cast<Float64*>(outData) = tail;
+            *static_cast<Float64*>(outData) = tailSecondsNow();
             *ioSize = sizeof(Float64);
             return noErr;
         }
@@ -1107,10 +1393,7 @@ struct Plugin
             if (*ioSize < sizeof(AUPreset)) return kAudioUnitErr_InvalidPropertyValue;
             auto* preset = static_cast<AUPreset*>(outData);
             preset->presetNumber = currentPresetNumber;
-            preset->presetName = presetName != nullptr
-                ? static_cast<CFStringRef>(CFRetain(presetName))
-                : CFStringCreateWithCString(nullptr, "Untitled",
-                                            kCFStringEncodingUTF8);
+            preset->presetName = copyPresetName();
             *ioSize = sizeof(AUPreset);
             return noErr;
         }
@@ -1121,10 +1404,13 @@ struct Plugin
             double norm[kNumParams == 0 ? 1 : kNumParams];
             for (size_t i = 0; i < kNumParams; ++i)
                 norm[i] = shadow[i].load(std::memory_order_relaxed);
+            EditorSize editorSize {};
+            const bool withSize = editorMemory.remembered(editorSize);
             const std::vector<uint8_t> blob = buildState(
                 user, norm, kNumParams,
                 kNumPresets > 0 ? currentPresetNumber : -1,
-                bypass.load(std::memory_order_relaxed) ? 1 : 0);
+                bypass.load(std::memory_order_relaxed) ? 1 : 0,
+                withSize ? &editorSize : nullptr);
 
             CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
                 nullptr, 0, &kCFTypeDictionaryKeyCallBacks,
@@ -1141,10 +1427,11 @@ struct Plugin
             putInt("type", static_cast<SInt32>(expectedType()));
             putInt("subtype", static_cast<SInt32>(subtype));
             putInt("manufacturer", static_cast<SInt32>(manufacturer));
-            CFStringRef nameKey = CFSTR("name");
-            CFStringRef nameVal = CFStringCreateWithCString(
-                nullptr, P::descriptor.name, kCFStringEncodingUTF8);
-            CFDictionarySetValue(dict, nameKey, nameVal);
+            // "name" is the PRESET's name (the aupreset convention hosts
+            // display and the reference implementation writes); the old code
+            // wrote the plugin's.
+            CFStringRef nameVal = copyPresetName();
+            CFDictionarySetValue(dict, CFSTR("name"), nameVal);
             CFRelease(nameVal);
             CFDataRef data = CFDataCreate(nullptr, blob.data(),
                                           static_cast<CFIndex>(blob.size()));
@@ -1272,7 +1559,7 @@ struct Plugin
                 if (preset->presetNumber >= kNumPresets)
                     return kAudioUnitErr_InvalidPropertyValue;
                 applyFactoryPresetIdx(preset->presetNumber);
-                refreshLatency();
+                refreshReported();
                 notifyAllParameters();
                 if (presetName != nullptr) CFRelease(presetName);
                 presetName = preset->presetName != nullptr
@@ -1318,8 +1605,11 @@ struct Plugin
         case kAudioUnitProperty_BypassEffect:
             if (inData == nullptr || inSize < sizeof(UInt32))
                 return kAudioUnitErr_InvalidPropertyValue;
-            bypass.store(*static_cast<const UInt32*>(inData) != 0,
-                         std::memory_order_relaxed);
+            // The bypass is also a parameter: its listeners (an automation
+            // lane, the generic view) follow the host's button. The old code
+            // left them showing the previous state.
+            if (setBypass(*static_cast<const UInt32*>(inData) != 0))
+                notifyParameterChanged(kBypassParamId);
             return noErr;
         case kAudioUnitProperty_SetRenderCallback:
         {
@@ -1355,6 +1645,21 @@ struct Plugin
             if (plist == nullptr || CFGetTypeID(plist) != CFDictionaryGetTypeID())
                 return kAudioUnitErr_InvalidPropertyValue;
             auto dict = static_cast<CFDictionaryRef>(plist);
+            // A preset of another unit is refused, as the format requires: the old
+            // code loaded any dictionary carrying this format's key - a
+            // preset of a different DSPark plugin fed this one its user
+            // section.
+            auto numberIs = [&](CFStringRef key, OSType expected) {
+                auto number = static_cast<CFNumberRef>(CFDictionaryGetValue(dict, key));
+                if (number == nullptr) return true;   // absent: tolerated
+                SInt32 value = 0;
+                return CFGetTypeID(number) == CFNumberGetTypeID()
+                    && CFNumberGetValue(number, kCFNumberSInt32Type, &value)
+                    && static_cast<OSType>(value) == expected;
+            };
+            if (!numberIs(CFSTR("subtype"), subtype)
+                || !numberIs(CFSTR("manufacturer"), manufacturer))
+                return kAudioUnitErr_InvalidPropertyValue;
             auto data = static_cast<CFDataRef>(
                 CFDictionaryGetValue(dict, CFSTR("dspark-state")));
             if (data == nullptr || CFGetTypeID(data) != CFDataGetTypeID())
@@ -1365,19 +1670,28 @@ struct Plugin
             loadDefaultNormalized<P>(norm);
             int program = -1;
             int bypassState = -1;
+            EditorSize editorSize { 0, 0 };
             if (applyState(user,
                            CFDataGetBytePtr(data),
                            static_cast<size_t>(CFDataGetLength(data)), norm,
-                           &program, &bypassState))
+                           &program, &bypassState, &editorSize))
             {
                 for (size_t i = 0; i < kNumParams; ++i)
                     applyFromAnyThread(static_cast<int>(i), norm[i]);
-                if (kNumPresets > 0 && program >= 0 && program < kNumPresets)
-                    currentPresetNumber = program;
-                if (bypassState >= 0)
-                    bypass.store(bypassState != 0, std::memory_order_relaxed);
-                refreshLatency();   // restored state may imply a new lookahead
+                currentPresetNumber =
+                    kNumPresets > 0 && program >= 0 && program < kNumPresets ? program : -1;
+                // The preset name travels with the state (the host shows it).
+                auto name = static_cast<CFStringRef>(CFDictionaryGetValue(dict, CFSTR("name")));
+                if (presetName != nullptr) CFRelease(presetName);
+                presetName = name != nullptr && CFGetTypeID(name) == CFStringGetTypeID()
+                           ? static_cast<CFStringRef>(CFRetain(name)) : nullptr;
+                if (bypassState >= 0 && setBypass(bypassState != 0))
+                    announce(kNotifyBypass);
+                if (editorSize.width > 0)
+                    editorMemory.remember(editorSize.width, editorSize.height);
+                refreshReported();   // restored state may imply a new lookahead
                 notifyAllParameters();
+                notifyProperty(kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0);
             }
             return noErr;
         }
@@ -1410,16 +1724,20 @@ struct Plugin
                           AudioUnitParameterValue value) noexcept
     {
         if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidParameter;
+        // A non-finite value is refused, as the format requires: the plain ->
+        // normalized mapping sends NaN to 0 and +Inf to 1, so the old code
+        // moved the parameter to an end of its range.
+        if (!std::isfinite(value)) return kAudioUnitErr_InvalidParameterValue;
         if (id == kBypassParamId)
         {
-            bypass.store(value >= 0.5f, std::memory_order_relaxed);
+            if (setBypass(value >= 0.5f)) announce(kNotifyBypass);
             return noErr;
         }
         const int idx = indexOfParamId(id);
         if (idx < 0) return kAudioUnitErr_InvalidParameter;
         if (applyFromAnyThread(idx,
                 toNormalized(P::parameters[static_cast<size_t>(idx)], value)))
-            refreshLatency();
+            refreshReported();
         return noErr;
     }
 
@@ -1671,27 +1989,85 @@ struct Plugin
         bypassMix = mix;
     }
 
+    /**
+     * The render selector: validates the call, runs the host's render
+     * notifications around the slice (pre-render first: hosts schedule the
+     * slice's parameters from it) and renders. As in the format's reference
+     * implementation, a refused call
+     * still ends with a post-render notification carrying the error flag,
+     * and the events scheduled for a slice that does not render never reach
+     * a later one (see discardSlice).
+     */
     OSStatus render(AudioUnitRenderActionFlags* ioFlags,
                     const AudioTimeStamp* timeStamp, UInt32 busNumber,
                     UInt32 frames, AudioBufferList* ioData) noexcept
     {
-        (void) busNumber;
-        if (ioData == nullptr || frames == 0) return noErr;
-        if (!initialized) return kAudioUnitErr_Uninitialized;
+        if (ioData == nullptr)
+        {
+            discardSlice();
+            return kAudio_ParamError;
+        }
+        // One output element. Rendering any other (the old code ignored the
+        // number) ran the DSP a second time in the same cycle.
+        if (busNumber != 0)
+        {
+            discardSlice();
+            return kAudioUnitErr_InvalidElement;
+        }
+        if (!initialized)
+        {
+            discardSlice();
+            return kAudioUnitErr_Uninitialized;
+        }
+
+        // FTZ/DAZ for the whole callback (the notifications included):
+        // DSPark processors guard their own hot loops, this covers user DSP
+        // in hosts that do not set it.
+        dspark::DenormalGuard denormalGuard;
+
+        applyNotifyCommands();   // this thread owns the notification list
+        using Flags = AudioUnitRenderActionFlags;
+        const Flags flags = ioFlags != nullptr ? *ioFlags : Flags { 0 };
+        constexpr Flags kPre = static_cast<Flags>(kAudioUnitRenderAction_PreRender);
+        constexpr Flags kPost = static_cast<Flags>(kAudioUnitRenderAction_PostRender);
+        constexpr Flags kError = static_cast<Flags>(kAudioUnitRenderAction_PostRenderError);
+        auto refuse = [&](OSStatus error) noexcept {
+            discardSlice();
+            callRenderNotifies(flags | kPost | kError, timeStamp, busNumber, frames, ioData);
+            return error;
+        };
         // Bound by the property and by what initialize() allocated (the
         // property cannot change while initialized; the second test is a
         // last guard for the buffers).
         if (frames > maxFrames || frames > pullL.size())
-            return kAudioUnitErr_TooManyFramesToProcess;
+            return refuse(kAudioUnitErr_TooManyFramesToProcess);
+        // A host buffer shorter than the slice is refused, as the format requires:
+        // the old code wrote `frames` samples into it regardless.
+        const UInt32 bytes = frames * static_cast<UInt32>(sizeof(float));
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; ++b)
+            if (ioData->mBuffers[b].mData != nullptr && ioData->mBuffers[b].mDataByteSize < bytes)
+                return refuse(kAudio_ParamError);
 
-        // FTZ/DAZ for the whole callback: DSPark processors guard their own
-        // hot loops, this covers user DSP in hosts that do not set it.
-        dspark::DenormalGuard denormalGuard;
+        callRenderNotifies(flags | kPre, timeStamp, busNumber, frames, ioData);
+        OSStatus status = noErr;
+        if (frames == 0)
+            discardSlice();
+        else
+            status = renderSlice(timeStamp, frames, ioData);
+        callRenderNotifies(flags | kPost | (status != noErr ? kError : Flags { 0 }),
+                           timeStamp, busNumber, frames, ioData);
+        return status;
+    }
 
+    /** One validated slice of @p frames (at least one). */
+    OSStatus renderSlice(const AudioTimeStamp* timeStamp, UInt32 frames,
+                         AudioBufferList* ioData) noexcept
+    {
         // This thread now owns setParameter; first apply what other threads
         // handed over, so the slice's scheduled events below still win.
         renderThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
         bool paramsChanged = drainPending();
+        bool bypassChanged = false;
 
         forwardTransport();
 
@@ -1703,6 +2079,14 @@ struct Plugin
         {
             uint32_t head = midiHead.load(std::memory_order_relaxed);
             const uint32_t tail = midiTail.load(std::memory_order_acquire);
+            if (midiDiscard.exchange(false, std::memory_order_acquire))
+            {
+                // Skip what a Reset found queued - only forward: a slice
+                // rendered between the Reset's two stores may be past it.
+                const uint32_t to = midiDiscardTo.load(std::memory_order_relaxed);
+                constexpr uint32_t mask = kMidiRingSize - 1;
+                if (((to - head) & mask) <= ((tail - head) & mask)) head = to;
+            }
             while (head != tail)
             {
                 BlockEvent ev {};
@@ -1728,7 +2112,7 @@ struct Plugin
             switch (ev.kind)
             {
             case BlockEvent::Kind::Bypass:
-                bypass.store(ev.value >= 0.5, std::memory_order_relaxed);
+                bypassChanged |= setBypass(ev.value >= 0.5);
                 return false;
             case BlockEvent::Kind::Midi:
                 if constexpr (HasMidi<P>)
@@ -1751,7 +2135,8 @@ struct Plugin
         };
         auto finish = [&]() noexcept {
             events.clear();
-            if (paramsChanged) refreshLatency();
+            if (paramsChanged) refreshReported();
+            if (bypassChanged) announce(kNotifyBypass);
         };
 
         const UInt32 width = static_cast<UInt32>(currentChannels);
@@ -1881,7 +2266,6 @@ struct Plugin
         }
 
         finish();
-        (void) ioFlags;
         return noErr;
     }
 };
@@ -2002,11 +2386,14 @@ struct Component
         return noErr;
     }
 
-    static OSStatus sAddRenderNotify(void*, AURenderCallback, void*) noexcept
-    { return noErr; }
+    /** Render notifications are honoured (the old selectors accepted and
+     *  dropped them, so a host scheduling parameters or metering from a
+     *  pre/post-render callback got nothing). */
+    static OSStatus sAddRenderNotify(void* self, AURenderCallback proc, void* refCon) noexcept
+    { return fromSelf(self)->state->queueRenderNotify(proc, refCon, true); }
 
-    static OSStatus sRemoveRenderNotify(void*, AURenderCallback, void*) noexcept
-    { return noErr; }
+    static OSStatus sRemoveRenderNotify(void* self, AURenderCallback proc, void* refCon) noexcept
+    { return fromSelf(self)->state->queueRenderNotify(proc, refCon, false); }
 
     /** Scheduled parameter events keep their buffer offsets: AUv2 calls
      *  this on the render thread right before the matching render, so the
@@ -2018,11 +2405,23 @@ struct Component
                                         UInt32 numEvents) noexcept
     {
         auto* state = fromSelf(self)->state;
+        // A non-finite value refuses the whole call, as the format requires (NaN
+        // used to map to the bottom of the range).
+        for (UInt32 i = 0; events != nullptr && i < numEvents; ++i)
+        {
+            const auto& ev = events[i];
+            if (ev.eventType == kParameterEvent_Immediate
+                    ? !std::isfinite(ev.eventValues.immediate.value)
+                    : (ev.eventType == kParameterEvent_Ramped
+                       && (!std::isfinite(ev.eventValues.ramp.startValue)
+                           || !std::isfinite(ev.eventValues.ramp.endValue))))
+                return kAudioUnitErr_InvalidParameterValue;
+        }
         // Immediate points (bypass included, as a timestamped event so its
         // crossfade starts where it lands) go into the block list; the list
         // merges past its capacity instead of dropping the newest points
         // (the old fixed array ignored every event after the 256th).
-        auto push = [&](AudioUnitParameterID id, float plain, SInt32 offset) {
+        auto push = [&](AudioUnitParameterID id, float plain, SInt32 offset, bool immediate) {
             BlockEvent ev {};
             ev.offset = offset < 0 ? 0 : offset;
             if (id == kBypassParamId)
@@ -2038,6 +2437,11 @@ struct Component
                 ev.kind = BlockEvent::Kind::Param;
                 ev.paramId = id;
                 ev.value = toNormalized(P::parameters[static_cast<size_t>(idx)], plain);
+                // The host reads an immediate value back at once (the format sets
+                // it when scheduled); the DSP still hears it at its offset.
+                if (immediate)
+                    state->shadow[static_cast<size_t>(idx)].store(ev.value,
+                                                                  std::memory_order_relaxed);
             }
             state->blockEvents.add(ev);
         };
@@ -2047,7 +2451,7 @@ struct Component
             if (ev.scope != kAudioUnitScope_Global) continue;
             if (ev.eventType == kParameterEvent_Immediate)
                 push(ev.parameter, ev.eventValues.immediate.value,
-                     static_cast<SInt32>(ev.eventValues.immediate.bufferOffset));
+                     static_cast<SInt32>(ev.eventValues.immediate.bufferOffset), true);
             else if (ev.eventType == kParameterEvent_Ramped)
             {
                 // Kept whole: render() evaluates it against the slice length.
@@ -2059,7 +2463,8 @@ struct Component
                 else
                     push(ev.parameter, ev.eventValues.ramp.endValue,
                          ev.eventValues.ramp.startBufferOffset
-                             + static_cast<SInt32>(ev.eventValues.ramp.durationInFrames));
+                             + static_cast<SInt32>(ev.eventValues.ramp.durationInFrames),
+                         false);
             }
         }
         return noErr;

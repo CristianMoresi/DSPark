@@ -117,8 +117,27 @@ struct SmokeHost
         &sRegisterTimer, &sUnregisterTimer
     };
 
+    // The gui host extension: resize requests are recorded and accepted.
+    uint32_t resizeRequests = 0, requestedW = 0, requestedH = 0;
+    static void sResizeHintsChanged(const clap_host_t*) {}
+    static bool sRequestResize(const clap_host_t* h, uint32_t width, uint32_t height)
+    {
+        auto* s = self(h);
+        ++s->resizeRequests;
+        s->requestedW = width;
+        s->requestedH = height;
+        return true;
+    }
+    static bool sRequestShow(const clap_host_t*) { return true; }
+    static bool sRequestHide(const clap_host_t*) { return true; }
+    static void sClosed(const clap_host_t*, bool) {}
+    inline static const clap_host_gui_t kGui = {
+        &sResizeHintsChanged, &sRequestResize, &sRequestShow, &sRequestHide, &sClosed
+    };
+
     static const void* sGetExtension(const clap_host_t*, const char* id)
     {
+        if (std::strcmp(id, CLAP_EXT_GUI) == 0) return &kGui;
         if (std::strcmp(id, CLAP_EXT_TIMER_SUPPORT) == 0) return &kTimer;
         if (std::strcmp(id, CLAP_EXT_LATENCY) == 0) return &kLatency;
         if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) return &kParams;
@@ -278,6 +297,22 @@ struct EventList
         ev.channel = -1;
         ev.key = -1;
         ev.amount = amount;
+        push(ev);
+    }
+    /// A per-note value for one voice, addressed by its note id.
+    void voiceValue(uint32_t paramId, double value, uint32_t time, int32_t noteId)
+    {
+        clap_event_param_value_t ev {};
+        ev.header.size = sizeof(ev);
+        ev.header.time = time;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.type = CLAP_EVENT_PARAM_VALUE;
+        ev.param_id = paramId;
+        ev.note_id = noteId;
+        ev.port_index = -1;
+        ev.channel = -1;
+        ev.key = -1;
+        ev.value = value;
         push(ev);
     }
     /// A note expression addressed by (channel, key).
@@ -1117,14 +1152,36 @@ int main(int argc, char** argv)
             const float modulated = voicePeak();
             events.expression(CLAP_NOTE_EXPRESSION_VOLUME, 0.5, 0, 0, 69);
             const float expressed = voicePeak();
+            // Per-note automation: the voice's own value (0.75) plus its own
+            // modulation (-0.5); the parameter itself stays at 1.
+            uint32_t perNoteFlags = 0;
+            for (uint32_t i = 0; i < numParams; ++i)
+            {
+                clap_param_info_t pi {};
+                if (params->get_info(plugin, i, &pi) && pi.id == gainId)
+                    perNoteFlags = pi.flags & (CLAP_PARAM_IS_AUTOMATABLE_PER_NOTE_ID
+                                               | CLAP_PARAM_IS_AUTOMATABLE_PER_KEY
+                                               | CLAP_PARAM_IS_AUTOMATABLE_PER_CHANNEL);
+            }
+            events.voiceValue(gainId, 0.75, 0, 7);
+            const float automated = voicePeak();
+            double gainAfter = 0.0;
+            params->get_value(plugin, gainId, &gainAfter);
             g_noteEnds.clear();
             events.noteOff(69, 0);
             processOnce();
-            std::printf("      voice peak %.3f -> per-voice gain %.3f -> volume expression %.3f\n",
-                        plainVoice, modulated, expressed);
+            std::printf("      voice peak %.3f -> per-voice gain %.3f -> volume expression %.3f"
+                        " -> per-note value %.3f (parameter %.2f)\n",
+                        plainVoice, modulated, expressed, automated, gainAfter);
             expect(std::fabs(plainVoice - 0.5f) < 0.01f && std::fabs(modulated - 0.25f) < 0.01f
                        && std::fabs(expressed - 0.125f) < 0.01f,
                    "per-voice modulation and a note expression reach the voice");
+            expect(perNoteFlags == (CLAP_PARAM_IS_AUTOMATABLE_PER_NOTE_ID
+                                    | CLAP_PARAM_IS_AUTOMATABLE_PER_KEY
+                                    | CLAP_PARAM_IS_AUTOMATABLE_PER_CHANNEL)
+                       && std::fabs(automated - 0.0625f) < 0.01f
+                       && std::fabs(gainAfter - 1.0) < 1e-9,
+                   "per-note automation sets the voice, not the parameter");
             expect(g_noteEnds.size() == 1 && g_noteEnds[0].note_id == 7
                        && g_noteEnds[0].key == 69,
                    "the voice's end reaches the host (NOTE_END with its note id)");
@@ -1211,6 +1268,21 @@ int main(int argc, char** argv)
                    "the editor reopens at the size the user left");
             ByteOStream session;
             expect(state->save(plugin, &session.iface), "state save with the editor size");
+            // A state loaded while the editor exists asks the host to resize
+            // it to the state's size (the old wrapper only remembered it).
+            expect(gui->set_size(plugin, width, height), "gui set_size back");
+            smokeHost.resizeRequests = 0;
+            ByteIStream reload;
+            reload.bytes = session.bytes;
+            expect(state->load(plugin, &reload.iface), "state load with the editor open");
+            uint32_t liveW = 0, liveH = 0;
+            gui->get_size(plugin, &liveW, &liveH);
+            std::printf("      state load with the editor open: %u resize request(s) to %u x %u,"
+                        " editor %u x %u\n", smokeHost.resizeRequests, smokeHost.requestedW,
+                        smokeHost.requestedH, liveW, liveH);
+            expect(smokeHost.resizeRequests == 1 && smokeHost.requestedW == bigW
+                       && smokeHost.requestedH == bigH && liveW == bigW && liveH == bigH,
+                   "a state loaded with the editor open resizes it");
             const clap_plugin_t* next = factory->create_plugin(factory, &smokeHost.host,
                                                                desc->id);
             expect(next != nullptr && next->init(next), "a second instance");

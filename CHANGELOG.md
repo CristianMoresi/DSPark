@@ -6,6 +6,34 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Plugin layer, VST3 note expressions: a class that declares
+  `static constexpr uint32_t noteExpressions = dspark::plugin::expressions(...)`
+  offers those expressions (volume, pan, tuning, vibrato, expression,
+  brightness) through `INoteExpressionController`, and each
+  `NoteExpressionValueEvent` reaches `handleMidiEvent` as a
+  `MidiEvent::Type::NoteExpression` on the voice its note id names, in the
+  same units as CLAP (volume a linear gain 0..4, tuning in semitones); a
+  NoteOn's own tuning arrives as the voice's first Tuning expression. A CLAP
+  build of a declaring class delivers only the declared types. Before, VST3
+  hosts could send no expression at all.
+- Plugin layer, CLAP per-note automation: a `perVoice()` parameter also
+  declares per-note-id, per-key and per-channel automation; an addressed
+  `CLAP_EVENT_PARAM_VALUE` sets the matching voices' own value (the
+  parameter's value stays as it is), and each voice's `NoteModulation`
+  carries its own value (else the parameter's) plus its own modulation
+  (else the global one). Before, an addressed value moved the global value.
+- AU: `MusicDeviceMIDIEventList` (Universal MIDI Packets, MIDI 1.0 and 2.0
+  channel voice messages) and `kAudioUnitProperty_AudioUnitMIDIProtocol`
+  (MIDI 2.0) on SDK 12 and later, so MIDI 2.0 data keeps its resolution
+  (65536 velocity levels instead of 127; 32-bit controllers and bend);
+  `kAudioUnitProperty_LastRenderError` (the first refused or failed render
+  since the last read, listeners told on the main thread) and
+  `kAudioUnitProperty_ShouldAllocateBuffer` per element (an input set to
+  false is pulled without lent buffers). Before, the three properties and
+  the selector were refused.
+- Plugin layer: a state the host loads while the editor is open resizes it
+  at once (VST3 `IPlugFrame::resizeView`, CLAP `request_resize`, the AU
+  container view); before, the loaded size applied at the next opening.
 - Plugin layer, CLAP per-voice signals: `perVoice(param(...))` marks a
   parameter the host may modulate voice by voice. It declares per-note-id,
   per-key, per-channel and per-port modulation, and each addressed
@@ -674,6 +702,17 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- AU: MIDI from several threads at once (a host's MIDI thread, its render
+  thread, an on-screen keyboard) is no longer lost: the MIDI queue takes any
+  number of producers (one compare-exchange per event). The single-producer
+  ring lost 132 of 32000 events pushed by two threads and 176 to 890 of
+  64000 pushed by four (and duplicated one); none now. A push costs 5.5 ns
+  instead of 2.5 ns.
+- CLAP: every voice the host starts receives exactly one NOTE_END. Past the
+  128 voices of the table a new voice retires the oldest (a released one
+  first) with its NOTE_END; before, voices past 128 were not tracked and
+  never ended for the host (128 NOTE_ENDs for 200 voices), which kept their
+  modulators running.
 - AU host contract: every parameter is flagged high-resolution (a host
   that limits control resolution now gives it the highest it has); a NaN or
   infinite value from `AudioUnitSetParameter` or `AudioUnitScheduleParameters`

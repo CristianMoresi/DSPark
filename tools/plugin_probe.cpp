@@ -13,10 +13,12 @@
 //                   bend (+/-2 st), CC1 adds 0.1 DC, CC74 adds 0.2 DC
 //                   from its sample offset on (the in-block position of a
 //                   controller event shows up as an exact step)
-//   - per voice     "gain" is perVoice(): a CLAP per-voice modulation
-//                   scales the voice by the value it delivers, a Volume
-//                   note expression scales it too, and isVoiceActive lets
-//                   the host see the voice end (NOTE_END)
+//   - per voice     "gain" is perVoice(): a CLAP per-voice modulation or
+//                   per-note value scales the voice by the value it
+//                   delivers, a Volume note expression (CLAP, and VST3
+//                   through the declared noteExpressions) scales it too,
+//                   and isVoiceActive lets the host see the voice end
+//                   (NOTE_END)
 //   - lookahead     a toggle that flips getLatency() 0 <-> 64 and delays the
 //                   input by exactly those 64 samples, so the smokes can
 //                   watch the latency-changed notification and check that
@@ -52,6 +54,9 @@ struct ProbePlugin
     static constexpr auto factoryPresets = dspark::plugin::presets(
         dspark::plugin::preset("Unity", 1.0f, 0.0f),
         dspark::plugin::preset("Half",  0.5f, 0.0f));
+
+    static constexpr uint32_t noteExpressions =
+        dspark::plugin::expressions(dspark::plugin::MidiEvent::ExpressionType::Volume);
 
     void prepare(const dspark::AudioSpec& spec) { sampleRate_ = spec.sampleRate; }
 

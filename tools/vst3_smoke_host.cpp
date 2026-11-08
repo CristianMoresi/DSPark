@@ -427,6 +427,28 @@ struct EventList
         e.Steinberg_Vst_Event_noteOff.pitch = pitch;
         events.push_back(e);
     }
+    void noteOnWithId(Steinberg_int16 pitch, float velocity, Steinberg_int32 offset,
+                      Steinberg_int32 noteId)
+    {
+        noteOn(pitch, velocity, offset);
+        events.back().Steinberg_Vst_Event_noteOn.noteId = noteId;
+    }
+    void noteOffWithId(Steinberg_int16 pitch, Steinberg_int32 offset, Steinberg_int32 noteId)
+    {
+        noteOff(pitch, offset);
+        events.back().Steinberg_Vst_Event_noteOff.noteId = noteId;
+    }
+    void expression(Steinberg_Vst_NoteExpressionTypeID type, Steinberg_int32 noteId,
+                    double value, Steinberg_int32 offset)
+    {
+        Steinberg_Vst_Event e {};
+        e.type = Steinberg_Vst_Event_EventTypes_kNoteExpressionValueEvent;
+        e.sampleOffset = offset;
+        e.Steinberg_Vst_Event_noteExpressionValue.typeId = type;
+        e.Steinberg_Vst_Event_noteExpressionValue.noteId = noteId;
+        e.Steinberg_Vst_Event_noteExpressionValue.value = value;
+        events.push_back(e);
+    }
     void polyPressure(Steinberg_int16 pitch, float pressure, Steinberg_int32 offset)
     {
         Steinberg_Vst_Event e {};
@@ -1228,6 +1250,43 @@ int main(int argc, char** argv)
             processOnce();
         }
 
+        // 19) Note expressions: the probe declares Volume, so the host sees
+        //     exactly one through INoteExpressionController, and a Volume
+        //     expression of 0.125 (gain 0.5) on the voice's note id halves
+        //     its peak. The old wrapper had no such interface and dropped
+        //     every expression event.
+        {
+            void* rawNe = nullptr;
+            ctrl->lpVtbl->queryInterface(ctrl, Steinberg_Vst_INoteExpressionController_iid,
+                                         &rawNe);
+            Steinberg_int32 offered = -1;
+            if (rawNe != nullptr)
+            {
+                auto* ne = static_cast<Steinberg_Vst_INoteExpressionController*>(rawNe);
+                offered = ne->lpVtbl->getNoteExpressionCount(ne, 0, 0);
+                ne->lpVtbl->release(ne);
+            }
+            auto peak = [&]() {
+                processOnce();
+                processOnce();
+                float p = 0.0f;
+                for (int i = 0; i < 512; ++i) p = std::fmax(p, std::fabs(outL[static_cast<size_t>(i)]));
+                return p;
+            };
+            fillInput(0.0f);
+            events.noteOnWithId(69, 0.5f, 0, 9);
+            const float plain = peak();
+            events.expression(Steinberg_Vst_NoteExpressionTypeIDs_kVolumeTypeID, 9, 0.125, 0);
+            const float quieter = peak();
+            events.noteOffWithId(69, 0, 9);
+            processOnce();
+            std::printf("      note expressions offered: %d; voice peak %.3f -> volume 0.125: %.3f\n",
+                        static_cast<int>(offered), plain, quieter);
+            expect(offered == 1 && std::fabs(plain - 0.5f) < 0.01f
+                       && std::fabs(quieter - 0.25f) < 0.01f,
+                   "a declared note expression reaches the voice its note id names");
+        }
+
         data.processContext = nullptr;
         context.state = 0;
     }
@@ -1342,6 +1401,26 @@ int main(int argc, char** argv)
                         nextSize.right - nextSize.left, nextSize.bottom - nextSize.top);
             expect(nextSize.right == bigger.right && nextSize.bottom == bigger.bottom,
                    "the next session opens the editor at the saved size");
+
+            // A state loaded while a view exists hands it the state's size
+            // at once (an attached view asks its frame through resizeView;
+            // the old wrapper kept the size until the next view).
+            if (Steinberg_IPlugView* live = ctrl->lpVtbl->createView(ctrl, "editor"))
+            {
+                Steinberg_ViewRect original { 0, 0, w, h };
+                live->lpVtbl->onSize(live, &original);
+                session.pos = 0;
+                expect(comp->lpVtbl->setState(comp,
+                           reinterpret_cast<Steinberg_IBStream*>(&session)) == Steinberg_kResultOk,
+                       "setState with a view open");
+                Steinberg_ViewRect liveSize {};
+                live->lpVtbl->getSize(live, &liveSize);
+                std::printf("      state load with a view open: view %d x %d\n",
+                            liveSize.right - liveSize.left, liveSize.bottom - liveSize.top);
+                expect(liveSize.right == bigger.right && liveSize.bottom == bigger.bottom,
+                       "a state loaded with a view open resizes it");
+                live->lpVtbl->release(live);
+            }
         }
 
         void* sameView = nullptr;

@@ -24,9 +24,10 @@
  * - **Single-component plugin**: one object implements IComponent,
  *   IAudioProcessor and IEditController (the layout hosts use for the vast
  *   majority of plugins); the COM "lenses" are consecutive vtable pointers
- *   and queryInterface hands out the right one. IUnitInfo (factory presets)
- *   and IMidiMapping (MIDI plugins) ride two more lenses, surfaced only
- *   when the plugin class declares the matching capability.
+ *   and queryInterface hands out the right one. IUnitInfo (factory presets),
+ *   IMidiMapping (MIDI plugins) and INoteExpressionController (declared
+ *   noteExpressions) ride three more lenses, surfaced only when the plugin
+ *   class declares the matching capability.
  * - **Parameters**: host ParamIDs are FNV-1a hashes of the stable text ids
  *   (never indices: reordering parameters between versions must not break
  *   automation). A wrapper-owned Bypass parameter (kIsBypass) is always
@@ -40,7 +41,12 @@
  *   width. Category::Instrument drops the audio inputs entirely and
  *   HasMidi adds an event input bus (notes natively; every CC, channel
  *   pressure and pitch bend through IMidiMapping proxy parameters, the
- *   VST3 scheme for MIDI controllers).
+ *   VST3 scheme for MIDI controllers). A class that declares
+ *   noteExpressions offers those to the host (volume, pan, tuning,
+ *   vibrato, expression, brightness) and receives them as
+ *   MidiEvent::Type::NoteExpression, resolved from the host's note id to
+ *   the voice's channel and key; a NoteOn's own tuning arrives as the
+ *   voice's first Tuning expression.
  * - **Transport**: when the class implements setTransport, the wrapper
  *   declares its needs through IProcessContextRequirements and forwards the
  *   host ProcessContext once per block.
@@ -62,7 +68,8 @@
  *   an IPlugView embedding the WebView editor (with content-scale support);
  *   otherwise hosts show their generic parameter UI. A resizable editor
  *   reopens at the size the user left, also in the next session (the size
- *   rides in the state).
+ *   rides in the state); a state loaded while the editor is open resizes
+ *   it through IPlugFrame::resizeView.
  */
 
 #define DSPARK_PLUGIN_VST3_INCLUDED 1
@@ -77,8 +84,13 @@
 
 #include "vst3_c_api.h"
 
+#include <array>
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <thread>
@@ -477,6 +489,118 @@ inline MidiEvent midiProxyToEvent(uint32_t id, double normalized, int offset) no
     return ev;
 }
 
+// -- note expressions ---------------------------------------------------------------
+
+/**
+ * @brief The notes the host started, by VST3 note id. A note expression event
+ * names its note by id only, while MidiEvent names a voice by channel, key
+ * and id, so the wrapper keeps the id -> (channel, key) of every NoteOn in an
+ * open-addressed table (home slot: the id's low bits; host ids usually count
+ * up, so consecutive notes land in consecutive slots). A note keeps its entry
+ * past its NoteOff - an expression may shape the release - until a newer
+ * note needs the slot; only when every slot holds a sounding note does one
+ * give way. Slots are never emptied, so a probe chain never breaks. Audio
+ * thread only; fixed capacity, no allocation, O(1) per note in practice.
+ */
+class NoteIdMap
+{
+public:
+    static constexpr uint32_t kCapacity = 256;   // power of two
+
+    void clear() noexcept
+    {
+        for (auto& entry : entries_) entry.noteId = -1;
+    }
+
+    /** A NoteOn with host note id @p noteId (ignored when negative). */
+    void noteOn(int32_t noteId, int channel, int key) noexcept
+    {
+        if (noteId < 0) return;
+        const uint32_t home = static_cast<uint32_t>(noteId) & (kCapacity - 1);
+        uint32_t slot = home;   // every slot sounding: the home slot gives way
+        for (uint32_t probe = 0; probe < kCapacity; ++probe)
+        {
+            const uint32_t at = (home + probe) & (kCapacity - 1);
+            const Entry& entry = entries_[at];
+            if (entry.noteId < 0 || !entry.held || entry.noteId == noteId)
+            {
+                slot = at;
+                break;
+            }
+        }
+        Entry& entry = entries_[slot];
+        entry.noteId = noteId;
+        entry.channel = static_cast<int16_t>(channel);
+        entry.key = static_cast<int16_t>(key);
+        entry.held = true;
+    }
+
+    /** The NoteOff of note @p noteId: its entry may now give way. */
+    void noteOff(int32_t noteId) noexcept
+    {
+        if (Entry* entry = lookup(noteId)) entry->held = false;
+    }
+
+    /** The channel and key note @p noteId started with; false when unknown. */
+    bool find(int32_t noteId, int& channel, int& key) noexcept
+    {
+        const Entry* entry = lookup(noteId);
+        if (entry == nullptr) return false;
+        channel = entry->channel;
+        key = entry->key;
+        return true;
+    }
+
+private:
+    struct Entry
+    {
+        int32_t noteId = -1;   ///< -1: never used
+        int16_t channel = 0;
+        int16_t key = 0;
+        bool    held = false;
+    };
+
+    /** The newest entry of @p noteId (the first one in probe order). */
+    Entry* lookup(int32_t noteId) noexcept
+    {
+        if (noteId < 0) return nullptr;
+        const uint32_t home = static_cast<uint32_t>(noteId) & (kCapacity - 1);
+        for (uint32_t probe = 0; probe < kCapacity; ++probe)
+        {
+            Entry& entry = entries_[(home + probe) & (kCapacity - 1)];
+            if (entry.noteId == noteId) return &entry;
+            if (entry.noteId < 0) return nullptr;   // the chain ends here
+        }
+        return nullptr;
+    }
+
+    std::array<Entry, kCapacity> entries_ {};
+};
+
+// The six expressions VST3 defines share their numbering with ExpressionType
+// (Pressure has no VST3 type: VST3 carries it as poly pressure).
+static_assert(static_cast<int>(MidiEvent::ExpressionType::Volume)
+                  == Steinberg_Vst_NoteExpressionTypeIDs_kVolumeTypeID
+              && static_cast<int>(MidiEvent::ExpressionType::Tuning)
+                  == Steinberg_Vst_NoteExpressionTypeIDs_kTuningTypeID
+              && static_cast<int>(MidiEvent::ExpressionType::Brightness)
+                  == Steinberg_Vst_NoteExpressionTypeIDs_kBrightnessTypeID,
+              "ExpressionType must follow the VST3 note-expression numbering");
+
+/** @brief A VST3 normalized note-expression value in MidiEvent units: Volume a
+ *  linear gain 0..4 (plain = 20 log10(4 norm) dB, 0.25 = 0 dB), Pan 0..1,
+ *  Tuning semitones 240 (norm - 0.5), the others 0..1. NaN reads as 0. */
+inline double vst3ExpressionValue(MidiEvent::ExpressionType type, double normalized) noexcept
+{
+    const double n = !(normalized > 0.0) ? 0.0 : (normalized > 1.0 ? 1.0 : normalized);
+    switch (type)
+    {
+    case MidiEvent::ExpressionType::Volume: return 4.0 * n;
+    case MidiEvent::ExpressionType::Tuning: return 240.0 * (n - 0.5);
+    default:                                return n;
+    }
+}
+
 template <typename P>
 struct Plugin
 {
@@ -495,15 +619,23 @@ struct Plugin
                   "reserved PRGM/BYPS/EDSW/EDSH state ids): automation and state "
                   "would cross-wire. Rename one id.");
 
+    /// The note expressions offered to the host: the declared ones VST3
+    /// defines (see HasNoteExpressions), none without the declaration.
+    static constexpr uint32_t kVst3Expressions =
+        (HasMidi<P> && HasNoteExpressions<P>)
+            ? noteExpressionsOf<P>() & ~expressionBit(MidiEvent::ExpressionType::Pressure)
+            : 0u;
+
     // COM lenses - consecutive vtable pointers; queryInterface returns the
     // address of the matching slot. Standard layout is asserted below. The
-    // last two lenses surface only for the matching capability.
+    // last three lenses surface only for the matching capability.
     const Steinberg_Vst_IComponentVtbl*       componentVtbl;
     const Steinberg_Vst_IAudioProcessorVtbl*  processorVtbl;
     const Steinberg_Vst_IEditControllerVtbl*  controllerVtbl;
     const Steinberg_Vst_IProcessContextRequirementsVtbl* contextReqVtbl;
     const Steinberg_Vst_IUnitInfoVtbl*        unitVtbl;
     const Steinberg_Vst_IMidiMappingVtbl*     midiMapVtbl;
+    const Steinberg_Vst_INoteExpressionControllerVtbl* noteExprVtbl;
 
     std::atomic<Steinberg_uint32> refs { 1 };
 
@@ -551,6 +683,12 @@ struct Plugin
     std::atomic<bool> processing { false };
     PendingParams<kNumParams> pending;
     BlockEventList blockEvents;   // one block of host events (audio thread)
+    NoteIdMap noteIds;            // note id -> voice, for note expressions (audio thread)
+
+    /// The editor view that exists right now (UI thread), so a state load
+    /// can resize it at once; set and cleared by the view itself.
+    void* liveView = nullptr;
+    void (*resizeLiveView)(void* view) noexcept = nullptr;
 
     Plugin() noexcept
     {
@@ -560,6 +698,7 @@ struct Plugin
         contextReqVtbl = &kContextReqVtbl;
         unitVtbl       = &kUnitVtbl;
         midiMapVtbl    = &kMidiMapVtbl;
+        noteExprVtbl   = &kNoteExprVtbl;
         for (size_t i = 0; i < kNumParams; ++i)
             shadow[i].store(toNormalized(P::parameters[i], P::parameters[i].defValue),
                             std::memory_order_relaxed);
@@ -602,6 +741,9 @@ struct Plugin
             *obj = lensPtr(4);
         else if (HasMidi<P> && tuidEqual(iid, Steinberg_Vst_IMidiMapping_iid))
             *obj = lensPtr(5);
+        else if (kVst3Expressions != 0u
+                 && tuidEqual(iid, Steinberg_Vst_INoteExpressionController_iid))
+            *obj = lensPtr(6);
         if (*obj == nullptr) return Steinberg_kNoInterface;
         refs.fetch_add(1, std::memory_order_relaxed);
         return Steinberg_kResultOk;
@@ -916,6 +1058,34 @@ struct Plugin
                         raw.Steinberg_Vst_Event_polyPressure.pitch & 0x7F);
                     midi.value = raw.Steinberg_Vst_Event_polyPressure.pressure;
                 }
+                else if (raw.type == Steinberg_Vst_Event_EventTypes_kNoteExpressionValueEvent)
+                {
+                    // A declared expression of a note this plugin started:
+                    // the host names it by note id only. The old wrapper
+                    // offered no expressions and dropped these events.
+                    if constexpr (kVst3Expressions == 0u)
+                        continue;
+                    else
+                    {
+                        const auto& ne = raw.Steinberg_Vst_Event_noteExpressionValue;
+                        const double v = ne.value;
+                        if (ne.typeId > static_cast<Steinberg_Vst_NoteExpressionTypeID>(
+                                Steinberg_Vst_NoteExpressionTypeIDs_kBrightnessTypeID)
+                            || v != v)
+                            continue;
+                        const auto type = static_cast<MidiEvent::ExpressionType>(ne.typeId);
+                        int channel = 0, key = 0;
+                        if ((kVst3Expressions & expressionBit(type)) == 0u
+                            || !noteIds.find(ne.noteId, channel, key))
+                            continue;
+                        midi.type = MidiEvent::Type::NoteExpression;
+                        midi.expression = type;
+                        midi.channel = static_cast<uint8_t>(channel & 0x0F);
+                        midi.note = static_cast<uint8_t>(key & 0x7F);
+                        midi.noteId = ne.noteId;
+                        midi.value = static_cast<float>(vst3ExpressionValue(type, v));
+                    }
+                }
                 else
                     continue;
                 Steinberg_int32 offset = raw.sampleOffset;
@@ -926,6 +1096,30 @@ struct Plugin
                 ev.kind = BlockEvent::Kind::Midi;
                 ev.midi = midi;
                 events.add(ev);
+                if constexpr (kVst3Expressions != 0u)
+                {
+                    if (midi.type == MidiEvent::Type::NoteOn)
+                    {
+                        noteIds.noteOn(midi.noteId, midi.channel, midi.note);
+                        // The NoteOn's own tuning (cents) is the voice's
+                        // first Tuning expression, delivered right after it.
+                        const float cents = raw.Steinberg_Vst_Event_noteOn.tuning;
+                        if ((kVst3Expressions & expressionBit(MidiEvent::ExpressionType::Tuning))
+                                != 0u
+                            && cents != 0.0f && cents == cents)
+                        {
+                            BlockEvent tune = ev;
+                            tune.midi.type = MidiEvent::Type::NoteExpression;
+                            tune.midi.expression = MidiEvent::ExpressionType::Tuning;
+                            const float semis = cents / 100.0f;
+                            tune.midi.value = semis < -120.0f ? -120.0f
+                                            : (semis > 120.0f ? 120.0f : semis);
+                            events.add(tune);
+                        }
+                    }
+                    else if (midi.type == MidiEvent::Type::NoteOff)
+                        noteIds.noteOff(midi.noteId);
+                }
             }
         }
         else
@@ -1109,6 +1303,7 @@ struct Plugin
                 p->cachedLatency.store(latency, std::memory_order_relaxed);
                 p->dryDelay.prepare(std::max(2 * latency, kDryDelayMinCapacity), maxBlock);
             }
+            p->noteIds.clear();   // the host starts its notes again
             p->prepared = true;
         }
         else
@@ -1157,9 +1352,15 @@ struct Plugin
         if (bypassState >= 0)
             p->bypass.store(bypassState != 0, std::memory_order_relaxed);
         // The editor size the session left: the next view opens at it (a
-        // state without one keeps the size this instance has).
+        // state without one keeps the size this instance has), and a view
+        // that exists right now takes it at once (the old code waited for
+        // the next view).
         if (editorSize.width > 0)
+        {
             p->editorMemory.remember(editorSize.width, editorSize.height);
+            if (p->liveView != nullptr && p->resizeLiveView != nullptr)
+                p->resizeLiveView(p->liveView);
+        }
         p->refreshLatency();   // restored state may imply a new lookahead
         return Steinberg_kResultOk;
     }
@@ -2035,6 +2236,140 @@ struct Plugin
         &sQuery<5>, &sAddRef<5>, &sRelease<5>,
         &sGetMidiControllerAssignment
     };
+
+    // ==========================================================================
+    // Lens 6 - INoteExpressionController (the declared note expressions;
+    // surfaced only when the class declares noteExpressions)
+    // ==========================================================================
+
+    /** The ExpressionType of the @p index-th offered expression, or -1. */
+    static int offeredExpression(Steinberg_int32 index) noexcept
+    {
+        if (index < 0) return -1;
+        int seen = 0;
+        for (int t = 0; t < 32; ++t)
+            if ((kVst3Expressions & (1u << t)) != 0u && seen++ == index) return t;
+        return -1;
+    }
+
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE sGetNoteExpressionCount(void*,
+        Steinberg_int32 busIndex, Steinberg_int16 channel)
+    {
+        if (busIndex != 0 || channel < 0 || channel >= 16) return 0;
+        return static_cast<Steinberg_int32>(std::popcount(kVst3Expressions));
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetNoteExpressionInfo(void*,
+        Steinberg_int32 busIndex, Steinberg_int16 channel, Steinberg_int32 index,
+        struct Steinberg_Vst_NoteExpressionTypeInfo* info)
+    {
+        const int type = offeredExpression(index);
+        if (info == nullptr || busIndex != 0 || channel < 0 || channel >= 16 || type < 0)
+            return Steinberg_kInvalidArgument;
+        std::memset(info, 0, sizeof(*info));
+        struct Names { const char* title; const char* shortTitle; const char* units; double def; };
+        static constexpr Names kNames[] = {
+            { "Volume", "Vol", "dB", 0.25 },   { "Pan", "Pan", "", 0.5 },
+            { "Tuning", "Tune", "st", 0.5 },  { "Vibrato", "Vib", "%", 0.0 },
+            { "Expression", "Expr", "%", 0.0 }, { "Brightness", "Brit", "%", 0.0 },
+        };
+        const Names& names = kNames[type];
+        info->typeId = static_cast<Steinberg_Vst_NoteExpressionTypeID>(type);
+        utf8ToString128(names.title, info->title);
+        utf8ToString128(names.shortTitle, info->shortTitle);
+        utf8ToString128(names.units, info->units);
+        info->unitId = -1;
+        info->valueDesc.defaultValue = names.def;
+        info->valueDesc.minimum = 0.0;
+        info->valueDesc.maximum = 1.0;
+        info->valueDesc.stepCount = 0;
+        info->associatedParameterId = 0xFFFFFFFFu;   // none
+        // Statements of value (absolute); Pan and Tuning sit at the centre.
+        info->flags = Steinberg_Vst_NoteExpressionTypeInfo_NoteExpressionTypeFlags_kIsAbsolute;
+        if (type == static_cast<int>(MidiEvent::ExpressionType::Pan)
+            || type == static_cast<int>(MidiEvent::ExpressionType::Tuning))
+            info->flags |= Steinberg_Vst_NoteExpressionTypeInfo_NoteExpressionTypeFlags_kIsBipolar;
+        return Steinberg_kResultOk;
+    }
+
+    /** True when @p id is one of the offered expressions. */
+    static bool offersExpression(Steinberg_Vst_NoteExpressionTypeID id) noexcept
+    {
+        return id < 32u && (kVst3Expressions & (1u << id)) != 0u;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetNoteExpressionStringByValue(void*,
+        Steinberg_int32 busIndex, Steinberg_int16, Steinberg_Vst_NoteExpressionTypeID id,
+        Steinberg_Vst_NoteExpressionValue valueNormalized, Steinberg_Vst_String128 string)
+    {
+        if (string == nullptr || busIndex != 0 || !offersExpression(id))
+            return Steinberg_kInvalidArgument;
+        const auto type = static_cast<MidiEvent::ExpressionType>(id);
+        const double v = vst3ExpressionValue(type, valueNormalized);
+        char text[64];
+        switch (type)
+        {
+        case MidiEvent::ExpressionType::Volume:
+            if (v > 0.0) std::snprintf(text, sizeof(text), "%.2f dB", 20.0 * std::log10(v));
+            else std::snprintf(text, sizeof(text), "-inf dB");
+            break;
+        case MidiEvent::ExpressionType::Pan:
+            std::snprintf(text, sizeof(text), "%+.0f %%", (v - 0.5) * 200.0);
+            break;
+        case MidiEvent::ExpressionType::Tuning:
+            std::snprintf(text, sizeof(text), "%+.2f st", v);
+            break;
+        default:
+            std::snprintf(text, sizeof(text), "%.0f %%", v * 100.0);
+            break;
+        }
+        utf8ToString128(text, string);
+        return Steinberg_kResultOk;
+    }
+
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sGetNoteExpressionValueByString(void*,
+        Steinberg_int32 busIndex, Steinberg_int16, Steinberg_Vst_NoteExpressionTypeID id,
+        const Steinberg_Vst_TChar* string, Steinberg_Vst_NoteExpressionValue* valueNormalized)
+    {
+        if (string == nullptr || valueNormalized == nullptr || busIndex != 0
+            || !offersExpression(id))
+            return Steinberg_kInvalidArgument;
+        char text[512];
+        string128ToUtf8(string, text, sizeof(text));
+        const auto type = static_cast<MidiEvent::ExpressionType>(id);
+        double n = 0.0;
+        if (type == MidiEvent::ExpressionType::Volume && std::strstr(text, "-inf") != nullptr)
+            n = 0.0;
+        else
+        {
+            char* end = nullptr;
+            const double x = std::strtod(text, &end);
+            if (end == text || x != x) return Steinberg_kResultFalse;
+            switch (type)
+            {
+            case MidiEvent::ExpressionType::Volume:
+                n = std::pow(10.0, x / 20.0) / 4.0;
+                break;
+            case MidiEvent::ExpressionType::Pan:
+                n = x / 200.0 + 0.5;
+                break;
+            case MidiEvent::ExpressionType::Tuning:
+                n = x / 240.0 + 0.5;
+                break;
+            default:
+                n = x / 100.0;
+                break;
+            }
+        }
+        *valueNormalized = !(n > 0.0) ? 0.0 : (n > 1.0 ? 1.0 : n);
+        return Steinberg_kResultOk;
+    }
+
+    inline static const Steinberg_Vst_INoteExpressionControllerVtbl kNoteExprVtbl = {
+        &sQuery<6>, &sAddRef<6>, &sRelease<6>,
+        &sGetNoteExpressionCount, &sGetNoteExpressionInfo,
+        &sGetNoteExpressionStringByValue, &sGetNoteExpressionValueByString
+    };
 };
 
 // -- the editor view (WebView editor layer) ---------------------------------------
@@ -2090,10 +2425,14 @@ struct View
         const EditorSize logical = owner->editorMemory.current();
         width  = logical.width;
         height = logical.height;
+        // A state the host loads while this view exists resizes it.
+        owner->liveView = this;
+        owner->resizeLiveView = &sApplyRememberedSize;
     }
 
     ~View()
     {
+        if (owner->liveView == this) owner->liveView = nullptr;
 #if defined(__linux__)
         releaseRunLoop();
 #endif
@@ -2156,6 +2495,35 @@ struct View
     {
         return reinterpret_cast<View*>(static_cast<char*>(iface)
                                        - static_cast<ptrdiff_t>(lens) * sizeof(void*));
+    }
+
+    /** A state load brought another editor size [UI thread]: an attached
+     *  view asks its frame for it (IPlugFrame::resizeView) and keeps its
+     *  size when the host refuses; a view not attached yet reports it from
+     *  getSize. */
+    static void sApplyRememberedSize(void* self) noexcept
+    {
+        auto* view = static_cast<View*>(self);
+        const EditorSize logical = view->owner->editorMemory.current();
+        const int w = toBoundedInt(logical.width * view->scale + 0.5,
+                                   1, static_cast<int>(kEditorMaxPixels));
+        const int h = toBoundedInt(logical.height * view->scale + 0.5,
+                                   1, static_cast<int>(kEditorMaxPixels));
+        if (w == view->width && h == view->height) return;
+        webview_ui::debugLog("vst3 state load: editor %dx%d -> %dx%d",
+                             view->width, view->height, w, h);
+        if (view->editor.created() && view->frame != nullptr)
+        {
+            Steinberg_ViewRect rect { 0, 0, w, h };
+            view->correctingSize = true;   // the host's onSize echoes this size
+            const Steinberg_tresult result = view->frame->lpVtbl->resizeView(view->frame,
+                reinterpret_cast<Steinberg_IPlugView*>(view->lensPtr(0)), &rect);
+            view->correctingSize = false;
+            if (result != Steinberg_kResultOk) return;
+            view->editor.setBounds(w, h);
+        }
+        view->width = w;
+        view->height = h;
     }
 
     void* lensPtr(int lens) noexcept

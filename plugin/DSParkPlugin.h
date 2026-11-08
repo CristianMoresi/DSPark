@@ -43,7 +43,9 @@
  *   - reset / getLatency / getTailSeconds / getState / setState
  *   - processBlock(io, sidechain)      -> a host-routable sidechain bus
  *   - handleMidiEvent(const MidiEvent&) -> note/CC/pitch-bend input, plus
- *     per-voice expressions and perVoice() parameter modulation (CLAP)
+ *     per-voice expressions and perVoice() parameter modulation and
+ *     automation (CLAP)
+ *   - noteExpressions                  -> the note expressions VST3 hosts offer
  *   - isVoiceActive(channel, key, noteId) -> when a voice really ends
  *   - setTransport(const TransportInfo&) -> host tempo & timeline, per block
  *   - setOfflineRendering(bool)        -> realtime vs bounce quality switch
@@ -197,10 +199,12 @@ constexpr Param choice(const char* id, const char* name,
  * `params(perVoice(param("cutoff", "Cutoff", 20.0f, 20000.0f, 1000.0f, "Hz")), ...)`.
  *
  * A host that modulates parameters polyphonically (CLAP per-note, per-key,
- * per-channel and per-port modulation) then targets single voices, and the
- * plugin receives each voice's value as a MidiEvent of type NoteModulation
- * (see MidiEvent). Requires handleMidiEvent - only a plugin with a note input
- * has voices. Formats without per-voice modulation ignore the mark.
+ * per-channel and per-port modulation) or automates them per note (CLAP
+ * per-note-id, per-key and per-channel automation) then targets single
+ * voices, and the plugin receives each voice's value as a MidiEvent of type
+ * NoteModulation (see MidiEvent). Requires handleMidiEvent - only a plugin
+ * with a note input has voices. Formats without per-voice parameters ignore
+ * the mark.
  */
 constexpr Param perVoice(Param p) noexcept
 {
@@ -588,7 +592,9 @@ concept HasTransport = requires(P p, const TransportInfo& t) {
  *
  * VST3 delivers notes as native events and pitch bend / CC / pressure
  * through its controller-mapping scheme; CLAP delivers note events plus raw
- * MIDI; AU delivers raw MIDI bytes. The wrapper translates ALL of them into
+ * MIDI; AU delivers raw MIDI bytes or, from hosts that send event lists,
+ * MIDI 2.0 messages (16-bit velocity, 32-bit controllers and bend, kept at
+ * that resolution in `value`). The wrapper translates ALL of them into
  * this one struct so the plugin handles a single vocabulary.
  *
  * `sampleOffset` is the event's position in frames RELATIVE TO THE NEXT
@@ -612,14 +618,17 @@ concept HasTransport = requires(P p, const TransportInfo& t) {
  *    `value` carries it - Volume a linear gain 0..4, Pan 0..1 (0.5 centre),
  *    Tuning semitones -120..+120, the others 0..1. A statement of value,
  *    not an increment; a voice starts from its neutral value (gain 1, pan
- *    0.5, tuning 0) until one arrives.
- *  - NoteModulation: a perVoice() parameter's value for this voice, in
- *    PLAIN units, clamped and snapped like any value - the parameter's
- *    value plus the host's modulation of this voice (which replaces the
- *    global modulation setParameter carries). Delivered again whenever the
- *    parameter itself moves. `param` is the parameter index.
- * Both come from CLAP hosts; ignore the types you do not use (a `default:`
- * in the switch keeps working as types are added).
+ *    0.5, tuning 0) until one arrives. CLAP hosts send every type; VST3
+ *    hosts send the ones the class declares (see HasNoteExpressions).
+ *  - NoteModulation: the value one voice hears for a perVoice() parameter,
+ *    in PLAIN units, clamped and snapped like any value: the voice's own
+ *    value when the host automates the parameter per note (else the
+ *    parameter's value), plus the host's modulation of this voice (else
+ *    the global modulation setParameter carries). Delivered again whenever
+ *    a value that reaches the voice moves. `param` is the parameter index.
+ *    Comes from CLAP hosts.
+ * Ignore the types you do not use (a `default:` in the switch keeps working
+ * as types are added).
  */
 struct MidiEvent
 {
@@ -657,6 +666,54 @@ struct MidiEvent
     int16_t param = -1;       ///< NoteModulation only: the parameter index.
     int32_t noteId = -1;      ///< Host voice id of the note (-1: none given).
 };
+
+/** @brief The bit of one ExpressionType in a note-expression mask. */
+constexpr uint32_t expressionBit(MidiEvent::ExpressionType type) noexcept
+{
+    return 1u << static_cast<uint32_t>(type);
+}
+
+/** @brief Every ExpressionType at once (the mask of a class that declares none). */
+inline constexpr uint32_t kAllNoteExpressions =
+    (1u << (static_cast<uint32_t>(MidiEvent::ExpressionType::Pressure) + 1u)) - 1u;
+
+/**
+ * @brief Builds a note-expression mask for the `noteExpressions` declaration:
+ * ```cpp
+ * using Expr = dspark::plugin::MidiEvent::ExpressionType;
+ * static constexpr uint32_t noteExpressions =
+ *     dspark::plugin::expressions(Expr::Volume, Expr::Tuning);
+ * ```
+ */
+template <typename... Types>
+constexpr uint32_t expressions(Types... types) noexcept
+{
+    return (0u | ... | expressionBit(types));
+}
+
+/**
+ * @brief Optional note-expression declaration: `static constexpr uint32_t
+ * noteExpressions = expressions(...)` - the NoteExpression types the plugin
+ * acts on. VST3 hosts offer exactly these in their note-expression editors
+ * (INoteExpressionController; Pressure travels as VST3 poly pressure
+ * instead), so a class without the declaration gets no VST3 expressions.
+ * CLAP hosts send expressions undeclared, and the wrapper delivers only
+ * the declared ones when the declaration exists (all of them without it).
+ */
+template <typename P>
+concept HasNoteExpressions = requires {
+    { P::noteExpressions } -> std::convertible_to<uint32_t>;
+};
+
+/** @brief The note expressions @p P receives: its declaration, else all. */
+template <typename P>
+constexpr uint32_t noteExpressionsOf() noexcept
+{
+    if constexpr (HasNoteExpressions<P>)
+        return static_cast<uint32_t>(P::noteExpressions) & kAllNoteExpressions;
+    else
+        return kAllNoteExpressions;
+}
 
 /**
  * @brief Optional voice query: `bool isVoiceActive(int channel, int key,
@@ -887,6 +944,9 @@ struct BlockEvent
     int16_t  targetPort = -1;
     int16_t  targetChannel = -1;
     int16_t  targetKey = -1;
+    /// Kind::Midi NoteModulation: `value` is the voice's own plain value
+    /// (per-note automation) rather than a modulation amount.
+    bool     voiceValue = false;
 };
 
 /** @brief Insertion sort by (offset, arrival order) - tiny N,

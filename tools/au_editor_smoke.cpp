@@ -11,9 +11,12 @@
 // format fixed while initialized, and to honour the render-time host
 // contract: render notifications around each slice, high-resolution
 // parameters, refused non-finite values, other output elements and short
-// buffers, scheduled values that read back at once, and the preset name in
-// the saved state. Exit code 0 means every step behaved. Companion to
-// vst3/clap_smoke_host; auval remains the format-conformance gate.
+// buffers, scheduled values that read back at once, the preset name in the
+// saved state, the first render error kept in LastRenderError (read and
+// cleared, its listener told), ShouldAllocateBuffer per element, and - for
+// the instrument - MIDI 2.0 event lists. Exit code 0 means every step
+// behaved. Companion to vst3/clap_smoke_host; auval remains the
+// format-conformance gate.
 //
 //   au_editor_smoke <type4> <subtype4> <manu4> --expect-editor <W>x<H>
 //   au_editor_smoke <type4> <subtype4> <manu4> --expect-no-editor
@@ -31,6 +34,7 @@ int main()
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreMIDI/MIDIServices.h>   // the Universal MIDI Packet types (header only)
 
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -153,13 +157,30 @@ OSStatus countNotify(void* refCon, AudioUnitRenderActionFlags* flags, const Audi
     return noErr;
 }
 
+int g_ownBufferPulls = 0;   // pulls that lent no buffer (ShouldAllocateBuffer false)
+
 OSStatus silentInput(void*, AudioUnitRenderActionFlags*, const AudioTimeStamp*, UInt32,
                      UInt32 frames, AudioBufferList* data)
 {
+    static float own[2][4096] {};   // what this source supplies when lent none
     for (UInt32 b = 0; b < data->mNumberBuffers; ++b)
+    {
+        if (data->mBuffers[b].mData == nullptr && b < 2 && frames <= 4096)
+        {
+            ++g_ownBufferPulls;
+            data->mBuffers[b].mData = own[b];
+        }
         if (data->mBuffers[b].mData != nullptr)
             std::memset(data->mBuffers[b].mData, 0, frames * sizeof(float));
+    }
     return noErr;
+}
+
+int g_renderErrorNotices = 0;
+void renderErrorListener(void*, AudioUnit, AudioUnitPropertyID id, AudioUnitScope,
+                         AudioUnitElement)
+{
+    if (id == kAudioUnitProperty_LastRenderError) ++g_renderErrorNotices;
 }
 
 /** Room for two deinterleaved buffers (AudioBufferList declares one). */
@@ -246,7 +267,33 @@ int main(int argc, char** argv)
                                     kAudioUnitScope_Output, 0, &format, &formatSize)
                    == noErr,
                "output stream format readable");
+
+        // ShouldAllocateBuffer: kept per element (true by default), set
+        // before initialize; an input set to false is pulled lending no
+        // buffer, so its source supplies one.
+        UInt32 inputs = 0, elementSize = sizeof(inputs);
+        AudioUnitGetProperty(au, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0,
+                             &inputs, &elementSize);
+        UInt32 allocate = 7, allocateSize = sizeof(allocate);
+        expect(AudioUnitGetProperty(au, kAudioUnitProperty_ShouldAllocateBuffer,
+                                    kAudioUnitScope_Output, 0, &allocate, &allocateSize)
+                   == noErr && allocate == 1,
+               "ShouldAllocateBuffer readable (output element, default true)");
+        UInt32 lendNone = 0;
+        if (inputs > 0)
+            expect(AudioUnitSetProperty(au, kAudioUnitProperty_ShouldAllocateBuffer,
+                                        kAudioUnitScope_Input, 0, &lendNone, sizeof(lendNone))
+                       == noErr,
+                   "ShouldAllocateBuffer set false on the input before initialize");
+        expect(AudioUnitAddPropertyListener(au, kAudioUnitProperty_LastRenderError,
+                                            &renderErrorListener, nullptr) == noErr,
+               "LastRenderError listener added");
         expect(AudioUnitInitialize(au) == noErr, "initialize");
+        if (inputs > 0)
+            expect(AudioUnitSetProperty(au, kAudioUnitProperty_ShouldAllocateBuffer,
+                                        kAudioUnitScope_Input, 0, &lendNone, sizeof(lendNone))
+                       == kAudioUnitErr_Initialized,
+                   "ShouldAllocateBuffer refused while initialized");
         expect(AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice,
                                     kAudioUnitScope_Global, 0, &frames, sizeof(frames))
                    == noErr,
@@ -286,10 +333,13 @@ int main(int argc, char** argv)
         NotifyCounts counts;
         expect(AudioUnitAddRenderNotify(au, &countNotify, &counts) == noErr,
                "render notification added");
+        g_ownBufferPulls = 0;
         expect(AudioUnitRender(au, &renderFlags, &stamp, 0, 256, bufferList(256)) == noErr,
                "render a slice");
         expect(counts.pre == 1 && counts.post == 1,
                "render notifications run before and after the slice");
+        if (inputs > 0)
+            expect(g_ownBufferPulls > 0, "an input set to false is pulled lending no buffer");
         AudioUnitRemoveRenderNotify(au, &countNotify, &counts);
         stamp.mSampleTime += 256;
         AudioUnitRender(au, &renderFlags, &stamp, 0, 256, bufferList(256));
@@ -302,6 +352,58 @@ int main(int argc, char** argv)
         list.mBuffers[1].mDataByteSize = 128 * 4;
         expect(AudioUnitRender(au, &renderFlags, &stamp, 0, 256, shortList) == kAudio_ParamError,
                "a host buffer shorter than the slice is refused");
+
+        // LastRenderError: the first refused render since the last read
+        // (the other element), cleared by the read; its listener heard of it.
+        OSStatus lastError = 1;
+        UInt32 errorSize = sizeof(lastError);
+        expect(AudioUnitGetProperty(au, kAudioUnitProperty_LastRenderError,
+                                    kAudioUnitScope_Global, 0, &lastError, &errorSize) == noErr
+                   && lastError == kAudioUnitErr_InvalidElement,
+               "LastRenderError holds the first refused render");
+        errorSize = sizeof(lastError);
+        AudioUnitGetProperty(au, kAudioUnitProperty_LastRenderError, kAudioUnitScope_Global, 0,
+                             &lastError, &errorSize);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);   // the main-queue tick
+        expect(lastError == noErr && g_renderErrorNotices >= 1,
+               "reading LastRenderError clears it; its listener was told");
+
+        // MIDI 2.0 event lists (the instrument): the unit asks for MIDI 2.0
+        // and a MIDI 2.0 Note On through MusicDeviceMIDIEventList sounds.
+        SInt32 protocol = 0;
+        UInt32 protocolSize = sizeof(protocol);
+        if (desc.componentType == fourCC("aumu"))
+        {
+            expect(AudioUnitGetProperty(au, kAudioUnitProperty_AudioUnitMIDIProtocol,
+                                        kAudioUnitScope_Global, 0, &protocol, &protocolSize)
+                       == noErr && protocol == kMIDIProtocol_2_0,
+                   "the instrument asks for MIDI 2.0 event lists");
+            if (__builtin_available(macOS 12.0, *))
+            {
+                struct { MIDIEventList list; MIDIEventPacket spare; } storage {};
+                storage.list.protocol = kMIDIProtocol_2_0;
+                storage.list.numPackets = 1;
+                storage.list.packet[0].timeStamp = 0;
+                storage.list.packet[0].wordCount = 2;
+                storage.list.packet[0].words[0] = 0x40904500u;   // Note On, channel 0, key 69
+                storage.list.packet[0].words[1] = 0xC0000000u;   // velocity 0.75
+                expect(MusicDeviceMIDIEventList(au, 0, &storage.list) == noErr,
+                       "MusicDeviceMIDIEventList accepted");
+                float energy = 0.0f;
+                for (int slice = 0; slice < 4; ++slice)
+                {
+                    stamp.mSampleTime += 256;
+                    AudioUnitRender(au, &renderFlags, &stamp, 0, 256, bufferList(256));
+                    for (int i = 0; i < 256; ++i) energy += left[i] * left[i];
+                }
+                expect(energy > 1e-3f, "a MIDI 2.0 Note On from an event list sounds");
+            }
+        }
+        else
+            expect(AudioUnitGetProperty(au, kAudioUnitProperty_AudioUnitMIDIProtocol,
+                                        kAudioUnitScope_Global, 0, &protocol, &protocolSize)
+                       != noErr,
+                   "an effect without MIDI reports no MIDI protocol");
 
         UInt32 listSize = 0;
         AudioUnitGetPropertyInfo(au, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global,
@@ -483,6 +585,20 @@ int main(int argc, char** argv)
         std::printf("    reopened: %.0fx%.0f\n", reopened.w, reopened.h);
         expect(reopened.w == bigger.width && reopened.h == bigger.height,
                "the editor reopens at the size the host left it");
+
+        // A state loaded while the view exists resizes it at once: shrink
+        // it back, then restore the state saved at the larger size.
+        reinterpret_cast<SetFrameSize>(&objc_msgSend)(view2, sel_registerName("setFrameSize:"),
+                                                      CgSize { frame.w, frame.h });
+        if (sessionState != nullptr)
+            expect(AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global,
+                                        0, &sessionState, sizeof(sessionState)) == noErr,
+                   "ClassInfo restored with the editor open");
+        const CgRect restoredLive = callRect(view2, "frame");
+        std::printf("    state load with the editor open: %.0fx%.0f\n", restoredLive.w,
+                    restoredLive.h);
+        expect(restoredLive.w == bigger.width && restoredLive.h == bigger.height,
+               "a state loaded with the editor open resizes it");
     }
 
     // --- teardown order B: AudioUnit dies first, view follows ----------------------

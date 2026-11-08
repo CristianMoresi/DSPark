@@ -4,7 +4,8 @@
 // X11 host: createView -> setFrame (offering a real IRunLoop) -> attached to
 // an X11 window created here -> drives the registered timer so GTK breathes
 // -> verifies the embedded WebKitGTK page completed the JS bridge handshake
-// (through the DSPARK_WEBVIEW_LOG diagnostic trace) -> removed/teardown.
+// (through the DSPARK_WEBVIEW_LOG diagnostic trace) -> a state loaded while
+// attached resizes the editor through the frame -> removed/teardown.
 // Plugins without an editor are checked to answer createView with null.
 // Exit code 0 means every step behaved. Companion to tools/au_editor_smoke
 // (macOS) and tools/vst3_editor_host (Windows).
@@ -36,6 +37,7 @@ int main()
 #include <cstring>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -154,10 +156,14 @@ struct SmokeFrame
     template <int Lens>
     static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sRelease(void*) { return 100; }
 
+    Steinberg_ViewRect lastResize {};
+
     static Steinberg_tresult SMTG_STDMETHODCALLTYPE sResizeView(void* self_,
-        Steinberg_IPlugView*, Steinberg_ViewRect*)
+        Steinberg_IPlugView*, Steinberg_ViewRect* rect)
     {
-        ++fromLens(self_, 0)->resizeCalls;
+        auto* s = fromLens(self_, 0);
+        ++s->resizeCalls;
+        if (rect != nullptr) s->lastResize = *rect;
         return Steinberg_kResultOk;
     }
 
@@ -201,6 +207,58 @@ struct SmokeFrame
     };
 
     SmokeFrame() : frameVtbl(&kFrameVtbl), runLoopVtbl(&kRunLoopVtbl) {}
+};
+
+// -- a byte-vector IBStream (state save / load) --------------------------------------
+
+struct ByteStream
+{
+    const Steinberg_IBStreamVtbl* vtbl;
+    std::vector<unsigned char> bytes;
+    size_t pos = 0;
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sQuery(void*, const Steinberg_TUID, void** obj)
+    {
+        if (obj != nullptr) *obj = nullptr;
+        return Steinberg_kNoInterface;
+    }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sRef(void*) { return 100; }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sRead(void* self_, void* dst,
+        Steinberg_int32 n, Steinberg_int32* got)
+    {
+        auto* s = static_cast<ByteStream*>(self_);
+        const size_t left = s->bytes.size() - s->pos;
+        const size_t take = n < 0 ? 0 : (left < static_cast<size_t>(n) ? left : static_cast<size_t>(n));
+        if (take > 0) std::memcpy(dst, s->bytes.data() + s->pos, take);
+        s->pos += take;
+        if (got != nullptr) *got = static_cast<Steinberg_int32>(take);
+        return take > 0 ? Steinberg_kResultOk : Steinberg_kResultFalse;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sWrite(void* self_, void* src,
+        Steinberg_int32 n, Steinberg_int32* put)
+    {
+        auto* s = static_cast<ByteStream*>(self_);
+        const auto* p = static_cast<const unsigned char*>(src);
+        if (n > 0) s->bytes.insert(s->bytes.end(), p, p + n);
+        if (put != nullptr) *put = n;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sSeek(void* self_, Steinberg_int64 to,
+        Steinberg_int32, Steinberg_int64* result)
+    {
+        auto* s = static_cast<ByteStream*>(self_);
+        s->pos = static_cast<size_t>(to);
+        if (result != nullptr) *result = to;
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE sTell(void* self_, Steinberg_int64* at)
+    {
+        if (at != nullptr) *at = static_cast<Steinberg_int64>(static_cast<ByteStream*>(self_)->pos);
+        return Steinberg_kResultOk;
+    }
+    inline static const Steinberg_IBStreamVtbl kVtbl = {
+        &sQuery, &sRef, &sRef, &sRead, &sWrite, &sSeek, &sTell
+    };
+    ByteStream() : vtbl(&kVtbl) {}
 };
 
 } // namespace
@@ -333,6 +391,34 @@ int main(int argc, char** argv)
             handshake = logContains("page metric");
     }
     expect(handshake, "JS bridge handshake completed");
+
+    // A state loaded while the editor is attached asks the frame to resize
+    // it to the state's size: the user grows the editor, the session is
+    // saved, the editor shrinks back, the session is loaded again. The old
+    // wrapper never asked (the size waited for the next view).
+    if (view->lpVtbl->canResize(view) == Steinberg_kResultTrue)
+    {
+        Steinberg_ViewRect big { 0, 0, expectedW + expectedW / 2, expectedH + expectedH / 2 };
+        view->lpVtbl->checkSizeConstraint(view, &big);
+        view->lpVtbl->onSize(view, &big);
+        ByteStream session;
+        expect(comp->lpVtbl->getState(comp, reinterpret_cast<Steinberg_IBStream*>(&session))
+                   == Steinberg_kResultOk,
+               "state saved with the editor grown");
+        Steinberg_ViewRect original { 0, 0, expectedW, expectedH };
+        view->lpVtbl->onSize(view, &original);
+        frame.resizeCalls = 0;
+        session.pos = 0;
+        expect(comp->lpVtbl->setState(comp, reinterpret_cast<Steinberg_IBStream*>(&session))
+                   == Steinberg_kResultOk,
+               "state loaded with the editor attached");
+        std::printf("    state load: %d resizeView call(s) to %dx%d\n", frame.resizeCalls,
+                    frame.lastResize.right - frame.lastResize.left,
+                    frame.lastResize.bottom - frame.lastResize.top);
+        expect(frame.resizeCalls == 1 && frame.lastResize.right == big.right
+                   && frame.lastResize.bottom == big.bottom,
+               "a state loaded with the editor attached resizes it through the frame");
+    }
 
     expect(view->lpVtbl->removed(view) == Steinberg_kResultOk, "removed");
     expect(frame.timerHandler == nullptr, "timer unregistered on removed");

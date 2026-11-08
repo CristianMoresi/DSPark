@@ -970,7 +970,7 @@ struct ClapEvents
         iface.ctx = this;
         iface.size = &size;
         iface.get = &get;
-        notes.reserve(16);
+        notes.reserve(512);
         midi.reserve(16);
         values.reserve(512);
         mods.reserve(16);
@@ -1022,6 +1022,17 @@ struct ClapEvents
     {
         note(type, channel, key, time);
         notes.back().note_id = noteId;
+    }
+    /// A value addressed to (note id, port, channel, key), -1 = any: per-note
+    /// automation.
+    void valueAt(clap_id id, double plain, uint32_t time, int32_t noteId, int16_t port,
+                 int16_t channel, int16_t key)
+    {
+        value(id, plain, time);
+        values.back().note_id = noteId;
+        values.back().port_index = port;
+        values.back().channel = channel;
+        values.back().key = key;
     }
     /// A modulation amount addressed to (note id, port, channel, key), -1 = any.
     void modAt(clap_id id, double amount, uint32_t time, int32_t noteId, int16_t port,
@@ -1584,6 +1595,124 @@ DSPARK_TEST(PluginClap_voices_end_at_the_noteoff_without_the_voice_query)
     cp->destroy(cp);
 }
 
+DSPARK_TEST(PluginClap_every_voice_receives_its_note_end)
+{
+    // The host keeps a modulator per voice until the plugin reports the
+    // voice's end. Past the 128 voices of the table a new voice retires the
+    // oldest with its NOTE_END, so each of 200 voices ends exactly once. The
+    // old table did not track voices 129..200: they never got a NOTE_END
+    // (128 of 200 reported), and the host kept their modulators forever.
+    using Wrap = dspark::plugin::clap_backend::Plugin<PolyNoQueryPlug>;
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    ClapEvents events;
+    ClapOut out;
+    constexpr int kVoices = 200;
+    auto noteOf = [](int i) { return std::pair<int16_t, int16_t>(
+        static_cast<int16_t>(i / 128), static_cast<int16_t>(i % 128)); };
+    for (int i = 0; i < 150; ++i)
+        events.noteWithId(CLAP_EVENT_NOTE_ON, noteOf(i).first, noteOf(i).second, 1000 + i, 0);
+    processClap(s, events, 256, &out);
+    for (int i = 150; i < kVoices; ++i)
+        events.noteWithId(CLAP_EVENT_NOTE_ON, noteOf(i).first, noteOf(i).second, 1000 + i, 0);
+    processClap(s, events, 256, &out);
+    for (int i = 0; i < kVoices; ++i)
+        events.noteWithId(CLAP_EVENT_NOTE_OFF, noteOf(i).first, noteOf(i).second, 1000 + i, 0);
+    processClap(s, events, 256, &out);
+    std::vector<int> ends(kVoices, 0);
+    bool foreign = false;
+    for (const auto& e : out.noteEnds)
+    {
+        const int i = static_cast<int>(e.note_id) - 1000;
+        if (i < 0 || i >= kVoices || e.channel != noteOf(i).first || e.key != noteOf(i).second)
+            foreign = true;
+        else
+            ++ends[static_cast<size_t>(i)];
+    }
+    int once = 0;
+    for (int n : ends) once += n == 1 ? 1 : 0;
+    EXPECT_EQ(static_cast<int>(out.noteEnds.size()), kVoices);
+    EXPECT_EQ(once, kVoices);
+    EXPECT_TRUE(!foreign);
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
+DSPARK_TEST(PluginClap_per_note_automation_sets_single_voices)
+{
+    // A perVoice() parameter declares per-note automation (by note id, key
+    // and channel): an addressed PARAM_VALUE sets the matching voices' own
+    // value, and each hears it plus the modulation that reaches it (its own
+    // amount, else the global one). The parameter's own value stays as it
+    // is. The old wrapper declared no per-note automation and moved the
+    // GLOBAL value instead (get_value 70, every voice).
+    using Wrap = dspark::plugin::clap_backend::Plugin<PolyPlug>;
+    using Type = dspark::plugin::MidiEvent::Type;
+    constexpr uint32_t kPerNote = CLAP_PARAM_IS_AUTOMATABLE_PER_NOTE_ID
+                                | CLAP_PARAM_IS_AUTOMATABLE_PER_KEY
+                                | CLAP_PARAM_IS_AUTOMATABLE_PER_CHANNEL;
+    clap_param_info_t info {};
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 0, &info));
+    EXPECT_EQ(info.flags & kPerNote, kPerNote);
+    EXPECT_EQ(info.flags & CLAP_PARAM_IS_AUTOMATABLE_PER_PORT, 0u);
+    EXPECT_TRUE(Wrap::kParams.get_info(nullptr, 1, &info));
+    EXPECT_EQ(info.flags & kPerNote, 0u);
+
+    const clap_plugin_t* cp = Wrap::create(nullptr);
+    auto* s = static_cast<Wrap*>(cp->plugin_data);
+    cp->init(cp);
+    cp->activate(cp, 48000.0, 32, 256);
+    const clap_id cut = dspark::plugin::hash32("cut");
+    const clap_id vol = dspark::plugin::hash32("vol");
+    auto value = [&](clap_id id) { double v = -1.0; Wrap::kParams.get_value(cp, id, &v); return v; };
+    ClapEvents events;
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 60, 11, 0);
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 0, 64, 12, 0);
+    events.noteWithId(CLAP_EVENT_NOTE_ON, 1, 60, 13, 0);
+    processClap(s, events, 256);
+    auto voiceValues = [&] { return voiceEvents(s->user.log, Type::NoteModulation); };
+
+    s->user.log.clear();
+    events.valueAt(cut, 70.0, 0, 12, -1, -1, -1);    // by note id
+    processClap(s, events, 256);
+    EXPECT_TRUE(hasAll(voiceValues(), { "0:64:12=70.00" }));
+    EXPECT_NEAR(value(cut), 50.0, 1e-9);
+    EXPECT_NEAR(s->user.heard[0], 50.0f, 1e-6f);
+
+    s->user.log.clear();
+    events.valueAt(cut, 30.0, 0, -1, -1, -1, 60);    // by key: both channels
+    events.valueAt(cut, 20.0, 0, -1, -1, 1, -1);     // by channel: the later wins
+    processClap(s, events, 256);
+    EXPECT_TRUE(hasAll(voiceValues(), { "0:60:11=30.00", "1:60:13=30.00", "1:60:13=20.00" }));
+
+    // The parameter moves: a voice with its own value keeps it. The global
+    // modulation then reaches each voice on top of its own value.
+    s->user.log.clear();
+    events.value(cut, 80.0, 0);
+    processClap(s, events, 256);
+    EXPECT_EQ(static_cast<int>(voiceValues().size()), 0);
+    EXPECT_NEAR(s->user.heard[0], 80.0f, 1e-6f);
+    s->user.log.clear();
+    events.mod(cut, 3.0, 0);
+    processClap(s, events, 256);
+    EXPECT_TRUE(hasAll(voiceValues(), { "0:60:11=33.00", "0:64:12=73.00", "1:60:13=23.00" }));
+
+    // A voice's own modulation replaces the global amount (it includes it).
+    s->user.log.clear();
+    events.modAt(cut, 5.0, 0, 12, -1, -1, -1);
+    processClap(s, events, 256);
+    EXPECT_TRUE(hasAll(voiceValues(), { "0:64:12=75.00" }));
+
+    // An address on a parameter without the mark keeps the global meaning.
+    events.valueAt(vol, 0.25, 0, 12, -1, -1, -1);
+    processClap(s, events, 256);
+    EXPECT_NEAR(value(vol), 0.25, 1e-9);
+    cp->deactivate(cp);
+    cp->destroy(cp);
+}
+
 DSPARK_TEST(PluginClap_nan_parameter_values_are_ignored)
 {
     // A NaN CLAP_EVENT_PARAM_VALUE is ignored like a NaN modulation amount.
@@ -1708,4 +1837,193 @@ DSPARK_TEST(PluginLayer_editor_size_persists_through_the_state)
 
     w->releaseImpl();
     v->releaseImpl();
+}
+
+namespace {
+
+// An instrument that declares the note expressions it uses (Pressure has no
+// VST3 type and must not be offered) and logs every MIDI event.
+struct ExprPlug
+{
+    using Expr = dspark::plugin::MidiEvent::ExpressionType;
+    static constexpr auto descriptor = dspark::plugin::Descriptor {
+        .name = "Expr", .vendor = "T", .url = "", .email = "",
+        .productId = "com.dspark.test.expr", .version = "1.0.0",
+        .category = dspark::plugin::Category::Instrument,
+    };
+    static constexpr auto parameters = dspark::plugin::params(
+        dspark::plugin::param("gain", "Gain", 0.0f, 1.0f, 1.0f, ""));
+    static constexpr uint32_t noteExpressions =
+        dspark::plugin::expressions(Expr::Volume, Expr::Tuning, Expr::Pressure);
+    std::vector<dspark::plugin::MidiEvent> log;
+    ExprPlug() { log.reserve(32); }
+    void prepare(const dspark::AudioSpec&) {}
+    void setParameter(int, float) noexcept {}
+    void processBlock(dspark::AudioBufferView<float>) noexcept {}
+    void handleMidiEvent(const dspark::plugin::MidiEvent& e) noexcept
+    {
+        if (log.size() < log.capacity()) log.push_back(e);
+    }
+};
+
+struct MockEventList
+{
+    Steinberg_Vst_IEventListVtbl* vtbl;
+    std::vector<Steinberg_Vst_Event> events;
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE q(void*, const Steinberg_TUID, void** o)
+    { *o = nullptr; return Steinberg_kNoInterface; }
+    static Steinberg_uint32 SMTG_STDMETHODCALLTYPE ref(void*) { return 1; }
+    static Steinberg_int32 SMTG_STDMETHODCALLTYPE count(void* s)
+    { return static_cast<Steinberg_int32>(static_cast<MockEventList*>(s)->events.size()); }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE get(void* s, Steinberg_int32 i,
+                                                        Steinberg_Vst_Event* e)
+    {
+        *e = static_cast<MockEventList*>(s)->events[static_cast<size_t>(i)];
+        return Steinberg_kResultOk;
+    }
+    static Steinberg_tresult SMTG_STDMETHODCALLTYPE add(void*, Steinberg_Vst_Event*)
+    { return Steinberg_kResultFalse; }
+    static inline Steinberg_Vst_IEventListVtbl kVtbl = { &q, &ref, &ref, &count, &get, &add };
+    MockEventList() : vtbl(&kVtbl) {}
+    void noteOn(int16_t channel, int16_t pitch, int32_t noteId, float tuningCents, int32_t offset)
+    {
+        Steinberg_Vst_Event e {};
+        e.type = Steinberg_Vst_Event_EventTypes_kNoteOnEvent;
+        e.sampleOffset = offset;
+        e.Steinberg_Vst_Event_noteOn.channel = channel;
+        e.Steinberg_Vst_Event_noteOn.pitch = pitch;
+        e.Steinberg_Vst_Event_noteOn.velocity = 1.0f;
+        e.Steinberg_Vst_Event_noteOn.tuning = tuningCents;
+        e.Steinberg_Vst_Event_noteOn.noteId = noteId;
+        events.push_back(e);
+    }
+    void expression(uint32_t typeId, int32_t noteId, double value, int32_t offset)
+    {
+        Steinberg_Vst_Event e {};
+        e.type = Steinberg_Vst_Event_EventTypes_kNoteExpressionValueEvent;
+        e.sampleOffset = offset;
+        e.Steinberg_Vst_Event_noteExpressionValue.typeId = typeId;
+        e.Steinberg_Vst_Event_noteExpressionValue.noteId = noteId;
+        e.Steinberg_Vst_Event_noteExpressionValue.value = value;
+        events.push_back(e);
+    }
+};
+
+} // namespace
+
+DSPARK_TEST(PluginVst3_note_expressions_reach_the_voice)
+{
+    // A class that declares noteExpressions offers them to the host through
+    // INoteExpressionController (Pressure excluded: VST3 sends it as poly
+    // pressure) and receives each NoteExpressionValueEvent as a
+    // MidiEvent::Type::NoteExpression on the voice its note id names, in
+    // MidiEvent units (Volume 4x the normalized value, Tuning 240 (v - 0.5)
+    // semitones). A NoteOn's own tuning arrives as the voice's first Tuning
+    // expression. The old wrapper had no such interface and dropped them.
+    using Wrap = dspark::plugin::vst3::Plugin<ExprPlug>;
+    using Type = dspark::plugin::MidiEvent::Type;
+    using Expr = dspark::plugin::MidiEvent::ExpressionType;
+    auto* p = new Wrap();
+    void* raw = nullptr;
+    EXPECT_EQ(p->query(Steinberg_Vst_INoteExpressionController_iid, &raw), Steinberg_kResultOk);
+    auto* nec = static_cast<Steinberg_Vst_INoteExpressionController*>(raw);
+    if (nec != nullptr)
+    {
+        EXPECT_EQ(nec->lpVtbl->getNoteExpressionCount(nec, 0, 3), 2);
+        EXPECT_EQ(nec->lpVtbl->getNoteExpressionCount(nec, 1, 3), 0);
+        Steinberg_Vst_NoteExpressionTypeInfo info {};
+        EXPECT_EQ(nec->lpVtbl->getNoteExpressionInfo(nec, 0, 3, 0, &info), Steinberg_kResultOk);
+        EXPECT_EQ(info.typeId, 0u);   // Volume
+        EXPECT_NEAR(info.valueDesc.defaultValue, 0.25, 1e-12);
+        EXPECT_EQ(nec->lpVtbl->getNoteExpressionInfo(nec, 0, 3, 1, &info), Steinberg_kResultOk);
+        EXPECT_EQ(info.typeId, 2u);   // Tuning
+        EXPECT_NE(info.flags & Steinberg_Vst_NoteExpressionTypeInfo_NoteExpressionTypeFlags_kIsBipolar, 0);
+        EXPECT_NE(nec->lpVtbl->getNoteExpressionInfo(nec, 0, 3, 2, &info), Steinberg_kResultOk);
+        Steinberg_Vst_String128 text {};
+        nec->lpVtbl->getNoteExpressionStringByValue(nec, 0, 0, 0, 0.25, text);
+        char utf8[64];
+        dspark::plugin::vst3::string128ToUtf8(text, utf8, sizeof(utf8));
+        EXPECT_TRUE(std::strcmp(utf8, "0.00 dB") == 0);
+        dspark::plugin::vst3::utf8ToString128("+12.00 st", text);
+        double norm = -1.0;
+        EXPECT_EQ(nec->lpVtbl->getNoteExpressionValueByString(nec, 0, 0, 2, text, &norm),
+                  Steinberg_kResultOk);
+        EXPECT_NEAR(norm, 0.55, 1e-12);
+        nec->lpVtbl->release(nec);
+    }
+    // A class without the declaration offers none.
+    auto* plain = new dspark::plugin::vst3::Plugin<PolyPlug>();
+    void* none = reinterpret_cast<void*>(1);
+    EXPECT_EQ(plain->query(Steinberg_Vst_INoteExpressionController_iid, &none),
+              Steinberg_kNoInterface);
+    plain->releaseImpl();
+
+    Steinberg_Vst_ProcessSetup setup { 0, Steinberg_Vst_SymbolicSampleSizes_kSample32, 256, 48000.0 };
+    p->kProcessorVtbl.setupProcessing(p->lensPtr(1), &setup);
+    p->kComponentVtbl.setActive(p->lensPtr(0), 1);
+    p->kProcessorVtbl.setProcessing(p->lensPtr(1), 1);
+    MockEventList list;
+    list.noteOn(2, 60, 5, 50.0f, 0);
+    list.expression(Steinberg_Vst_NoteExpressionTypeIDs_kTuningTypeID, 5, 0.55, 64);
+    list.expression(Steinberg_Vst_NoteExpressionTypeIDs_kVolumeTypeID, 5, 0.125, 96);
+    list.expression(Steinberg_Vst_NoteExpressionTypeIDs_kPanTypeID, 5, 0.9, 100);   // not declared
+    list.expression(Steinberg_Vst_NoteExpressionTypeIDs_kVolumeTypeID, 99, 0.5, 120); // unknown note
+    std::vector<float> l(256), r(256);
+    float* out[2] = { l.data(), r.data() };
+    Steinberg_Vst_AudioBusBuffers outBus {};
+    outBus.numChannels = 2;
+    outBus.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = out;
+    Steinberg_Vst_ProcessData data {};
+    data.symbolicSampleSize = Steinberg_Vst_SymbolicSampleSizes_kSample32;
+    data.numSamples = 256;
+    data.numOutputs = 1;
+    data.outputs = &outBus;
+    data.inputEvents = reinterpret_cast<Steinberg_Vst_IEventList*>(&list);
+    EXPECT_EQ(p->kProcessorVtbl.process(p->lensPtr(1), &data), Steinberg_kResultOk);
+    const auto& log = p->user.log;
+    EXPECT_EQ(static_cast<int>(log.size()), 4);
+    if (log.size() == 4)
+    {
+        EXPECT_TRUE(log[0].type == Type::NoteOn && log[0].noteId == 5);
+        EXPECT_TRUE(log[1].type == Type::NoteExpression && log[1].expression == Expr::Tuning);
+        EXPECT_NEAR(log[1].value, 0.5f, 1e-6f);   // the NoteOn's 50 cents
+        EXPECT_TRUE(log[2].type == Type::NoteExpression && log[2].expression == Expr::Tuning);
+        EXPECT_NEAR(log[2].value, 12.0f, 1e-4f);
+        EXPECT_EQ(static_cast<int>(log[2].channel), 2);
+        EXPECT_EQ(static_cast<int>(log[2].note), 60);
+        EXPECT_EQ(static_cast<int>(log[2].noteId), 5);
+        EXPECT_TRUE(log[3].type == Type::NoteExpression && log[3].expression == Expr::Volume);
+        EXPECT_NEAR(log[3].value, 0.5f, 1e-6f);
+    }
+    p->releaseImpl();
+}
+
+DSPARK_TEST(PluginVst3_state_load_reaches_the_open_editor)
+{
+    // A state loaded while an editor view exists hands its size to that
+    // view at once (the view then asks its frame to resize). The old
+    // wrapper only remembered it for the next view.
+    using Wrap = dspark::plugin::vst3::Plugin<ResizablePlug>;
+    auto* source = new Wrap();
+    source->editorMemory.remember(600.0, 450.0);
+    MockStream saved;
+    source->kComponentVtbl.getState(source->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved));
+    auto* p = new Wrap();
+    struct Seen { int calls = 0; dspark::plugin::EditorSize size {}; Wrap* owner = nullptr; } seen;
+    seen.owner = p;
+    p->liveView = &seen;
+    p->resizeLiveView = [](void* v) noexcept {
+        auto* s = static_cast<Seen*>(v);
+        ++s->calls;
+        s->size = s->owner->editorMemory.current();
+    };
+    saved.pos = 0;
+    EXPECT_EQ(p->kComponentVtbl.setState(p->lensPtr(0), reinterpret_cast<Steinberg_IBStream*>(&saved)),
+              Steinberg_kResultOk);
+    EXPECT_EQ(seen.calls, 1);
+    EXPECT_EQ(seen.size.width, 600);
+    EXPECT_EQ(seen.size.height, 450);
+    p->liveView = nullptr;
+    p->releaseImpl();
+    source->releaseImpl();
 }

@@ -34,10 +34,15 @@
  *   `aumu` music device (no input elements; MIDI drives it), a HasMidi
  *   effect is an `aumf` music effect, anything else stays `aufx`. The
  *   bundle's Info.plist entry must declare the same type.
- * - MIDI arrives through the MusicDevice selectors as raw bytes, lands in a
- *   lock-free ring and is delivered as MidiEvents, time-ordered with the
- *   scheduled parameter events (sample-accurate sub-block processing, the
- *   same scheme as the VST3/CLAP backends).
+ * - MIDI arrives through the MusicDevice selectors as raw bytes or, from
+ *   hosts that send event lists (SDK 12 and later), as Universal MIDI
+ *   Packets in either protocol - the unit asks for MIDI 2.0
+ *   (kAudioUnitProperty_AudioUnitMIDIProtocol), so velocity, controllers
+ *   and bend keep their 16- and 32-bit resolution. Events land in a
+ *   lock-free queue that any number of threads may push into at once and
+ *   are delivered as MidiEvents, time-ordered with the scheduled parameter
+ *   events (sample-accurate sub-block processing, the same scheme as the
+ *   VST3/CLAP backends).
  * - HasTransport plugins get the host-callback transport (BeatAndTempo /
  *   TransportState / MusicalTimeLocation) once per render.
  * - Mono and stereo follow the declared ChannelSupport through
@@ -61,7 +66,11 @@
  *   every render, with the pre/post-render flags (and the error flag on a
  *   refused call), as the format's reference implementation runs them. A
  *   render of another output element, or into a host buffer shorter than
- *   the slice, is refused.
+ *   the slice, is refused. The first refused or failed render since the
+ *   host last asked is kept in kAudioUnitProperty_LastRenderError (read and
+ *   cleared), and that property's listeners hear of it on the main thread.
+ *   kAudioUnitProperty_ShouldAllocateBuffer is kept per element; an input
+ *   set to false is pulled without lent buffers (its source supplies them).
  * - Reset clears the plugin's history and drops the MIDI queued before it.
  * - Host bypass maps to kAudioUnitProperty_BypassEffect with the same
  *   crossfade as the other backends. The bypass is also a parameter: a
@@ -82,7 +91,8 @@
  *   factory from this bundle and get the same WKWebView editor as the
  *   VST3/CLAP backends; otherwise they show their generic parameter UI. A
  *   resizable editor reopens at the size the host left it (the container
- *   view records every setFrameSize:), also in the next session.
+ *   view records every setFrameSize:), also in the next session; a state
+ *   loaded while the view exists resizes it at once.
  */
 
 #define DSPARK_PLUGIN_AU_INCLUDED 1
@@ -97,6 +107,19 @@
 // AUParameterListenerNotify (state / preset loads), AUParameterSet and
 // AUEventListenerNotify (editor gestures): all in AudioToolbox.framework.
 #include <AudioToolbox/AudioUnitUtilities.h>
+
+// MIDI 2.0 event lists (MusicDeviceMIDIEventList and the AudioUnitMIDIProtocol
+// property, SDK 12 and later): the Universal MIDI Packet types come from the
+// CoreMIDI header alone - no CoreMIDI function is called, nothing more to link.
+#if defined(__has_include)
+#if __has_include(<CoreMIDI/MIDIServices.h>) && (defined(__MAC_12_0) || defined(__IPHONE_15_0))
+#include <CoreMIDI/MIDIServices.h>
+#define DSPARK_AU_HAVE_MIDI2 1
+#endif
+#endif
+#if !defined(DSPARK_AU_HAVE_MIDI2)
+#define DSPARK_AU_HAVE_MIDI2 0
+#endif
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
 #include <dlfcn.h>
@@ -374,16 +397,27 @@ struct Plugin
     // Host transport callbacks (kAudioUnitProperty_HostCallbacks).
     HostCallbackInfo hostCallbacks {};
 
-    // Incoming MIDI: the MusicDevice selectors push, render() drains.
-    // Single producer (host MIDI thread), single consumer (render thread).
+    // Incoming MIDI: the MusicDevice selectors push, render() drains. Any
+    // number of threads may push at once - the host's MIDI thread, its
+    // render thread, an on-screen keyboard on the main thread - so this is a
+    // bounded multi-producer queue: a producer claims a position with one
+    // compare-exchange and publishes its cell with a release store of the
+    // cell's sequence number; the render thread is the one consumer. (The
+    // old single-producer ring let two pushing threads take the same slot:
+    // events were lost, duplicated or torn.)
     static constexpr uint32_t kMidiRingSize = 256;   // power of two
-    MidiEvent midiRing[HasMidi<P> ? kMidiRingSize : 1] {};
-    std::atomic<uint32_t> midiHead { 0 }, midiTail { 0 };
+    struct MidiCell
+    {
+        std::atomic<uint32_t> seq { 0 };   ///< position + 1 once published
+        MidiEvent event {};
+    };
+    MidiCell midiRing[HasMidi<P> ? kMidiRingSize : 1] {};
+    std::atomic<uint32_t> midiEnqueue { 0 };   // the next position a producer claims
+    uint32_t midiDequeue = 0;                  // the render thread's position
     // Reset discards the MIDI queued before it (a transport stop must not
-    // replay notes into the next run): it records the ring position, the
-    // render thread skips up to it.
-    std::atomic<uint32_t> midiDiscardTo { 0 };
-    std::atomic<bool>     midiDiscard { false };
+    // replay notes into the next run): positions before this mark are
+    // drained without being delivered.
+    std::atomic<uint32_t> midiDiscardBefore { 0 };
 
     // Render notifications (AudioUnitAddRenderNotify): host callbacks run
     // before and after every render - hosts schedule parameters from the
@@ -454,6 +488,20 @@ struct Plugin
     /// The editor size the user left (kept without the editor layer too, so
     /// a session saved where the editor ran keeps its size here).
     EditorSizeMemory<P> editorMemory;
+
+    /// The first render error since the host last read
+    /// kAudioUnitProperty_LastRenderError (reading it clears it). The
+    /// render thread records it; the property's listeners hear of it on
+    /// the main thread.
+    std::atomic<OSStatus> lastRenderError { noErr };
+
+    /// kAudioUnitProperty_ShouldAllocateBuffer of each element (input 0 and
+    /// 1, output 0). With false on an input, its source supplies the buffers
+    /// (the pull passes none); the unit keeps its own fallback buffers either
+    /// way (MaximumFramesPerSlice floats per channel), so a host that passes
+    /// no output buffer still renders. Fixed while initialized.
+    bool allocateInput[2] = { true, true };
+    bool allocateOutput = true;
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     webview_ui::Editor<P> editor;
@@ -534,7 +582,10 @@ struct Plugin
 
     // --- property notifications (main thread; ~30 Hz main-queue tick) ------------------
 
-    enum : uint32_t { kNotifyLatency = 1u, kNotifyTail = 2u, kNotifyBypass = 4u };
+    enum : uint32_t
+    {
+        kNotifyLatency = 1u, kNotifyTail = 2u, kNotifyBypass = 4u, kNotifyRenderError = 8u
+    };
     std::atomic<uint32_t> notifyPending { 0u };
     std::atomic<bool> tickRunning { false };
     dispatch_source_t tick = nullptr;
@@ -549,6 +600,29 @@ struct Plugin
             notifyPending.fetch_or(bits, std::memory_order_release);
     }
 
+    /** The same from the render thread, which never calls the host's
+     *  listeners itself: off the main thread the bits wait for the tick
+     *  (or, while no tick runs, for the next initialize). */
+    void announceFromRender(uint32_t bits) noexcept
+    {
+        if (pthread_main_np() != 0)
+            deliverNotifications(bits);
+        else
+            notifyPending.fetch_or(bits, std::memory_order_release);
+    }
+
+    /** Records a render error for kAudioUnitProperty_LastRenderError: the
+     *  first one since the host last read the property (as the format's
+     *  reference implementation keeps it). The old code had no such
+     *  property, so a host never learned why a slice came back empty. */
+    void recordRenderError(OSStatus error) noexcept
+    {
+        if (error == noErr) return;
+        OSStatus none = noErr;
+        if (lastRenderError.compare_exchange_strong(none, error, std::memory_order_relaxed))
+            announceFromRender(kNotifyRenderError);
+    }
+
     void deliverNotifications(uint32_t bits) noexcept
     {
         if ((bits & kNotifyLatency) != 0u)
@@ -559,6 +633,8 @@ struct Plugin
         // parameter the host itself moved (automation, a state load).
         if ((bits & kNotifyBypass) != 0u)
             notifyProperty(kAudioUnitProperty_BypassEffect, kAudioUnitScope_Global, 0);
+        if ((bits & kNotifyRenderError) != 0u)
+            notifyProperty(kAudioUnitProperty_LastRenderError, kAudioUnitScope_Global, 0);
     }
 
     static void onTick(void* self)
@@ -580,6 +656,10 @@ struct Plugin
                                   33u * 1000000u, 5u * 1000000u);
         dispatch_resume(tick);
         tickRunning.store(true, std::memory_order_release);
+        // A render error raised while no tick ran (a refused render before
+        // initialize) reaches its listeners now, on the main thread.
+        const uint32_t bits = notifyPending.exchange(0u, std::memory_order_acq_rel);
+        if (bits != 0u) deliverNotifications(bits);
     }
 
     /** Main thread (uninitialize/close): no tick runs after this returns;
@@ -625,6 +705,9 @@ struct Plugin
         for (size_t i = 0; i < kNumParams; ++i)
             shadow[i].store(toNormalized(P::parameters[i], P::parameters[i].defValue),
                             std::memory_order_relaxed);
+        uint32_t position = 0;
+        for (auto& cell : midiRing)   // each cell open for its first position
+            cell.seq.store(position++, std::memory_order_relaxed);
     }
 
     static int indexOfParamId(AudioUnitParameterID id) noexcept
@@ -792,6 +875,24 @@ struct Plugin
         return static_cast<Plugin*>(context)->createEditorView(width, height);
     }
 
+    /** A state loaded while the editor view exists carried another size:
+     *  the container takes it at once (setFrameSize:, which the host's
+     *  window follows as it follows any editor resize). The old code only
+     *  remembered it for the next view. */
+    void applyRememberedEditorSize() noexcept
+    {
+        if constexpr (kHasWebEditor)
+        {
+            if (editorContainer == nullptr) return;
+            namespace og = webview_ui::objc_glue;
+            const EditorSize logical = editorMemory.current();
+            og::call<void>(static_cast<og::ObjId>(editorContainer), "setFrameSize:",
+                           ViewSize { static_cast<double>(logical.width),
+                                      static_cast<double>(logical.height) });
+            editor.setBounds(logical.width, logical.height);
+        }
+    }
+
     /** Builds the container NSView + embedded web engine. Returns the view
      *  AUTORELEASED (Cocoa factory convention: the host retains it), or null
      *  so the host falls back to its generic UI. The host's preferred size is
@@ -878,11 +979,8 @@ struct Plugin
         blockEvents.clear();
         rampCount = 0;
         if constexpr (HasMidi<P>)   // MIDI queued while uninitialized is stale
-        {
-            midiHead.store(midiTail.load(std::memory_order_acquire),
-                           std::memory_order_release);
-            midiDiscard.store(false, std::memory_order_relaxed);
-        }
+            midiDiscardBefore.store(midiEnqueue.load(std::memory_order_acquire),
+                                    std::memory_order_release);
         applyNotifyCommands();   // no render runs before `initialized` below
         renderThread.store(std::thread::id {}, std::memory_order_relaxed);
         startTick();
@@ -909,11 +1007,8 @@ struct Plugin
         dryDelay.reset();
         bypassMix = bypass.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
         if constexpr (HasMidi<P>)
-        {
-            midiDiscardTo.store(midiTail.load(std::memory_order_acquire),
-                                std::memory_order_relaxed);
-            midiDiscard.store(true, std::memory_order_release);
-        }
+            midiDiscardBefore.store(midiEnqueue.load(std::memory_order_acquire),
+                                    std::memory_order_release);
         return noErr;
     }
 
@@ -1044,6 +1139,19 @@ struct Plugin
         return channelSupportOf<P>() == ChannelSupport::MonoAndStereo ? 2 : 1;
     }
 
+    /** True for an input or output element this unit has. */
+    static constexpr bool isIoElement(AudioUnitScope scope, AudioUnitElement element) noexcept
+    {
+        if (scope == kAudioUnitScope_Input)
+        {
+            if constexpr (kNumInputElements == 0)   // an instrument: none
+                return false;
+            else
+                return element < kNumInputElements;
+        }
+        return scope == kAudioUnitScope_Output && element == 0;
+    }
+
     /** Lazily builds the FactoryPresets CFArray (records + names live in
      *  the instance; the array holds bare AUPreset pointers, callbacks-free). */
     void buildPresetArray() noexcept
@@ -1130,6 +1238,20 @@ struct Plugin
         case kAudioUnitProperty_PresentPreset:
         case kAudioUnitProperty_CurrentPreset:
             size = sizeof(AUPreset); writable = true; break;
+        case kAudioUnitProperty_LastRenderError:
+            if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
+            size = sizeof(OSStatus); break;
+        case kAudioUnitProperty_ShouldAllocateBuffer:
+            if (scope != kAudioUnitScope_Input && scope != kAudioUnitScope_Output)
+                return kAudioUnitErr_InvalidScope;
+            if (!isIoElement(scope, element)) return kAudioUnitErr_InvalidElement;
+            size = sizeof(UInt32); writable = true; break;
+#if DSPARK_AU_HAVE_MIDI2
+        case kAudioUnitProperty_AudioUnitMIDIProtocol:
+            if constexpr (!HasMidi<P>) return kAudioUnitErr_InvalidProperty;
+            if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
+            size = sizeof(SInt32); break;
+#endif
 #if defined(DSPARK_PLUGIN_WEBVIEW)
         case kAudioUnitProperty_CocoaUI:
             if constexpr (!kHasWebEditor) return kAudioUnitErr_InvalidProperty;
@@ -1387,6 +1509,36 @@ struct Plugin
             *static_cast<UInt32*>(outData) = 1;
             *ioSize = sizeof(UInt32);
             return noErr;
+        case kAudioUnitProperty_LastRenderError:
+            // Read and cleared, as the format defines (the next error is
+            // recorded afresh).
+            if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
+            if (*ioSize < sizeof(OSStatus)) return kAudioUnitErr_InvalidPropertyValue;
+            *static_cast<OSStatus*>(outData) =
+                lastRenderError.exchange(noErr, std::memory_order_relaxed);
+            *ioSize = sizeof(OSStatus);
+            return noErr;
+        case kAudioUnitProperty_ShouldAllocateBuffer:
+            if (scope != kAudioUnitScope_Input && scope != kAudioUnitScope_Output)
+                return kAudioUnitErr_InvalidScope;
+            if (!isIoElement(scope, element)) return kAudioUnitErr_InvalidElement;
+            if (*ioSize < sizeof(UInt32)) return kAudioUnitErr_InvalidPropertyValue;
+            *static_cast<UInt32*>(outData) =
+                (scope == kAudioUnitScope_Input ? allocateInput[element] : allocateOutput)
+                    ? 1u : 0u;
+            *ioSize = sizeof(UInt32);
+            return noErr;
+#if DSPARK_AU_HAVE_MIDI2
+        case kAudioUnitProperty_AudioUnitMIDIProtocol:
+            // MIDI 2.0: event lists then keep 16-bit velocity and 32-bit
+            // controllers (the framework converts MIDI 1.0 sources up).
+            if constexpr (!HasMidi<P>) return kAudioUnitErr_InvalidProperty;
+            if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
+            if (*ioSize < sizeof(SInt32)) return kAudioUnitErr_InvalidPropertyValue;
+            *static_cast<SInt32*>(outData) = static_cast<SInt32>(kMIDIProtocol_2_0);
+            *ioSize = sizeof(SInt32);
+            return noErr;
+#endif
         case kAudioUnitProperty_PresentPreset:
         case kAudioUnitProperty_CurrentPreset:
         {
@@ -1595,6 +1747,23 @@ struct Plugin
                                                        : sizeof(hostCallbacks));
             return noErr;
         }
+        case kAudioUnitProperty_ShouldAllocateBuffer:
+        {
+            // Per element, before initialize (it decides which buffers the
+            // render uses); the old code refused the property entirely.
+            if (scope != kAudioUnitScope_Input && scope != kAudioUnitScope_Output)
+                return kAudioUnitErr_InvalidScope;
+            if (!isIoElement(scope, element)) return kAudioUnitErr_InvalidElement;
+            if (inData == nullptr || inSize < sizeof(UInt32))
+                return kAudioUnitErr_InvalidPropertyValue;
+            if (initialized) return kAudioUnitErr_Initialized;
+            const bool allocate = *static_cast<const UInt32*>(inData) != 0;
+            if (scope == kAudioUnitScope_Input)
+                allocateInput[element] = allocate;
+            else
+                allocateOutput = allocate;
+            return noErr;
+        }
         case kAudioUnitProperty_OfflineRender:
             if (inData == nullptr || inSize < sizeof(UInt32))
                 return kAudioUnitErr_InvalidPropertyValue;
@@ -1688,7 +1857,12 @@ struct Plugin
                 if (bypassState >= 0 && setBypass(bypassState != 0))
                     announce(kNotifyBypass);
                 if (editorSize.width > 0)
+                {
                     editorMemory.remember(editorSize.width, editorSize.height);
+#if defined(DSPARK_PLUGIN_WEBVIEW)
+                    applyRememberedEditorSize();
+#endif
+                }
                 refreshReported();   // restored state may imply a new lookahead
                 notifyAllParameters();
                 notifyProperty(kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0);
@@ -1787,12 +1961,7 @@ struct Plugin
             default:
                 return noErr;   // system messages: accepted, ignored
             }
-            const uint32_t tail = midiTail.load(std::memory_order_relaxed);
-            const uint32_t next = (tail + 1) & (kMidiRingSize - 1);
-            if (next == midiHead.load(std::memory_order_acquire))
-                return noErr;   // ring full: drop (never block the MIDI thread)
-            midiRing[tail] = ev;
-            midiTail.store(next, std::memory_order_release);
+            (void) queueMidi(ev);   // full: dropped (never block the caller)
             return noErr;
         }
         else
@@ -1804,6 +1973,137 @@ struct Plugin
             return kAudioUnitErr_InvalidProperty;
         }
     }
+
+    /** Queues one event for the next render, from any thread (lock-free:
+     *  one compare-exchange claims a position). False when the queue is
+     *  full - the event is dropped rather than the caller blocked. */
+    bool queueMidi(const MidiEvent& ev) noexcept
+    {
+        constexpr uint32_t mask = kMidiRingSize - 1;
+        uint32_t position = midiEnqueue.load(std::memory_order_relaxed);
+        for (;;)
+        {
+            MidiCell& cell = midiRing[position & mask];
+            const uint32_t seq = cell.seq.load(std::memory_order_acquire);
+            const auto lag = static_cast<int32_t>(seq - position);
+            if (lag == 0)
+            {
+                if (midiEnqueue.compare_exchange_weak(position, position + 1,
+                                                      std::memory_order_relaxed))
+                {
+                    cell.event = ev;
+                    cell.seq.store(position + 1, std::memory_order_release);
+                    return true;
+                }
+            }
+            else if (lag < 0)
+                return false;   // the consumer has not freed this cell yet: full
+            else
+                position = midiEnqueue.load(std::memory_order_relaxed);
+        }
+    }
+
+#if DSPARK_AU_HAVE_MIDI2
+    /** One MIDI 2.0 channel voice message (UMP type 4): @p status is the
+     *  opcode and channel, @p index the note or controller, @p data the
+     *  32-bit second word. Values keep their resolution: 16-bit velocity,
+     *  32-bit pressure, controllers and bend. A Note On of velocity 0 stays a
+     *  Note On (MIDI 2.0 defines no running note-off). Per-note controllers,
+     *  per-note pitch bend, RPN/NRPN and program change are accepted and
+     *  ignored, as system messages are. */
+    void queueMidi2(UInt32 status, UInt32 index, UInt32 data, UInt32 offsetFrame) noexcept
+    {
+        MidiEvent ev {};
+        ev.channel = static_cast<uint8_t>(status & 0x0Fu);
+        ev.note = static_cast<uint8_t>(index & 0x7Fu);
+        ev.sampleOffset = static_cast<int>(offsetFrame);
+        constexpr double k32 = 4294967295.0;
+        switch (status & 0xF0u)
+        {
+        case 0x90:
+            ev.type = MidiEvent::Type::NoteOn;
+            ev.value = static_cast<float>((data >> 16) / 65535.0);
+            break;
+        case 0x80:
+            ev.type = MidiEvent::Type::NoteOff;
+            ev.value = static_cast<float>((data >> 16) / 65535.0);
+            break;
+        case 0xA0:
+            ev.type = MidiEvent::Type::PolyPressure;
+            ev.value = static_cast<float>(data / k32);
+            break;
+        case 0xB0:
+            ev.type = MidiEvent::Type::ControlChange;
+            ev.value = static_cast<float>(data / k32);
+            break;
+        case 0xD0:
+            ev.type = MidiEvent::Type::ChannelPressure;
+            ev.note = 0;
+            ev.value = static_cast<float>(data / k32);
+            break;
+        case 0xE0:
+            ev.type = MidiEvent::Type::PitchBend;
+            ev.note = 0;
+            ev.value = static_cast<float>((static_cast<double>(data) - 2147483648.0)
+                                          / 2147483648.0);
+            break;
+        default:
+            return;
+        }
+        (void) queueMidi(ev);
+    }
+
+    /**
+     * MusicDeviceMIDIEventList: Universal MIDI Packets in either protocol -
+     * MIDI 1.0 channel voice messages (type 2) and MIDI 2.0 ones (type 4);
+     * the other message types are accepted and ignored. Each packet's
+     * timestamp is its offset from @p offsetFrame (the format's definition);
+     * a timestamp no slice can hold (a host stamping host time) counts as 0.
+     */
+    OSStatus pushEventList(UInt32 offsetFrame, const MIDIEventList* list) noexcept
+    {
+        if constexpr (HasMidi<P>)
+        {
+            if (list == nullptr) return kAudio_ParamError;
+            // UMP sizes in 32-bit words, by message type.
+            static constexpr UInt32 kWords[16] = { 1, 1, 1, 2, 2, 4, 1, 1,
+                                                   2, 2, 2, 3, 3, 4, 4, 4 };
+            const MIDIEventPacket* packet = &list->packet[0];
+            for (UInt32 p = 0; p < list->numPackets; ++p)
+            {
+                const UInt32 count = packet->wordCount;
+                if (count > 64) break;   // malformed: the packet cannot hold it
+                const uint64_t stamp = static_cast<uint64_t>(packet->timeStamp);
+                uint64_t at = static_cast<uint64_t>(offsetFrame)
+                            + (stamp < (uint64_t { 1 } << 24) ? stamp : 0u);
+                if (at > 0x7FFFFFFFu) at = 0x7FFFFFFFu;
+                const auto offset = static_cast<UInt32>(at);
+                for (UInt32 w = 0; w < count;)
+                {
+                    const UInt32 word = packet->words[w];
+                    const UInt32 type = word >> 28;
+                    const UInt32 size = kWords[type];
+                    if (w + size > count) break;   // truncated message
+                    const UInt32 status = (word >> 16) & 0xFFu;
+                    const UInt32 index = (word >> 8) & 0xFFu;
+                    if (type == 0x2u)
+                        (void) pushMidi(status, index, word & 0xFFu, offset);
+                    else if (type == 0x4u)
+                        queueMidi2(status, index, packet->words[w + 1], offset);
+                    w += size;
+                }
+                packet = reinterpret_cast<const MIDIEventPacket*>(packet->words + count);
+            }
+            return noErr;
+        }
+        else
+        {
+            (void) offsetFrame;
+            (void) list;
+            return kAudioUnitErr_InvalidProperty;
+        }
+    }
+#endif // DSPARK_AU_HAVE_MIDI2
 
     /** Forwards the host-callback transport once per render (HasTransport). */
     void forwardTransport() noexcept
@@ -1897,16 +2197,20 @@ struct Plugin
                                   ? sidechainChannels
                                   : static_cast<UInt32>(currentChannels);
         const UInt32 width = elementWidth < 2u ? elementWidth : 2u;
+        // ShouldAllocateBuffer false: the source supplies the buffers, so
+        // the pull lends none (the format's convention for that element).
+        const bool lendBuffers = allocateInput[element < 2u ? element : 0u];
         list.mNumberBuffers = width;
         for (UInt32 ch = 0; ch < width; ++ch)
         {
             list.mBuffers[ch].mNumberChannels = 1;
             list.mBuffers[ch].mDataByteSize = frames * sizeof(float);
-            list.mBuffers[ch].mData = dst[ch];
+            list.mBuffers[ch].mData = lendBuffers ? dst[ch] : nullptr;
         }
         auto* abl = reinterpret_cast<AudioBufferList*>(&list);
         OSStatus status = noErr;
         AudioUnitRenderActionFlags flags = 0;
+        bool pulled = true;
         if (inputCallback[element].inputProc != nullptr)
             status = inputCallback[element].inputProc(
                 inputCallback[element].inputProcRefCon, &flags, timeStamp,
@@ -1915,12 +2219,17 @@ struct Plugin
             status = AudioUnitRender(inputConnection[element], &flags, timeStamp,
                                      inputConnectionBus[element], frames, abl);
         else
-            for (UInt32 ch = 0; ch < width; ++ch)
-                std::memset(dst[ch], 0, frames * sizeof(float));
+            pulled = false;
         if (status != noErr) return status;
-        for (UInt32 ch = 0; ch < width && ch < list.mNumberBuffers; ++ch)
-            if (list.mBuffers[ch].mData != nullptr)
+        for (UInt32 ch = 0; ch < width; ++ch)
+        {
+            // A source that supplied a buffer of its own is read in place;
+            // one that left the lent-out slot empty yields silence.
+            if (pulled && ch < list.mNumberBuffers && list.mBuffers[ch].mData != nullptr)
                 dst[ch] = static_cast<float*>(list.mBuffers[ch].mData);
+            else if (!pulled || !lendBuffers)
+                std::memset(dst[ch], 0, frames * sizeof(float));
+        }
         if (width == 1 && currentChannels > 1)
             dst[1] = dst[0];   // a mono key feeds both detector ears
         return noErr;
@@ -1996,29 +2305,23 @@ struct Plugin
      * implementation, a refused call
      * still ends with a post-render notification carrying the error flag,
      * and the events scheduled for a slice that does not render never reach
-     * a later one (see discardSlice).
+     * a later one (see discardSlice). Every error is also recorded for
+     * kAudioUnitProperty_LastRenderError before that notification runs.
      */
     OSStatus render(AudioUnitRenderActionFlags* ioFlags,
                     const AudioTimeStamp* timeStamp, UInt32 busNumber,
                     UInt32 frames, AudioBufferList* ioData) noexcept
     {
-        if (ioData == nullptr)
-        {
+        auto refuseEarly = [&](OSStatus error) noexcept {
             discardSlice();
-            return kAudio_ParamError;
-        }
+            recordRenderError(error);
+            return error;
+        };
+        if (ioData == nullptr) return refuseEarly(kAudio_ParamError);
         // One output element. Rendering any other (the old code ignored the
         // number) ran the DSP a second time in the same cycle.
-        if (busNumber != 0)
-        {
-            discardSlice();
-            return kAudioUnitErr_InvalidElement;
-        }
-        if (!initialized)
-        {
-            discardSlice();
-            return kAudioUnitErr_Uninitialized;
-        }
+        if (busNumber != 0) return refuseEarly(kAudioUnitErr_InvalidElement);
+        if (!initialized) return refuseEarly(kAudioUnitErr_Uninitialized);
 
         // FTZ/DAZ for the whole callback (the notifications included):
         // DSPark processors guard their own hot loops, this covers user DSP
@@ -2033,6 +2336,7 @@ struct Plugin
         constexpr Flags kError = static_cast<Flags>(kAudioUnitRenderAction_PostRenderError);
         auto refuse = [&](OSStatus error) noexcept {
             discardSlice();
+            recordRenderError(error);
             callRenderNotifies(flags | kPost | kError, timeStamp, busNumber, frames, ioData);
             return error;
         };
@@ -2054,6 +2358,7 @@ struct Plugin
             discardSlice();
         else
             status = renderSlice(timeStamp, frames, ioData);
+        recordRenderError(status);
         callRenderNotifies(flags | kPost | (status != noErr ? kError : Flags { 0 }),
                            timeStamp, busNumber, frames, ioData);
         return status;
@@ -2077,26 +2382,35 @@ struct Plugin
         expandRamps(static_cast<int>(frames));
         if constexpr (HasMidi<P>)
         {
-            uint32_t head = midiHead.load(std::memory_order_relaxed);
-            const uint32_t tail = midiTail.load(std::memory_order_acquire);
-            if (midiDiscard.exchange(false, std::memory_order_acquire))
+            // Every published event, in position order; a claimed position
+            // still being written ends the drain (it arrives next slice).
+            constexpr uint32_t mask = kMidiRingSize - 1;
+            const uint32_t discardBefore = midiDiscardBefore.load(std::memory_order_acquire);
+            uint32_t position = midiDequeue;
+            for (;;)
             {
-                // Skip what a Reset found queued - only forward: a slice
-                // rendered between the Reset's two stores may be past it.
-                const uint32_t to = midiDiscardTo.load(std::memory_order_relaxed);
-                constexpr uint32_t mask = kMidiRingSize - 1;
-                if (((to - head) & mask) <= ((tail - head) & mask)) head = to;
+                MidiCell& cell = midiRing[position & mask];
+                if (cell.seq.load(std::memory_order_acquire) != position + 1) break;
+                const MidiEvent midi = cell.event;
+                cell.seq.store(position + kMidiRingSize, std::memory_order_release);
+                // Queued after the last Reset: delivered (wrap-safe order).
+                if (static_cast<int32_t>(position - discardBefore) >= 0)
+                {
+                    BlockEvent ev {};
+                    ev.kind = BlockEvent::Kind::Midi;
+                    ev.midi = midi;
+                    ev.offset = midi.sampleOffset;
+                    blockEvents.add(ev);
+                }
+                ++position;
             }
-            while (head != tail)
-            {
-                BlockEvent ev {};
-                ev.kind = BlockEvent::Kind::Midi;
-                ev.midi = midiRing[head];
-                ev.offset = ev.midi.sampleOffset;
-                blockEvents.add(ev);
-                head = (head + 1) & (kMidiRingSize - 1);
-            }
-            midiHead.store(head, std::memory_order_release);
+            midiDequeue = position;
+            // Once passed, the mark follows the drain so the wrap-safe order
+            // above stays valid; a newer Reset's mark wins the exchange.
+            uint32_t mark = discardBefore;
+            if (static_cast<int32_t>(position - mark) > 0)
+                (void) midiDiscardBefore.compare_exchange_strong(mark, position,
+                                                          std::memory_order_acq_rel);
         }
         BlockEventList& events = blockEvents;
         for (int i = 0; i < events.size(); ++i)
@@ -2485,6 +2799,17 @@ struct Component
         return noErr;   // accepted, ignored (no sysex contract in v1)
     }
 
+#if DSPARK_AU_HAVE_MIDI2
+    /** MusicDeviceMIDIEventList: MIDI 1.0 and 2.0 Universal MIDI Packets
+     *  (the old unit offered no such selector, so MIDI 2.0 data reached it
+     *  only as MIDI 1.0 bytes: 7-bit velocity and controllers). */
+    static OSStatus sMidiEventList(void* self, UInt32 offsetSampleFrame,
+                                   const MIDIEventList* list) noexcept
+    {
+        return fromSelf(self)->state->pushEventList(offsetSampleFrame, list);
+    }
+#endif
+
     static AudioComponentMethod sLookup(SInt16 selector) noexcept
     {
         if constexpr (HasMidi<P>)
@@ -2493,6 +2818,10 @@ struct Component
                 return reinterpret_cast<AudioComponentMethod>(&sMidiEvent);
             if (selector == kMusicDeviceSysExSelect)
                 return reinterpret_cast<AudioComponentMethod>(&sSysEx);
+#if DSPARK_AU_HAVE_MIDI2
+            if (selector == kMusicDeviceMIDIEventListSelect)
+                return reinterpret_cast<AudioComponentMethod>(&sMidiEventList);
+#endif
         }
         switch (selector)
         {

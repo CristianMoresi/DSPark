@@ -574,8 +574,12 @@ DSPARK_TEST(CoreReg_biquad_channel_pair_runs_in_lock_step)
     float* p2[2] = { l.data(), r.data() };
     float* p1[1] = { l.data() };
     // Rounds alternate, so a burst of load on a shared runner reaches both
-    // forms alike instead of one whole measurement (x86: 1.05x locally,
-    // 1.55x once on a busy runner when stereo ran before mono).
+    // forms alike instead of one whole measurement. The bound depends on the
+    // register file: 32-bit x86 has 8 vector registers, and the pair costs
+    // 1.05x mono on one machine but a steady 1.55x on some hosted runner CPUs
+    // (621600 against 400800-403200 ns, twice). Separate channels cost 2.0x
+    // everywhere, which both bounds still catch.
+    constexpr double kPairBound = sizeof(void*) == 4 ? 1.8 : 1.5;
     double stereo = 1e30, mono = 1e30;
     for (int round = 0; round < 15; ++round)
     {
@@ -583,7 +587,7 @@ DSPARK_TEST(CoreReg_biquad_channel_pair_runs_in_lock_step)
         mono = std::min(mono, minNanoseconds([&] { for (int k = 0; k < 20; ++k) q.processBlock(AudioBufferView<float>(p1, 1, 4096)); }, 1));
     }
     gRegSink = l[7];
-    EXPECT_LT(stereo, 1.5 * mono);                // old: about 2.0x
+    EXPECT_LT(stereo, kPairBound * mono);         // old: about 2.0x
     }
 }
 

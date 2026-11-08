@@ -1426,17 +1426,19 @@ DSPARK_TEST(PitchDetector_noise_suppression_reads_through_0_db_noise)
 
 namespace {
 
-/// Windows of 2 s of band-pass noise (constant-peak band-pass biquad on
+/// Windows of `seconds` of band-pass noise (constant-peak band-pass biquad on
 /// white noise) that read voiced at 48 kHz.
-int bandNoiseVoicedWindows(double centreHz, double q, bool suppression, uint64_t seed)
+int bandNoiseVoicedWindows(double centreHz, double q, bool suppression, uint64_t seed,
+                           double seconds = 2.0)
 {
     const double fs = 48000.0, w0 = 2.0 * pi<double> * centreHz / fs, alpha = std::sin(w0) / (2.0 * q);
     const double a0 = 1.0 + alpha, b0 = alpha / a0, b2 = -alpha / a0;
     const double a1 = -2.0 * std::cos(w0) / a0, a2 = (1.0 - alpha) / a0;
     NoiseSource rng { seed };
-    std::vector<float> x(96000);
+    const int length = static_cast<int>(fs * seconds);
+    std::vector<float> x(static_cast<size_t>(length));
     double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
-    for (int i = 0; i < 4000 + 96000; ++i)
+    for (int i = 0; i < 4000 + length; ++i)
     {
         const double w = rng.gauss();
         const double y = b0 * w + b2 * x2 - a1 * y1 - a2 * y2;
@@ -1474,6 +1476,73 @@ DSPARK_TEST(PitchDetector_noise_suppression_ignores_narrow_band_noise)
               << " on " << q5On << ", Q 2 at 300 Hz off " << q2Off << " on " << q2On << "\n";
     EXPECT_LT(q5On, q5Off + 15);
     EXPECT_LT(q2On, q2Off + 11);
+}
+
+// The multiples of a period are now read over the last two windows of input,
+// not over the analysis window alone: a narrow band of noise has more
+// multiples to decorrelate at, over a longer span. Over 20 s of four bands
+// (Q 5 at 1 kHz and 300 Hz, Q 2 at 300 and 120 Hz) the second read added 182
+// windows to those the first read voices; now 65.
+DSPARK_TEST(PitchDetector_noise_suppression_tests_multiples_over_two_windows)
+{
+    int excess = 0;
+    for (const auto& band : { std::pair { 1000.0, 5.0 }, std::pair { 300.0, 5.0 },
+                              std::pair { 300.0, 2.0 }, std::pair { 120.0, 2.0 } })
+    {
+        const int off = bandNoiseVoicedWindows(band.first, band.second, false, 6u, 20.0);
+        const int on = bandNoiseVoicedWindows(band.first, band.second, true, 6u, 20.0);
+        EXPECT_TRUE(on >= off);
+        excess += on - off;
+    }
+    std::cout << "  [pitch noise] band noise, 20 s of four bands: second read adds " << excess
+              << " voiced windows\n";
+    EXPECT_LT(excess, 100);
+}
+
+// Notes below 67 Hz leave no multiple of their period inside the 48 kHz
+// window, so the second read used to drop them: 50, 55 and 62 Hz harmonic
+// tones at 2 dB SNR read 0 of 513 detections. Two windows of history hold
+// three periods of the lowest note the detector reads; now 280, none wrong.
+DSPARK_TEST(PitchDetector_noise_suppression_reads_notes_below_67_hz)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 2.0);
+    int correct = 0, wrong = 0, total = 0;
+    for (const double f0 : { 50.0, 55.0, 62.0 })
+    {
+        NoiseSource rng { 77u };
+        std::vector<double> tone(static_cast<size_t>(n), 0.0);
+        for (int h = 1; h <= 40 && h * f0 < 20000.0; ++h)
+        {
+            const double amp = std::pow(10.0, -6.0 * std::log2(static_cast<double>(h)) / 20.0);
+            const double phase = 2.0 * pi<double> * rng.uniform();
+            for (int i = 0; i < n; ++i)
+                tone[static_cast<size_t>(i)] += amp * std::sin(2.0 * pi<double> * f0 * h * i / fs + phase);
+        }
+        double power = 0.0;
+        for (const double v : tone) power += v * v;
+        const double sigma = std::sqrt(power / n / std::pow(10.0, 2.0 / 10.0));
+        std::vector<float> x(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            x[static_cast<size_t>(i)] = static_cast<float>(0.2 * (tone[static_cast<size_t>(i)] + sigma * rng.gauss()));
+        PitchDetector<float> pd;
+        pd.prepare(fs);
+        pd.setNoiseSuppression(true);
+        for (int at = 0; at + 512 <= n; at += 512)
+        {
+            pd.pushSamples(std::span<const float>(x.data() + at, 512));
+            if (at < 8192) continue;
+            ++total;
+            const double hz = static_cast<double>(pd.getFrequencyHz());
+            if (hz <= 0.0) continue;
+            if (std::abs(1200.0 * std::log2(hz / f0)) < 50.0) ++correct;
+            else ++wrong;
+        }
+    }
+    std::cout << "  [pitch noise] 50-62 Hz at 2 dB SNR: " << correct << " of " << total
+              << " right, " << wrong << " wrong\n";
+    EXPECT_GT(correct, 200);
+    EXPECT_EQ(wrong, 0);
 }
 
 DSPARK_TEST(PitchFollower_tracks_glide_without_jumps)

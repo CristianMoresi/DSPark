@@ -286,6 +286,37 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `OnsetDetector` gated picker (the default; analysis readout, no audio): a
+  peak whose frame energy falls across the release test is also kept when
+  bands it raised at least double their amplitude over anything they or
+  their neighbours held in the two analysis frames before, and still hold
+  that energy twice the test's look-ahead after it, by 0.3% of the energy
+  after the peak: a quiet note starting while a louder one is released. The
+  share is computed only for candidates (allocation free; CPU unchanged at
+  0.88 ms per second of audio; 16 KB more held from prepare()). The envelope
+  of `getLastOdfFrame()`, the BeatTracker and `Picker::Plain` are unchanged,
+  bit for bit, and so is the latency. On 24 held-out files per kind at 44.1
+  kHz, offline (F at +/-50 ms): 60 ms attacks 0.946 to 0.960 (0.952 to 0.964
+  and 0.965 at 48 and 96 kHz; causal 0.951/0.952/0.955 to
+  0.965/0.964/0.969), 30 ms attacks 0.981 to 0.987, 1 ms 0.999 to 1.000,
+  slow attacks over pink noise 0.803 to 0.805; the false onsets of every
+  kind are unchanged on the held-out files and on two further sets of 24
+  files per kind. Quiet attacks 15 to 45 ms before a louder note's end:
+  10/7/8 of 56 to 53 offline and 52 causal at 44.1/48/96 kHz.
+- `PitchDetector::setNoiseSuppression()` (opt-in): the multiples of a period
+  are tested over the last two analysis windows of input instead of the
+  window alone (the input buffer keeps two windows: 32 KB more at 48 kHz).
+  Notes below 67 Hz at 48 kHz, which left no multiple inside the window and
+  were never read through the noise, now are: 47-67 Hz tones at 0 dB SNR
+  0.5% to 40.5% right in white noise (0.5% wrong both), 3.0% to 12.5% in
+  pink (1.0% to 6.0% wrong, all within 85 cents, confidence below 0.75).
+  Narrow bands of noise voice less: over 20 s, a Q 2 band at 120 Hz 9.8% to
+  6.4% of windows (off 4.4%), at 300 Hz 2.0% to 1.3% (off 0.3%), a Q 5 band
+  at 1 kHz 5.5% to 4.3% (off 4.0%). Tones of 70 to 1000 Hz at 0 dB in white
+  noise: 84.5% right as before, wrong 0.2% to 0; 80 to 1000 Hz in pink 75.2%
+  to 74.8% right, 3.0% to 1.8% wrong; continuous notes at 2 dB 88.7% as
+  before, 86.8% to 83.4% with 50 cents of vibrato. Off, the output is
+  unchanged, bit for bit.
 - `wdf::DiodePairRoot` and `wdf::DiodeRoot` above the low-drive series
   evaluate the diode's closed form with a full-precision omega table
   (`detail::DiodeOmegaTable`, 83 KB, built once per process) instead of an

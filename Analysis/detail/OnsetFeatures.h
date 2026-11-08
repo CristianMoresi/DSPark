@@ -269,9 +269,22 @@ template <FloatType T> class OnsetNovelty final
      *                         maximum the persistence value compares with: a
      *                         partial whose level oscillates within the span
      *                         does not read as a rise.
+     * @param contentBack      Frames before the content candidate its band
+     *                         energies are compared from.
+     * @param contentAhead     Frames after the candidate they are compared at.
+     * @param contentHold      Frames after the candidate the grown bands must
+     *                         still hold their energy at; 0 (the default)
+     *                         disables contentShare(), and it must exceed
+     *                         contentAhead otherwise. A ring of band energies
+     *                         is allocated here.
+     * @param contentSpan      Frames, ending contentBack before the candidate,
+     *                         whose band-wise maximum the energies are compared
+     *                         from: a sound whose level or pitch oscillates
+     *                         within the span does not read as new content.
      */
     void prepare(double sampleRate, int fftSize, bool boundedWorkspace = false, int pickLag = 1,
-                 int persistLag = 0, int persistSpan = 1)
+                 int persistLag = 0, int persistSpan = 1, int contentBack = 0, int contentAhead = 0,
+                 int contentHold = 0, int contentSpan = 1)
     {
         prepared_ = false;
         sampleRate_ = sampleRate;
@@ -293,6 +306,14 @@ template <FloatType T> class OnsetNovelty final
                              ? std::max(pickLag_, persistLag_ + persistSpan_ - 1) : 0;
         maxHistory_.assign(static_cast<size_t>(historyFrames_) * static_cast<size_t>(numBands_), T(0));
         spanMax_.assign(persistSpan_ > 1 ? static_cast<size_t>(numBands_) : size_t(0), T(0));
+        contentBack_ = std::max(0, contentBack);
+        contentAhead_ = std::max(0, contentAhead);
+        contentHold_ = contentHold > contentAhead_ ? contentHold : 0;
+        contentSpan_ = std::max(1, contentSpan);
+        contentFrames_ = contentHold_ > 0 ? contentHold_ + contentBack_ + contentSpan_ : 0;
+        contentRing_.assign(static_cast<size_t>(contentFrames_) * static_cast<size_t>(numBands_), T(0));
+        bandAmp_.assign(contentHold_ > 0 ? static_cast<size_t>(numBands_) : size_t(0), T(0));
+        contentBefore_.assign(bandAmp_.size(), T(0));
         reset();
         prepared_ = true;
     }
@@ -307,7 +328,9 @@ template <FloatType T> class OnsetNovelty final
         std::fill(bandPrev_.begin(), bandPrev_.end(), T(0));
         std::fill(bandMaxPrev_.begin(), bandMaxPrev_.end(), T(0));
         std::fill(maxHistory_.begin(), maxHistory_.end(), T(0));
+        std::fill(contentRing_.begin(), contentRing_.end(), T(0));
         historyWrite_ = 0;
+        contentWrite_ = 0;
         curPick_ = T(0);
         curPersist_ = T(0);
         curRegisters_.fill(T(0));
@@ -316,6 +339,55 @@ template <FloatType T> class OnsetNovelty final
     [[nodiscard]] int getNumBands() const noexcept
     {
         return numBands_;
+    }
+    /**
+     * @brief New-content share of the frame contentHold back from the last
+     *        processed one (prepare()); zero when no content hold is
+     *        configured. Computed on request, allocation free.
+     *
+     * A band counts when its energy contentAhead after that frame is more
+     * than kContentGain times the largest energy it, or either neighbour,
+     * held over the contentSpan frames ending contentBack before it; it then
+     * contributes the smaller of its energies contentAhead and contentHold
+     * after the frame. The share is their sum over all band energy
+     * contentAhead after the frame. A note that starts while a louder one
+     * ends raises its own bands and holds them; the spectral spread of a
+     * note-off raises bands that are silent again a few frames later, and
+     * the neighbours and the span keep a vibrato or a tremolo from reading
+     * as new. Frames of the functions that compute no bands read as silence.
+     */
+    [[nodiscard]] T contentShare() noexcept
+    {
+        if (contentHold_ <= 0)
+            return T(0);
+        const int frames = contentFrames_;
+        const int newest = (contentWrite_ - 1 + frames) % frames;
+        const size_t nb = static_cast<size_t>(numBands_);
+        const auto frameAt = [&](int back) {
+            return &contentRing_[static_cast<size_t>((newest - back + frames) % frames) * nb];
+        };
+        std::fill(contentBefore_.begin(), contentBefore_.end(), T(0));
+        for (int q = 0; q < contentSpan_; ++q)
+        {
+            const T *f = frameAt(contentHold_ + contentBack_ + q);
+            for (size_t b = 0; b < nb; ++b)
+            {
+                T m = f[b];
+                if (b > 0) m = std::max(m, f[b - 1]);
+                if (b + 1 < nb) m = std::max(m, f[b + 1]);
+                contentBefore_[b] = std::max(contentBefore_[b], m);
+            }
+        }
+        const T *after = frameAt(contentHold_ - contentAhead_);
+        const T *held = frameAt(0);
+        double total = 0.0, grown = 0.0;
+        for (size_t b = 0; b < nb; ++b)
+        {
+            total += static_cast<double>(after[b]);
+            if (after[b] > T(kContentGain) * contentBefore_[b])
+                grown += static_cast<double>(std::min(after[b], held[b]));
+        }
+        return total > 0.0 ? static_cast<T>(grown / total) : T(0);
     }
     /** @brief Computes Frame::linear alongside SuperFlux. Allocation free.
      *  @param on True to compute it. */
@@ -338,6 +410,13 @@ template <FloatType T> class OnsetNovelty final
             (!phase.empty() && phase.size() != mag.size()) ||
             (method == Method::ComplexDomain && (phase.empty() || !phaseHistoryValid_)))
             return result;
+        // The new-content share reads the raw band energies, as the frame
+        // energies of the release test do: whitening rewrites the magnitudes.
+        // Frames of the other functions store silence, so the ring stays
+        // aligned with the frames and reads no growth across them.
+        const bool content = contentHold_ > 0 && (method == Method::SuperFlux || method == Method::BothFlux);
+        if (content && whiten)
+            rawBandAmplitudes(mag);
         if (whiten)
             applyWhitening(mag);
         curRegisters_.fill(T(0));
@@ -360,6 +439,8 @@ template <FloatType T> class OnsetNovelty final
                 result.linear = computeLinearFlux(mag);
             break;
         }
+        if (contentHold_ > 0)
+            storeContentFrame(content);
         if (method != Method::SuperFlux && method != Method::BothFlux)
             result.pick = result.value;
         if (!phase.empty())
@@ -436,7 +517,8 @@ template <FloatType T> class OnsetNovelty final
         // it. Below the floor the divisor is the absolute constant
         // kWhitenFloor, so those bins keep the linear-in-N growth --
         // the residual rate dependence documented at prepare().
-        filterLogBands(mag, bandCur_, whiten ? T(1) : odfScale_);
+        filterLogBands(mag, bandCur_, whiten ? T(1) : odfScale_,
+                       contentHold_ > 0 && !whiten ? bandAmp_.data() : nullptr);
         curRegisters_.fill(T(0));
         // Branch free (a rise and a fall are equally likely band by band);
         // adding the zero of a fall leaves both sums exactly as they were.
@@ -591,22 +673,54 @@ template <FloatType T> class OnsetNovelty final
             numBands_ = 1; // degenerate guard (tiny fftSize)
     }
 
-    void filterLogBands(std::span<const T> mag, std::vector<T> &out, T scale) noexcept
+    /// Log-compressed filterbank bands of mag; raw, when given, receives each
+    /// band's linear amplitude before the scale and the compression.
+    void filterLogBands(std::span<const T> mag, std::vector<T> &out, T scale, T *raw = nullptr) noexcept
     {
         for (int b = 0; b < numBands_ && b < static_cast<int>(fbStart_.size()); ++b)
         {
-            const int start = fbStart_[static_cast<size_t>(b)];
-            const int off = fbOffset_[static_cast<size_t>(b)];
-            const int cnt = fbCount_[static_cast<size_t>(b)];
-            T acc = T(0);
-            for (int i = 0; i < cnt; ++i)
-            {
-                const int k = start + i;
-                if (k >= 0 && k < numBins_)
-                    acc += mag[static_cast<size_t>(k)] * fbWeights_[static_cast<size_t>(off + i)];
-            }
+            const T acc = bandAmplitude(mag, b);
+            if (raw)
+                raw[b] = acc;
             out[static_cast<size_t>(b)] = std::log10(acc * scale + T(1));
         }
+    }
+
+    /// Linear filterbank amplitude of band b.
+    [[nodiscard]] T bandAmplitude(std::span<const T> mag, int b) const noexcept
+    {
+        const int start = fbStart_[static_cast<size_t>(b)];
+        const int off = fbOffset_[static_cast<size_t>(b)];
+        const int cnt = fbCount_[static_cast<size_t>(b)];
+        T acc = T(0);
+        for (int i = 0; i < cnt; ++i)
+        {
+            const int k = start + i;
+            if (k >= 0 && k < numBins_)
+                acc += mag[static_cast<size_t>(k)] * fbWeights_[static_cast<size_t>(off + i)];
+        }
+        return acc;
+    }
+
+    /// Fills bandAmp_ from magnitudes the whitening has not yet rewritten.
+    void rawBandAmplitudes(std::span<const T> mag) noexcept
+    {
+        for (int b = 0; b < numBands_ && b < static_cast<int>(fbStart_.size()); ++b)
+            bandAmp_[static_cast<size_t>(b)] = bandAmplitude(mag, b);
+    }
+
+    /// Stores this frame's band energies in the content ring, or silence when
+    /// the frame's function computed no bands.
+    void storeContentFrame(bool bands) noexcept
+    {
+        const size_t nb = static_cast<size_t>(numBands_);
+        T *cur = &contentRing_[static_cast<size_t>(contentWrite_) * nb];
+        for (size_t b = 0; b < nb; ++b)
+        {
+            const T a = bands && b < bandAmp_.size() ? bandAmp_[b] : T(0);
+            cur[b] = a * a;
+        }
+        contentWrite_ = (contentWrite_ + 1) % contentFrames_;
     }
 
     void maxFilterFreq(const std::vector<T> &in, std::vector<T> &out) const noexcept
@@ -636,6 +750,9 @@ template <FloatType T> class OnsetNovelty final
     static constexpr int kBandsPerOctave = 24;
     static constexpr std::size_t kBandCapacity = 256;
     static constexpr T kWhitenDecay = T(0.9995), kWhitenFloor = T(1e-4);
+    /// Energy growth a band needs to count as new content (its amplitude
+    /// doubles).
+    static constexpr double kContentGain = 4.0;
     double sampleRate_ = 44100;
     int fftSize_ = 0, numBins_ = 0, numBands_ = 1;
     bool phaseHistoryValid_ = true;
@@ -651,6 +768,12 @@ template <FloatType T> class OnsetNovelty final
     int historyFrames_ = 0, historyWrite_ = 0;
     std::vector<T> maxHistory_; ///< Max-filtered band frames, historyFrames_ of them.
     std::vector<T> spanMax_;    ///< Scratch: band-wise maximum over a span.
+    int contentBack_ = 0, contentAhead_ = 0, contentHold_ = 0;
+    int contentFrames_ = 0, contentWrite_ = 0;
+    int contentSpan_ = 1;
+    std::vector<T> contentRing_;   ///< Band energies, contentFrames_ frames of them.
+    std::vector<T> contentBefore_; ///< Scratch: band-wise maximum over the span.
+    std::vector<T> bandAmp_;       ///< This frame's raw band amplitudes.
     T curPick_ = T(0), curPersist_ = T(0);
 };
 

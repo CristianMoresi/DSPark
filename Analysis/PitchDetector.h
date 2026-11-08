@@ -29,7 +29,7 @@
  * 87.3% and 92.0% on the same tones. At 0 dB SNR the detector reads
  * unvoiced rather than guess (that frame stage is right 29% of the time
  * there and wrong 71%); setNoiseSuppression() (opt-in) reads those tones 84%
- * right and 0.2% wrong. Noisy readings report their honest confidence, about
+ * right and none wrong. Noisy readings report their honest confidence, about
  * 0.76 at 5 dB, so a confidence gate keeps ignoring them. Steady clean tones
  * read exactly as before; on clean material the change is fewer octave
  * errors. Across a legato note change two notes can share a longer period
@@ -155,9 +155,13 @@ public:
         hopSize_    = (hopSize <= 0) ? std::max(1, windowSize_ / 4)
                                      : std::clamp(hopSize, 1, windowSize_);
 
-        // Mirrored buffer technique: size is 2x windowSize.
-        // Guarantees continuous memory layout without modulo operations.
-        buffer_.assign(static_cast<size_t>(windowSize_) * 2, T(0));
+        // Mirrored buffer technique: the last kHistoryWindows windows of
+        // input, written twice, so the analysis window (the newest of them)
+        // and the whole history are both contiguous without modulo
+        // operations. The history is read only by the opt-in noise
+        // suppression, for periods whose multiples the window cannot hold.
+        historySize_ = windowSize_ * kHistoryWindows;
+        buffer_.assign(static_cast<size_t>(historySize_) * 2, T(0));
         yinBuffer_.assign(static_cast<size_t>(halfWindow_), T(0));
         rawDiff_.assign(static_cast<size_t>(halfWindow_), T(0));
 
@@ -184,7 +188,7 @@ public:
         cleanScratch_.assign(static_cast<size_t>(kFloorBins), T(0));
         yinClean_.assign(static_cast<size_t>(halfWindow_), T(0));
         rawClean_.assign(static_cast<size_t>(halfWindow_), T(0));
-        persistSq_.assign(static_cast<size_t>(windowSize_) + 1, 0.0);
+        persistSq_.assign(static_cast<size_t>(historySize_) + 1, 0.0);
         fftClean_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(windowSize_) * 2);
 
         writePos_ = 0;
@@ -216,7 +220,7 @@ public:
      * absolute numbers vary by machine, the growth tracks N log N). Against
      * the old fixed-2048 default at the SAME rate the automatic window costs
      * roughly 5% more (30.5 vs 28.9 ms at 192 kHz). prepare()-time heap grows
-     * the same way: ~100 KB at 44.1/48 kHz, ~190 KB at 88.2/96 kHz, ~390 KB
+     * the same way: ~260 KB at 44.1/48 kHz, ~515 KB at 88.2/96 kHz, ~1030 KB
      * at 176.4/192 kHz (float); the audio path stays allocation-free. Budget
      * from these figures, not from the rate alone. For very low-latency
      * callbacks you can still feed an SPSC queue (Core/SpscQueue.h) and
@@ -233,10 +237,10 @@ public:
         {
             // Write into mirrored buffer
             buffer_[static_cast<size_t>(writePos_)] = sample;
-            buffer_[static_cast<size_t>(writePos_ + windowSize_)] = sample;
+            buffer_[static_cast<size_t>(writePos_ + historySize_)] = sample;
 
             writePos_++;
-            if (writePos_ >= windowSize_)
+            if (writePos_ >= historySize_)
             {
                 writePos_ = 0;
             }
@@ -322,26 +326,32 @@ public:
      * semitone sharp). The reading is kept only when the input repeats at
      * the multiples of that period about as strongly as at the period
      * itself: a tone does, a narrow band of noise that the cleaning made
-     * look periodic does not. The reading's confidence stays the input's own
-     * dip at that period, about 0.5 at 0 dB SNR, so a confidence gate keeps
-     * ignoring it. Periods that leave no multiple to compare within the
-     * window (below 67 Hz at the automatic window and 48 kHz) are not read
-     * through the noise.
+     * look periodic does not. The multiples are read over the last two
+     * windows of input, which hold three periods of the lowest note the
+     * detector reads. The reading's confidence stays the input's own dip at
+     * that period, about 0.5 at 0 dB SNR, so a confidence gate keeps
+     * ignoring it.
      *
      * Measured at 48 kHz on harmonic tones of 70 to 1000 Hz (random spectral
      * tilt), readings within 50 cents, 400 tones: in white noise at 0 dB
-     * SNR 84.5% right and 0.2% wrong (off: unvoiced; the frame stage of the
-     * probabilistic-threshold method 29% and 71%), in pink noise 75.2% and
-     * 3.0%; 5 and 10 dB readings are those of the first reading. Continuous
-     * notes at 2 dB SNR: 88.7% of detections right and none wrong, 86.8%
-     * and none with 50 cents of vibrato.
+     * SNR 84.5% right and none wrong (off: unvoiced; the frame stage of the
+     * probabilistic-threshold method 29% and 71%), in pink noise 74.8% and
+     * 1.8% (80 to 1000 Hz); 5 and 10 dB readings are those of the first
+     * reading. Tones of 47
+     * to 67 Hz at 0 dB: 40.5% right and 0.5% wrong in white noise, 12.5% and
+     * 6.0% in pink, where the misses are 50 to 85 cents out at a confidence
+     * below 0.75 (the frame stage reads 95.5% and 83.5% right there, 4.5% and
+     * 16.5% wrong). Continuous notes of 70 to 880 Hz at 2 dB SNR: 88.7% of
+     * detections right and none wrong, 83.4% and none with 50 cents of
+     * vibrato.
      *
      * Noise alone: white and pink still read unvoiced, and band-limited
-     * noise stays close to what the first reading alone voices: a Q 5 band
-     * at 1 kHz 10.1% of windows (off 8.4%), at 300 Hz 12.3% (off 10.1%), a
-     * Q 2 band at 300 Hz 0.6% (off 0%). The second read costs more than a
-     * detection: 75 to 95 ns per sample on noise and on noisy tones, against
-     * 20 off; voiced windows are not read twice. Off, the output is
+     * noise stays close to what the first reading alone voices, over 20 s: a
+     * Q 5 band at 1 kHz 4.3% of windows (off 4.0%), at 300 Hz 11.6% (off
+     * 11.2%), a Q 2 band at 300 Hz 1.3% (off 0.3%), at 120 Hz 6.4% (off
+     * 4.4%). The second read costs more than a detection: about 90 ns per
+     * sample on noise and 100 on a low note in noise, against 20 off; voiced
+     * windows are not read twice. Off, the output is
      * unchanged. Control thread; relaxed atomic.
      */
     void setNoiseSuppression(bool on) noexcept
@@ -382,8 +392,10 @@ private:
     void detect() noexcept
     {
         // Obtain a perfectly contiguous block of memory representing the current window.
-        // writePos_ points to the oldest sample in the mirrored buffer.
-        const T* currentWindow = &buffer_[static_cast<size_t>(writePos_)];
+        // writePos_ points to the oldest sample of the history in the mirrored
+        // buffer; the window is its newest windowSize_ samples.
+        const T* history = &buffer_[static_cast<size_t>(writePos_)];
+        const T* currentWindow = history + (historySize_ - windowSize_);
 
         T energy = T(0), e1 = T(0);
         if (!differenceFunction(currentWindow, yinBuffer_.data(), rawDiff_.data(), energy, e1))
@@ -448,7 +460,7 @@ private:
                 {
                     const int lag = inputDipNear(tau);
                     const T period = parabolicInterp(rawDiff_.data(), lag);
-                    if (periodPersists(currentWindow, static_cast<double>(period)))
+                    if (periodPersists(history, static_cast<double>(period)))
                     {
                         // The confidence is the input's own dip there: a
                         // reading taken through the noise stays a
@@ -729,8 +741,9 @@ private:
     }
 
     /**
-     * @brief True when the input window repeats at the multiples of `period`
-     *        about as strongly as at `period` itself.
+     * @brief True when the input repeats at the multiples of `period` about
+     *        as strongly as at `period` itself, over the last kHistoryWindows
+     *        windows of input (the analysis window and the one before it).
      *
      * A tone in noise repeats equally at every multiple of its period; a
      * narrow band of noise that the cleaned window made look periodic
@@ -741,18 +754,23 @@ private:
      * around the multiple) above the mean of the lags half a period either
      * side, so a smooth noise correlation, such as pink noise's, cancels.
      * The mean of the multiples must reach kPersistRatio of the first. All
-     * the multiples that leave an eighth of the window to correlate over are
-     * used, over one common span; a period with no such multiple is not
-     * read through the noise.
+     * the multiples that leave an eighth of a window to correlate over are
+     * used, over one common span. The history holds at least three periods
+     * of every period the detector reads, so the lowest notes are tested too,
+     * and the longer span and the extra multiples make a narrow band of noise
+     * less likely to pass than over the window alone.
+     * @param history The input history, kHistoryWindows windows, oldest first.
+     * @param period  The period under test, in samples.
      */
-    [[nodiscard]] bool periodPersists(const T* x, double period) noexcept
+    [[nodiscard]] bool periodPersists(const T* history, double period) noexcept
     {
-        const int n = windowSize_;
         if (!(period >= 2.0)) return false;
         const auto reach = [&](int k) noexcept {
             return static_cast<int>(std::lround((static_cast<double>(k) + 0.5) * period)) + 2;
         };
-        const int minSpan = n / 8;
+        const int minSpan = windowSize_ / 8;
+        const T* x = history;
+        const int n = historySize_;
         int kmax = kMaxMultiple;
         while (kmax >= 2 && n - reach(kmax) < minSpan) --kmax;
         if (kmax < 2) return false;
@@ -890,6 +908,8 @@ private:
     static constexpr int kFloorBins = 32;
     /// Over-subtraction of the noise floor: bins below twice the floor go to zero.
     static constexpr double kOverSubtraction = 2.0;
+    /// Windows of input history kept for periodPersists().
+    static constexpr int kHistoryWindows = 2;
 
     /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
     /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
@@ -900,6 +920,7 @@ private:
 
     double sampleRate_ = 44100.0;
     int windowSize_ = 2048;
+    int historySize_ = 4096;
     int halfWindow_ = 1024;
     int hopSize_ = 512;
     int writePos_ = 0;
@@ -916,7 +937,7 @@ private:
     std::atomic<T> confidence_{T(0)};
 
     // Mirrored buffer keeps every analysis window contiguous
-    std::vector<T> buffer_;     // Size: 2 * windowSize_
+    std::vector<T> buffer_;     // Size: 2 * historySize_
     std::vector<T> yinBuffer_;  // Size: halfWindow_
     std::vector<T> rawDiff_;    // Size: halfWindow_ (difference function d(tau))
 
@@ -939,7 +960,7 @@ private:
     std::vector<T> cleanScratch_; // Size: kFloorBins
     std::vector<T> yinClean_;     // Size: halfWindow_
     std::vector<T> rawClean_;     // Size: halfWindow_
-    std::vector<double> persistSq_; // Size: windowSize_ + 1 (periodPersists())
+    std::vector<double> persistSq_; // Size: historySize_ + 1 (periodPersists())
 };
 
 } // namespace dspark

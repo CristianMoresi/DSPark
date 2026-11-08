@@ -1182,6 +1182,125 @@ DSPARK_TEST(Onset_gated_picker_ignores_beating_partials_of_held_bass)
     }
 }
 
+namespace {
+
+// A loud note (10 ms attack, 20 ms release) and a quiet one 12 to 24 dB below
+// it, 60 ms attack, starting 15 to 45 ms before the loud note ends, at least
+// five semitones away; pairs of them over 16 s on a quiet floor. quiet holds
+// the second note of every pair, truth both.
+void quietAttacksUnderRelease(double fs, uint32_t seed, std::vector<float>& sig,
+                              std::vector<int64_t>& quiet, std::vector<int64_t>& truth)
+{
+    const int n = static_cast<int>(fs * 16.0);
+    sig.assign(static_cast<size_t>(n), 0.0f);
+    quiet.clear();
+    truth.clear();
+    uint32_t state = seed;
+    auto uniform = [&]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<double>(state >> 8) / 16777216.0;
+    };
+    auto note = [&](int64_t at, double midi, double amp, double att, double dur) {
+        const double f0 = 440.0 * std::exp2((midi - 69.0) / 12.0);
+        const int len = static_cast<int>(dur * fs);
+        const int a = static_cast<int>(att * fs), r = static_cast<int>(0.020 * fs);
+        for (int i = 0; i < len && at + i < n; ++i)
+        {
+            const double u = static_cast<double>(i) / fs;
+            double env = std::min(1.0, static_cast<double>(i) / a) * std::exp(-2.0 * u);
+            if (i > len - r) env *= static_cast<double>(len - i) / r;
+            double s = 0.0;
+            for (int h = 1; h <= 6; ++h) s += std::sin(dspark::twoPi<double> * f0 * h * u) / h;
+            sig[static_cast<size_t>(at + i)] += static_cast<float>(amp * env * s);
+        }
+    };
+    double t = 0.3;
+    while (t < 15.0)
+    {
+        const double midiLoud = 48.0 + 24.0 * uniform(), durLoud = 0.35 + 0.15 * uniform();
+        const int64_t loud = static_cast<int64_t>(t * fs);
+        note(loud, midiLoud, std::pow(10.0, (-6.0 + 3.0 * uniform()) / 20.0), 0.010, durLoud);
+        double midiQuiet = 48.0 + 24.0 * uniform();
+        if (std::abs(midiQuiet - midiLoud) < 5.0) midiQuiet += midiQuiet < midiLoud ? -7.0 : 7.0;
+        const double tq = t + durLoud - (0.015 + 0.03 * uniform());
+        const int64_t soft = static_cast<int64_t>(tq * fs);
+        note(soft, midiQuiet, std::pow(10.0, (-24.0 + 12.0 * uniform()) / 20.0), 0.060, 0.4);
+        truth.push_back(loud);
+        truth.push_back(soft);
+        quiet.push_back(soft);
+        t = tq + 0.6 + 0.2 * uniform();
+    }
+    for (float& v : sig)
+    {
+        state = state * 1664525u + 1013904223u;
+        v += 3e-4f * (static_cast<float>(state >> 8) / 8388608.0f - 1.0f);
+    }
+}
+
+int countNear(const std::vector<int64_t>& detected, const std::vector<int64_t>& events, double fs)
+{
+    int hits = 0;
+    for (const int64_t e : events)
+        for (const int64_t d : detected)
+            if (std::abs(static_cast<double>(d - e)) <= 0.05 * fs) { ++hits; break; }
+    return hits;
+}
+
+} // namespace
+
+// ===========================================================================
+// A quiet slow attack that starts while a louder note is released: the frame
+// energy falls across the release test's span, so the test alone rejects it.
+// The bands the new note raises over anything they held in the two analysis
+// frames before still hold that energy twice the test's look-ahead after it,
+// while the spread of a note-off is gone by then. Before, the offline and
+// causal pickers recalled 10, 7 and 8 of the 56 quiet attacks at 44.1, 48 and
+// 96 kHz; now 53 offline and 52 causal at every rate, with no false onset.
+// ===========================================================================
+DSPARK_TEST(Onset_gated_picker_recalls_attacks_under_a_louder_release)
+{
+    for (const double fs : { 44100.0, 48000.0, 96000.0 })
+    {
+        int offQuiet = 0, liveQuiet = 0, offFp = 0, liveFp = 0, offTp = 0, total = 0, quietTotal = 0;
+        for (const uint32_t seed : { 11u, 23u, 37u, 59u })
+        {
+            std::vector<float> sig;
+            std::vector<int64_t> quiet, truth;
+            quietAttacksUnderRelease(fs, seed, sig, quiet, truth);
+            OnsetDetector<float> od;
+            od.prepare(AudioSpec{ fs, 512, 1 });
+            float* ptr = sig.data();
+            const auto offline = od.detectOffline(AudioBufferView<float>(&ptr, 1, static_cast<int>(sig.size())));
+            OnsetDetector<float> live;
+            live.prepare(AudioSpec{ fs, 256, 1 });
+            std::vector<int64_t> causal;
+            for (size_t i = 0; i < sig.size(); i += 256)
+            {
+                const size_t len = std::min<size_t>(256, sig.size() - i);
+                live.pushSamples(std::span<const float>(sig.data() + i, len));
+                if (live.onsetDetected()) causal.push_back(live.getLastOnsetSample());
+            }
+            const PRF o = scoreOnsets(offline, truth, fs, 50.0), c = scoreOnsets(causal, truth, fs, 50.0);
+            offQuiet += countNear(offline, quiet, fs);
+            liveQuiet += countNear(causal, quiet, fs);
+            offTp += o.tp;
+            offFp += o.fp;
+            liveFp += c.fp;
+            total += static_cast<int>(truth.size());
+            quietTotal += static_cast<int>(quiet.size());
+        }
+        std::cout << "  [picker] quiet attacks under a release at " << fs << " Hz: offline "
+                  << offQuiet << ", causal " << liveQuiet << " of " << quietTotal
+                  << " (all onsets " << offTp << " of " << total << "), fp " << offFp << " / "
+                  << liveFp << "\n";
+        EXPECT_EQ(quietTotal, 56);
+        EXPECT_TRUE(offQuiet >= 48);
+        EXPECT_TRUE(liveQuiet >= 48);
+        EXPECT_EQ(offFp, 0);
+        EXPECT_EQ(liveFp, 0);
+    }
+}
+
 // OdfFrame::linear is the SpectralFlux method's own value on the same
 // spectrum (summed in another order), and asking for it changes nothing else:
 // the envelope and the onsets are bit-identical with it off.

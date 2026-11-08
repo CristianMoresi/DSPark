@@ -43,8 +43,8 @@
  * automatic frame) instead of the previous one, which doubles the rise a slow
  * attack shows while a fast fluctuation gains less. A peak must clear twice
  * the moving mean plus the delta, the frame energy around it must not show a
- * note release, and a peak near the threshold must show a new sound (see
- * setPicker()). A plain picker cannot get there: the delta low enough for 60
+ * note release unless bands it raised hold new energy, and a peak near the
+ * threshold must show a new sound (see setPicker()). A plain picker cannot get there: the delta low enough for 60
  * ms attacks also reports note releases and the fluctuations of a noise bed.
  * Measured on a synthetic corpus of eleven kinds (1, 30 and 60 ms attacks;
  * sharp attacks under vibrato, over a quiet noise bed, and on sustained notes
@@ -55,21 +55,21 @@
  * chosen on six files per kind and reported on 24 others:
  *
  *   kind               gated 0.0035   plain 0.015   plain 0.004
- *   1 ms attacks        0.999          0.978         0.997
- *   30 ms attacks       0.981          0.788         0.977
- *   60 ms attacks       0.946          0.603         0.934
+ *   1 ms attacks        1.000          0.978         0.997
+ *   30 ms attacks       0.987          0.788         0.977
+ *   60 ms attacks       0.960          0.603         0.934
  *   releases, bass      1.000 / 0.00   0.980 / 0.06  0.806 / 0.66
  *   releases, slow      1.000 / 0.00   0.923 / 0.23  0.773 / 0.82
  *   percussion          0.964          0.948         0.980
  *   clicks in noise     0.995 / 0.02   1.000 / 0.00  0.450 / 4.65
- *   slow in noise       0.803          0.471         0.500 / 3.24
+ *   slow in noise       0.805          0.471         0.500 / 3.24
  *
  * (F, and false onsets per second where there are any). The vibrato, bed
  * and tremolo kinds stay at 0.987 to 0.998 with no false onset. At 48 and
- * 96 kHz 60 ms attacks read 0.952 and the rest within 0.015 of these;
- * the causal picker reads 60 ms attacks at 0.951, 0.952 and 0.955.
+ * 96 kHz 60 ms attacks read 0.964 and 0.965 and the rest within 0.02 of
+ * these; the causal picker reads 60 ms attacks at 0.965, 0.964 and 0.969.
  * Lower the delta for still more recall of slow attacks (0.0025: 60 ms
- * 0.953, with 0.05 tremolo and 0.02 slow-attack false onsets per second);
+ * 0.965, with 0.05 tremolo and 0.02 slow-attack false onsets per second);
  * Picker::Plain with setThreshold(0.015) restores the former default
  * exactly, onset function included.
  *
@@ -255,8 +255,8 @@ public:
      * CPU per 10 s of audio at 48/96/192 kHz automatic, vs 50.4 ms at
      * 192 kHz with an explicit 2048; g++ -O2, one core -- absolute numbers
      * vary by machine, the growth tracks the frame size). prepare()-time
-     * heap grows the same way: ~125 KB at 44.1/48 kHz, ~223 KB at
-     * 88.2/96 kHz, ~420 KB at 176.4/192 kHz (float instantiation). The audio
+     * heap grows the same way: ~150 KB at 44.1/48 kHz, ~245 KB at
+     * 88.2/96 kHz, ~440 KB at 176.4/192 kHz (float instantiation). The audio
      * path stays allocation-free at every size. Budget from these figures;
      * an explicit 2048 restores the old cost at the cost of the register
      * above.
@@ -311,7 +311,7 @@ public:
         // (see setPicker()). The look-ahead always fits inside the
         // fixed latency L: a candidate is reported at reference + L, which is
         // 0.84 * fftSize + hop after its frame, and the test needs only
-        // 0.43 * fftSize of it.
+        // 0.43 * fftSize of it (its new-content rescue, below, at most all).
         energyBack_ = std::max(1, static_cast<int>(std::lround(kEnergyLookBack
             * static_cast<double>(fftSize_) / static_cast<double>(hop_))));
         energyAhead_ = std::max(1, static_cast<int>(std::lround(kEnergyLookAhead
@@ -325,10 +325,26 @@ public:
         pickLag_ = std::max(1, static_cast<int>(std::lround(static_cast<double>(fftSize_)
                                                           / (4.0 * static_cast<double>(hop_)))));
 
+        // The new-content rescue of the release test (setPicker()) reads the
+        // bands twice the release test's look-ahead after the candidate, as
+        // far as the fixed latency allows: the frame that many hops after the
+        // candidate must fire before its reporting sample. When no frame past
+        // the release test's fits, the rescue is off. Its baseline spans two
+        // analysis frames before the release test's.
+        {
+            const int lead = fftSize_ / 2 - localizationOffset_;
+            const int fits = (fftSize_ + hop_ - lead) / hop_;
+            contentHold_ = std::min(2 * energyAhead_, fits);
+            if (contentHold_ <= energyAhead_) contentHold_ = 0;
+            decideAhead_ = std::max(energyAhead_, contentHold_);
+        }
+        const int contentSpan = std::max(1, static_cast<int>(std::lround(kContentSpan
+            * static_cast<double>(fftSize_) / static_cast<double>(hop_))));
+
         ring_.assign(static_cast<size_t>(fftSize_) * 2, T(0));
         spectrum_.prepare(fftSize_);
         novelty_.prepare(sampleRate_, fftSize_, false, pickLag_, energyBack_ + energyAhead_,
-                         energyAhead_);
+                         energyAhead_, energyBack_, energyAhead_, contentHold_, contentSpan);
 
         // Bin edges of the four registers of OdfFrame::registers, for the
         // release test's per-register energies.
@@ -351,17 +367,17 @@ public:
         waitFrames_    = msToFrames(30.0);
 
         // Causal ODF history: enough for the pre_avg look-back plus the
-        // single-frame causal confirmation.
-        odfHistLen_ = std::max(preAvgFrames_ + energyAhead_, preMaxFrames_) + 4;
+        // single-frame causal confirmation, over the frames a candidate waits.
+        odfHistLen_ = std::max(preAvgFrames_ + decideAhead_, preMaxFrames_) + 4;
         odfHist_.assign(static_cast<size_t>(odfHistLen_), T(0));
         pickHist_.assign(static_cast<size_t>(odfHistLen_), T(0));
 
-        energyHistLen_ = energyAhead_ + 4 * energyBack_ + 2;
+        energyHistLen_ = decideAhead_ + 4 * energyBack_ + 2;
         energyHist_.assign(static_cast<size_t>(energyHistLen_), 0.0);
         registerEnergyHist_.assign(static_cast<size_t>(energyHistLen_), RegisterEnergy {});
-        persistHistLen_ = preAvgFrames_ + energyAhead_ + 4;
+        persistHistLen_ = preAvgFrames_ + decideAhead_ + 4;
         persistHist_.assign(static_cast<size_t>(persistHistLen_), T(0));
-        candidates_.assign(static_cast<size_t>(energyAhead_ + 2), Candidate{});
+        candidates_.assign(static_cast<size_t>(decideAhead_ + 2), Candidate{});
 
         // Pending-onset ring: onsets are held from detection until their
         // release sample (reference + L). At most ceil(L/hop)+2 can be
@@ -448,6 +464,15 @@ public:
      *   four of OdfFrame::registers) at least doubles its energy, by 3% of
      *   the frame's: a new note sounding while a louder one elsewhere is
      *   released.
+     *   It is excused too when bands at least double their amplitude over
+     *   anything they or their neighbours held in the two analysis frames
+     *   before, and still hold that energy at twice the test's look-ahead
+     *   (or as far as L allows), by 0.3% of the energy after the peak: a quiet note starting while a louder
+     *   one is released. A note-off's spectral spread is gone again by then,
+     *   and the span and the neighbours keep a vibrato or a tremolo from
+     *   reading as new. Where the fixed latency L has no frame past the
+     *   release test's (very short explicit frames or hops), this rescue is
+     *   off.
      * - HELD NOTES. A low note whose partials beat inside one band, or a
      *   fluctuating bed, crosses a low threshold at a steady energy. A peak
      *   within 0.0045 of its threshold must therefore show a new sound:
@@ -461,8 +486,9 @@ public:
      * moving mean extended over the frames the release test waits for (the
      * offline mean extends 70 ms past the peak). The causal look-ahead fits
      * inside the fixed reporting latency L, which does not change: a peak is
-     * reported 0.84 analysis frames plus one hop after its frame and the test
-     * needs 0.43 of them.
+     * reported 0.84 analysis frames plus one hop after its frame, the test
+     * needs 0.43 of them and its new-content rescue twice that, as far as
+     * they reach. A causal peak is decided when its last frame is computed.
      *
      * Plain with setThreshold(0.015f) is exactly the former default: it
      * picks the envelope of getLastOdfFrame() with neither test.
@@ -783,6 +809,7 @@ public:
             offEnergy_.reserve(frames);
             offRegisterEnergy_.reserve(frames);
             offPersist_.reserve(frames);
+            offContent_.reserve(frames);
         }
         resetState();
         offMethod_ = method_.load(std::memory_order_relaxed);
@@ -812,6 +839,8 @@ public:
                 offEnergy_.push_back(curEnergy_);
                 offRegisterEnergy_.push_back(curRegisterEnergy_);
                 offPersist_.push_back(curPersist_);
+                offContent_.push_back(T(0));
+                storeOfflineContent();
             }
         }
     }
@@ -845,13 +874,14 @@ public:
         const auto energyAt = [&](int64_t i) { return offEnergy_[at(i)]; };
         const auto registersAt = [&](int64_t i) -> const RegisterEnergy& { return offRegisterEnergy_[at(i)]; };
         const auto persistAt = [&](int64_t i) { return offPersist_[at(i)]; };
+        const auto contentAt = [&](int64_t i) { return offContent_[at(i)]; };
         for (size_t f = static_cast<size_t>(primeFrames_); f < odf.size(); ++f)
         {
             if (picker.accept(f, odf.size(), [&](size_t i) { return odf[i]; }, windows, delta,
                               gated ? T(kGatedMeanScale) : T(1),
                               [&](size_t i, T margin) {
                                   return !gated || keepsGate(static_cast<int64_t>(i), energyAt,
-                                                             registersAt, persistAt,
+                                                             registersAt, persistAt, contentAt,
                                                              margin < T(kWeakMargin),
                                                              postAvgFrames_);
                               }))
@@ -883,6 +913,31 @@ private:
         offEnergy_.clear();
         offRegisterEnergy_.clear();
         offPersist_.clear();
+        offContent_.clear();
+    }
+
+    /**
+     * @brief Records the new-content share of the offline frame contentHold_
+     *        before the newest one, while the novelty kernel still holds the
+     *        frames it reads.
+     *
+     * Only a frame that can be a peak of the offline picker needs one: none of
+     * the frames within its maximum window, as far as they exist yet, may
+     * exceed it. Every other frame keeps a share of zero; so does every frame
+     * closer than contentHold_ to the end of the session.
+     */
+    void storeOfflineContent() noexcept
+    {
+        if (contentHold_ <= 0 || offMethod_ != Method::SuperFlux) return;
+        const int64_t newest = static_cast<int64_t>(offPick_.size()) - 1;
+        const int64_t c = newest - contentHold_;
+        if (c < 0) return;
+        const T v = offPick_[static_cast<size_t>(c)];
+        const int64_t from = std::max<int64_t>(0, c - preMaxFrames_);
+        const int64_t to = std::min<int64_t>(newest, c + postMaxFrames_);
+        for (int64_t j = from; j <= to; ++j)
+            if (offPick_[static_cast<size_t>(j)] > v) return;
+        offContent_[static_cast<size_t>(c)] = novelty_.contentShare();
     }
 
     [[nodiscard]] static std::vector<int64_t> positionsOf(const std::vector<Onset>& onsets)
@@ -927,6 +982,13 @@ private:
     /// energy must grow by this factor, by at least this share of the frame.
     static constexpr double kRescueGain = 2.0;
     static constexpr double kRescueShare = 0.03;
+    /// New-content rescue of the release test: the share of the energy after
+    /// the candidate held by bands that at least doubled their amplitude over
+    /// anything they or their neighbours held in the kContentSpan analysis
+    /// frames before, and still hold it contentHold_ frames after the
+    /// candidate.
+    static constexpr double kContentShare = 0.003;
+    static constexpr double kContentSpan = 2.0;
     static constexpr double kLocalizationLead = 0.34; ///< Flux-to-energy lead (fraction of N).
     static constexpr int kPhaseRestartFrames = 3; ///< Frames phase prediction needs after a restart.
 
@@ -1104,10 +1166,16 @@ private:
             const int64_t oldest = std::max<int64_t>(1, frameIndex_ - persistHistLen_ + 1);
             return persistHist_[static_cast<size_t>(std::clamp(k, oldest, frameIndex_) % persistHistLen_)];
         };
+        // A candidate is decided exactly decideAhead_ frames after its own,
+        // which is contentHold_ when the rescue is on: the frames the content
+        // share reads are the newest the novelty kernel holds.
+        const auto contentAt = [&](int64_t k) {
+            return frameIndex_ - k == contentHold_ ? novelty_.contentShare() : T(0);
+        };
         while (candidateCount_ > 0)
         {
             Candidate c = candidates_[static_cast<size_t>(candidateHead_)];
-            if (c.frame + energyAhead_ > frameIndex_) break;
+            if (c.frame + decideAhead_ > frameIndex_) break;
             candidateHead_ = (candidateHead_ + 1) % static_cast<int>(candidates_.size());
             --candidateCount_;
             if (gated)
@@ -1131,7 +1199,7 @@ private:
                 c.weak = margin < T(kWeakMargin);
             }
             if (c.frame - lastOnsetFrame_ > waitFrames_
-                && (!gated || keepsGate(c.frame, energyAt, registersAt, persistAt, c.weak, 0)))
+                && (!gated || keepsGate(c.frame, energyAt, registersAt, persistAt, contentAt, c.weak, 0)))
             {
                 scheduleOnset(c.referenceSample, c.strength);
                 lastOnsetFrame_ = c.frame;
@@ -1180,17 +1248,21 @@ private:
      * @param registersAt Accessor from a frame number to its register energies.
      * @param persistAt   Accessor from a frame number to the persistence value
      *                    computed on that frame.
+     * @param contentAt   Accessor from a candidate's frame number to its
+     *                    new-content share (OnsetNovelty's Frame::content).
      * @param weak        The peak cleared the threshold by less than
      *                    kWeakMargin.
      * @param ahead       Frames after f the persistence mean extends over
      *                    (zero causally).
      * @return True when the peak is kept.
      */
-    template <typename Energy, typename Registers, typename Persist>
+    template <typename Energy, typename Registers, typename Persist, typename Content>
     [[nodiscard]] bool keepsGate(int64_t f, Energy energyAt, Registers registersAt,
-                                 Persist persistAt, bool weak, int64_t ahead) const noexcept
+                                 Persist persistAt, Content contentAt, bool weak,
+                                 int64_t ahead) const noexcept
     {
-        if (!keepsEnergy(f, energyAt, weak) && !registerRises(f, energyAt, registersAt))
+        if (!keepsEnergy(f, energyAt, weak) && !registerRises(f, energyAt, registersAt)
+            && !(contentHold_ > 0 && static_cast<double>(contentAt(f)) >= kContentShare))
             return false;
         if (!weak) return true;
         const double ratio = persistenceRatio(f, persistAt, ahead);
@@ -1366,6 +1438,8 @@ private:
     std::array<int, detail::OnsetNovelty<T>::kNumRegisters + 1> registerEdge_ {}; ///< Register bin edges.
     std::vector<T> persistHist_;
     int persistHistLen_ = 1;
+    int contentHold_ = 0;         ///< Frames after a candidate its content share reads.
+    int decideAhead_ = 4;         ///< Frames after a candidate its decision waits for.
     std::vector<Candidate> candidates_;
     int candidateHead_ = 0;
     int candidateCount_ = 0;
@@ -1388,6 +1462,7 @@ private:
     std::vector<double> offEnergy_;
     std::vector<RegisterEnergy> offRegisterEnergy_;
     std::vector<T> offPersist_;
+    std::vector<T> offContent_;
     int64_t offTotal_ = 0;
     int offHop_ = 0;
     Method offMethod_ = Method::SuperFlux;

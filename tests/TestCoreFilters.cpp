@@ -1241,19 +1241,33 @@ DSPARK_TEST(FIR_seqlock_coefficient_swap_is_atomic)
         }
     });
 
+    // The overlap is guaranteed by construction: the reader keeps going until it
+    // has done its reads AND the producer has landed its publications. A fixed
+    // read count finished before the producer thread was first scheduled on a
+    // hosted macOS runner (0 publications), leaving nothing to check. The cap
+    // makes a producer that never runs fail loudly.
+    constexpr long long kReads = 400000;
+    constexpr long long kMinPublications = 2001;
+    constexpr long long kReadCap = 80000000LL;
+
     int torn = 0;
-    for (int i = 0; i < 400000; ++i)
+    long long reads = 0;
+    while (reads < kReadCap
+           && (reads < kReads
+               || published.load(std::memory_order_relaxed) < kMinPublications))
     {
         const float out = fir.processSample(1.0f, 0);
         const bool isA = std::abs(out - 1.0f) < 1e-4f;
         const bool isB = std::abs(out - 3.0f) < 1e-4f;
         if (!isA && !isB) ++torn;
+        ++reads;
     }
 
     stop.store(true, std::memory_order_relaxed);
     producer.join();
 
     EXPECT_EQ(torn, 0);
+    EXPECT_TRUE(reads < kReadCap);   // the producer really ran
     EXPECT_GT(published.load(std::memory_order_relaxed), 2000);
 }
 

@@ -270,6 +270,35 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `wdf::DiodePairRoot` and `wdf::DiodeRoot` above the low-drive series
+  evaluate the diode's closed form with a full-precision omega table
+  (`detail::DiodeOmegaTable`, 83 KB, built once per process) instead of an
+  omega estimate and a correction step with an exponential and a division;
+  the pair's reverse diode is a correction read from the same table point.
+  The roots stay within one unit in the last place of 50-digit roots (as
+  before); RC-clipper output moves by at most -287 dB re its RMS. Cost per
+  sample on an RC clipper at 0.5-8 V peak, default constants: pair 28-30 ->
+  19-20 ns behind 707 ohm and 30-32 -> 23-25 ns behind 5-9 k ohm; single
+  diode 26-27 -> 13-16 ns. Low drive (series) unchanged.
+- `LadderFilter` `Saturation::Stages` (opt-in): above the state-start
+  cutoff Newton now starts from the drive-free ladder solved exactly while
+  its stages stay within two knee widths (the fixed-pivot start otherwise),
+  and channel pairs are solved together. Mean cost over cutoff, resonance,
+  drive and signal falls from 2.7 to 2.2 Newton-step equivalents, worst 8 ->
+  7 steps; mono at a 15 kHz cutoff with drive 3: sines 76 -> 58 ns, a saw
+  72 -> 54 ns, white noise 104 -> 98 ns per sample (at drive 10 white noise
+  rises 103 -> 110 ns); stereo 10-20 % less per channel. Below the
+  state-start cutoff mono output is bit-identical; above
+  it the output moves within the solver tolerance.
+- `TubePreamp` `GridModel::Conduction` (opt-in) at 2x: the coupling
+  capacitor's voltage ramps across each internal sample instead of being
+  held at its predicted midpoint and stepped at every boundary. Worst alias
+  over the documented sweep: one stage -83.4/-72.7/-68.3 -> -85.5/-74.0/-74.0
+  dBc at +12/+24/+36 dB, two stages -77.1/-68.2/-65.5 -> -81.6/-73.1/-73.1.
+  The output moves by -88 to -54 dB RMS (0 to +36 dB drive), within the
+  model's error against the dense point circuit, which is unchanged; the
+  blocking figures are unchanged. 1x and 4x and above are bit-identical;
+  the Clamp default is untouched.
 - `Limiter` true-peak mode reads every sample interval with a 64-tap 4x
   reconstruction refined to its local maxima, maxed with the BS.1770 Annex 2
   estimate it used alone before (which under-reads peaks built from content

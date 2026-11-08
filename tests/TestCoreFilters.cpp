@@ -799,6 +799,84 @@ DSPARK_TEST(Ladder_stages_either_start_reaches_the_converged_solution)
     EXPECT_LT(detail::kLadderStagesStateStartGain, std::tan(pi<double> * 2300.0 / 48000.0));
 }
 
+DSPARK_TEST(Ladder_stages_linear_start_reaches_the_converged_solution)
+{
+    // Above the state-start gain Newton now starts from the drive-free
+    // ladder solved exactly while its stages stay within two knee widths
+    // (a fixed-pivot solve otherwise): fewer steps for the same root. Pin:
+    // on sines, a saw and noise at high cutoffs, every sample lands on the
+    // solution of a deeply converged solve from the same states.
+    for (double fc : { 5000.0, 15000.0, 21000.0 })
+        for (double drive : { 0.5, 1.0, 3.0, 10.0 })
+            for (int signal = 0; signal < 3; ++signal)
+            {
+                const double g = std::tan(pi<double> * fc / 48000.0);
+                const auto c = detail::makeLadderStageCoeffs(g, 0.9, drive);
+                auto deep = c;
+                deep.tol = 1e-14;
+                std::array<double, 4> z{}, zDeep{};
+                uint32_t rng = 0xACE1u;
+                double worst = 0;
+                for (int i = 0; i < 2000; ++i)
+                {
+                    rng = rng * 1664525u + 1013904223u;
+                    const double t = static_cast<double>(i) / 48000.0;
+                    const double x = signal == 0 ? 0.9 * std::sin(2.0 * pi<double> * 110.0 * t)
+                                   : signal == 1 ? 2.0 * std::fmod(110.0 * t, 1.0) - 1.0
+                                                 : 1.6 * (((rng >> 8) * (1.0 / 16777216.0)) - 0.5);
+                    const double y = detail::ladderStepStages<detail::LadderTap::LP24>(x, z, c);
+                    const double yDeep = detail::ladderStepStages<detail::LadderTap::LP24>(x, zDeep, deep);
+                    worst = std::max(worst, std::abs(y - yDeep) * drive);
+                    zDeep = z;
+                }
+                EXPECT_LT(worst, 1e-11);
+            }
+}
+
+DSPARK_TEST(Ladder_stages_channel_pairs_match_single_channels)
+{
+    // Speed-up pin: the Stages block loop advances channel pairs together
+    // (their solves overlap). Each channel's output must stay bit-identical
+    // to the same channel processed alone, for an odd channel count too.
+    using L = LadderFilter<float>;
+    constexpr int kCh = 3, kN = 700;
+    std::vector<std::vector<float>> in(kCh, std::vector<float>(kN));
+    uint32_t rng = 0x5EEDu;
+    for (auto& ch : in)
+        for (auto& v : ch)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<float>(((rng >> 8) * (1.0 / 16777216.0)) - 0.5) * 1.8f;
+        }
+    const auto setup = [](L& f, int channels) {
+        f.prepare(AudioSpec{ 48000.0, 256, channels });
+        f.setCutoff(15000.0f);
+        f.setResonance(0.9f);
+        f.setDrive(3.0f);
+        f.setSaturation(L::Saturation::Stages);
+    };
+    L multi;
+    setup(multi, kCh);
+    auto out = in;
+    for (int at = 0; at < kN; at += 175)
+    {
+        float* ptr[kCh] = { out[0].data() + at, out[1].data() + at, out[2].data() + at };
+        multi.processBlock(AudioBufferView<float>(ptr, kCh, 175));
+    }
+    for (int ch = 0; ch < kCh; ++ch)
+    {
+        L single;
+        setup(single, 1);
+        auto alone = in[static_cast<size_t>(ch)];
+        for (int at = 0; at < kN; at += 175)
+        {
+            float* ptr[1] = { alone.data() + at };
+            single.processBlock(AudioBufferView<float>(ptr, 1, 175));
+        }
+        EXPECT_TRUE(alone == out[static_cast<size_t>(ch)]);
+    }
+}
+
 // ============================================================================
 // StateVariableFilter - analytic exactness and robustness
 // ============================================================================

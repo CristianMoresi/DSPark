@@ -311,11 +311,13 @@ public:
      *
      * Feedback (the default) keeps the stages linear. Stages saturates every
      * stage and solves the loop implicitly: a clipped Newton iteration in
-     * double, 2.1 steps on average and at most 8 measured (cap 16). It costs
-     * 53 to 104 ns per sample and channel against 10 to 19 ns for Feedback
-     * (MSVC x64, float), rising with cutoff and drive: 56 ns at a 1 kHz
-     * cutoff with drive 3, 104 ns at 15 kHz. The integrator state
-     * carries over a switch. Out-of-range values (a wild
+     * double, 2.1 steps on average and at most 7 measured (cap 16). It costs
+     * 38 to 100 ns per sample (mono) against 10 to 19 ns for Feedback (MSVC
+     * x64, float), rising with cutoff, drive and the noisiness of the input:
+     * 54 ns at a 1 kHz cutoff with drive 3; at 15 kHz with drive 3, 54-58 ns
+     * for sines and a saw and 98 ns for white noise. Channel pairs are solved
+     * together, which lowers the cost per channel by 10-20 % in stereo. The
+     * integrator state carries over a switch. Out-of-range values (a wild
      * cast or a corrupt state blob) select Feedback.
      *
      * @param model Saturation model.
@@ -461,7 +463,26 @@ private:
     template <detail::LadderTap Tap>
     void stagesLoop(AudioBufferView<T> buffer, int nCh, int nS, const detail::LadderStageCoeffs& c) noexcept
     {
-        for (int ch = 0; ch < nCh; ++ch)
+        int ch = 0;
+        // Channel pairs advance together, one sample of each per iteration:
+        // the two solves are independent, so their dependency chains overlap
+        // (same arithmetic per channel, identical output).
+        for (; ch + 1 < nCh; ch += 2)
+        {
+            auto* a = buffer.getChannel(ch);
+            auto* b = buffer.getChannel(ch + 1);
+            std::array<T, 4> za = state_[ch].z, zb = state_[ch + 1].z;
+            for (int i = 0; i < nS; ++i)
+            {
+                a[i] = detail::ladderStepStages<Tap>(a[i], za, c);
+                b[i] = detail::ladderStepStages<Tap>(b[i], zb, c);
+            }
+            if (!std::isfinite(za[0] + za[1] + za[2] + za[3])) za.fill(T(0));
+            if (!std::isfinite(zb[0] + zb[1] + zb[2] + zb[3])) zb.fill(T(0));
+            state_[ch].z = za;
+            state_[ch + 1].z = zb;
+        }
+        for (; ch < nCh; ++ch)
         {
             auto* channelData = buffer.getChannel(ch);
             std::array<T, 4> z = state_[ch].z;

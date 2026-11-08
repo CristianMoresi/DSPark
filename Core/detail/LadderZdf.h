@@ -136,6 +136,9 @@ inline constexpr double kLadderStagesMaxGain = 6.313751514675041;
 struct LadderStageCoeffs
 {
     double g, k, d, gOverD, tol;
+    /// Linear (drive-free) prediction: G = g / (1 + g), the state weights
+    /// of the loop estimate and 1 / (1 + k G^4).
+    double G, w0, w1, w2, w3, invLoop;
 };
 
 /**
@@ -159,6 +162,13 @@ template <FloatType T>
     // is about 10 * tol^2 knee widths (measured 9.8e-8 at 1e-4, 1.6e-11 at
     // 1e-7): below the sample type's resolution.
     c.tol = std::is_same_v<T, float> ? 1e-4 : 1e-7;
+    const double ig = 1.0 / (1.0 + c.g);
+    c.G = c.g * ig;
+    c.w3 = ig;
+    c.w2 = c.G * ig;
+    c.w1 = c.G * c.w2;
+    c.w0 = c.G * c.w1;
+    c.invLoop = 1.0 / (1.0 + c.k * (c.G * c.G) * (c.G * c.G));
     return c;
 }
 
@@ -196,18 +206,32 @@ template <FloatType T>
 inline constexpr int kLadderStagesMaxIterations = 16;
 
 /**
- * @brief Integrator gain below which ladderStepStages() starts Newton at the
+ * @brief Integrator gain below which ladderStepStages() falls back to the
  *        integrator states instead of the fixed-pivot solve (cutoff about
- *        0.047 * fs).
+ *        0.047 * fs) when the linear prediction is not used.
  *
  * At a low gain each stage moves little in one sample, so the states are
  * already a close start and the fixed-pivot solve (five tanh ratios and five
- * divisions, about one Newton step of work) does not pay for itself: with the
- * float tolerance the states need at most 0.8 more Newton steps on average up
- * to this gain, and none below 0.03. Above it the fixed-pivot start saves more
- * than it costs.
+ * divisions, about one Newton step of work) does not pay for itself. Above
+ * it the fixed-pivot start saves more than it costs.
  */
 inline constexpr double kLadderStagesStateStartGain = 0.15;
+
+/**
+ * @brief Largest stage level of the linear prediction, in knee widths, at
+ *        which ladderStepStages() starts Newton from that prediction (above
+ *        kLadderStagesStateStartGain).
+ *
+ * The prediction is the drive-free ladder solved exactly (a dozen operations,
+ * no division): close to the root wherever the stages are not deep in
+ * saturation, and often closer than the fixed-pivot solve, which costs about
+ * one Newton step. With the float tolerance over noise, sines and a saw at
+ * 44.1 to 96 kHz, cutoff 0.004 to 0.45 * fs, resonance 0 to 1.15 and drive
+ * 0.3 to 10, the mean cost falls from 2.7 to 2.2 steps (a fixed-pivot start
+ * counted as one), and from 2.9 to 2.0 for sines at a 15 kHz cutoff with
+ * drive 3. Beyond the limit the fixed-pivot start takes over.
+ */
+inline constexpr double kLadderStagesLinearStartLimit = 2.0;
 
 /**
  * @brief Advances the per-stage saturating ladder by one sample.
@@ -223,9 +247,12 @@ inline constexpr double kLadderStagesStateStartGain = 0.15;
  * solved jointly, as in Zavalishin's TPT treatment of nonlinear zero-delay
  * loops:
  *
- * 1. A fixed-pivot linear solve (each phi replaced by v * phi(s)/s at the
- *    integrator states) gives a stable starting point at any gain. Below
- *    kLadderStagesStateStartGain the states themselves start Newton.
+ * 1. Start. Below kLadderStagesStateStartGain the states themselves. Above
+ *    it, the drive-free ladder solved exactly (the linear prediction, no
+ *    division) while every stage of it stays within
+ *    kLadderStagesLinearStartLimit knee widths, otherwise a fixed-pivot
+ *    linear solve (each phi replaced by v * phi(s)/s at the integrator
+ *    states), a stable starting point at any gain.
  * 2. Newton iterations on the four equations. The Jacobian is bidiagonal
  *    plus the feedback corner, so each step is an O(4) elimination, and the
  *    closing pivot is always >= 1 (no singularity at any setting). Each step
@@ -236,9 +263,10 @@ inline constexpr double kLadderStagesStateStartGain = 0.15;
  * falls below c.tol knee widths, after at most kLadderStagesMaxIterations
  * steps: measured with the float tolerance over noise, sine and saw inputs at
  * 44.1 to 96 kHz, cutoff 0.004 to 0.45 * fs, resonance 0 to 1.15 and drive
- * 0.3 to 10, a mean of 2.1 Newton steps (1.7 with the fixed-pivot start at
- * every gain, which costs about one step), 4.4 at the worst setting, and at
- * most 8 (the cap is never reached).
+ * 0.3 to 10, a mean of 2.2 steps counting a fixed-pivot start as one (2.7
+ * with the fixed-pivot start at every gain above the state-start limit),
+ * 4.1 Newton steps at the worst setting, and at most 7 (the cap is never
+ * reached).
  * In the linear limit (drive -> 0) it reduces to ladderStep() without
  * drive. Output taps are those of ladderStep().
  *
@@ -254,12 +282,32 @@ template <LadderTap Tap, FloatType T>
     const double s0 = static_cast<double>(z[0]), s1 = static_cast<double>(z[1]);
     const double s2 = static_cast<double>(z[2]), s3 = static_cast<double>(z[3]);
 
-    // 1) Start. Below kLadderStagesStateStartGain Newton starts at the states.
-    //    Above it, a fixed-pivot solve: phi(v) ~ v * r_i with
-    //    r_i = tanh(d s)/(d s) at the states. Each stage is then linear,
-    //    y_i = a_i * y_{i-1} + b_i, and the loop closes in one division.
-    double u = 0, y0 = s0, y1 = s1, y2 = s2, y3 = s3;
+    // 1) Start. Below kLadderStagesStateStartGain the states. Above it the
+    //    drive-free ladder solved exactly, while every stage of it stays
+    //    within kLadderStagesLinearStartLimit knee widths; otherwise a
+    //    fixed-pivot solve: phi(v) ~ v * r_i with r_i = tanh(d s)/(d s) at
+    //    the states. Each stage is then linear, y_i = a_i * y_{i-1} + b_i,
+    //    and the loop closes in one division.
+    double u = 0.0, y0 = s0, y1 = s1, y2 = s2, y3 = s3;
+    bool pivot = false;
     if (g >= kLadderStagesStateStartGain)
+    {
+        // Linear prediction in closed form (every stage from u and the
+        // states at once): y_i = G y_{i-1} + (1 - G) s_i.
+        const double G = c.G, H = 1.0 - G;
+        const double h0 = H * s0, h1 = H * s1, h2 = H * s2, h3 = H * s3;
+        u = (x - k * ((c.w0 * s0 + c.w1 * s1) + (c.w2 * s2 + c.w3 * s3))) * c.invLoop;
+        const double G2 = G * G;
+        const double l0 = G * u + h0;
+        const double l1 = G2 * u + (G * h0 + h1);
+        const double l2 = (G2 * G) * u + (G2 * h0 + (G * h1 + h2));
+        const double l3 = (G2 * G2) * u + ((G2 * G) * h0 + (G2 * h1 + (G * h2 + h3)));
+        const double reach = std::max(std::max(std::abs(u), std::abs(l0)),
+                                      std::max(std::max(std::abs(l1), std::abs(l2)), std::abs(l3))) * d;
+        pivot = !(reach < kLadderStagesLinearStartLimit);
+        y0 = l0; y1 = l1; y2 = l2; y3 = l3;
+    }
+    if (pivot)
     {
         const double r0 = ladderTanhRatio(d * (x - k * s3));
         const double r1 = ladderTanhRatio(d * s0), r2 = ladderTanhRatio(d * s1);

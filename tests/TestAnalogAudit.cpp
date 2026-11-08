@@ -947,6 +947,108 @@ DSPARK_TEST(AnalogAudit_wdf_low_drive_series_roots_are_exact)
     EXPECT_LT(worst, 4.5e-16);
 }
 
+// Speed-up pin: above the low-drive series the roots now come from a
+// full-precision omega table (the forward diode's closed form and, for the
+// pair, the reverse diode's correction from the same table point) instead of
+// an omega estimate and one correction step with an exponential and a
+// division (pair 28-32 -> 19-25 ns, single 26-27 -> 13-16 ns per sample in an
+// RC circuit). The output must stay the root to rounding: 50-digit roots of
+// s + 2c sinh(s) = x (pair) and s + c (e^s - 1) = x (single), nVt = 1 and
+// R = 1 so that c = Is and x is the source, across every table region (below
+// and above omega = 0.57, and the octave cells beyond ln c + x = 32).
+DSPARK_TEST(AnalogAudit_wdf_table_roots_are_exact)
+{
+    using namespace dspark::wdf;
+    struct Point { int pair; double c, x, s; };
+    static constexpr Point kPoints[] = {
+        { 1, 3.93e-05, 1.5, 1.4998326695717819 },
+        { 1, 3.93e-05, 3.0, 2.9992132173824881 },
+        { 1, 3.93e-05, 7.25, 7.1974922424195151 },
+        { 1, 3.93e-05, 12.0, 10.529731248222374 },
+        { 1, 3.93e-05, 30.0, 12.978748680095542 },
+        { 1, 3.93e-05, 45.0, 13.591368774039944 },
+        { 1, 3.93e-05, 300.0, 15.793985417731058 },
+        { 1, 3.93e-05, 30000.0, 20.452556715344343 },
+        { 1, 3.93e-05, 500000.0, 23.266602882204921 },
+        { 1, 0.0001, 1.5, 1.4995743443337046 },
+        { 1, 0.0001, 3.0, 2.9980004471762358 },
+        { 1, 0.0001, 7.25, 7.1256539714894256 },
+        { 1, 0.0001, 12.0, 9.9353170525858783 },
+        { 1, 0.0001, 30.0, 12.095398139018503 },
+        { 1, 0.0001, 45.0, 12.685845719253297 },
+        { 1, 0.0001, 300.0, 14.863309054617536 },
+        { 1, 0.0001, 30000.0, 19.51864219946787 },
+        { 1, 0.0001, 500000.0, 22.332659083064819 },
+        { 1, 0.001, 1.5, 1.4957613449999703 },
+        { 1, 0.001, 3.0, 2.9803559490065177 },
+        { 1, 0.001, 7.25, 6.5504456017814601 },
+        { 1, 0.001, 12.0, 8.2338172933251528 },
+        { 1, 0.001, 30.0, 9.9080733563191838 },
+        { 1, 0.001, 45.0, 10.450158249712992 },
+        { 1, 0.001, 300.0, 12.568739018406605 },
+        { 1, 0.001, 30000.0, 17.216133903769244 },
+        { 1, 0.001, 500000.0, 20.030078595426847 },
+        { 1, 0.0199, 7.25, 4.8093616470431551 },
+        { 1, 0.0199, 12.0, 5.7496785744283034 },
+        { 1, 0.0199, 30.0, 7.0503394449089791 },
+        { 1, 0.0199, 45.0, 7.5403014784389244 },
+        { 1, 0.0199, 300.0, 9.5883350028141408 },
+        { 1, 0.0199, 30000.0, 14.225513911638679 },
+        { 1, 0.0199, 500000.0, 17.039364845345638 },
+        { 0, 3.93e-05, 1.5, 1.4998631937136309 },
+        { 0, 3.93e-05, -1.5, -1.4999694692830223 },
+        { 0, 3.93e-05, 3.0, 2.9992505297802921 },
+        { 0, 3.93e-05, -7.25, -7.2499607279109499 },
+        { 0, 3.93e-05, 12.0, 10.529747156921951 },
+        { 0, 3.93e-05, 45.0, 13.591369986677636 },
+        { 0, 3.93e-05, -300.0, -299.99996069999997 },
+        { 0, 3.93e-05, 300.0, 15.793985555526159 },
+        { 0, 3.93e-05, 500000.0, 23.266602882283522 },
+        { 0, 0.001, 1.5, 1.4965338183865577 },
+        { 0, 0.001, -1.5, -1.4992233035318756 },
+        { 0, 0.001, 3.0, 2.981286832132279 },
+        { 0, 0.001, -7.25, -7.2490007108844132 },
+        { 0, 0.001, 12.0, 8.2340270317346196 },
+        { 0, 0.001, 45.0, 10.450186378034756 },
+        { 0, 0.001, -300.0, -299.99900000000002 },
+        { 0, 0.001, 300.0, 12.568742485419126 },
+        { 0, 0.001, 500000.0, 20.030078597426922 },
+        { 0, 0.04, 1.5, 1.3808661593177498 },
+        { 0, 0.04, -1.5, -1.4692043400197221 },
+        { 0, 0.04, 3.0, 2.5352277947271711 },
+        { 0, 0.04, -7.25, -7.2100295654120918 },
+        { 0, 0.04, 12.0, 5.1490803736122999 },
+        { 0, 0.04, 45.0, 6.8611573302330067 },
+        { 0, 0.04, -300.0, -299.95999999999998 },
+        { 0, 0.04, 300.0, 8.8927051319114927 },
+        { 0, 0.04, 500000.0, 16.341206599327862 },
+    };
+    double worst = 0.0;
+    for (const auto& p : kPoints)
+    {
+        ResistiveVoltageSource<double> source { 1.0 };
+        double v = 0.0;
+        if (p.pair)
+        {
+            DiodePairRoot<double, decltype(source)> root { source, p.c, 1.0 };
+            root.prepare(48000.0);
+            source.setVoltage(p.x);
+            root.process();
+            v = root.getVoltage();
+        }
+        else
+        {
+            DiodeRoot<double, decltype(source)> root { source, p.c, 1.0 };
+            root.prepare(48000.0);
+            source.setVoltage(p.x);
+            root.process();
+            v = root.getVoltage();
+        }
+        worst = std::max(worst, std::abs(v - p.s) / std::abs(p.s));
+    }
+    EXPECT_LT(worst, 4.5e-16);
+}
+
 // The grid clamp is referenced to ground: it compresses from 0 V although the
 // cathode sits near +1.2 V, so a 1 V source reaches the grid as 0.624 V.
 // GridModel::Conduction drives the grid through 68 k ohm against a grid
@@ -1072,4 +1174,50 @@ DSPARK_TEST(AnalogAudit_tube_conduction_models_blocking_distortion)
         EXPECT_LT(probe(TubePreamp<double>::GridModel::Conduction, factor), -10.0);
         EXPECT_GT(probe(TubePreamp<double>::GridModel::Clamp, factor), -3.0);
     }
+}
+
+// The conduction model held each coupling capacitor at its predicted value
+// over the whole internal sample and stepped it at every boundary. Under
+// grid current the steps are large, and the output kernel cannot remove a
+// step train: at 2x and +36 dB the fifth harmonic of a high tone came back
+// folded at -65.5 dBc (two stages, 19.25 kHz: 255 Hz) and -68.3 dBc (one
+// stage, 20 kHz: 4 kHz). The grid reference now ramps continuously across
+// each interval: -74.5 and -74.6 dBc.
+DSPARK_TEST(AnalogAudit_tube_conduction_reference_is_continuous)
+{
+    const double fs = 48000.0;
+    const int n = 16384;
+    const auto worst = [&](int stages, double hz) {
+        int b = static_cast<int>(std::lround(hz / fs * n));
+        if ((b & 1) == 0) ++b;
+        TubePreamp<double> amp;
+        amp.setGridModel(TubePreamp<double>::GridModel::Conduction);
+        amp.setStages(stages);
+        amp.setDrive(36.0);
+        amp.prepare(spec(fs, 512, 1));
+        const size_t settle = 24000 + static_cast<size_t>(amp.getLatency());
+        const size_t total = (settle + static_cast<size_t>(n) + 511) / 512 * 512;
+        std::vector<double> y(total);
+        for (size_t i = 0; i < total; ++i)
+            y[i] = 0.5 * std::sin(kTwoPi * (b * fs / n) * static_cast<double>(i) / fs);
+        for (size_t pos = 0; pos < total; pos += 512)
+        {
+            double* ch[] = { y.data() + pos };
+            amp.processBlock({ ch, 1, 512 });
+        }
+        // Worst non-harmonic line from 20 Hz to 20 kHz (the coupling
+        // network's settling stays below 20 Hz).
+        std::vector<double> frame(y.begin() + static_cast<std::ptrdiff_t>(settle),
+                                  y.begin() + static_cast<std::ptrdiff_t>(settle) + n);
+        FFTReal<double> fft(static_cast<size_t>(n));
+        std::vector<double> spectrum(static_cast<size_t>(n) + 2);
+        fft.forward(frame.data(), spectrum.data());
+        const auto mag = [&](size_t k) { return std::hypot(spectrum[2 * k], spectrum[2 * k + 1]); };
+        double w = 0.0;
+        for (size_t k = static_cast<size_t>(std::ceil(20.0 / fs * n)); k <= static_cast<size_t>(20000.0 / fs * n); ++k)
+            if (k % static_cast<size_t>(b) != 0) w = std::max(w, mag(k));
+        return toDb(w / mag(static_cast<size_t>(b)));
+    };
+    EXPECT_LT(worst(2, 19250.0), -71.0);
+    EXPECT_LT(worst(1, 20000.0), -71.0);
 }

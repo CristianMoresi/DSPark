@@ -11,11 +11,12 @@
  * (resistor, capacitor, inductor, resistive voltage source), adapted
  * three-port series/parallel connectors, a polarity inverter, and circuit
  * roots -- an ideal voltage source for linear networks and nonlinear roots
- * (Shockley diode, antiparallel diode pair) solved in closed form: a Wright
- * omega estimate plus one exact correction step reaches full double
- * precision at a fixed cost per sample, and at low drive an exact series
- * reversion of the diode equation does so without any transcendental
- * function.
+ * (Shockley diode, antiparallel diode pair) solved in closed form to full
+ * double precision at a fixed cost per sample: for silicon-like constants a
+ * full-precision Wright omega table gives the root directly (no exponential
+ * and no division on the sample's path), otherwise an omega estimate is
+ * followed by one exact correction step, and at low drive an exact series
+ * reversion of the diode equation needs no transcendental function at all.
  *
  * Wave convention: voltage waves with a = v + R*i (incident) and
  * b = v - R*i (reflected), so v = (a+b)/2 and i = (a-b)/(2R). Reactances
@@ -65,6 +66,10 @@
  * A non-finite incident wave at a root (a NaN or infinite source voltage)
  * resets the tree instead of being scattered, so it cannot stay in the
  * reactive states; the next finite input continues from rest.
+ *
+ * Memory: the omega tables (detail::WrightOmega, 22 KB, and
+ * detail::DiodeOmegaTable, 83 KB) are built once per process when the first
+ * diode root is constructed; nothing is allocated afterwards.
  *
  * Dependencies: DspMath.h.
  */
@@ -592,6 +597,184 @@ private:
 };
 
 /**
+ * @brief Full-precision Wright omega tables for the diode roots (no
+ *        correction step needed).
+ *
+ * Where the single-diode root s = A - omega(z) (z = ln c + A) is evaluated
+ * in the form that keeps its rounding small, a polynomial of degree 9 in the
+ * offset from the nearest table point reaches the root to double precision,
+ * so neither an exponential nor a division is left on the sample's critical
+ * path:
+ * - z in [-40, 32): 289 nodes 0.25 apart. Below z = 0 a node expands
+ *   -omega (the root is A plus the expansion), above it ln(omega) = z - omega
+ *   (the root is the expansion minus ln c, free of the cancellation between
+ *   A and a large omega). Every
+ *   node also expands R = 1 / (omega (1 + omega)) to degree 7 and
+ *   1 / (1 + omega)^2 to degree 1, which give the antiparallel pair's
+ *   reverse-diode correction (see DiodePairRoot).
+ * - z in [32, 2^20): ln(omega) to degree 9 and R to degree 7 about the
+ *   midpoint of each of 16 cells per octave, indexed by the exponent and
+ *   leading mantissa bits of z.
+ * Truncation (largest omitted Taylor terms at the cell edges) stays below
+ * 6e-17 of the root, and below 1e-16 for the pair's correction terms up to
+ * c = 0.02. The coefficients follow from the Taylor recurrences of
+ * P = 1 / (1 + omega) and R at each node, computed once per process on first
+ * use (instance(), 83 KB); thread-safe and allocation free afterwards.
+ */
+class DiodeOmegaTable
+{
+public:
+    static constexpr double kLo = -40.0, kHi = 32.0;
+    static constexpr int kNodes = 289;
+    static constexpr int kFirstLogNode = 160;                     ///< z = 0.
+    static constexpr double kOctaveMax = 1048576.0;
+    static constexpr int kCells = 16 * 15;                        ///< 32 .. 2^20.
+
+    struct Node { double p[10]; double r[8]; double h[2]; };      ///< Scaled to t in [-0.5, 0.5].
+    struct Cell { double mid; double p[10]; double r[8]; };
+
+    [[nodiscard]] static const DiodeOmegaTable& instance() noexcept
+    {
+        static const DiodeOmegaTable table;
+        return table;
+    }
+
+    /**
+     * Nearest node of z = z4 / 4 in [kLo, kHi) (z4 = 4 z, which the caller
+     * forms as 4 x + 4 ln c with the same single rounding as z) and the
+     * offset t = z4 - 4 z_k in [-0.5, 0.5]. The nodes are the multiples of
+     * 1/4, so z4 + 1.5 * 2^52 rounds 4 z_k into the low mantissa bits (offset
+     * by the node index of z = 0) and t is exact.
+     */
+    [[nodiscard]] const Node& node(double z4, double& t, int& index) const noexcept
+    {
+        constexpr double kRound = 6755399441055744.0 + kFirstLogNode;
+        const double rounded = z4 + kRound;
+        index = static_cast<int>(std::bit_cast<std::uint64_t>(rounded) & 0x1FFu);
+        t = z4 - (rounded - kRound);
+        return nodes_[static_cast<size_t>(index)];
+    }
+
+    /** Cell of z in [kHi, kOctaveMax) and the scaled offset in [-0.5, 0.5]. */
+    [[nodiscard]] const Cell& cell(double z, double& t) const noexcept
+    {
+        const auto bits = std::bit_cast<std::uint64_t>(z);
+        const Cell& c = cells_[static_cast<size_t>((bits >> 48) - kFirstCellBits)];
+        t = (z - c.mid) * std::bit_cast<double>(kInverseSixteenth - (bits & kExponentMask));
+        return c;
+    }
+
+    /** Degree-9 polynomial without its constant term c[0] (Estrin scheme). */
+    [[nodiscard]] static double poly9Rest(const double* c, double t) noexcept
+    {
+        const double t2 = t * t, t4 = t2 * t2;
+        const double a = (c[1] * t) + t2 * (c[2] + c[3] * t);
+        const double b = (c[4] + c[5] * t) + t2 * (c[6] + c[7] * t);
+        return (a + t4 * b) + (t4 * t4) * (c[8] + c[9] * t);
+    }
+
+    /** Degree-7 polynomial (Estrin scheme). */
+    [[nodiscard]] static double poly7(const double* c, double t) noexcept
+    {
+        const double t2 = t * t;
+        const double a = (c[0] + c[1] * t) + t2 * (c[2] + c[3] * t);
+        const double b = (c[4] + c[5] * t) + t2 * (c[6] + c[7] * t);
+        return a + (t2 * t2) * b;
+    }
+
+private:
+    static constexpr std::uint64_t kFirstCellBits = 0x4040u;      // bits(32.0) >> 48
+    static constexpr std::uint64_t kExponentMask = 0x7FF0000000000000ull;
+    static constexpr std::uint64_t kInverseSixteenth = std::uint64_t(2050) << 52; // 2^(4 - e)
+    static constexpr int kOrder = 10;
+
+    static double solve(double z) noexcept
+    {
+        double y = z < 1.0 ? std::exp(z) : z - std::log(z);
+        for (int it = 0; it < 64; ++it)
+        {
+            const double step = (y + std::log(y) - z) * y / (1.0 + y);
+            y -= step;
+            if (!(std::abs(step) > 1e-17 * y)) break;
+        }
+        return y;
+    }
+
+    /**
+     * Taylor coefficients about z (unscaled, degree kOrder) of omega (w),
+     * ln omega (l) and R = 1 / (omega (1 + omega)) (r). They follow from
+     * P = 1 / (1 + omega), which obeys P' = -P^2 (1 - P), and R' = -R P (2 - P):
+     * every product is of terms of one sign, so the coefficients keep their
+     * relative accuracy where omega is large (the recurrence of omega itself,
+     * omega' (1 + omega) = omega, cancels there).
+     */
+    static void series(double z, double* w, double* l, double* r) noexcept
+    {
+        const double y = solve(z);
+        double p[kOrder + 1], q[kOrder + 1], pp[kOrder + 1], rp[kOrder + 1];
+        p[0] = 1.0 / (1.0 + y);
+        q[0] = y * p[0];                                   // 1 - P
+        r[0] = p[0] / y;
+        for (int n = 0; n < kOrder; ++n)
+        {
+            double s = 0.0;
+            for (int j = 0; j <= n; ++j) s += p[j] * p[n - j];
+            pp[n] = s;                                     // [P^2]_n
+            s = 0.0;
+            for (int j = 0; j <= n; ++j) s += pp[j] * q[n - j];
+            p[n + 1] = -s / (n + 1);
+            q[n + 1] = -p[n + 1];
+            s = 0.0;
+            for (int j = 0; j <= n; ++j) s += r[j] * p[n - j];
+            rp[n] = s;                                     // [R P]_n
+            s = rp[n];
+            for (int j = 0; j <= n; ++j) s += rp[j] * q[n - j];
+            r[n + 1] = -s / (n + 1);
+        }
+        w[0] = y;
+        l[0] = std::log(y);
+        for (int n = 0; n < kOrder; ++n)
+        {
+            w[n + 1] = q[n] / (n + 1);
+            l[n + 1] = p[n] / (n + 1);
+        }
+    }
+
+    DiodeOmegaTable() noexcept
+    {
+        double w[kOrder + 1], l[kOrder + 1], r[kOrder + 1];
+        for (int i = 0; i < kNodes; ++i)
+        {
+            series(kLo + 0.25 * i, w, l, r);
+            Node& n = nodes_[static_cast<size_t>(i)];
+            double scale = 1.0;
+            for (int k = 0; k < 10; ++k, scale *= 0.25)
+                n.p[k] = (i < kFirstLogNode ? -w[k] : l[k]) * scale;
+            scale = 1.0;
+            for (int k = 0; k < 8; ++k, scale *= 0.25) n.r[k] = r[k] * scale;
+            const double u = 1.0 / (1.0 + w[0]);
+            n.h[0] = u * u;
+            n.h[1] = -2.0 * w[0] * u * u * u * u * 0.25;
+        }
+        for (int c = 0; c < kCells; ++c)
+        {
+            const double width = std::ldexp(1.0, 1 + c / 16);     // 2^e / 16, e = 5 + c/16
+            const double mid = std::ldexp(1.0 + (c % 16) / 16.0, 5 + c / 16) + 0.5 * width;
+            series(mid, w, l, r);
+            Cell& cl = cells_[static_cast<size_t>(c)];
+            cl.mid = mid;
+            double scale = 1.0;
+            for (int k = 0; k < 10; ++k, scale *= width) cl.p[k] = l[k] * scale;
+            scale = 1.0;
+            for (int k = 0; k < 8; ++k, scale *= width) cl.r[k] = r[k] * scale;
+        }
+    }
+
+    std::array<Node, kNodes> nodes_ {};
+    std::array<Cell, kCells> cells_ {};
+};
+
+/**
  * @brief Exact low-drive roots of the normalised diode equations by series
  *        reversion (no transcendental function and no division per sample).
  *
@@ -749,11 +932,22 @@ private:
  * to 0.02) the exact reversion series of
  * detail::DiodeSeries replaces the estimate and its correction step: no
  * transcendental function and no division, 2.2e-16 worst relative error
- * against 50-digit roots. Cost for an RC clipper on the development machine
- * (MSVC x64): 14.7 ns per sample at low drive (0.01-0.05 V peak) and about
- * 29-31 ns above, against 29-31 ns everywhere with the estimate alone and
- * 20.9-27.8 ns for the single-omega approximation that ignores the reverse
- * diode (-56 to -82 dB error).
+ * against 50-digit roots. Above it, up to c = 0.02 and ln c + x < 2^20, the
+ * root comes from detail::DiodeOmegaTable instead: the forward diode's root
+ * s1 = x - omega(ln c + x) to double precision, plus the reverse diode's
+ * correction from the same table point, with no exponential and no division
+ * per sample; for c > 1e-4 this starts where the correction is small enough
+ * (c^2 / (omega (1 + omega)) <= 3e-5), and the estimate with its correction
+ * step covers the drives between. Against
+ * 50-digit roots for c from 1e-15 to 0.02 and drives up to 1e6 nVt the
+ * table root is within one unit in the last place. Cost for an RC clipper
+ * on the development machine (MSVC x64), default constants: 13.4-13.7 ns
+ * per sample at low drive (0.01-0.05 V peak) and 19-20 ns above (0.5-8 V
+ * peak) behind 707 ohm, 23-25 ns behind 5-9 k ohm, and behind 94 k ohm 25 ns
+ * at 8 V but 29 ns at 0.5 V peak, where most of the waveform lies below the
+ * table's start; against 26-32 ns with the estimate and its correction step
+ * everywhere, and 20-27 ns for the single-omega approximation that ignores
+ * the reverse diode (-46 to -82 dB error).
  */
 template <FloatType T, typename Tree>
 class DiodePairRoot
@@ -762,7 +956,7 @@ public:
     explicit DiodePairRoot(Tree& tree, T saturationCurrent = T(2.52e-9),
                            T idealityTimesVt = T(1.752 * 0.02585)) noexcept
         : tree_(tree), is_(saturationCurrent), nvt_(idealityTimesVt),
-          omega_(&detail::WrightOmega::instance()) {}
+          omega_(&detail::WrightOmega::instance()), exact_(&detail::DiodeOmegaTable::instance()) {}
 
     void setSaturationCurrent(T amps) noexcept { is_ = std::max(amps, T(1e-15)); }
     void setIdealityTimesVt(T volts) noexcept { nvt_ = std::max(volts, T(1e-4)); }
@@ -832,16 +1026,38 @@ private:
         invNvt_ = 1.0 / nvt;
         c_ = 0.5 * k * invNvt_;
         logC_ = std::log(c_);
+        logC4_ = 4.0 * logC_;
         bound_ = 1.0 / (1.0 + 2.0 * c_);
         cPlus_ = 1.0 + 2.0 * c_;
         mode_ = c_ <= 1e-4 ? Mode::Newton : (c_ <= 0.02 ? Mode::Halley : Mode::Iterate);
+        c2_ = c_ * c_;
+        halfC2_ = 0.5 * c2_;
+        // ln c = logC_ + ln(c e^-logC_): the residual, to about 1e-16.
+        logCLow_ = std::fma(c_, std::exp(-logC_), -1.0);
         invBeta_ = bound_;
         seriesLimit_ = cPlus_ * detail::DiodeSeries::pair(2.0 * c_ * bound_, series_);
+        // The table root holds where q = c^2 / (omega (1 + omega)) <= kTableQ:
+        // above the series limit for c <= 1e-4; from omega(1 + omega) =
+        // c^2 / kTableQ up to c = 0.02.
+        tableFrom_ = seriesLimit_;
+        if (mode_ == Mode::Halley)
+        {
+            const double w = 0.5 * (std::sqrt(1.0 + 4.0 * c2_ / kTableQ) - 1.0);
+            tableFrom_ = std::max(seriesLimit_, w + std::log(w) - logC_);
+        }
+        else if (mode_ == Mode::Iterate)
+            tableFrom_ = std::numeric_limits<double>::infinity();
     }
 
     /** Root s >= 0 of s + c (e^s - e^-s) = x for x >= 0. */
     [[nodiscard]] double solveNormalised(double x) const noexcept
     {
+        if (x >= tableFrom_) [[likely]]
+        {
+            const double z4 = x * 4.0 + logC4_;   // 4 (ln c + x), one rounding
+            if (z4 < 4.0 * detail::DiodeOmegaTable::kOctaveMax) [[likely]]
+                return mode_ == Mode::Newton ? solveTable(x, z4) : solveTableWide(x, z4);
+        }
         const auto& omega = *omega_;
         // Both diodes' closed forms.
         const double s = (x + omega(logC_ - x)) - omega(logC_ + x);
@@ -857,6 +1073,93 @@ private:
             return s - g / g1;
         }
         return refineHalley(s, x);
+    }
+
+    /**
+     * Table root for c <= 1e-4 and kLo <= z < kOctaveMax (z = ln c + x):
+     * the forward diode alone has the root s1 = x - omega(z), and the reverse
+     * diode moves it by d, the root of d + omega (e^d - 1) = (c^2 / omega) e^-d.
+     * With q = c^2 R = c^2 / (omega (1 + omega)) and h = 1 / (1 + omega)^2,
+     * d = q (1 - c^2 h / 2) - q^2 (1 - 1.5 q) + O(q^4): q < 5e-5 above the
+     * series limit for c <= 1e-4, so the omitted terms stay below 1e-17 of
+     * the root. Below z = kLo, omega < e^-40 and the root is x.
+     */
+    [[nodiscard]] double solveTable(double x, double z4) const noexcept
+    {
+        using Table = detail::DiodeOmegaTable;
+        if (z4 < 4.0 * Table::kHi)
+        {
+            if (!(z4 >= 4.0 * Table::kLo)) return x;
+            double t = 0.0;
+            int index = 0;
+            const auto& n = exact_->node(z4, t, index);
+            const double rest = Table::poly9Rest(n.p, t);
+            // q = c^2 R with c^2 applied to the two Estrin halves of R (one
+            // multiply less on the path), and d = q (1 - h) - q^2 + 1.5 q^3.
+            const double t2 = t * t;
+            const double* r = n.r;
+            const double ra = (r[0] + r[1] * t) + t2 * (r[2] + r[3] * t);
+            const double rb = (r[4] + r[5] * t) + t2 * (r[6] + r[7] * t);
+            const double q = c2_ * ra + (c2_ * (t2 * t2)) * rb;
+            const double h = halfC2_ * (n.h[0] + n.h[1] * t);
+            const double q2 = q * q;
+            const double d = (q * (1.0 - h) - q2) + (1.5 * q) * q2;
+            // Root = base + p0 + rest + d, with the large base + p0 summed
+            // exactly (|base| > |p0|) so that only the final add rounds.
+            const bool logForm = index >= Table::kFirstLogNode;
+            const double base = logForm ? -logC_ : x;
+            const double s0 = base + n.p[0];
+            const double e0 = n.p[0] - (s0 - base);
+            return s0 + (((rest + e0) - (logForm ? logCLow_ : 0.0)) + d);
+        }
+        // Above z = 32, q < c^2 / 818: q^2 is below 1e-24 of the root.
+        double t = 0.0;
+        const auto& cl = exact_->cell(0.25 * z4, t);
+        const double r = Table::poly7(cl.r, t);
+        const double rest = Table::poly9Rest(cl.p, t);
+        const double s0 = cl.p[0] - logC_;
+        const double v = s0 - cl.p[0];
+        const double e0 = (cl.p[0] - (s0 - v)) - (logC_ + v);   // two-sum error
+        return s0 + (((rest + e0) - logCLow_) + c2_ * r);
+    }
+
+    /**
+     * Table root for 1e-4 < c <= 0.02, where q is bounded by kTableQ instead of
+     * by the series limit: the full second and third order of d in q, with
+     * w = omega / (1 + omega) = 1 - omega R:
+     * d = q - q^2 (1 + w/2) + q^3 (3/2 + 4w/3 + w^2/2) + O(8.75 q^4).
+     */
+    [[nodiscard]] double solveTableWide(double x, double z4) const noexcept
+    {
+        using Table = detail::DiodeOmegaTable;
+        if (z4 < 4.0 * Table::kHi)
+        {
+            if (!(z4 >= 4.0 * Table::kLo)) return x;
+            double t = 0.0;
+            int index = 0;
+            const auto& n = exact_->node(z4, t, index);
+            const double rest = Table::poly9Rest(n.p, t);
+            const double R = Table::poly7(n.r, t);
+            const bool logForm = index >= Table::kFirstLogNode;
+            const double omega = logForm ? 0.25 * z4 - (n.p[0] + rest) : -(n.p[0] + rest);
+            const double w = 1.0 - omega * R;
+            const double q = c2_ * R, q2 = q * q;
+            const double d = (q - q2 * (1.0 + 0.5 * w)) + (q2 * q) * (1.5 + w * (4.0 / 3.0 + 0.5 * w));
+            const double base = logForm ? -logC_ : x;
+            const double s0 = base + n.p[0];
+            const double e0 = n.p[0] - (s0 - base);
+            return s0 + (((rest + e0) - (logForm ? logCLow_ : 0.0)) + d);
+        }
+        double t = 0.0;
+        const auto& cl = exact_->cell(0.25 * z4, t);
+        const double R = Table::poly7(cl.r, t);
+        const double rest = Table::poly9Rest(cl.p, t);
+        const double w = 1.0 - (0.25 * z4 - (cl.p[0] + rest)) * R;
+        const double q = c2_ * R;
+        const double s0 = cl.p[0] - logC_;
+        const double v = s0 - cl.p[0];
+        const double e0 = (cl.p[0] - (s0 - v)) - (logC_ + v);   // two-sum error
+        return s0 + (((rest + e0) - logCLow_) + (q - (q * q) * (1.0 + 0.5 * w)));
     }
 
     /** Halley steps (u g'' = c (u^2 - 1) as well), once for c <= 0.02, else
@@ -895,8 +1198,14 @@ private:
     Tree& tree_;
     T is_, nvt_;
     const detail::WrightOmega* omega_;
+    const detail::DiodeOmegaTable* exact_;
     double v_ = 0.0;
     double kCached_ = -1.0, nvtCached_ = -1.0;
+    double c2_ = 1.0, halfC2_ = 0.5;   ///< c^2 and c^2 / 2 (table path).
+    double logCLow_ = 0.0;              ///< ln c - logC_ (table path).
+    double logC4_ = 0.0;                ///< 4 logC_ (table index).
+    double tableFrom_ = 0.0;            ///< Table root from this x on (see updateConstants()).
+    static constexpr double kTableQ = 3e-5;   ///< 8.75 kTableQ^4 < 1e-17.
     enum class Mode { Newton, Halley, Iterate };
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0, bound_ = 1.0, cPlus_ = 3.0;
     double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.
@@ -910,17 +1219,23 @@ private:
  * Conducts for positive v, blocks (down to -Is) for negative v.
  *
  * Solver: s + c (e^s - 1) = a / nVt (s = v/nVt, c = R Is / nVt) has the
- * exact root s = A + c - omega(ln c + A + c) (Werner et al. 2015). One
- * correction step with one expm1() turns the tabulated omega into the root
- * to full double precision: Newton while c <= 1e-4, Halley up to c = 10,
- * repeated Halley steps beyond. Measured worst relative error over drives
- * of +-1e-9 to 1e4 nVt: 9e-16 for c from 1e-15 to 10, 1.1e-14 up to 1e5.
- * For incident waves below about 42-49 mV of either sign (default
- * constants behind 0.7-2.2 k ohm; any c up to 0.04)
- * the exact reversion series of detail::DiodeSeries is used instead (4e-16
- * worst relative error against 50-digit roots): 11.9 against 26.6 ns per
- * sample for an RC circuit at low drive on the development machine, where
- * the closed form with a cubic omega estimate takes 18.4 ns.
+ * exact root s = A + c - omega(ln c + A + c) (Werner et al. 2015). For c up
+ * to 0.04 (where the reversion series below covers the small drives at which
+ * A + c and omega would cancel) and ln c + A + c < 2^20, that closed form is
+ * evaluated with detail::DiodeOmegaTable to double precision, within one
+ * unit in the last place of 50-digit roots: no exponential and no division
+ * per sample. Otherwise one correction step with one expm1() turns a
+ * tabulated omega estimate into the root to full double precision: Newton
+ * while c <= 1e-4, Halley up to c = 10, repeated Halley steps beyond.
+ * Measured worst relative error over drives of +-1e-9 to 1e4 nVt: 9e-16 for
+ * c from 1e-15 to 10, 1.1e-14 up to 1e5. For incident waves below about
+ * 42-49 mV of either sign (default constants behind 0.7-2.2 k ohm; any c up
+ * to 0.04) the exact reversion series of detail::DiodeSeries is used
+ * instead (4e-16 worst relative error against 50-digit roots). Cost per
+ * sample for an RC circuit on the development machine (MSVC x64): 12.2 ns
+ * at low drive and 13-16 ns above (0.5-8 V peak), against 26-27 ns with the
+ * estimate and its correction step and 19-23 ns for the closed form with a
+ * cubic omega estimate.
  */
 template <FloatType T, typename Tree>
 class DiodeRoot
@@ -929,7 +1244,7 @@ public:
     explicit DiodeRoot(Tree& tree, T saturationCurrent = T(2.52e-9),
                        T idealityTimesVt = T(1.752 * 0.02585)) noexcept
         : tree_(tree), is_(saturationCurrent), nvt_(idealityTimesVt),
-          omega_(&detail::WrightOmega::instance()) {}
+          omega_(&detail::WrightOmega::instance()), exact_(&detail::DiodeOmegaTable::instance()) {}
 
     void setSaturationCurrent(T amps) noexcept { is_ = std::max(amps, T(1e-15)); }
     void setIdealityTimesVt(T volts) noexcept { nvt_ = std::max(volts, T(1e-4)); }
@@ -962,6 +1277,8 @@ public:
             c_ = k * invNvt_;
             logC_ = std::log(c_);
             steps_ = c_ <= 1e-4 ? 0 : (c_ <= 10.0 ? 1 : 32);
+            logCc4_ = 4.0 * (logC_ + c_);
+            logCLow_ = std::fma(c_, std::exp(-logC_), -1.0);
             invBeta_ = 1.0 / (1.0 + c_);
             seriesLimit_ = (1.0 + c_) * detail::DiodeSeries::single(c_ * invBeta_, series_);
         }
@@ -978,7 +1295,11 @@ public:
                                    + y4 * (d[12] + d[13] * y));
             v_ = (y + y2 * q) * nvt;
         }
-        else if (std::abs(x) < 1e12) [[likely]]
+        else if (seriesLimit_ > 0.0 && x * 4.0 + logCc4_ < 4.0 * detail::DiodeOmegaTable::kOctaveMax) [[likely]]
+        {
+            v_ = solveTable(x, x * 4.0 + logCc4_) * nvt;
+        }
+        else if (std::abs(x) < 1e12)
         {
             double s = x + c_ - (*omega_)(logC_ + x + c_);
             for (int it = 0; it <= steps_; ++it)
@@ -1018,12 +1339,50 @@ public:
     [[nodiscard]] T getVoltage() const noexcept { return static_cast<T>(v_); }
 
 private:
+    /**
+     * Exact root s = x + c - omega(z) (z = ln c + x + c, 4 z = z4) for
+     * c <= 0.04 (the series covers the small drives, where x + c and omega
+     * would cancel) and z < kOctaveMax, from the full-precision table: x + c - omega
+     * below z = 0 (x plus the -omega expansion, summed exactly, then c), and
+     * ln(omega) - ln c above. Below z = kLo, omega < e^-40 and the root is x + c.
+     */
+    [[nodiscard]] double solveTable(double x, double z4) const noexcept
+    {
+        using Table = detail::DiodeOmegaTable;
+        if (z4 < 4.0 * Table::kHi)
+        {
+            if (!(z4 >= 4.0 * Table::kLo)) return x + c_;
+            double t = 0.0;
+            int index = 0;
+            const auto& n = exact_->node(z4, t, index);
+            const double rest = Table::poly9Rest(n.p, t);
+            if (index < Table::kFirstLogNode)
+            {
+                const double s0 = x + n.p[0];               // |x| > omega
+                const double e0 = n.p[0] - (s0 - x);
+                return s0 + ((rest + e0) + c_);
+            }
+            const double s0 = n.p[0] - logC_;               // -ln c > |ln omega|
+            const double e0 = n.p[0] - (s0 + logC_);
+            return s0 + ((rest + e0) - logCLow_);
+        }
+        double t = 0.0;
+        const auto& cl = exact_->cell(0.25 * z4, t);
+        const double rest = Table::poly9Rest(cl.p, t);
+        const double s0 = cl.p[0] - logC_;
+        const double v = s0 - cl.p[0];
+        const double e0 = (cl.p[0] - (s0 - v)) - (logC_ + v);   // two-sum error
+        return s0 + ((rest + e0) - logCLow_);
+    }
+
     Tree& tree_;
     T is_, nvt_;
     const detail::WrightOmega* omega_;
+    const detail::DiodeOmegaTable* exact_;
     double v_ = 0.0;
     double kCached_ = -1.0, nvtCached_ = -1.0;
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0;
+    double logCc4_ = 0.0, logCLow_ = 0.0;   ///< 4 (logC_ + c), ln c - logC_ (table path).
     double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.
     double series_[14] {};                        ///< y^2 .. y^15 coefficients.
     int steps_ = 1;   ///< 0: one Newton step, 1: one Halley step, else Halley until converged.

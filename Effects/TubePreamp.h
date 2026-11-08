@@ -538,8 +538,9 @@ namespace detail {
         std::array<std::array<double, kKernelOrder>, kKernelOrder> kernel {};
         std::vector<double> compensation;       ///< Linear-phase droop FIR plus padding.
         int latency = 0;             ///< Base-rate samples added by the core.
+        int osFactor = 2;            ///< Oversampling factor of the design.
 
-        explicit TubePreampCoreDesign(int factor)
+        explicit TubePreampCoreDesign(int factor) : osFactor(factor)
         {
             // Least-squares Farrow fits over 0..22 kHz at 48 kHz (scaled with
             // the base rate), interpolating the two interval samples. Max
@@ -1055,13 +1056,18 @@ public:
      * 10.8 dB at 10 ms and 1.8 dB at 20 ms, recovered by 40 ms; during the
      * burst the supply reads 277.4 V against 264.4 V without the coupling
      * network (less plate current). Against the point circuit at 32x the
-     * core error stays within 1.9 dB of the Clamp figure (worst -56.7 dB,
-     * Clamp -58.4). Worst alias over the documented sweep at 2x (after 2 s
-     * of settling): -83.4/-72.7/-68.3 dBc at one stage, +12/+24/+36 dB
-     * (Clamp -87.7/-80.6/-80.6) and -77.1/-68.2/-65.5 at two stages (Clamp
-     * -83.0/-83.0/-84.8): the stronger harmonics fold more at 2x; at 4x the
-     * worst is -84.9 (one stage, +36 dB) and -84.0 dBc (two stages, +24 dB).
-     * CPU rises 3-23 %, most at +24..+36 dB drive.
+     * core error stays within 1.8 dB of the Clamp figure (worst -56.6 dB,
+     * Clamp -58.4). At 2x the coupling capacitor's voltage ramps across each
+     * internal sample from where the previous one ended (held at its
+     * predicted midpoint, it stepped at every boundary under grid current, a
+     * step train the output kernel cannot remove). Worst alias over the
+     * documented sweep at 2x (after 2 s of settling): -85.5/-74.0/-74.0 dBc
+     * at one stage, +12/+24/+36 dB (Clamp -87.7/-80.6/-80.6) and
+     * -81.6/-73.1/-73.1 at two stages (Clamp -83.0/-83.0/-84.8), against
+     * -83.4/-72.7/-68.3 and -77.1/-68.2/-65.5 with the held capacitor; at 4x,
+     * where the held midpoint measured lower and is kept, the worst is -84.9
+     * (one stage, +36 dB) and -84.0 dBc (two stages, +24 dB). CPU rises
+     * 3-23 %, most at +24..+36 dB drive.
      */
     void setGridModel(GridModel model)
     {
@@ -1556,6 +1562,8 @@ private:
         double gridIntegral1 = 0.0, gridIntegral2 = 0.0;
         /// Coupling capacitor voltages and interval-average grid sources (conduction).
         double vc1 = 0.0, vc2 = 0.0, x1Prev = 0.0, x2Prev = 0.0, x2Integral = 0.0;
+        double vcSlope2 = 0.0;   ///< Change of the stage-2 grid reference over the interval.
+        double vcRamp1 = 0.0, vcRamp2 = 0.0;   ///< Grid reference ramps at the interval start.
         double couplingDecay = 1.0;
         detail::TubePreampToneModes modes;
         std::array<double, 16> ring {};
@@ -1663,6 +1671,7 @@ private:
             i1Prev = i2Prev = i1;
             g1Prev = g2Prev = 0.0;
             vc1 = vc2 = x1Prev = x2Prev = x2Integral = 0.0;
+            vcRamp1 = vcRamp2 = vcSlope2 = 0.0;
             q[0] = q[1] = q[2] = 0.0;
             ring.fill(0.0);
             ringPos = 0;
@@ -1933,9 +1942,24 @@ private:
                 lo = std::min(lo, sv[k]);
                 hi = std::max(hi, sv[k]);
             }
+            // Conduction model: the coupling capacitor's predicted change
+            // across the interval (linear in time), removed from the source
+            // that the grid sees; the capacitor update uses the source itself.
+            const double ramp = grid ? vcSlope2 : 0.0;
+            const auto src = [&](double t) { return kInterstage * tr(t) - ramp * (a + h * t); };
             if (grid)   // Simpson average of the stage-2 source on this piece
+            {
                 x2Integral += h * (samples == 4 ? (sv[0] + 4.0 * sv[1] + 2.0 * sv[2] + 4.0 * sv[3] + sv[4]) / 12.0
                                                 : (sv[0] + 4.0 * sv[1] + sv[2]) / 6.0);
+                lo = std::numeric_limits<double>::max();
+                hi = -lo;
+                for (int k = 0; k <= samples; ++k)
+                {
+                    sv[k] -= ramp * (a + h * double(k) / samples);
+                    lo = std::min(lo, sv[k]);
+                    hi = std::max(hi, sv[k]);
+                }
+            }
             const bool edges = hi - lo < (grid ? kConductionKneeRange : kKneeRange);
             const auto cls = [&](double v) { return edges ? classifyEdges(lev2, v) : classify(lev2, v); };
             double pt = 0.0, pv = sv[0];
@@ -1959,8 +1983,8 @@ private:
                         for (int it = 0; it < 2; ++it)
                         {
                             double dv;
-                            const double f = kInterstage * tr.eval(tt, dv) - level;
-                            dv *= kInterstage;
+                            const double f = kInterstage * tr.eval(tt, dv) - ramp * (a + h * tt) - level;
+                            dv = dv * kInterstage - ramp * h;
                             if (dv == 0.0) break;
                             const double next = tt - f / dv;
                             if (!(next > pt && next < t)) break;
@@ -1978,7 +2002,7 @@ private:
             {
                 const double xa = cuts[k], xb = cuts[k + 1], len = xb - xa;
                 if (len <= 0.0) continue;
-                const int cm = changed ? cls(kInterstage * tr(0.5 * (xa + xb))) : first;
+                const int cm = changed ? cls(src(0.5 * (xa + xb))) : first;
                 if (cm == 0 || (cm == levels && !grid))
                 {
                     double i2 = 0.0;
@@ -1996,7 +2020,7 @@ private:
                     // Long smooth piece: a cubic interpolant keeps harmonics
                     // near 0.8 cycles/sample from leaking past the kernel.
                     double xs[4], is[4], gs[4], y[4], poly[4];
-                    for (int j = 0; j < 4; ++j) xs[j] = kInterstage * tr(xa + len * kG4x[j]);
+                    for (int j = 0; j < 4; ++j) xs[j] = src(xa + len * kG4x[j]);
                     currents<4>(slice2, ref2, xs, is, gs);
                     for (int j = 0; j < 4; ++j)
                     {
@@ -2016,7 +2040,7 @@ private:
                     // Short piece: two nodes and the exact moments of their
                     // linear interpolant.
                     constexpr double g0 = 0.21132486540518713, g1 = 0.78867513459481287;
-                    double xs[2] = {kInterstage * tr(xa + len * g0), kInterstage * tr(xa + len * g1)}, is[2], gs[2];
+                    double xs[2] = {src(xa + len * g0), src(xa + len * g1)}, is[2], gs[2];
                     currents<2>(slice2, ref2, xs, is, gs);
                     integral2 += h * len * 0.5 * (is[0] + is[1]);
                     if (grid) gridIntegral2 += h * len * 0.5 * (gs[0] + gs[1]);
@@ -2028,7 +2052,7 @@ private:
                     continue;
                 }
                 double xs[3], is[3], gs[3];
-                for (int j = 0; j < 3; ++j) xs[j] = kInterstage * tr(xa + len * kG3x[j]);
+                for (int j = 0; j < 3; ++j) xs[j] = src(xa + len * kG3x[j]);
                 currents<3>(slice2, ref2, xs, is, gs);
                 if (grid)
                     for (int j = 0; j < 3; ++j) gridIntegral2 += h * len * kG3w[j] * gs[j];
@@ -2110,16 +2134,42 @@ private:
             if (std::abs(s1 - cutSupply[0]) > 0.05) { cutSupply[0] = s1; cutVgk[0] = cutoffVgk(s1); }
             if (std::abs(s2 - cutSupply[1]) > 0.05) { cutSupply[1] = s2; cutVgk[1] = cutoffVgk(s2); }
             // Grid references: the cathode, plus the coupling capacitor voltage
-            // (conduction model), held at its predicted interval midpoint like
-            // the cathode and advanced exactly below with the interval-average
-            // source and grid current.
+            // (conduction model), advanced exactly below with the interval-
+            // average source and grid current.
             ref1 = a1;
             ref2 = a2;
-            if (grid)
+            double x1Avg = 0.0;
+            if (grid && design->osFactor == 2)
             {
+                // At 2x the capacitor voltage ramps linearly across the
+                // interval, from where the previous interval's ramp ended to
+                // the predicted end of this one: the grid reference is
+                // continuous, with only a change of slope at the boundary (the
+                // prediction error goes into the next slope). Held at its
+                // midpoint it stepped by the whole interval's change at every
+                // boundary, which the output kernel cannot remove. The source
+                // polynomial (stage 1) and vcSlope2 (stage 2) carry the slope.
+                for (int p = 0; p <= deg; ++p) x1Avg += c[p] / (p + 1);
+                const double rise = 1.0 - couplingDecay;
+                const double end1 = vc1 + rise * ((x1Avg + Conduction::kRg * g1Prev) - vc1);
+                const double end2 = vc2 + rise * ((x2Prev + Conduction::kRg * g2Prev) - vc2);
+                ref1 += vcRamp1;
+                ref2 += vcRamp2;
+                c[1] -= end1 - vcRamp1;
+                vcSlope2 = end2 - vcRamp2;
+                vcRamp1 = end1;
+                vcRamp2 = end2;
+            }
+            else if (grid)
+            {
+                // From 4x the held midpoint measured lower (two stages,
+                // +24 dB: -84.0 against -77.7 dBc for the ramp), so the
+                // references are held at their predicted midpoints there.
+                for (int p = 0; p <= deg; ++p) x1Avg += c[p] / (p + 1);
                 const double half = 0.5 * (1.0 - couplingDecay);
                 ref1 += vc1 + half * ((x1Prev + Conduction::kRg * g1Prev) - vc1);
                 ref2 += vc2 + half * ((x2Prev + Conduction::kRg * g2Prev) - vc2);
+                vcSlope2 = 0.0;
             }
             lev1[0] = ref1 + cutVgk[0]; lev1[1] = ref1 - 3.0; lev1[2] = ref1 - 1.0; lev1[3] = 1.0; lev1[4] = 6.0;
             lev2[0] = ref2 + cutVgk[1]; lev2[1] = ref2 - 3.0; lev2[2] = ref2 - 1.0; lev2[3] = 1.0; lev2[4] = 6.0;
@@ -2260,8 +2310,6 @@ private:
             {
                 // Coupling capacitors: Cc dvc/dt = (x - vc) / Rg + Ig, exact for
                 // the interval-average source x and grid current Ig.
-                double x1Avg = 0.0;
-                for (int p = 0; p <= deg; ++p) x1Avg += c[p] / (p + 1);
                 vc1 = vc1 * couplingDecay + (1.0 - couplingDecay) * (x1Avg + Conduction::kRg * gridIntegral1);
                 x1Prev = x1Avg;
                 if (stages > 1)
@@ -2385,7 +2433,7 @@ private:
             core.vk1 += kRk * di;
             core.i1Prev += di;
             core.vp1 = reference;
-            core.vc2 = core.x2Prev = core.g2Prev = 0.0;
+            core.vc2 = core.x2Prev = core.g2Prev = core.vcRamp2 = 0.0;
             if (design)
                 for (int mode = 0; mode < 3; ++mode)
                     for (int capacitor = 0; capacitor < 3; ++capacitor)

@@ -1376,7 +1376,12 @@ public:
      * needs a kernel; the cascade's delay must equal the common delay:
      * - 1 (1x): the tube kernel only (one sample);
      * - 2 (2x): first-order tube, tape kernel, first-order transformer
-     *   (0.5 + 1 + 0.5 samples);
+     *   (0.5 + 1 + 0.5 samples). Every other split of the two samples
+     *   aliases more (worst at +24 dB: -14.5 dBc with the tape at first
+     *   order, -1.3 to -19.2 with a plain stage or the tube at second
+     *   order); the transformer at second order as well (-36.3 dBc at
+     *   +24 dB, -33.5 at +12) needs 2.5 samples, which only a pad to four
+     *   (a second base sample of latency) aligns with the dry path;
      * - 3 (4x and above): second-order kernels on all three stages.
      * Worst alias over 1-19.25 kHz tones at -6/-18 dBFS, +12/+24 dB:
      * -37.1/-28.0 dBc at 2x and -70.6/-49.7 dBc at 4x, against

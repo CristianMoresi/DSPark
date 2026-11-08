@@ -430,6 +430,9 @@ private:
     T vs_ = 0;
 };
 
+template <FloatType T, typename Tree> class DiodePairRoot;
+template <FloatType T, typename Tree> class DiodeRoot;
+
 namespace detail {
 
 /**
@@ -639,6 +642,21 @@ public:
         return table;
     }
 
+    /** Degree-9 polynomial without its constant term c[0] (Estrin scheme). */
+    [[nodiscard]] static double poly9Rest(const double* c, double t) noexcept
+    {
+        const double t2 = t * t, t4 = t2 * t2;
+        const double a = (c[1] * t) + t2 * (c[2] + c[3] * t);
+        const double b = (c[4] + c[5] * t) + t2 * (c[6] + c[7] * t);
+        return (a + t4 * b) + (t4 * t4) * (c[8] + c[9] * t);
+    }
+
+private:
+    // The lookups return references into the table, which is immutable after
+    // construction; only the two diode roots read them.
+    template <FloatType U, typename Tr> friend class wdf::DiodePairRoot;
+    template <FloatType U, typename Tr> friend class wdf::DiodeRoot;
+
     /**
      * Nearest node of z = z4 / 4 in [kLo, kHi) (z4 = 4 z, which the caller
      * forms as 4 x + 4 ln c with the same single rounding as z) and the
@@ -664,15 +682,7 @@ public:
         return c;
     }
 
-    /** Degree-9 polynomial without its constant term c[0] (Estrin scheme). */
-    [[nodiscard]] static double poly9Rest(const double* c, double t) noexcept
-    {
-        const double t2 = t * t, t4 = t2 * t2;
-        const double a = (c[1] * t) + t2 * (c[2] + c[3] * t);
-        const double b = (c[4] + c[5] * t) + t2 * (c[6] + c[7] * t);
-        return (a + t4 * b) + (t4 * t4) * (c[8] + c[9] * t);
-    }
-
+public:
     /** Degree-7 polynomial (Estrin scheme). */
     [[nodiscard]] static double poly7(const double* c, double t) noexcept
     {

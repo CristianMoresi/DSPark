@@ -306,6 +306,14 @@ struct Vec<float, 8>
         return _mm256_permute_ps(swapped, _MM_SHUFFLE(0, 1, 2, 3));
 #endif
     }
+    /// loadDeinterleave() without crossing the 128-bit halves: the lanes come
+    /// out in the order (0, 1, 4, 5, 2, 3, 6, 7).
+    static void loadDeinterleaveInLane(const float* p, V& re, V& im) noexcept
+    {
+        const V a = _mm256_loadu_ps(p), b = _mm256_loadu_ps(p + 8);
+        re = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+        im = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+    }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
         const V a = _mm256_loadu_ps(p), b = _mm256_loadu_ps(p + 8);
@@ -384,6 +392,14 @@ struct Vec<double, 4>
         return _mm256_permute_pd(swapped, 0x5);
 #endif
     }
+    /// loadDeinterleave() without crossing the 128-bit halves: the lanes come
+    /// out in the order (0, 2, 1, 3).
+    static void loadDeinterleaveInLane(const double* p, V& re, V& im) noexcept
+    {
+        const V a = _mm256_loadu_pd(p), b = _mm256_loadu_pd(p + 4);
+        re = _mm256_unpacklo_pd(a, b);
+        im = _mm256_unpackhi_pd(a, b);
+    }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {
         const V a = _mm256_loadu_pd(p), b = _mm256_loadu_pd(p + 4);
@@ -398,6 +414,13 @@ struct Vec<double, 4>
         const V hi = _mm256_unpackhi_pd(re, im);
         _mm256_storeu_pd(p,     _mm256_permute2f128_pd(lo, hi, 0x20));
         _mm256_storeu_pd(p + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
+    }
+    /// storeInterleave2() of lanes held in the order (0, 2, 1, 3): no shuffle
+    /// crosses the 128-bit halves.
+    static void storeInterleave2InLane(double* p, V re, V im) noexcept
+    {
+        _mm256_storeu_pd(p,     _mm256_unpacklo_pd(re, im));
+        _mm256_storeu_pd(p + 4, _mm256_unpackhi_pd(re, im));
     }
     /// loadDeinterleave() with the lanes reversed, in the same four shuffles.
     static void loadDeinterleaveReversed(const double* p, V& re, V& im) noexcept
@@ -650,6 +673,80 @@ inline double dotProductWide(const double* DSPARK_RESTRICT a, const double* DSPA
 
     for (; i < count; ++i) sum += a[i] * b[i];
     return sum;
+}
+
+/// dotProductWide() of one operand with four others, each bit for bit as
+/// on its own: every product keeps its two accumulators and its reduction,
+/// and the shared operand is loaded once for all four (see dotProduct4() in
+/// SimdOps.h).
+inline void dotProduct4Wide(const double* shared, const double* const* other, int count, double* out) noexcept
+{
+    __m256d s0[4], s1[4];
+    for (int x = 0; x < 4; ++x) s0[x] = s1[x] = _mm256_setzero_pd();
+    const double* const b0 = other[0];
+    const double* const b1 = other[1];
+    const double* const b2 = other[2];
+    const double* const b3 = other[3];
+    int i = 0;
+    for (; i + 7 < count; i += 8)
+    {
+        const __m256d u = _mm256_loadu_pd(shared + i), v = _mm256_loadu_pd(shared + i + 4);
+    #if defined(DSPARK_VEC_FMA)
+        s0[0] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b0 + i), s0[0]);
+        s1[0] = _mm256_fmadd_pd(v, _mm256_loadu_pd(b0 + i + 4), s1[0]);
+        s0[1] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b1 + i), s0[1]);
+        s1[1] = _mm256_fmadd_pd(v, _mm256_loadu_pd(b1 + i + 4), s1[1]);
+        s0[2] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b2 + i), s0[2]);
+        s1[2] = _mm256_fmadd_pd(v, _mm256_loadu_pd(b2 + i + 4), s1[2]);
+        s0[3] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b3 + i), s0[3]);
+        s1[3] = _mm256_fmadd_pd(v, _mm256_loadu_pd(b3 + i + 4), s1[3]);
+    #else
+        s0[0] = _mm256_add_pd(s0[0], _mm256_mul_pd(u, _mm256_loadu_pd(b0 + i)));
+        s1[0] = _mm256_add_pd(s1[0], _mm256_mul_pd(v, _mm256_loadu_pd(b0 + i + 4)));
+        s0[1] = _mm256_add_pd(s0[1], _mm256_mul_pd(u, _mm256_loadu_pd(b1 + i)));
+        s1[1] = _mm256_add_pd(s1[1], _mm256_mul_pd(v, _mm256_loadu_pd(b1 + i + 4)));
+        s0[2] = _mm256_add_pd(s0[2], _mm256_mul_pd(u, _mm256_loadu_pd(b2 + i)));
+        s1[2] = _mm256_add_pd(s1[2], _mm256_mul_pd(v, _mm256_loadu_pd(b2 + i + 4)));
+        s0[3] = _mm256_add_pd(s0[3], _mm256_mul_pd(u, _mm256_loadu_pd(b3 + i)));
+        s1[3] = _mm256_add_pd(s1[3], _mm256_mul_pd(v, _mm256_loadu_pd(b3 + i + 4)));
+    #endif
+    }
+    for (; i + 3 < count; i += 4)
+    {
+        const __m256d u = _mm256_loadu_pd(shared + i);
+    #if defined(DSPARK_VEC_FMA)
+        s0[0] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b0 + i), s0[0]);
+        s0[1] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b1 + i), s0[1]);
+        s0[2] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b2 + i), s0[2]);
+        s0[3] = _mm256_fmadd_pd(u, _mm256_loadu_pd(b3 + i), s0[3]);
+    #else
+        s0[0] = _mm256_add_pd(s0[0], _mm256_mul_pd(u, _mm256_loadu_pd(b0 + i)));
+        s0[1] = _mm256_add_pd(s0[1], _mm256_mul_pd(u, _mm256_loadu_pd(b1 + i)));
+        s0[2] = _mm256_add_pd(s0[2], _mm256_mul_pd(u, _mm256_loadu_pd(b2 + i)));
+        s0[3] = _mm256_add_pd(s0[3], _mm256_mul_pd(u, _mm256_loadu_pd(b3 + i)));
+    #endif
+    }
+    const __m256d v0 = _mm256_add_pd(s0[0], s1[0]), v1 = _mm256_add_pd(s0[1], s1[1]);
+    const __m256d v2 = _mm256_add_pd(s0[2], s1[2]), v3 = _mm256_add_pd(s0[3], s1[3]);
+    // Low half plus high half of each (outputs 0 and 2, then 1 and 3), then
+    // the two lanes left: (x0 + x2) + (x1 + x3), as dotProductWide().
+    const __m256d ac = _mm256_add_pd(_mm256_permute2f128_pd(v0, v2, 0x20), _mm256_permute2f128_pd(v0, v2, 0x31));
+    const __m256d bd = _mm256_add_pd(_mm256_permute2f128_pd(v1, v3, 0x20), _mm256_permute2f128_pd(v1, v3, 0x31));
+    const __m256d r = _mm256_hadd_pd(ac, bd);
+    if (i == count)
+    {
+        _mm256_storeu_pd(out, r);
+        return;
+    }
+    // The last count % 4 terms one at a time, as dotProductWide() adds them.
+    const __m128d lo = _mm256_castpd256_pd128(r), hi = _mm256_extractf128_pd(r, 1);
+    double sum[4] = { _mm_cvtsd_f64(lo), _mm_cvtsd_f64(_mm_unpackhi_pd(lo, lo)),
+                      _mm_cvtsd_f64(hi), _mm_cvtsd_f64(_mm_unpackhi_pd(hi, hi)) };
+    for (int x = 0; x < 4; ++x)
+    {
+        for (int j = i; j < count; ++j) sum[x] += shared[j] * other[x][j];
+        out[x] = sum[x];
+    }
 }
 
 /// complexMulAccum() at 4 complex float bins per iteration.

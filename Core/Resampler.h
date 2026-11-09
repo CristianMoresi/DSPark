@@ -41,7 +41,7 @@
  * rate (or at twice it) does the sharp band-limiting, after which the
  * signal is oversampled enough for a short interpolation kernel (22 to 34
  * taps at High and Ultra) to change the rate. Its arithmetic is double for
- * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 9x faster than
+ * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 11x faster than
  * Direct (see setOfflineEngine()). process() also writes into caller
  * storage, which allocates nothing once the engine is designed.
  *
@@ -141,18 +141,20 @@ public:
      * output rate is an integer fraction of that rate (48 <-> 96 kHz) the
      * output is read straight from the band-limited signal. Both stages run
      * in double, for both instantiations, so the float output is limited by
-     * its own rounding only.
+     * its own rounding only. Outputs one cycle of phases apart share their
+     * stage-2 kernel row, so four of them are computed together
+     * (simd::dotProduct4(), each bit for bit the single product).
      *
      * Measured against Direct (MSVC x64, AVX2 dispatch, double, ns per
      * input sample once prepared, into caller storage) at 96 -> 44.1 /
-     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 2.7 / 4.5 / 4.7 / 7.0
-     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 2.8 / 4.7 / 5.5 / 8.5
+     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 2.3 / 3.9 / 3.6 / 5.3
+     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 2.3 / 3.7 / 4.9 / 7.8
      * instead of 26.2 / 26.9 / 27.7 / 60.3. Stage 1 reads a double input
      * straight from the caller's buffer, and its filter product and inverse
      * are one transform. At 2:1 (96 -> 48 kHz) the inverse runs at half
-     * the length on the folded spectrum: High 1.4, Ultra 1.6 instead of 14.6
+     * the length on the folded spectrum: High 1.2, Ultra 1.3 instead of 14.6
      * and 23.9. The vector-returning process() adds the vector:
-     * Ultra 3.2 / 5.4 / 6.5 / 10.8. Passband edge, image
+     * Ultra 2.9 / 4.5 / 5.6 / 9.4. Passband edge, image
      * and alias rejection and the residual of in-band tones are those of
      * Direct or better; on in-band material the two engines agree to -152 dB
      * at High and -222 dB at Ultra.
@@ -1108,10 +1110,10 @@ private:
         if (p0 > kTwoStagePhases - 1) p0 = kTwoStagePhases - 1;
         const double u = exactPhase - static_cast<double>(p0);
         const double* k = plan_.table2.data() + static_cast<size_t>(p0) * static_cast<size_t>(taps2);
-        const double sm = simd::dotProduct(k, src, taps2);
-        const double s0 = simd::dotProduct(k + taps2, src, taps2);
-        const double s1 = simd::dotProduct(k + 2 * taps2, src, taps2);
-        const double s2 = simd::dotProduct(k + 3 * taps2, src, taps2);
+        const double* const rows[4] = { k, k + taps2, k + 2 * taps2, k + 3 * taps2 };
+        double y[4];
+        simd::dotProduct4(src, rows, taps2, y);
+        const double sm = y[0], s0 = y[1], s1 = y[2], s2 = y[3];
         const double wm = -u * (u - 1.0) * (u - 2.0) / 6.0;
         const double w0 = (u + 1.0) * (u - 1.0) * (u - 2.0) / 2.0;
         const double w1 = -(u + 1.0) * u * (u - 2.0) / 2.0;
@@ -1241,7 +1243,41 @@ private:
                     const int64_t* const advance = p.advance2.data();
                     int64_t k = p.cycleOf2[static_cast<size_t>(phase)];
                     const double* row = rows + k * taps2;
-                    do
+                    // Outputs j and j + l share a kernel row, and their windows
+                    // lie step2 mid samples apart: whole sets of four cycles
+                    // run as one cycle of four-product dot products (each bit
+                    // for bit the single product, the row loaded once for the
+                    // four windows), the rest one by one. Output j from here
+                    // sits at w0 + floor((phase + j step2) / l), so those up to
+                    // `last` are the first ((last - w0 + 1) l - phase - 1) /
+                    // step2 + 1.
+                    const int64_t cycleStep = p.step2;
+                    const int64_t batch = std::min<int64_t>(
+                        count - i, ((last - w0 + 1) * l - phase - 1) / cycleStep + 1);
+                    const int64_t sets = batch / (4 * l);
+                    for (int64_t g = 0; g < sets; ++g)
+                    {
+                        for (int64_t t = 0; t < l; ++t)
+                        {
+                            const double* const windows[4] = { src, src + cycleStep, src + 2 * cycleStep,
+                                                               src + 3 * cycleStep };
+                            double y[4];
+                            simd::dotProduct4(row, windows, taps2, y);
+                            out[i + t]         = static_cast<T>(y[0]);
+                            out[i + t + l]     = static_cast<T>(y[1]);
+                            out[i + t + 2 * l] = static_cast<T>(y[2]);
+                            out[i + t + 3 * l] = static_cast<T>(y[3]);
+                            const int64_t a = advance[k];
+                            src += a;
+                            row += taps2;
+                            if (++k == l) { k = 0; row = rows; }
+                        }
+                        // One cycle walked: the other three are step2 each.
+                        src += 3 * cycleStep;
+                        w0 += 4 * cycleStep;
+                        i += 4 * l;
+                    }
+                    for (int64_t b = sets * 4 * l; b < batch; ++b)
                     {
                         out[i++] = static_cast<T>(simd::dotProduct(row, src, taps2));
                         const int64_t a = advance[k];
@@ -1249,7 +1285,7 @@ private:
                         w0 += a;
                         row += taps2;
                         if (++k == l) { k = 0; row = rows; }
-                    } while (i < count && w0 <= last);
+                    }
                     phase = (k * remStep) % l;
                 }
                 anchor = w0 + half2 - 1;

@@ -18,6 +18,11 @@ All notable user-facing changes to DSPark are documented here.
   against 24 ms from a note change to a reading within 50 cents; with the
   noise suppression and `setConfidence(0.45)`, 86.2% at 0 dB SNR, where the
   HMM reads none.
+- `simd::dotProduct4(shared, other, count, out)`: four double dot products of
+  one array with four others, each equal to `dotProduct(shared, other[x],
+  count)` bit for bit. The AVX kernels load the shared operand once for the
+  four products and share their reductions; other builds run four
+  `dotProduct()` calls.
 - Plugin layer, VST3 note expressions: a class that declares
   `static constexpr uint32_t noteExpressions = dspark::plugin::expressions(...)`
   offers those expressions (volume, pan, tuning, vibrato, expression,
@@ -373,6 +378,39 @@ All notable user-facing changes to DSPark are documented here.
   0.7% now; notes whose fundamental is 15 dB below its partials 28.6% to
   0.7%. Readings within 50 cents at the defaults 68.9% to 89.4% (clean
   legato), time to a note change 104 to 48 ms.
+- FFT engine (`FFTReal`, `FFTComplex` and the split engine the two-stage
+  resampler runs on), faster with the same output, bit for bit, in every
+  build: the passes keep their pointers in registers and load each twiddle
+  where it is used (no twiddle vector is spilled); a pass whose stride is one
+  block broadcasts its twiddles per block; the radix-8 closing pass takes its
+  sums and its differences in two sweeps over its inputs; at the AVX width the
+  first pass reads interleaved input without crossing 128-bit halves (its
+  twiddles follow the permuted lanes: `FFTReal` and `FFTComplex` keep a
+  permuted copy of the first pass's twiddles in x86-64 builds, 0.75 N and
+  1.5 N values), and a double transform that ends in interleaved output keeps
+  its blocks in that lane order, so its closing pass interleaves within halves
+  too; transforms of one pass (2 or 4 complex points) run inline. A transform
+  runs all of its passes on one kernel set, and `FFTReal::inverseStep()` keeps
+  the set its first engine step ran on, so a `simd::setRuntimeDispatch()`
+  change between steps no longer mixes the two sets (the steps then equal
+  `inverse()` on that set, bit for bit). Forward plus inverse, double, real:
+  13-15% faster with the AVX2 dispatch from 256 to 4096 points (5% at 128,
+  2-9% above 4096), 3-11% on SSE2; complex 15-22% and 4-16%; float real 1-10%
+  and 5-12% (parity at 64 and 128 points with the dispatch).
+  Against a reference FFT's ordered real transform, double, both built for
+  AVX2: 1.17 / 1.12 / 1.17 times its time at 256 / 512 / 1024 points before,
+  1.00-1.02 / 0.93-0.95 / 0.99-1.00 now (0.77-0.97 at the other sizes from 64
+  to 16384); on SSE2 1.09 / 1.05 / 1.04 at 1024 / 2048 / 4096 (1.11 / 1.09 /
+  1.07 before), 1.02 at 16384 and below 1.0 at the other sizes.
+- `Resampler` two-stage engine (opt-in): its stage-2 interpolation computes
+  outputs one phase cycle apart together, four at a time with
+  `simd::dotProduct4()`, so each kernel row is read once for four windows, and
+  the table mode reads its four phases in one call. Output unchanged, bit for
+  bit. With the faster transforms, ns per input sample (MSVC x64, AVX2
+  dispatch, double): Ultra 96 -> 44.1 kHz 2.60 -> 2.32, 48 -> 44.1 4.31 ->
+  3.74, 44.1 -> 48 5.15 -> 4.88, 44.1 -> 96 8.11 -> 7.75, 96 -> 48 1.41 ->
+  1.30; High 2.47 -> 2.30, 4.19 -> 3.87, 4.25 -> 3.58, 6.33 -> 5.33, 1.27 ->
+  1.18.
 - `OnsetDetector` gated picker (the default; analysis readout, no audio): a
   peak whose frame energy falls across the release test is also kept when
   bands it raised at least double their amplitude over anything they or

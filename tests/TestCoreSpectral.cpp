@@ -535,6 +535,111 @@ DSPARK_TEST(FFT_blocked_engine_matches_a_reference_at_every_size)
     checkFftAgainstReference<double>(1e-14);
 }
 
+// Interleaved data is read, and written, through permuted lanes where the
+// vector width allows it (no shuffle then crosses 128-bit halves): every value
+// must still be what the split route computes in natural order, bit for bit.
+// Forward against runFromSplit(); inverse against runFromSplit() of the
+// conjugated input, scaled and conjugated back. Every size, float and double,
+// with the vector kernels and with the baseline ones.
+template <typename T>
+static void checkInterleavedMatchesSplit()
+{
+    unsigned int rng = 1357u;
+    auto next = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<T>((static_cast<double>(rng >> 8) + 0.5) / 8388608.0 - 1.0);
+    };
+    const auto same = [](T a, T b) { return std::memcmp(&a, &b, sizeof(T)) == 0; };
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool wide : { true, false })
+    {
+        simd::setRuntimeDispatch(wide && dispatch);
+        for (size_t n = 2; n <= 16384; n *= 2)
+        {
+            std::vector<T> data(2 * n), re(n), im(n), conj(n);
+            for (auto& v : data) v = next();
+            for (size_t i = 0; i < n; ++i)
+            {
+                re[i] = data[2 * i];
+                im[i] = data[2 * i + 1];
+                conj[i] = -im[i];
+            }
+            FFTComplex<T> c(n);
+            detail::fft::SplitFFT<T> split(n);
+            const T* zr = nullptr;
+            const T* zi = nullptr;
+            std::vector<T> out = data;
+            c.forward(out.data());
+            split.runFromSplit(re.data(), im.data(), zr, zi);
+            bool forwardSame = true;
+            for (size_t k = 0; k < n; ++k)
+                forwardSame = forwardSame && same(out[2 * k], zr[k]) && same(out[2 * k + 1], zi[k]);
+            EXPECT_TRUE(forwardSame);
+
+            out = data;
+            c.inverse(out.data());
+            split.runFromSplit(re.data(), conj.data(), zr, zi);
+            const T scale = T(1) / static_cast<T>(n);
+            bool inverseSame = true;
+            for (size_t k = 0; k < n; ++k)
+                inverseSame = inverseSame && same(out[2 * k], zr[k] * scale) && same(out[2 * k + 1], zi[k] * -scale);
+            EXPECT_TRUE(inverseSame);
+        }
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
+DSPARK_TEST(FFT_interleaved_transforms_match_the_split_route)
+{
+    checkInterleavedMatchesSplit<float>();
+    checkInterleavedMatchesSplit<double>();
+}
+
+// A transform split into steps keeps the kernel set its first engine step ran
+// on, as one call does, even if the run-time dispatch changes in between:
+// the work layout between the passes can differ between the sets, so mixing
+// them would not just round differently. The steps then match inverse() on
+// that set bit for bit.
+template <typename T>
+static void checkSteppedInverseKeepsItsKernels()
+{
+    unsigned int rng = 2468u;
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (size_t n = 4; n <= 16384; n *= 2)
+    {
+        std::vector<T> spec(n + 2);
+        for (auto& v : spec)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+        }
+        for (const bool first : { false, true })
+        {
+            const bool start = first && dispatch;
+            FFTReal<T> whole(n), stepped(n);
+            std::vector<T> a(n), b(n, T(-7));
+            simd::setRuntimeDispatch(start);
+            whole.inverse(spec.data(), a.data());
+            const int steps = stepped.getInverseStepCount();
+            for (int s = 0; s < steps; ++s)
+            {
+                // The pack and the engine's first step on `start`, the rest
+                // alternating.
+                simd::setRuntimeDispatch(s < 2 ? start : (((s & 1) != 0) != start) && dispatch);
+                stepped.inverseStep(s, spec.data(), b.data());
+            }
+            EXPECT_EQ(std::memcmp(a.data(), b.data(), n * sizeof(T)), 0);
+        }
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
+DSPARK_TEST(FFTReal_inverse_steps_keep_the_kernel_set_they_begin_on)
+{
+    checkSteppedInverseKeepsItsKernels<float>();
+    checkSteppedInverseKeepsItsKernels<double>();
+}
+
 // ============================================================================
 // WindowFunctions
 // ============================================================================

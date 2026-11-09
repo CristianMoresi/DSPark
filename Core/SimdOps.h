@@ -749,6 +749,32 @@ inline double dotProduct(const double* DSPARK_RESTRICT a, const double* DSPARK_R
 #endif
 }
 
+/**
+ * @brief dotProduct() of one array with four others: out[x] equals
+ *        dotProduct(shared, other[x], count) bit for bit. The wide kernels
+ *        load the shared operand once for all four products and share their
+ *        reductions.
+ * @param shared The operand common to the four products.
+ * @param other  Four operands (may repeat, may alias the shared one).
+ * @param count  Length of every product.
+ * @param out    Receives the four results.
+ */
+inline void dotProduct4(const double* shared, const double* const* other, int count, double* out) noexcept
+{
+#if defined(DSPARK_SIMD_AVX)
+    dotProduct4Wide(shared, other, count, out);
+#else
+  #if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive())
+    {
+        avx2::dotProduct4Wide(shared, other, count, out);
+        return;
+    }
+  #endif
+    for (int x = 0; x < 4; ++x) out[x] = dotProduct(shared, other[x], count);
+#endif
+}
+
 // ============================================================================
 // add -- dst[i] += src[i]
 // ============================================================================

@@ -26,6 +26,22 @@ inline size_t blockedOffset(size_t i) noexcept
     return 2 * i - (i & (B - 1));
 }
 
+/// Whether the copy's W-lane vector deinterleaves without crossing its 128-bit
+/// halves (the AVX widths): its lanes then come out as four runs of W / 4 in
+/// the order (0, 2, 1, 3), which the first pass follows in its twiddles and
+/// in where it stores each butterfly (see FFT.h, SplitFFT).
+template <typename T, int W>
+inline constexpr bool kInLaneDeinterleave = requires { &Vec<T, W>::loadDeinterleaveInLane; };
+
+/// Whether this copy can hold double blocks with their lanes in the order
+/// (0, 2, 1, 3) (the AVX width): a transform that closes into interleaved
+/// output then writes that order from its first pass, so the closing pass
+/// interleaves without crossing 128-bit halves. Every other pass is
+/// lane-wise and does not see the order. Float keeps the natural order: its
+/// half-block pass needs each half of a block to hold one butterfly group.
+template <typename T>
+inline constexpr bool kInLaneLayout = std::is_same_v<T, double> && kInLaneDeinterleave<T, kWide<T>>;
+
 /// Where the first pass reads its input from, and where the last pass writes.
 /// Reading interleaved data directly in the first pass, and writing it directly
 /// in the last, saves one full pass over memory in each direction.
@@ -33,6 +49,7 @@ template <typename T, int W>
 struct SplitSource
 {
     using O = Vec<T, W>;
+    static constexpr bool inLane = false;
     const T* re;
     const T* im;
     void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
@@ -60,10 +77,14 @@ template <typename T, int W>
 struct InterleavedSource
 {
     using O = Vec<T, W>;
+    static constexpr bool inLane = kInLaneDeinterleave<T, W>;
     const T* data;
     void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
     {
-        O::loadDeinterleave(data + 2 * i, r, m);
+        if constexpr (inLane)
+            O::loadDeinterleaveInLane(data + 2 * i, r, m);
+        else
+            O::loadDeinterleave(data + 2 * i, r, m);
     }
 };
 
@@ -71,10 +92,14 @@ template <typename T, int W>
 struct ConjugatedSource
 {
     using O = Vec<T, W>;
+    static constexpr bool inLane = kInLaneDeinterleave<T, W>;
     const T* data;
     void read(size_t i, typename O::V& r, typename O::V& m) const noexcept
     {
-        O::loadDeinterleave(data + 2 * i, r, m);
+        if constexpr (inLane)
+            O::loadDeinterleaveInLane(data + 2 * i, r, m);
+        else
+            O::loadDeinterleave(data + 2 * i, r, m);
         m = O::sub(O::set1(T(0)), m);
     }
 };
@@ -87,6 +112,7 @@ template <typename T, int W>
 struct ScaledSwapSource
 {
     using O = Vec<T, W>;
+    static constexpr bool inLane = false;
     const T* re;
     const T* im;
     const T* gain;
@@ -107,6 +133,7 @@ template <typename T, int W>
 struct FoldedScaledSwapSource
 {
     using O = Vec<T, W>;
+    static constexpr bool inLane = false;
     const T* re;
     const T* im;
     const T* gain;
@@ -153,6 +180,21 @@ struct InterleavedSink
     }
 };
 
+/// InterleavedSink for blocks in the in-lane order (kInLaneLayout); only
+/// instantiated at the width that has it.
+template <typename T, int W>
+struct InterleavedInLaneSink
+{
+    using O = Vec<T, W>;
+    T* data;
+    typename O::V scaleRe;
+    typename O::V scaleIm;
+    void write(size_t i, typename O::V r, typename O::V m) const noexcept
+    {
+        O::storeInterleave2InLane(data + 2 * i, O::mul(r, scaleRe), O::mul(m, scaleIm));
+    }
+};
+
 /**
  * @brief One Stockham radix-4 DIF pass with stride s >= kBlock, blocked
  *        layout in and out, vectorised over the stride (twiddles broadcast
@@ -173,6 +215,46 @@ void radix4Blocked(const T* x, T* y, size_t n, size_t s, const TwiddleSpan<T>& t
     const T* const w1rp = tw.w1r; const T* const w1ip = tw.w1i;
     const T* const w2rp = tw.w2r; const T* const w2ip = tw.w2i;
     const T* const w3rp = tw.w3r; const T* const w3ip = tw.w3i;
+    if (s == B)
+    {
+        // One block per row: a group's twiddles serve one block, so they are
+        // broadcast where they are used rather than kept live, and the four
+        // output rows are adjacent blocks.
+        for (size_t p = 0; p < n1; ++p)
+        {
+            const T* const a = x + 2 * B * p;
+            const T* const b = a + rowIn;
+            const T* const c = b + rowIn;
+            const T* const d = c + rowIn;
+            T* const y0 = y + 8 * B * p;
+            for (size_t h = 0; h < B; h += W)
+            {
+                const V a_r = O::load(a + h), a_i = O::load(a + B + h);
+                const V b_r = O::load(b + h), b_i = O::load(b + B + h);
+                const V c_r = O::load(c + h), c_i = O::load(c + B + h);
+                const V d_r = O::load(d + h), d_i = O::load(d + B + h);
+                const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
+                const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
+                const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
+                const V bmdR = O::sub(b_r, d_r), bmdI = O::sub(b_i, d_i);
+                const V t1R = O::add(amcR, bmdI), t1I = O::sub(amcI, bmdR);
+                const V t2R = O::sub(apcR, bpdR), t2I = O::sub(apcI, bpdI);
+                const V t3R = O::sub(amcR, bmdI), t3I = O::add(amcI, bmdR);
+                O::store(y0 + h,         O::add(apcR, bpdR));
+                O::store(y0 + B + h,     O::add(apcI, bpdI));
+                V w = O::set1(w1rp[p]), u = O::set1(w1ip[p]);
+                O::store(y0 + 2 * B + h, O::mulSub(t1R, w, t1I, u));
+                O::store(y0 + 3 * B + h, O::mulAdd(t1R, u, t1I, w));
+                w = O::set1(w2rp[p]); u = O::set1(w2ip[p]);
+                O::store(y0 + 4 * B + h, O::mulSub(t2R, w, t2I, u));
+                O::store(y0 + 5 * B + h, O::mulAdd(t2R, u, t2I, w));
+                w = O::set1(w3rp[p]); u = O::set1(w3ip[p]);
+                O::store(y0 + 6 * B + h, O::mulSub(t3R, w, t3I, u));
+                O::store(y0 + 7 * B + h, O::mulAdd(t3R, u, t3I, w));
+            }
+        }
+        return;
+    }
     for (size_t p = 0; p < n1; ++p)
     {
         const V w1r = O::set1(w1rp[p]), w1i = O::set1(w1ip[p]);
@@ -273,23 +355,26 @@ void radix4HalfBlock(const T* x, T* y, size_t n, const TwiddleSpan<T>& tw) noexc
  *        contiguous in p, and the four outputs of each butterfly are adjacent,
  *        written through a 4-way interleave into the blocked layout.
  */
-template <typename T, int W, typename Source>
+template <typename T, int W, typename Source, bool InLaneOut = false>
 void radix4First(const Source& input, T* y, size_t n, const TwiddleSpan<T>& tw) noexcept
 {
     using O = Vec<T, W>;
     using V = typename O::V;
     constexpr size_t B = kBlock<T>;
     const size_t n1 = n / 4;
+    // Locals, not the structs: a store through y may not alias them, so the
+    // pointers stay in registers, and each twiddle is loaded where it is used.
+    const Source in = input;
+    const T* const w1rp = tw.w1r; const T* const w1ip = tw.w1i;
+    const T* const w2rp = tw.w2r; const T* const w2ip = tw.w2i;
+    const T* const w3rp = tw.w3r; const T* const w3ip = tw.w3i;
     for (size_t p = 0; p < n1; p += W)
     {
-        const V w1r = O::load(tw.w1r + p), w1i = O::load(tw.w1i + p);
-        const V w2r = O::load(tw.w2r + p), w2i = O::load(tw.w2i + p);
-        const V w3r = O::load(tw.w3r + p), w3i = O::load(tw.w3i + p);
         V a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i;
-        input.read(p, a_r, a_i);
-        input.read(p + n1, b_r, b_i);
-        input.read(p + 2 * n1, c_r, c_i);
-        input.read(p + 3 * n1, d_r, d_i);
+        in.read(p, a_r, a_i);
+        in.read(p + n1, b_r, b_i);
+        in.read(p + 2 * n1, c_r, c_i);
+        in.read(p + 3 * n1, d_r, d_i);
         const V apcR = O::add(a_r, c_r), apcI = O::add(a_i, c_i);
         const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
         const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
@@ -302,14 +387,27 @@ void radix4First(const Source& input, T* y, size_t n, const TwiddleSpan<T>& tw) 
         T* const r1 = y + blockedOffset<T>(4 * p + W);
         T* const r2 = y + blockedOffset<T>(4 * p + 2 * W);
         T* const r3 = y + blockedOffset<T>(4 * p + 3 * W);
-        O::storeInterleave4To(r0, r1, r2, r3, O::add(apcR, bpdR),
-                              O::mulSub(t1R, w1r, t1I, w1i),
-                              O::mulSub(t2R, w2r, t2I, w2i),
-                              O::mulSub(t3R, w3r, t3I, w3i));
-        O::storeInterleave4To(r0 + B, r1 + B, r2 + B, r3 + B, O::add(apcI, bpdI),
-                              O::mulAdd(t1R, w1i, t1I, w1r),
-                              O::mulAdd(t2R, w2i, t2I, w2r),
-                              O::mulAdd(t3R, w3i, t3I, w3r));
+        const V y0r = O::add(apcR, bpdR), y0i = O::add(apcI, bpdI);
+        V w = O::load(w1rp + p), u = O::load(w1ip + p);
+        const V y1r = O::mulSub(t1R, w, t1I, u), y1i = O::mulAdd(t1R, u, t1I, w);
+        w = O::load(w2rp + p); u = O::load(w2ip + p);
+        const V y2r = O::mulSub(t2R, w, t2I, u), y2i = O::mulAdd(t2R, u, t2I, w);
+        w = O::load(w3rp + p); u = O::load(w3ip + p);
+        const V y3r = O::mulSub(t3R, w, t3I, u), y3i = O::mulAdd(t3R, u, t3I, w);
+        // In-lane input holds the butterflies' runs in the order (0, 2, 1, 3).
+        T* const s1 = Source::inLane ? r2 : r1;
+        T* const s2 = Source::inLane ? r1 : r2;
+        // The in-lane layout holds a block's four outputs as (0, 2, 1, 3).
+        if constexpr (InLaneOut)
+        {
+            O::storeInterleave4To(r0, s1, s2, r3, y0r, y2r, y1r, y3r);
+            O::storeInterleave4To(r0 + B, s1 + B, s2 + B, r3 + B, y0i, y2i, y1i, y3i);
+        }
+        else
+        {
+            O::storeInterleave4To(r0, s1, s2, r3, y0r, y1r, y2r, y3r);
+            O::storeInterleave4To(r0 + B, s1 + B, s2 + B, r3 + B, y0i, y1i, y2i, y3i);
+        }
     }
 }
 
@@ -359,6 +457,7 @@ void radix4LastBlocked(const T* x, const Sink& output, size_t s) noexcept
     using O = Vec<T, W>;
     using V = typename O::V;
     constexpr size_t B = kBlock<T>;
+    const Sink out = output;   // a local: the stores cannot alias its pointers
     for (size_t qb = 0; qb < s; qb += B)
     {
         const T* const r0 = x + 2 * qb;
@@ -376,10 +475,10 @@ void radix4LastBlocked(const T* x, const Sink& output, size_t s) noexcept
             const V amcR = O::sub(a_r, c_r), amcI = O::sub(a_i, c_i);
             const V bpdR = O::add(b_r, d_r), bpdI = O::add(b_i, d_i);
             const V bmdR = O::sub(b_r, d_r), bmdI = O::sub(b_i, d_i);
-            output.write(q,         O::add(apcR, bpdR), O::add(apcI, bpdI));
-            output.write(q + s,     O::add(amcR, bmdI), O::sub(amcI, bmdR));
-            output.write(q + 2 * s, O::sub(apcR, bpdR), O::sub(apcI, bpdI));
-            output.write(q + 3 * s, O::sub(amcR, bmdI), O::add(amcI, bmdR));
+            out.write(q,         O::add(apcR, bpdR), O::add(apcI, bpdI));
+            out.write(q + s,     O::add(amcR, bmdI), O::sub(amcI, bmdR));
+            out.write(q + 2 * s, O::sub(apcR, bpdR), O::sub(apcI, bpdI));
+            out.write(q + 3 * s, O::sub(amcR, bmdI), O::add(amcI, bmdR));
         }
     }
 }
@@ -391,6 +490,7 @@ void radix2LastBlocked(const T* x, const Sink& output, size_t s) noexcept
     using O = Vec<T, W>;
     using V = typename O::V;
     constexpr size_t B = kBlock<T>;
+    const Sink out = output;   // a local: the stores cannot alias its pointers
     for (size_t qb = 0; qb < s; qb += B)
     {
         const T* const r0 = x + 2 * qb;
@@ -400,27 +500,20 @@ void radix2LastBlocked(const T* x, const Sink& output, size_t s) noexcept
             const size_t q = qb + h;
             const V a_r = O::load(r0 + h), a_i = O::load(r0 + B + h);
             const V b_r = O::load(r1 + h), b_i = O::load(r1 + B + h);
-            output.write(q, O::add(a_r, b_r), O::add(a_i, b_i));
-            output.write(q + s, O::sub(a_r, b_r), O::sub(a_i, b_i));
+            out.write(q, O::add(a_r, b_r), O::add(a_i, b_i));
+            out.write(q + s, O::sub(a_r, b_r), O::sub(a_i, b_i));
         }
     }
 }
 
-/**
- * @brief The closing radix-8 pass (n = 8, stride s = N / 8 >= kBlock) from the
- *        blocked layout: it replaces a radix-4 pass of length 8 and the
- *        closing radix-2 pass that would follow it, one pass over the data
- *        fewer. Twiddle-free: the eighth roots enter as the exact sqrt(1/2).
- *
- * y[q + s k] = sum_r x[q + s r] w8^(r k), split as two 4-point transforms of
- * the sums x_r + x_(r+4) (even k) and the twiddled differences (odd k).
- */
+/// radix8LastBlocked() of a stride of one block: a single column, whose
+/// sums and differences are all taken at once (one sweep over the inputs).
 template <typename T, int W, typename Sink>
-void radix8LastBlocked(const T* x, const Sink& output, size_t s) noexcept
+void radix8LastOneBlock(const T* x, const Sink& output) noexcept
 {
     using O = Vec<T, W>;
     using V = typename O::V;
-    constexpr size_t B = kBlock<T>;
+    constexpr size_t B = kBlock<T>, s = B;
     const V h = O::set1(static_cast<T>(0.70710678118654752440));
     const V zero = O::set1(T(0));
     // 4-point transform of z0..z3 into rows k0, k0 + 2, k0 + 4, k0 + 6.
@@ -434,30 +527,96 @@ void radix8LastBlocked(const T* x, const Sink& output, size_t s) noexcept
         output.write(q + s * (k0 + 4), O::sub(apcR, bpdR), O::sub(apcI, bpdI));
         output.write(q + s * (k0 + 6), O::sub(amcR, bmdI), O::add(amcI, bmdR));
     };
+    for (size_t hh = 0; hh < B; hh += W)
+    {
+        V ar[4], ai[4], br[4], bi[4];
+        for (size_t r = 0; r < 4; ++r)
+        {
+            const T* const lo = x + 2 * s * r + hh;
+            const T* const hi = lo + 8 * s;
+            const V xr = O::load(lo), xi = O::load(lo + B);
+            const V yr = O::load(hi), yi = O::load(hi + B);
+            ar[r] = O::add(xr, yr); ai[r] = O::add(xi, yi);
+            br[r] = O::sub(xr, yr); bi[r] = O::sub(xi, yi);
+        }
+        // Differences times w8^r: (1 - j) / sqrt 2, -j, -(1 + j) / sqrt 2.
+        const V b1r = O::mul(O::add(br[1], bi[1]), h), b1i = O::mul(O::sub(bi[1], br[1]), h);
+        const V b2r = bi[2], b2i = O::sub(zero, br[2]);
+        const V b3r = O::mul(O::sub(bi[3], br[3]), h), b3i = O::sub(zero, O::mul(O::add(br[3], bi[3]), h));
+        br[1] = b1r; bi[1] = b1i;
+        br[2] = b2r; bi[2] = b2i;
+        br[3] = b3r; bi[3] = b3i;
+        dft4(hh, 0, ar, ai);
+        dft4(hh, 1, br, bi);
+    }
+}
+
+/**
+ * @brief The closing radix-8 pass (n = 8, stride s = N / 8 >= kBlock) from the
+ *        blocked layout: it replaces a radix-4 pass of length 8 and the
+ *        closing radix-2 pass that would follow it, one pass over the data
+ *        fewer. Twiddle-free: the eighth roots enter as the exact sqrt(1/2).
+ *
+ * y[q + s k] = sum_r x[q + s r] w8^(r k), split as two 4-point transforms of
+ * the sums x_r + x_(r+4) (even k) and the twiddled differences (odd k). Past
+ * one block of stride the two are taken in two sweeps over the inputs, so
+ * only eight sums or differences are live at a time (sixteen do not fit the
+ * vector registers).
+ */
+template <typename T, int W, typename Sink>
+void radix8LastBlocked(const T* x, const Sink& output, size_t s) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t B = kBlock<T>;
+    if (s == B)
+    {
+        radix8LastOneBlock<T, W>(x, output);
+        return;
+    }
+    const Sink out = output;   // a local: the stores cannot alias its pointers
+    // 4-point transform of z0..z3 into rows k0, k0 + 2, k0 + 4, k0 + 6.
+    const auto dft4 = [s, &out](size_t q, size_t k0, V z0r, V z0i, V z1r, V z1i, V z2r, V z2i,
+                                V z3r, V z3i) noexcept {
+        const V apcR = O::add(z0r, z2r), apcI = O::add(z0i, z2i);
+        const V amcR = O::sub(z0r, z2r), amcI = O::sub(z0i, z2i);
+        const V bpdR = O::add(z1r, z3r), bpdI = O::add(z1i, z3i);
+        const V bmdR = O::sub(z1r, z3r), bmdI = O::sub(z1i, z3i);
+        out.write(q + s * k0,       O::add(apcR, bpdR), O::add(apcI, bpdI));
+        out.write(q + s * (k0 + 2), O::add(amcR, bmdI), O::sub(amcI, bmdR));
+        out.write(q + s * (k0 + 4), O::sub(apcR, bpdR), O::sub(apcI, bpdI));
+        out.write(q + s * (k0 + 6), O::sub(amcR, bmdI), O::add(amcI, bmdR));
+    };
     for (size_t qb = 0; qb < s; qb += B)
     {
         const T* const r0 = x + 2 * qb;
         for (size_t hh = 0; hh < B; hh += W)
         {
-            V ar[4], ai[4], br[4], bi[4];
-            for (size_t r = 0; r < 4; ++r)
-            {
-                const T* const lo = r0 + 2 * s * r + hh;
-                const T* const hi = lo + 8 * s;
-                const V xr = O::load(lo), xi = O::load(lo + B);
-                const V yr = O::load(hi), yi = O::load(hi + B);
-                ar[r] = O::add(xr, yr); ai[r] = O::add(xi, yi);
-                br[r] = O::sub(xr, yr); bi[r] = O::sub(xi, yi);
-            }
+            const T* const lo0 = r0 + hh;
+            const T* const lo1 = lo0 + 2 * s;
+            const T* const lo2 = lo0 + 4 * s;
+            const T* const lo3 = lo0 + 6 * s;
+            const size_t hi = 8 * s;
+            dft4(qb + hh, 0,
+                 O::add(O::load(lo0), O::load(lo0 + hi)), O::add(O::load(lo0 + B), O::load(lo0 + hi + B)),
+                 O::add(O::load(lo1), O::load(lo1 + hi)), O::add(O::load(lo1 + B), O::load(lo1 + hi + B)),
+                 O::add(O::load(lo2), O::load(lo2 + hi)), O::add(O::load(lo2 + B), O::load(lo2 + hi + B)),
+                 O::add(O::load(lo3), O::load(lo3 + hi)), O::add(O::load(lo3 + B), O::load(lo3 + hi + B)));
             // Differences times w8^r: (1 - j) / sqrt 2, -j, -(1 + j) / sqrt 2.
-            const V b1r = O::mul(O::add(br[1], bi[1]), h), b1i = O::mul(O::sub(bi[1], br[1]), h);
-            const V b2r = bi[2], b2i = O::sub(zero, br[2]);
-            const V b3r = O::mul(O::sub(bi[3], br[3]), h), b3i = O::sub(zero, O::mul(O::add(br[3], bi[3]), h));
-            br[1] = b1r; bi[1] = b1i;
-            br[2] = b2r; bi[2] = b2i;
-            br[3] = b3r; bi[3] = b3i;
-            dft4(qb + hh, 0, ar, ai);
-            dft4(qb + hh, 1, br, bi);
+            const V h = O::set1(static_cast<T>(0.70710678118654752440));
+            const V zero = O::set1(T(0));
+            const V b0r = O::sub(O::load(lo0), O::load(lo0 + hi));
+            const V b0i = O::sub(O::load(lo0 + B), O::load(lo0 + hi + B));
+            const V d1r = O::sub(O::load(lo1), O::load(lo1 + hi));
+            const V d1i = O::sub(O::load(lo1 + B), O::load(lo1 + hi + B));
+            const V d2r = O::sub(O::load(lo2), O::load(lo2 + hi));
+            const V d2i = O::sub(O::load(lo2 + B), O::load(lo2 + hi + B));
+            const V d3r = O::sub(O::load(lo3), O::load(lo3 + hi));
+            const V d3i = O::sub(O::load(lo3 + B), O::load(lo3 + hi + B));
+            dft4(qb + hh, 1, b0r, b0i,
+                 O::mul(O::add(d1r, d1i), h), O::mul(O::sub(d1i, d1r), h),
+                 d2i, O::sub(zero, d2r),
+                 O::mul(O::sub(d3i, d3r), h), O::sub(zero, O::mul(O::add(d3r, d3i), h)));
         }
     }
 }
@@ -473,19 +632,59 @@ TwiddleSpan<T> twiddleSpanOf(const Pass& pass, const T* twiddles) noexcept
 
 /// Runs the first pass at the widest vector its length allows, into the
 /// blocked layout at y.
-template <typename T, template <typename, int> class Source, typename... Args>
-void firstPass(const Pass& pass, const T* twiddles, T* y, Args... input) noexcept
+template <typename T, template <typename, int> class Source, bool InLaneOut, typename... Args>
+void firstPassAs(const Pass& pass, const T* twiddles, const T* inLaneTwiddles, T* y, Args... input) noexcept
 {
     const size_t n1 = pass.len / 4;
     const TwiddleSpan<T> tw = twiddleSpanOf(pass, twiddles);
     constexpr int wide = kWide<T>;
     constexpr int narrow = kNarrow<T>;
-    if (n1 % wide == 0)
-        radix4First<T, wide>(Source<T, wide> { input... }, y, pass.len, tw);
+    // In-lane input needs its permuted twiddles; without them it is read at
+    // the narrow width.
+    if (n1 % wide == 0 && (!Source<T, wide>::inLane || inLaneTwiddles != nullptr))
+    {
+        if constexpr (Source<T, wide>::inLane)
+        {
+            // The same twiddles, permuted as the in-lane input (see SplitFFT).
+            const Pass permuted { pass.len, pass.stride, 0, false, false };
+            radix4First<T, wide, Source<T, wide>, InLaneOut>(Source<T, wide> { input... }, y, pass.len,
+                                                              twiddleSpanOf(permuted, inLaneTwiddles));
+        }
+        else
+            radix4First<T, wide, Source<T, wide>, InLaneOut>(Source<T, wide> { input... }, y, pass.len, tw);
+    }
     else if (n1 % narrow == 0)
-        radix4First<T, narrow>(Source<T, narrow> { input... }, y, pass.len, tw);
+        radix4First<T, narrow, Source<T, narrow>, InLaneOut>(Source<T, narrow> { input... }, y, pass.len, tw);
     else
-        radix4First<T, 1>(Source<T, 1> { input... }, y, pass.len, tw);
+        radix4First<T, 1, Source<T, 1>, InLaneOut>(Source<T, 1> { input... }, y, pass.len, tw);
+}
+
+/// firstPassAs() writing the in-lane layout when asked (and this copy has it).
+template <typename T, template <typename, int> class Source, typename... Args>
+void firstPass(const Pass& pass, const T* twiddles, const T* inLaneTwiddles, bool inLaneOut, T* y,
+               Args... input) noexcept
+{
+    if constexpr (kInLaneLayout<T>)
+    {
+        if (inLaneOut)
+        {
+            firstPassAs<T, Source, true>(pass, twiddles, inLaneTwiddles, y, input...);
+            return;
+        }
+    }
+    firstPassAs<T, Source, false>(pass, twiddles, inLaneTwiddles, y, input...);
+}
+
+/// Whether a transform of these passes that closes into interleaved output
+/// uses the in-lane layout on this copy: it needs a blocked closing pass at
+/// the full width.
+template <typename T>
+bool inLaneLayoutFor(const Pass* passes, size_t passCount) noexcept
+{
+    if constexpr (kInLaneLayout<T>)
+        return passCount > 1 && passes[passCount - 1].stride % static_cast<size_t>(kWide<T>) == 0;
+    else
+        return false;
 }
 
 /// Runs a radix-4 pass of stride > 1 at the widest vector its stride allows,
@@ -569,7 +768,7 @@ void closingPass(const Pass& pass, const T* xr, const T* xi, bool blocked, Args.
 
 /// Runs passes [begin, end) between the two work buffers.
 template <typename T>
-void runPasses(const Pass* passes, size_t begin, size_t end, const T* twiddles,
+void runPasses(const Pass* passes, size_t begin, size_t end, const T* twiddles, bool inLaneOut,
                Buffers<T>& b) noexcept
 {
     for (size_t i = begin; i < end; ++i)
@@ -578,7 +777,7 @@ void runPasses(const Pass* passes, size_t begin, size_t end, const T* twiddles,
         if (pass.radix2 || pass.radix8 || pass.len == 4)
             closingPass<T, SplitSink>(pass, b.xr, b.xi, i > 0, b.yr, b.yi);
         else if (pass.stride == 1)
-            firstPass<T, SplitSource>(pass, twiddles, b.yr, b.xr, b.xi);
+            firstPass<T, SplitSource>(pass, twiddles, nullptr, inLaneOut, b.yr, b.xr, b.xi);
         else
             stridedPass(pass, twiddles, b);
         T* r = b.xr; b.xr = b.yr; b.yr = r;
@@ -589,7 +788,8 @@ void runPasses(const Pass* passes, size_t begin, size_t end, const T* twiddles,
 /// Reads interleaved input, conjugated if asked; returns the passes it ran.
 template <typename T>
 size_t readInput(const Pass* passes, size_t passCount, size_t n, const T* twiddles,
-                 const T* data, bool conjugate, Buffers<T>& b) noexcept
+                 const T* inLaneTwiddles, bool inLaneOut, const T* data, bool conjugate,
+                 Buffers<T>& b) noexcept
 {
     if (passCount < 2)
     {
@@ -601,9 +801,9 @@ size_t readInput(const Pass* passes, size_t passCount, size_t n, const T* twiddl
         return 0;
     }
     if (conjugate)
-        firstPass<T, ConjugatedSource>(passes[0], twiddles, b.yr, data);
+        firstPass<T, ConjugatedSource>(passes[0], twiddles, inLaneTwiddles, inLaneOut, b.yr, data);
     else
-        firstPass<T, InterleavedSource>(passes[0], twiddles, b.yr, data);
+        firstPass<T, InterleavedSource>(passes[0], twiddles, inLaneTwiddles, inLaneOut, b.yr, data);
     T* r = b.xr; b.xr = b.yr; b.yr = r;
     T* m = b.xi; b.xi = b.yi; b.yi = m;
     return 1;
@@ -623,7 +823,7 @@ size_t readSplit(const Pass* passes, size_t passCount, size_t n, const T* twiddl
         }
         return 0;
     }
-    firstPass<T, SplitSource>(passes[0], twiddles, b.yr, re, im);
+    firstPass<T, SplitSource>(passes[0], twiddles, nullptr, false, b.yr, re, im);
     T* r = b.xr; b.xr = b.yr; b.yr = r;
     T* m = b.xi; b.xi = b.yi; b.yi = m;
     return 1;
@@ -646,7 +846,7 @@ size_t readScaledSwap(const Pass* passes, size_t passCount, size_t n, const T* t
         }
         return 0;
     }
-    firstPass<T, ScaledSwapSource>(passes[0], twiddles, b.yr, re, im, gain, mask);
+    firstPass<T, ScaledSwapSource>(passes[0], twiddles, nullptr, false, b.yr, re, im, gain, mask);
     T* r = b.xr; b.xr = b.yr; b.yr = r;
     T* m = b.xi; b.xi = b.yi; b.yi = m;
     return 1;
@@ -675,7 +875,7 @@ size_t readScaledSwapFolded(const Pass* passes, size_t passCount, size_t n, cons
         }
         return 0;
     }
-    firstPass<T, FoldedScaledSwapSource>(passes[0], twiddles, b.yr, re, im, gain, n, fold);
+    firstPass<T, FoldedScaledSwapSource>(passes[0], twiddles, nullptr, false, b.yr, re, im, gain, n, fold);
     T* r = b.xr; b.xr = b.yr; b.yr = r;
     T* m = b.xi; b.xi = b.yi; b.yi = m;
     return 1;
@@ -739,9 +939,18 @@ void packRealSpectrum(const T* in, T* zr, T* zi, size_t m, const T* twRe, const 
 
 /// Runs the closing pass with scaled interleaved output.
 template <typename T>
-void closeInterleaved(const Pass& pass, const T* xr, const T* xi, bool blocked, T* out, T scaleRe,
-                      T scaleIm) noexcept
+void closeInterleaved(const Pass& pass, const T* xr, const T* xi, bool blocked, bool inLane, T* out,
+                      T scaleRe, T scaleIm) noexcept
 {
+    if constexpr (kInLaneLayout<T>)
+    {
+        // inLaneLayoutFor() guarantees a blocked pass at the full width.
+        if (inLane)
+        {
+            closingAt<T, kWide<T>, InterleavedInLaneSink>(pass, xr, xi, true, out, scaleRe, scaleIm);
+            return;
+        }
+    }
     closingPass<T, InterleavedSink>(pass, xr, xi, blocked, out, scaleRe, scaleIm);
 }
 
@@ -800,4 +1009,86 @@ void unpackRealForward(const T* zr, const T* zi, T* out, size_t m, const T* twRe
         unpackRealForwardAt<T, kNarrow<T>>(zr, zi, out, m, twRe, twIm);
     else
         unpackRealForwardAt<T, 1>(zr, zi, out, m, twRe, twIm);
+}
+
+// ---------------------------------------------------------------------------
+// Whole transforms. SplitFFT (FFT.h) chooses the kernel copy once per
+// transform and calls one of these, so every pass of a transform runs on one
+// copy and they all agree on the work layout.
+// ---------------------------------------------------------------------------
+
+/// The passes on the input buffers, split output (SplitFFT::run()).
+template <typename T>
+void transformRun(const Plan<T>& p, Buffers<T>& b) noexcept
+{
+    runPasses(p.passes, 0, p.passCount, p.twiddles, false, b);
+}
+
+/// Interleaved input, conjugated if asked, split output (SplitFFT::runFrom()).
+template <typename T>
+void transformFrom(const Plan<T>& p, Buffers<T>& b, const T* data, bool conjugate) noexcept
+{
+    const size_t done = readInput(p.passes, p.passCount, p.n, p.twiddles, p.inLaneTwiddles, false,
+                                  data, conjugate, b);
+    runPasses(p.passes, done, p.passCount, p.twiddles, false, b);
+}
+
+/// Split input from outside the work buffers (SplitFFT::runFromSplit()).
+template <typename T>
+void transformFromSplit(const Plan<T>& p, Buffers<T>& b, const T* re, const T* im) noexcept
+{
+    const size_t done = readSplit(p.passes, p.passCount, p.n, p.twiddles, re, im, b);
+    runPasses(p.passes, done, p.passCount, p.twiddles, false, b);
+}
+
+/// A scaled, swapped spectrum product (SplitFFT::runScaledSwap()).
+template <typename T>
+void transformScaledSwap(const Plan<T>& p, Buffers<T>& b, const T* re, const T* im, const T* gain,
+                         size_t mask) noexcept
+{
+    const size_t done = readScaledSwap(p.passes, p.passCount, p.n, p.twiddles, re, im, gain, mask, b);
+    runPasses(p.passes, done, p.passCount, p.twiddles, false, b);
+}
+
+/// Its folded form (SplitFFT::runScaledSwapFolded()).
+template <typename T>
+void transformScaledSwapFolded(const Plan<T>& p, Buffers<T>& b, const T* re, const T* im, const T* gain,
+                               size_t fold) noexcept
+{
+    const size_t done = readScaledSwapFolded(p.passes, p.passCount, p.n, p.twiddles, re, im, gain, fold, b);
+    runPasses(p.passes, done, p.passCount, p.twiddles, false, b);
+}
+
+/// The input buffers to interleaved output (SplitFFT::runTo()).
+template <typename T>
+void transformTo(const Plan<T>& p, Buffers<T>& b, const Closing<T>& c) noexcept
+{
+    const bool inLane = inLaneLayoutFor<T>(p.passes, p.passCount);
+    runPasses(p.passes, 0, p.passCount - 1, p.twiddles, inLane, b);
+    closeInterleaved(p.passes[p.passCount - 1], b.xr, b.xi, p.passCount > 1, inLane, c.out, c.scaleRe,
+                     c.scaleIm);
+}
+
+/// Interleaved input to interleaved output (SplitFFT::runFromTo()).
+template <typename T>
+void transformFromTo(const Plan<T>& p, Buffers<T>& b, const T* data, bool conjugate, const Closing<T>& c) noexcept
+{
+    const bool inLane = inLaneLayoutFor<T>(p.passes, p.passCount);
+    const size_t done = readInput(p.passes, p.passCount, p.n, p.twiddles, p.inLaneTwiddles, inLane,
+                                  data, conjugate, b);
+    runPasses(p.passes, done, p.passCount - 1, p.twiddles, inLane, b);
+    closeInterleaved(p.passes[p.passCount - 1], b.xr, b.xi, p.passCount > 1, inLane, c.out, c.scaleRe,
+                     c.scaleIm);
+}
+
+/// One step of transformTo() (SplitFFT::runToStep()).
+template <typename T>
+void transformToStep(const Plan<T>& p, Buffers<T>& b, size_t step, const Closing<T>& c) noexcept
+{
+    const bool inLane = inLaneLayoutFor<T>(p.passes, p.passCount);
+    if (step + 1 < p.passCount)
+        runPasses(p.passes, step, step + 1, p.twiddles, inLane, b);
+    else
+        closeInterleaved(p.passes[p.passCount - 1], b.xr, b.xi, p.passCount > 1, inLane, c.out, c.scaleRe,
+                         c.scaleIm);
 }

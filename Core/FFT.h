@@ -30,7 +30,13 @@
  *   (simd::setRuntimeDispatch()); SSE2 on every other x86-64, NEON on ARM64,
  *   scalar otherwise. The first pass, whose stride is 1, runs across
  *   butterflies and writes its outputs through an in-register 4-way
- *   interleave.
+ *   interleave. A transform runs all of its passes on one kernel set, chosen
+ *   when it starts.
+ * - **No shuffle across 128-bit halves for interleaved data** at the AVX
+ *   width: the first pass reads interleaved input with its lanes permuted
+ *   (its twiddles follow), and a double transform that ends in interleaved
+ *   output keeps its blocks in that order, so its closing pass interleaves
+ *   within halves. The lane-wise passes in between do not see the order.
  * - **Twiddles in double**: every factor is computed directly with cos/sin in
  *   double precision (no recurrences), so the error stays at the level of the
  *   arithmetic itself.
@@ -44,10 +50,11 @@
  *   noexcept and accept pointers of any alignment.
  *
  * Measured on one desktop x86-64 core, double, forward plus inverse, ns
- * per real point, 64 / 1024 / 4096 / 65536 points: 1.5 / 1.9 / 2.3 / 3.2 on
- * SSE2 and 1.1 / 1.0 / 1.2 / 2.2 with the AVX2 dispatch (the previous engine:
- * 2.0 / 2.4 / 2.8 / 3.7 and 1.5 / 1.3 / 1.5 / 2.7). Float: 1.2 / 1.0 / 1.2 /
- * 1.6 and 1.0 / 0.6 / 0.7 / 1.0.
+ * per real point, 64 / 1024 / 4096 / 65536 points: 1.4 / 1.8 / 2.1 / 2.9 on
+ * SSE2 and 1.1 / 0.87 / 1.1 / 1.9 with the AVX2 dispatch (before the
+ * register-resident passes and the in-lane layout: 1.5 / 1.9 / 2.2 / 3.0 and
+ * 1.1 / 1.0 / 1.3 / 2.0). Float: 1.1 / 0.97 / 1.1 / 1.5 and 0.97 / 0.59 /
+ * 0.63 / 0.93.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
  * thread at a time; give each thread its own instance.
@@ -117,11 +124,29 @@ struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; bool radi
 template <typename T>
 struct Buffers { T* xr; T* xi; T* yr; T* yi; };
 
+/// What a transform reads of its engine: the passes, their twiddles, and the
+/// first pass's twiddles permuted for in-lane input (null when not built).
+template <typename T>
+struct Plan
+{
+    const Pass* passes;
+    size_t passCount;
+    size_t n;
+    const T* twiddles;
+    const T* inLaneTwiddles;
+};
+
+/// Where a closing pass into interleaved output writes, and its scales.
+template <typename T>
+struct Closing { T* out; T scaleRe; T scaleIm; };
+
 } // namespace plan
 
 using plan::TwiddleSpan;
 using plan::Pass;
 using plan::Buffers;
+using plan::Plan;
+using plan::Closing;
 
 /// Block of the work layout between passes (detail/FftKernels.inl): the
 /// widest vector any copy of the kernels uses, the same in every copy.
@@ -168,7 +193,7 @@ template <typename T>
 class SplitFFT
 {
 public:
-    explicit SplitFFT(size_t n) : n_(n)
+    explicit SplitFFT(size_t n, bool interleavedInput = false) : n_(n)
     {
         bufA_.assign(2 * n_, T(0));
         bufB_.assign(2 * n_, T(0));
@@ -214,6 +239,32 @@ public:
                 w[5 * n1 + p] = static_cast<T>(std::sin(3.0 * a));
             }
         }
+
+        // The first pass's twiddles once more, for interleaved input read in
+        // lane (see FftKernels.inl, kInLaneDeinterleave): within each block of
+        // butterflies, its four runs of kBlock / 4 in the order (0, 2, 1, 3).
+        // Only builds with a kernel set that reads that way keep them.
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        constexpr bool inLaneReader = true;
+#else
+        constexpr bool inLaneReader = kInLaneDeinterleave<T, kWide<T>>;
+#endif
+        const Pass& first = passes_.front();
+        if (inLaneReader && interleavedInput && passes_.size() > 1 && !first.radix2 && !first.radix8
+            && (first.len / 4) % kBlock<T> == 0)
+        {
+            constexpr size_t B = kBlock<T>, q = B / 4;
+            const size_t n1 = first.len / 4;
+            inLaneTwiddles_.assign(6 * n1, T(0));
+            const T* w = twiddles_.data() + first.twOffset;
+            for (size_t row = 0; row < 6; ++row)
+                for (size_t p = 0; p < n1; ++p)
+                {
+                    const size_t l = p % B, j = l / q;
+                    const size_t from = p - l + q * ((j & 1) * 2 + (j >> 1)) + l % q;
+                    inLaneTwiddles_[row * n1 + p] = w[row * n1 + from];
+                }
+        }
     }
 
     [[nodiscard]] size_t size() const noexcept { return n_; }
@@ -230,7 +281,13 @@ public:
     void run(const T*& outRe, const T*& outIm) noexcept
     {
         Buffers<T> b = buffers();
-        passes(b, 0, passes_.size());
+        const Plan<T> p = plan();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            avx2::transformRun(p, b);
+        else
+#endif
+            fft::transformRun(p, b);
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -245,9 +302,24 @@ public:
      */
     void runFrom(const T* data, bool conjugate, const T*& outRe, const T*& outIm) noexcept
     {
+        if (passes_.size() == 1)
+        {
+            T* const re = bufB_.data();
+            T* const im = re + n_;
+            onePass([&](size_t i, T& r, T& m) { readPair(data, conjugate, i, r, m); },
+                    [&](size_t i, T r, T m) { re[i] = r; im[i] = m; });
+            outRe = re;
+            outIm = im;
+            return;
+        }
         Buffers<T> b = buffers();
-        const size_t done = input(data, conjugate, b);
-        passes(b, done, passes_.size());
+        const Plan<T> p = plan();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            avx2::transformFrom(p, b, data, conjugate);
+        else
+#endif
+            fft::transformFrom(p, b, data, conjugate);
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -263,8 +335,13 @@ public:
     void runFromSplit(const T* re, const T* im, const T*& outRe, const T*& outIm) noexcept
     {
         Buffers<T> b = buffers();
-        const size_t done = inputSplit(re, im, b);
-        passes(b, done, passes_.size());
+        const Plan<T> p = plan();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            avx2::transformFromSplit(p, b, re, im);
+        else
+#endif
+            fft::transformFromSplit(p, b, re, im);
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -299,8 +376,13 @@ public:
             std::swap(b.xr, b.yr);
             std::swap(b.xi, b.yi);
         }
-        const size_t done = inputScaledSwap(re, im, gain, mask, b);
-        passes(b, done, passes_.size());
+        const Plan<T> p = plan();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            avx2::transformScaledSwap(p, b, re, im, gain, mask);
+        else
+#endif
+            fft::transformScaledSwap(p, b, re, im, gain, mask);
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -322,16 +404,13 @@ public:
                              const T*& outRe, const T*& outIm) noexcept
     {
         Buffers<T> b = buffers();
-        size_t done = 0;
+        const Plan<T> p = plan();
 #if defined(DSPARK_SIMD_DISPATCH_AVX2)
         if (simd::isRuntimeDispatchActive())
-            done = avx2::readScaledSwapFolded(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im,
-                                              gain, fold, b);
+            avx2::transformScaledSwapFolded(p, b, re, im, gain, fold);
         else
 #endif
-            done = fft::readScaledSwapFolded(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im,
-                                             gain, fold, b);
-        passes(b, done, passes_.size());
+            fft::transformScaledSwapFolded(p, b, re, im, gain, fold);
         outRe = b.xr;
         outIm = b.xi;
     }
@@ -344,19 +423,44 @@ public:
      */
     void runTo(T* out, T scaleRe, T scaleIm) noexcept
     {
+        if (passes_.size() == 1)
+        {
+            const T* const re = bufA_.data();
+            const T* const im = re + n_;
+            onePass([&](size_t i, T& r, T& m) { r = re[i]; m = im[i]; },
+                    [&](size_t i, T r, T m) { out[2 * i] = r * scaleRe; out[2 * i + 1] = m * scaleIm; });
+            return;
+        }
         Buffers<T> b = buffers();
-        passes(b, 0, passes_.size() - 1);
-        close(b, out, scaleRe, scaleIm);
+        const Plan<T> p = plan();
+        const Closing<T> c { out, scaleRe, scaleIm };
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            avx2::transformTo(p, b, c);
+        else
+#endif
+            fft::transformTo(p, b, c);
     }
 
     /// runFrom() and runTo() together. A transform of one pass cannot do both
     /// in that pass, so it reads through the input buffers.
     void runFromTo(const T* data, bool conjugate, T* out, T scaleRe, T scaleIm) noexcept
     {
+        if (passes_.size() == 1)
+        {
+            onePass([&](size_t i, T& r, T& m) { readPair(data, conjugate, i, r, m); },
+                    [&](size_t i, T r, T m) { out[2 * i] = r * scaleRe; out[2 * i + 1] = m * scaleIm; });
+            return;
+        }
         Buffers<T> b = buffers();
-        const size_t done = input(data, conjugate, b);
-        passes(b, done, passes_.size() - 1);
-        close(b, out, scaleRe, scaleIm);
+        const Plan<T> p = plan();
+        const Closing<T> c { out, scaleRe, scaleIm };
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            avx2::transformFromTo(p, b, data, conjugate, c);
+        else
+#endif
+            fft::transformFromTo(p, b, data, conjugate, c);
     }
 
     /// Steps of runTo() as runToStep() splits it: one per pass before the
@@ -368,7 +472,8 @@ public:
      *        pass s, the last step the closing pass into `out`. All steps in
      *        order, with nothing else run in between, equal runTo() bit for
      *        bit (the passes alternate between the two work buffers, so the
-     *        buffer a step reads follows from its index).
+     *        buffer a step reads follows from its index). Step 0 chooses the
+     *        kernel set and the later steps keep it, as runTo() does.
      * @param step    Step index, 0 .. runToStepCount() - 1.
      * @param out     Receives N interleaved complex values (last step only).
      * @param scaleRe Factor applied to the real parts (last step only).
@@ -382,10 +487,15 @@ public:
             std::swap(b.xr, b.yr);
             std::swap(b.xi, b.yi);
         }
-        if (step + 1 < passes_.size())
-            passes(b, step, step + 1);
+        const Plan<T> p = plan();
+        const Closing<T> c { out, scaleRe, scaleIm };
+        if (step == 0) stepAvx2_ = simd::isRuntimeDispatchActive();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (stepAvx2_)
+            avx2::transformToStep(p, b, step, c);
         else
-            close(b, out, scaleRe, scaleIm);
+#endif
+            fft::transformToStep(p, b, step, c);
     }
 
 private:
@@ -394,68 +504,57 @@ private:
         return { bufA_.data(), bufA_.data() + n_, bufB_.data(), bufB_.data() + n_ };
     }
 
-    // Each step runs on the AVX2+FMA copy of the passes when it is active.
-    void passes(Buffers<T>& b, size_t begin, size_t end) const noexcept
+    /// Interleaved pair i, conjugated if asked (by negation, as readInput()).
+    static void readPair(const T* data, bool conjugate, size_t i, T& r, T& m) noexcept
     {
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-        if (simd::isRuntimeDispatchActive())
+        r = data[2 * i];
+        m = conjugate ? -data[2 * i + 1] : data[2 * i + 1];
+    }
+
+    // A transform of one pass (2 or 4 points) runs here: its few additions
+    // cost less than reaching the kernels. The arithmetic is the closing
+    // pass's (FftKernels.inl), so the result is the same to the bit. Every
+    // input is read before the first output is written (in place is safe).
+    template <typename Load, typename Store>
+    void onePass(Load load, Store store) const noexcept
+    {
+        if (n_ == 2)
         {
-            avx2::runPasses(passes_.data(), begin, end, twiddles_.data(), b);
+            T ar, ai, br, bi;
+            load(0, ar, ai);
+            load(1, br, bi);
+            store(0, ar + br, ai + bi);
+            store(1, ar - br, ai - bi);
             return;
         }
-#endif
-        fft::runPasses(passes_.data(), begin, end, twiddles_.data(), b);
+        T ar, ai, br, bi, cr, ci, dr, di;
+        load(0, ar, ai);
+        load(1, br, bi);
+        load(2, cr, ci);
+        load(3, dr, di);
+        const T apcR = ar + cr, apcI = ai + ci, amcR = ar - cr, amcI = ai - ci;
+        const T bpdR = br + dr, bpdI = bi + di, bmdR = br - dr, bmdI = bi - di;
+        store(0, apcR + bpdR, apcI + bpdI);
+        store(1, amcR + bmdI, amcI - bmdR);
+        store(2, apcR - bpdR, apcI - bpdI);
+        store(3, amcR - bmdI, amcI + bmdR);
     }
 
-    size_t input(const T* data, bool conjugate, Buffers<T>& b) const noexcept
+    // Each transform makes one call into one kernel set (the AVX2+FMA copy
+    // when the dispatch is active), so all of its passes agree on the work
+    // layout even if the dispatch flag changes meanwhile.
+    [[nodiscard]] Plan<T> plan() const noexcept
     {
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-        if (simd::isRuntimeDispatchActive())
-            return avx2::readInput(passes_.data(), passes_.size(), n_, twiddles_.data(), data,
-                                   conjugate, b);
-#endif
-        return fft::readInput(passes_.data(), passes_.size(), n_, twiddles_.data(), data,
-                              conjugate, b);
-    }
-
-    size_t inputSplit(const T* re, const T* im, Buffers<T>& b) const noexcept
-    {
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-        if (simd::isRuntimeDispatchActive())
-            return avx2::readSplit(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, b);
-#endif
-        return fft::readSplit(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, b);
-    }
-
-    size_t inputScaledSwap(const T* re, const T* im, const T* gain, size_t mask, Buffers<T>& b) const noexcept
-    {
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-        if (simd::isRuntimeDispatchActive())
-            return avx2::readScaledSwap(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, gain,
-                                        mask, b);
-#endif
-        return fft::readScaledSwap(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, gain, mask, b);
-    }
-
-    // The closing pass reads the blocked layout after other passes, and the
-    // split input buffers when it is the only one.
-    void close(const Buffers<T>& b, T* out, T scaleRe, T scaleIm) const noexcept
-    {
-        const bool blocked = passes_.size() > 1;
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-        if (simd::isRuntimeDispatchActive())
-        {
-            avx2::closeInterleaved(passes_.back(), b.xr, b.xi, blocked, out, scaleRe, scaleIm);
-            return;
-        }
-#endif
-        fft::closeInterleaved(passes_.back(), b.xr, b.xi, blocked, out, scaleRe, scaleIm);
+        return { passes_.data(), passes_.size(), n_, twiddles_.data(),
+                 inLaneTwiddles_.empty() ? nullptr : inLaneTwiddles_.data() };
     }
 
     size_t n_;
     std::vector<T> bufA_, bufB_;   ///< Ping-pong buffers, [re | im] each.
     std::vector<T> twiddles_;
+    std::vector<T> inLaneTwiddles_;   ///< The first pass's, permuted for in-lane interleaved input.
     std::vector<Pass> passes_;
+    bool stepAvx2_ = false;           ///< The kernel set runToStep() chose at step 0.
 };
 
 } // namespace fft
@@ -486,7 +585,7 @@ public:
      *        asserts and degrades to the minimal valid size instead).
      */
     explicit FFTComplex(size_t size)
-        : engine_(validateSize(size))
+        : engine_(validateSize(size), true)
     {
     }
 
@@ -571,7 +670,7 @@ public:
     explicit FFTReal(size_t size)
         : realSize_(validateSize(size))   // validates BEFORE the engine is built
         , halfSize_(realSize_ / 2)        // derived from the VALIDATED size, so the
-        , engine_(realSize_ / 2)          // trio stays coherent when size degrades
+        , engine_(realSize_ / 2, true)    // trio stays coherent when size degrades
     {
         computePostTwiddles();
     }

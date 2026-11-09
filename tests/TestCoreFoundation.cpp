@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1392,6 +1393,49 @@ DSPARK_TEST(SimdOps_runtime_dispatch_matches_the_baseline)
                       return acc;
                   }),
                   1e-6);
+    }
+}
+
+DSPARK_TEST(SimdOps_dot_product_of_four_matches_four_dot_products)
+{
+    // dotProduct4() loads its shared operand once for four products and
+    // shares their reductions; each result must still be dotProduct() of its
+    // pair bit for bit, at every length (the vector body, the four-wide step
+    // and the scalar tail), with the other operands at any offset, repeated
+    // or aliasing the shared one, on both kernel sets.
+    using namespace dspark;
+    DispatchScope scope;
+    std::vector<double> buf(600);
+    uint32_t rng = 0xD07u;
+    for (auto& v : buf)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+    }
+    const bool dispatch = simd::runtimeDispatchSupported();
+    for (const bool wide : { false, true })
+    {
+        simd::setRuntimeDispatch(wide && dispatch);
+        bool same = true;
+        for (int count = 0; count <= 70; ++count)
+        {
+            const double* shared = buf.data() + 3;
+            const double* const others[][4] = {
+                { buf.data() + 100, buf.data() + 201, buf.data() + 302, buf.data() + 403 },
+                { buf.data() + 3, buf.data() + 7, buf.data() + 7, buf.data() + 150 },
+            };
+            for (const auto& other : others)
+            {
+                double out[4];
+                simd::dotProduct4(shared, other, count, out);
+                for (int x = 0; x < 4; ++x)
+                {
+                    const double one = simd::dotProduct(shared, other[x], count);
+                    same = same && std::memcmp(&out[x], &one, sizeof(double)) == 0;
+                }
+            }
+        }
+        EXPECT_TRUE(same);
     }
 }
 

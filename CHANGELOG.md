@@ -6,6 +6,18 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `PitchFollower::isVoiced()`: whether the latest detection passed the
+  confidence and range gates, a per-detection voicing flag without
+  `isTracking()`'s 250 ms hold; and `PitchFollower::setNoiseSuppression()` /
+  `getNoiseSuppression()`, which reach the wrapped detector's opt-in second
+  read. Against an HMM note tracker (the second stage of Mauch & Dixon 2014,
+  decoded causally) on 30 s legato melodies at 48 kHz, with `setGlide(0)`,
+  `setConfidence(0.5)` and `isVoiced()`: readings within 50 cents 93.7%
+  against 93.5% clean, 94.6% against 94.1% with 100 cents of vibrato, 93.6%
+  against 71.0% at 5 dB SNR; voicing false alarms 1.9% against 5.1%; 22
+  against 24 ms from a note change to a reading within 50 cents; with the
+  noise suppression and `setConfidence(0.45)`, 86.2% at 0 dB SNR, where the
+  HMM reads none.
 - Plugin layer, VST3 note expressions: a class that declares
   `static constexpr uint32_t noteExpressions = dspark::plugin::expressions(...)`
   offers those expressions (volume, pan, tuning, vibrato, expression,
@@ -314,6 +326,53 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `PitchDetector` (default path, analysis readout): each threshold of the
+  vote picks the deepest minimum of the stretch of lags below it instead of
+  the first minimum there, so the small minima noise leaves on a broad
+  dip's walls no longer split its vote. 48 kHz, readings within 50 cents,
+  harmonic tones in white noise: 47 to 67 Hz at 10 dB SNR 68.5% to 100%
+  (31.5% had read 50 to 140 cents sharp at confidence 0.81 to 0.89), 70 to
+  1000 Hz at 10 dB 92.0% to 100% and at 5 dB 85.2% to 97.0% (octave errors
+  5.5% to 2.0%); in pink noise 47 to 67 Hz at 5 dB 70.0% to 79.5% right,
+  14.0% to 4.5% wrong. Steady clean tones, sweeps, noise alone and
+  band-limited noise read exactly as before; on clean stepped melodies at
+  three rates the wrong readings fall from 52 to 46 of 66090, every
+  correct reading kept. The prior's survival is read from a table (cubic
+  Hermite, error below 1e-9 at the default threshold) and the vote's
+  records are merged on a stack:
+  CPU 16.8 to 17.0 ns per sample on a clean tone, 18.7 to 19.1 on a tone in
+  noise.
+- `PitchDetector::setNoiseSuppression()` (opt-in): where the cleaned window
+  does not dip below the threshold, the input's own dip is the candidate;
+  either candidate is refined from the correlation peaks at its multiples
+  over the two windows of history, and a reading is kept only when two of
+  the three detections before it found the same period (within 25 cents
+  per detection of age). At 0 dB SNR: 70 to 1000 Hz in white noise 84.5% to
+  99.8% right (0 wrong), 80 to 1000 Hz in pink noise 74.8% to 80.8% (1.8%
+  wrong both), 47 to 67 Hz 40.5% to 99.5% in white noise (0.5% to 0
+  wrong) and 12.5% to 51.5% in pink (6.0% to 1.5% wrong); continuous notes
+  at 2 dB 88.7% to 99.6%, and with 50 cents of vibrato 83.4% to 99.6%.
+  Band-limited noise alone voices at most 0.1% of windows more than the
+  first read (up to 2.0% before; a Q 2 band at 120 Hz 6.4% to 4.4%, off
+  4.4%). A reading through the noise starts one or two detections after
+  the tone. CPU with it on: 89 to 90 ns per sample on noise, 100 to 110 on
+  a tone in white noise and 80 to 91 on a low note in pink noise, which it
+  now reads.
+- `PitchCorrector` (audio): its pitch readings follow the `PitchDetector`
+  vote change above. Clean input is corrected exactly as before, bit for
+  bit; on a 196 Hz melody at 10 dB SNR 4 of 265 detections read
+  differently, on a 55 Hz melody 228 of 267 (by 14 cents on average, the
+  earlier readings pulled off the period by noise), so its output on noisy
+  low notes differs from the previous release's.
+- `PitchFollower`: a large interval, an octave leap among them, arrives once
+  two consecutive readings agree on it (three before); a single reading
+  whole octaves away is still folded back. Before, every octave-away
+  reading was folded, so a melody's octave leap never came through and a
+  wrong octave read at a note's start stayed: on legato melodies with an
+  octave leap in one step of eight, 21.9% of voiced frames an octave off,
+  0.7% now; notes whose fundamental is 15 dB below its partials 28.6% to
+  0.7%. Readings within 50 cents at the defaults 68.9% to 89.4% (clean
+  legato), time to a note change 104 to 48 ms.
 - `OnsetDetector` gated picker (the default; analysis readout, no audio): a
   peak whose frame energy falls across the release test is also kept when
   bands it raised at least double their amplitude over anything they or

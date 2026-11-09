@@ -16,26 +16,29 @@
  * method of Mauch & Dixon (2014): instead of one fixed threshold, a Beta
  * distribution of thresholds votes, each picking the first dip of the
  * normalised difference function below it, and the most probable dip wins.
- * A dip is reported when the prior accepts it with probability 1% or more,
- * which at the default setting voices dips up to 0.30 where the single
- * threshold stopped at 0.10; above 0.10 the window must also be steady (its
- * halves within a 0.6 energy ratio), so note starts and ends read as before.
+ * A dip is the whole stretch of lags below the threshold, read at its
+ * deepest minimum, so the small minima noise leaves on a broad dip's walls
+ * do not split its vote (chooseDip()). A dip is reported when the prior
+ * accepts it with probability 1% or more, which at the default setting
+ * voices dips up to 0.30 where the single threshold stopped at 0.10; above
+ * 0.10 the window must also be steady (its halves within a 0.6 energy
+ * ratio), so note starts and ends read as before.
  *
- * Measured at 48 kHz on harmonic tones of 70 to 1000 Hz (random spectral
- * tilt) in white noise, readings within 50 cents of the fundamental: 87.4%
- * of 2000 tones at 5 dB SNR, where the single threshold read every frame
- * unvoiced, and 92.0% of 400 at 10 dB (88.5% before), with octave errors
- * down from 6.8% to 0; a clean-room port of the method's frame stage scores
- * 87.3% and 92.0% on the same tones. At 0 dB SNR the detector reads
- * unvoiced rather than guess (that frame stage is right 29% of the time
- * there and wrong 71%); setNoiseSuppression() (opt-in) reads those tones 84%
- * right and none wrong. Noisy readings report their honest confidence, about
- * 0.76 at 5 dB, so a confidence gate keeps ignoring them. Steady clean tones
- * read exactly as before; on clean material the change is fewer octave
- * errors. Across a legato note change two notes can share a longer period
- * (four periods of one, five of the other); a window whose dip lies there
- * reads unvoiced, not that period: on clean tones, sweeps and stepped
- * melodies at three rates the wrong readings fall from 184 to 52 of 66090,
+ * Measured at 48 kHz on harmonic tones (random spectral tilt) in white
+ * noise, readings within 50 cents of the fundamental, 400 tones of 70 to
+ * 1000 Hz: 100% at 10 dB SNR and 97.0% at 5 dB with 2.0% octave errors
+ * (the method's frame stage, as a clean-room port, 92.0% and 86.8% with
+ * 6.0%); 200 tones of 47 to 67 Hz at 10 dB: 100% (the frame stage 74.0%;
+ * reading each threshold's first minimum, 31.5% read 50 to 140 cents
+ * sharp). At 0 dB SNR the detector reads unvoiced rather than guess (that
+ * frame stage is right 29% of the time there and wrong 71%);
+ * setNoiseSuppression() (opt-in) reads those tones 99.8% right and none
+ * wrong. Noisy readings report their honest confidence, about 0.76 at 5 dB,
+ * so a confidence gate keeps ignoring them. Steady clean tones read exactly
+ * as before. Across a legato note change two notes can share a longer
+ * period (four periods of one, five of the other); a window whose dip lies
+ * there reads unvoiced, not that period: on clean tones, sweeps and stepped
+ * melodies at three rates the wrong readings fall from 184 to 46 of 66090,
  * with every correct reading kept.
  *
  * Threading:
@@ -58,9 +61,11 @@
 #include "../Core/SimdOps.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -189,6 +194,14 @@ public:
         yinClean_.assign(static_cast<size_t>(halfWindow_), T(0));
         rawClean_.assign(static_cast<size_t>(halfWindow_), T(0));
         persistSq_.assign(static_cast<size_t>(historySize_) + 1, 0.0);
+        const int multipleReach = static_cast<int>(std::ceil(kMultipleSearch * historySize_)) + 2;
+        multipleScratch_.assign(static_cast<size_t>(2 * multipleReach + 1), 0.0);
+        dipRecords_.assign(static_cast<size_t>(halfWindow_ / 2 + 2), DipRecord {});
+        dipGroups_.assign(dipRecords_.size(), DipGroup {});
+        survivalTable_.assign(static_cast<size_t>(kSurvivalSteps) + 1, 0.0);
+        survivalSlope_.assign(static_cast<size_t>(kSurvivalSteps) + 1, 0.0);
+        cachedThreshold_ = T(-1);   // rebuild the prior tables at the first detection
+        recent_.fill(0.0);
         fftClean_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(windowSize_) * 2);
 
         writePos_ = 0;
@@ -323,36 +336,40 @@ public:
      * period; the period itself is then read from the input's own
      * difference function next to that dip, since the subtraction shifts a
      * partial's peak by a few hertz (which read tones near 100 Hz up to a
-     * semitone sharp). The reading is kept only when the input repeats at
-     * the multiples of that period about as strongly as at the period
-     * itself: a tone does, a narrow band of noise that the cleaning made
-     * look periodic does not. The multiples are read over the last two
-     * windows of input, which hold three periods of the lowest note the
-     * detector reads. The reading's confidence stays the input's own dip at
-     * that period, about 0.5 at 0 dB SNR, so a confidence gate keeps
-     * ignoring it.
+     * semitone sharp). Where the cleaned window does not dip that far (low
+     * notes, whose partials crowd the floor estimate, and pink noise), the
+     * input's own dip is the candidate. The period is refined from the
+     * correlation peaks at its multiples over the last two windows of input
+     * (refineByMultiples()), and the reading is kept only when the input
+     * repeats at those multiples about as strongly as at the period itself
+     * (a tone does, a narrow band of noise that the cleaning made look
+     * periodic does not) and two of the three detections before it found
+     * the same period (a narrow band of noise wanders). The reading's
+     * confidence stays the input's own dip at that period, about 0.5 at
+     * 0 dB SNR, so a confidence gate keeps ignoring it. A reading through
+     * the noise therefore starts one or two detections after the tone.
      *
-     * Measured at 48 kHz on harmonic tones of 70 to 1000 Hz (random spectral
-     * tilt), readings within 50 cents, 400 tones: in white noise at 0 dB
-     * SNR 84.5% right and none wrong (off: unvoiced; the frame stage of the
-     * probabilistic-threshold method 29% and 71%), in pink noise 74.8% and
-     * 1.8% (80 to 1000 Hz); 5 and 10 dB readings are those of the first
-     * reading. Tones of 47
-     * to 67 Hz at 0 dB: 40.5% right and 0.5% wrong in white noise, 12.5% and
-     * 6.0% in pink, where the misses are 50 to 85 cents out at a confidence
-     * below 0.75 (the frame stage reads 95.5% and 83.5% right there, 4.5% and
-     * 16.5% wrong). Continuous notes of 70 to 880 Hz at 2 dB SNR: 88.7% of
-     * detections right and none wrong, 83.4% and none with 50 cents of
-     * vibrato.
+     * Measured at 48 kHz on harmonic tones (random spectral tilt), readings
+     * within 50 cents, at 0 dB SNR: 70 to 1000 Hz in white noise 99.8% right
+     * and none wrong (off: unvoiced; the frame stage of the
+     * probabilistic-threshold method 29% and 71%), 80 to 1000 Hz in pink
+     * noise 80.8% and 1.8%; 47 to 67 Hz 99.5% and none in white noise, 51.5%
+     * and 1.5% in pink. That frame stage reads 95.5% and 83.5% of the low
+     * tones right because it reads every window: at any threshold on its own
+     * voicing probability that keeps band-limited noise from reading voiced
+     * every time, it reads none of them. Continuous notes of 70 to 880 Hz at
+     * 2 dB SNR: 99.6% of detections right and none wrong, also with 50
+     * cents of vibrato.
      *
      * Noise alone: white and pink still read unvoiced, and band-limited
-     * noise stays close to what the first reading alone voices, over 20 s: a
-     * Q 5 band at 1 kHz 4.3% of windows (off 4.0%), at 300 Hz 11.6% (off
-     * 11.2%), a Q 2 band at 300 Hz 1.3% (off 0.3%), at 120 Hz 6.4% (off
-     * 4.4%). The second read costs more than a detection: about 90 ns per
-     * sample on noise and 100 on a low note in noise, against 20 off; voiced
-     * windows are not read twice. Off, the output is
-     * unchanged. Control thread; relaxed atomic.
+     * noise stays within 0.1% of windows of what the first reading alone
+     * voices, over 20 s at 60 Hz to 3 kHz and Q 2 to 10: a Q 2 band at 60 Hz
+     * 8.9% (off 8.8%), at 120 and 300 Hz as off, a Q 5 band at 120 Hz 18.8%
+     * (off 18.7%), at 300 Hz and 1 kHz as off. The second read costs more than a
+     * detection: about 90 ns per sample on noise, 110 on a tone in white
+     * noise and 91 on a low note in pink noise, against 17 to 20 off; voiced
+     * windows are not read twice. Off, the output is that of the first read.
+     * Control thread; relaxed atomic.
      */
     void setNoiseSuppression(bool on) noexcept
     {
@@ -382,6 +399,7 @@ public:
     void reset() noexcept
     {
         std::fill(buffer_.begin(), buffer_.end(), T(0));
+        recent_.fill(0.0);
         writePos_ = 0;
         samplesSinceLastDetect_ = 0;
         frequency_.store(T(0), std::memory_order_relaxed);
@@ -400,6 +418,7 @@ private:
         T energy = T(0), e1 = T(0);
         if (!differenceFunction(currentWindow, yinBuffer_.data(), rawDiff_.data(), energy, e1))
         {
+            rememberCandidate(0.0);
             publishUnvoiced();
             return;
         }
@@ -436,19 +455,27 @@ private:
         {
             // Sub-sample precision from the raw difference function (see
             // parabolicInterp()); the CMND only selects the dip.
-            publish(parabolicInterp(rawDiff_.data(), tauEstimate),
-                    std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)], T(0), T(1)));
+            const T period = parabolicInterp(rawDiff_.data(), tauEstimate);
+            rememberCandidate(static_cast<double>(period));
+            publish(period, std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)], T(0), T(1)));
             return;
         }
 
         // Noise floor suppression (opt-in): a steady window that reads
-        // unvoiced is read again with its broadband noise removed. A dip
-        // below the threshold there locates the period, which is then taken
+        // unvoiced is read again. Its noise removed, a dip of the cleaned
+        // window below the threshold locates the period, which is then taken
         // from the input's own difference function next to it (the
-        // subtraction shifts the partials' peaks by a few hertz), and kept
-        // only when the input repeats at its multiples (periodPersists()).
+        // subtraction shifts the partials' peaks by a few hertz); when the
+        // cleaning finds none, the input's own dip is the candidate. Either
+        // is refined over its multiples (refineByMultiples()) and kept only
+        // when the input repeats at its multiples (periodPersists()) and the
+        // period agrees with recent detections (agreesWithRecent()). The
+        // confidence is the input's own dip there: a reading taken through
+        // the noise stays a low-confidence one (about 0.5 at 0 dB SNR).
+        double candidate = 0.0;
         if (noiseSuppression_.load(std::memory_order_relaxed) && steady)
         {
+            historySumsReady_ = false;
             const T* clean = suppressNoise(currentWindow);
             T cleanEnergy = T(0), cleanFirst = T(0);
             if (differenceFunction(clean, yinClean_.data(), rawClean_.data(), cleanEnergy, cleanFirst))
@@ -459,19 +486,85 @@ private:
                 if (tau >= 0 && yinClean_[static_cast<size_t>(tau)] < threshold)
                 {
                     const int lag = inputDipNear(tau);
-                    const T period = parabolicInterp(rawDiff_.data(), lag);
-                    if (periodPersists(history, static_cast<double>(period)))
+                    const double period = refineByMultiples(history,
+                        static_cast<double>(parabolicInterp(rawDiff_.data(), lag)));
+                    double contrast = 0.0;
+                    if (periodPersists(history, period, contrast))
                     {
-                        // The confidence is the input's own dip there: a
-                        // reading taken through the noise stays a
-                        // low-confidence one (about 0.5 at 0 dB SNR).
-                        publish(period, std::clamp(T(1) - yinBuffer_[static_cast<size_t>(lag)], T(0), T(1)));
+                        candidate = period;
+                        if (agreesWithRecent(period))
+                        {
+                            rememberCandidate(period);
+                            publish(static_cast<T>(period),
+                                    std::clamp(T(1) - yinBuffer_[static_cast<size_t>(lag)], T(0), T(1)));
+                            return;
+                        }
+                    }
+                }
+            }
+            // The input's own dip, where noise keeps the cleaned window from
+            // dipping below the threshold: low notes, whose partials crowd
+            // the floor estimate, and pink noise. Not a dip at the floor that
+            // noise alone reaches (kFallbackCeiling), nor a periodicity as
+            // weak as low-passed noise shows or as strong as a narrow band of
+            // noise makes (kMinFallbackContrast, kMaxFallbackContrast).
+            const double own = (tauEstimate >= 0)
+                ? static_cast<double>(parabolicInterp(rawDiff_.data(), tauEstimate)) : 0.0;
+            if (tauEstimate >= 0 && dip < kFallbackCeiling
+                && !(candidate > 0.0 && std::abs(own - candidate) < kSameCandidate * candidate))
+            {
+                const double period = refineByMultiples(history, own);
+                double contrast = 0.0;
+                if (periodPersists(history, period, contrast)
+                    && contrast >= kMinFallbackContrast && contrast <= kMaxFallbackContrast)
+                {
+                    if (candidate == 0.0) candidate = period;
+                    if (agreesWithRecent(period))
+                    {
+                        rememberCandidate(period);
+                        publish(static_cast<T>(period),
+                                std::clamp(T(1) - yinBuffer_[static_cast<size_t>(tauEstimate)], T(0), T(1)));
                         return;
                     }
                 }
             }
         }
+        rememberCandidate(candidate);
         publishUnvoiced();
+    }
+
+    /**
+     * @brief Records this detection's period candidate (0 for none) for
+     *        agreesWithRecent().
+     */
+    void rememberCandidate(double period) noexcept
+    {
+        for (size_t i = recent_.size() - 1; i > 0; --i) recent_[i] = recent_[i - 1];
+        recent_[0] = period;
+    }
+
+    /**
+     * @brief True when at least kAgreementsNeeded of the last
+     *        kRecentCandidates detections found a period within
+     *        kAgreementCents of `period` per detection of age.
+     *
+     * A tone holds its period from one detection to the next; a narrow band
+     * of noise wanders. A reading taken through the noise must be confirmed
+     * by the detections before it: over 20 s of band-limited noise at 60 to
+     * 1000 Hz and Q 2 to 10, the second read then voices at most 0.1% of
+     * windows more than the first reading alone (up to 5% without), while
+     * a steady tone in noise is confirmed one or two hops after it is first
+     * found, and 50 cents of vibrato at 5.5 Hz still agrees.
+     */
+    [[nodiscard]] bool agreesWithRecent(double period) const noexcept
+    {
+        int agree = 0;
+        for (int i = 0; i < kRecentCandidates; ++i)
+        {
+            const double p = recent_[static_cast<size_t>(i)];
+            if (p > 0.0 && std::abs(1200.0 * std::log2(period / p)) <= kAgreementCents * (i + 1)) ++agree;
+        }
+        return agree >= kAgreementsNeeded;
     }
 
     void publish(T period, T confidence) noexcept
@@ -561,15 +654,29 @@ private:
      * @brief Candidate selection over a distribution of thresholds (the frame
      *        stage of Mauch & Dixon 2014); returns the chosen lag, or -1.
      *
-     * A threshold s picks the first local minimum of the CMND below s, so
-     * scanning the minima in lag order, a minimum that is lower than every
-     * earlier one is picked by exactly the thresholds in (its value, the
-     * previous record]: its probability is the prior mass of that interval.
-     * Thresholds below the deepest minimum pick nothing and hand
-     * kAbsoluteMinWeight of their mass to the deepest minimum. The most
-     * probable candidate wins; ties go to the shorter lag, as the first-dip
-     * rule does. The records below kPartialLevel go to `partial` (at most
+     * A threshold s picks the first dip of the CMND below s, and a dip is an
+     * excursion: the stretch of lags where the CMND stays below s, read at
+     * its deepest minimum. Scanning the minima in lag order, a minimum lower
+     * than every earlier one (a record) is the first one below the
+     * thresholds in (its value, the previous record]; the highest CMND
+     * sample between two consecutive records (their barrier) decides whether
+     * a threshold sees them as one excursion. So a record keeps the
+     * thresholds up to its barrier, and those above it pass on to the next,
+     * deeper record (and on, while every barrier on the way stays below the
+     * threshold). Each record's probability is the prior mass of the
+     * thresholds it ends up with. Thresholds below the deepest minimum pick
+     * nothing and hand kAbsoluteMinWeight of their mass to the deepest
+     * minimum. The most probable candidate wins; ties go to the shorter lag.
+     * The records below kPartialLevel go to `partial` (at most
      * kMaxPartials), for sharesItsPeriod().
+     *
+     * Reading each threshold's first minimum instead splits a broad dip
+     * across the small minima that noise leaves on its walls: a 47 to 67 Hz
+     * tone at 10 dB SNR has dozens of them on the way down to its period,
+     * each with a sliver of the mass, and one on the wall won, reading the
+     * tone 50 to 140 cents sharp at confidence 0.81 to 0.89 (31.5% of 200
+     * tones). Separate dips stay apart: between a period and its multiple
+     * the CMND rises far above any threshold the prior weighs.
      *
      * A dip is valued at the vertex of the parabola through its three
      * samples: a period that falls between two lags (a high note, a sweep)
@@ -582,49 +689,128 @@ private:
      * before the exact test in double. The screen is branch-free on purpose:
      * on noise the minima fall at random lags.
      */
-    [[nodiscard]] int chooseDip(const T* c, int* partial, int& numPartial) const noexcept
+    [[nodiscard]] int chooseDip(const T* c, int* partial, int& numPartial) noexcept
     {
         const int W = halfWindow_;
-        int bestTau = -1, lastTau = -1;
-        double bestMass = -1.0, lastMass = 0.0, recordValue = 1.0, recordSurvival = 0.0;
+        DipRecord* rec = dipRecords_.data();
+        const int capacity = static_cast<int>(dipRecords_.size());
+        DipGroup* groups = dipGroups_.data();
+        int numGroups = 0;
+        double passing = 0.0;   // prior mass that passes on to the newest record
+        int count = 0, leader = -1;
+        double leaderMass = -1.0, recordValue = 1.0, recordSurvival = 0.0;
         T screen = T(1) + kScreenSlack;
+        T barrier = T(0);       // highest CMND sample since the last record
+        T stopLevel = std::numeric_limits<T>::infinity();   // settled once the barrier reaches it
         numPartial = 0;
         for (int tau = 2; tau + 1 < W; ++tau)
         {
             const T c0 = c[tau - 1], c1 = c[tau], c2 = c[tau + 1];
+            barrier = std::max(barrier, c0);
+            if (barrier >= stopLevel) break;
             if (!((c1 < c0) & (c1 <= c2) & (c1 - std::abs(c0 - c2) * T(0.125) < screen)))
                 continue;
             const double d0 = static_cast<double>(c0), d1 = static_cast<double>(c1),
                          d2 = static_cast<double>(c2);
             const double v = std::max(0.0, d1 - (d0 - d2) * (d0 - d2) / (8.0 * (d0 - 2.0 * d1 + d2)));
-            if (!(v < recordValue)) continue;
-            if (lastTau >= 0 && lastMass > bestMass) { bestMass = lastMass; bestTau = lastTau; }
+            if (!(v < recordValue) || count == capacity) continue;
             const double s = priorSurvival(v);
-            lastMass = s - recordSurvival;
-            lastTau = tau;
+            DipRecord& r = rec[count];
+            r.lag = tau;
+            r.value = v;
+            r.survival = s;
+            r.mass = s - recordSurvival;   // its own thresholds, (v, previous record]
+            if (count > 0)
+            {
+                // The previous record's barrier is now known: every threshold
+                // above it that reached that record passes on to this one.
+                // Thresholds in (rec[i].value, rec[i - 1].value] first meet
+                // record i and reach this one when they clear every barrier
+                // from record i on. The records with the same highest such
+                // barrier form a group on a stack, so each one is merged once
+                // and the passing mass is a running total.
+                DipRecord& prev = rec[count - 1];
+                prev.barrier = static_cast<double>(barrier);
+                prev.barrierSurvival = priorSurvival(prev.barrier);
+                int first = count - 1;
+                while (numGroups > 0 && groups[numGroups - 1].gate <= prev.barrier)
+                {
+                    --numGroups;
+                    passing -= groups[numGroups].mass;
+                    first = groups[numGroups].first;
+                }
+                // Records first..count-1 now share this barrier; those whose
+                // upper bound (the record before them, 1 for the first) lies
+                // above it pass the thresholds in between. The bounds fall
+                // with the index: find the first one at or below it.
+                int lo = first, hi = count;
+                while (lo < hi)
+                {
+                    const int mid = (lo + hi) / 2;
+                    const double upper = (mid == 0) ? 1.0 : rec[mid - 1].value;
+                    if (upper > prev.barrier) lo = mid + 1; else hi = mid;
+                }
+                const auto upperSum = [&](int i) noexcept { return (i <= 1) ? 0.0 : rec[i - 1].prefix; };
+                DipGroup& g = groups[numGroups++];
+                g.first = first;
+                g.gate = prev.barrier;
+                g.mass = static_cast<double>(lo - first) * prev.barrierSurvival
+                       - (upperSum(lo) - upperSum(first));
+                passing += g.mass;
+                prev.mass -= passing;
+                r.mass += passing;
+                if (prev.mass > leaderMass) { leaderMass = prev.mass; leader = count - 1; }
+            }
+            r.prefix = (count == 0) ? 0.0 : rec[count - 1].prefix + rec[count - 1].survival;
+            ++count;
             recordValue = v;
             recordSurvival = s;
             if (v < kPartialLevel && numPartial < kMaxPartials) partial[numPartial++] = tau;
             screen = static_cast<T>(v) + kScreenSlack;
+            barrier = c1;
+            stopLevel = settledAbove(r.mass, s, leaderMass);
+        }
+        if (count == 0) return -1;
+        const DipRecord& last = rec[count - 1];
+        const double lastMass = last.mass + kAbsoluteMinWeight * (1.0 - last.survival);
+        return (lastMass > leaderMass) ? last.lag : rec[leader].lag;
+    }
 
-            // Every later candidate shares at most the prior mass below this
-            // record, plus the absolute-minimum share of it. Once the leader
-            // holds more, and the share that goes to the deepest minimum
-            // cannot swap this record with the earlier best, no later lag
-            // changes the choice: stop (a clean dip near 0 ends the scan at
-            // once, as the first-dip rule did). The result is the full scan's.
-            const double below = 1.0 - s;
-            const bool settled = (lastMass > bestMass)
-                              || (bestMass > lastMass + kAbsoluteMinWeight * below);
-            if (settled && std::max(bestMass, lastMass) > (1.0 + kAbsoluteMinWeight) * below)
-                break;
-        }
-        if (lastTau >= 0)
+    /**
+     * @brief The barrier above the newest record at which the choice of
+     *        chooseDip() is settled (infinity while it cannot be).
+     *
+     * Later lags can only add records deeper than the newest one, which
+     * gather at most the prior mass below it (plus the deepest minimum's
+     * share) and the thresholds above the newest record's barrier, which
+     * pass on to them: no more than the survival at that barrier. Once the
+     * leader keeps more than any later record could gather, no later lag
+     * changes the choice and the scan stops with the full scan's result (a
+     * clean dip ends it a few lags past its bottom).
+     * @param mass        The newest record's mass so far.
+     * @param survival    Prior survival at its value.
+     * @param leaderMass  The best mass among the earlier records (-1 if none).
+     */
+    [[nodiscard]] T settledAbove(double mass, double survival, double leaderMass) const noexcept
+    {
+        const double below = 1.0 - survival;
+        const double future = (1.0 + kAbsoluteMinWeight) * below;
+        const bool earlierLeads = leaderMass >= mass + kAbsoluteMinWeight * below;
+        double target = earlierLeads ? leaderMass - future
+                                     : std::min(mass - leaderMass, 0.5 * (mass - future));
+        target -= kSettleMargin;
+        if (!(target > 0.0)) return std::numeric_limits<T>::infinity();
+        if (earlierLeads && mass <= target) return T(-1);
+        // The first node of the survival table at or below the target (the
+        // table holds the exact survival at its nodes, and it falls
+        // monotonically).
+        int lo = 0, hi = kSurvivalSteps;
+        while (lo < hi)
         {
-            lastMass += kAbsoluteMinWeight * (1.0 - recordSurvival);
-            if (lastMass > bestMass) { bestMass = lastMass; bestTau = lastTau; }
+            const int mid = (lo + hi) / 2;
+            if (survivalTable_[static_cast<size_t>(mid)] > target) lo = mid + 1; else hi = mid;
         }
-        return bestTau;
+        return static_cast<T>(static_cast<double>(lo) / static_cast<double>(kSurvivalSteps));
     }
 
     /**
@@ -741,6 +927,116 @@ private:
     }
 
     /**
+     * @brief Prefix sums of the squared history (persistSq_), computed on
+     *        first use in a detection and shared by refineByMultiples() and
+     *        periodPersists().
+     * @param history The input history, kHistoryWindows windows, oldest first.
+     */
+    void historyEnergy(const T* history) noexcept
+    {
+        if (historySumsReady_) return;
+        historySumsReady_ = true;
+        // Four samples at a time with one carry, so the running sum is not a
+        // chain of dependent additions (historySize_ is a multiple of 4).
+        double* sq = persistSq_.data();
+        sq[0] = 0.0;
+        double carry = 0.0;
+        for (int i = 0; i < historySize_; i += 4)
+        {
+            const double a = static_cast<double>(history[i]) * static_cast<double>(history[i]);
+            const double b = a + static_cast<double>(history[i + 1]) * static_cast<double>(history[i + 1]);
+            const double c = b + static_cast<double>(history[i + 2]) * static_cast<double>(history[i + 2]);
+            const double d = c + static_cast<double>(history[i + 3]) * static_cast<double>(history[i + 3]);
+            sq[i + 1] = carry + a;
+            sq[i + 2] = carry + b;
+            sq[i + 3] = carry + c;
+            sq[i + 4] = carry + d;
+            carry += d;
+        }
+    }
+
+    /**
+     * @brief Normalised correlation of the history with itself at `lag`, over
+     *        its first `span` samples (historyEnergy() must have run).
+     */
+    [[nodiscard]] double historyCorrelation(const T* x, int lag, int span) const noexcept
+    {
+        const double* sq = persistSq_.data();
+        const double e = sq[span] + sq[lag + span] - sq[lag];
+        const double r = static_cast<double>(simd::dotProductT(x, x + lag, span));
+        return e > 0.0 ? 2.0 * r / e : 0.0;
+    }
+
+    /**
+     * @brief A period refined from the correlation peaks at its multiples
+     *        over the history.
+     *
+     * Through strong noise the analysis window's own dip wanders: pink
+     * noise, strong near a low note, tilts the difference function around
+     * the period and shifted 47 to 67 Hz tones at 0 dB SNR 50 to 135 cents
+     * (one window in five). The history holds two to eight periods of
+     * every period the detector reads; the peak of the correlation near k
+     * periods gives the period to 1/k of its own error, and the noise's
+     * tilt is flatter there. Each multiple k from 2 to kRefineMultiples that
+     * leaves an eighth of a window to correlate over is searched near k times
+     * the estimate so far (kMultipleSearch of it at k = 2, narrowing as the
+     * estimate firms up; every few lags first, then every lag around the
+     * best; parabolic peak), and the estimate becomes the mean of the
+     * window's period and each multiple's, weighted by k squared. Over the
+     * same tones (one window each, the input's own dip refined in double),
+     * the period is then within 50 cents in 94.5% of windows where the
+     * window alone gave 80.5%; higher multiples added no accuracy.
+     * @param x      The input history, kHistoryWindows windows, oldest first.
+     * @param period The period found in the analysis window, in samples.
+     */
+    [[nodiscard]] double refineByMultiples(const T* x, double period) noexcept
+    {
+        if (!(period >= 2.0)) return period;
+        historyEnergy(x);
+        const int n = historySize_;
+        double weighted = period, weight = 1.0, estimate = period;
+        double* values = multipleScratch_.data();
+        const int capacity = static_cast<int>(multipleScratch_.size());
+        for (int k = 2; k <= kRefineMultiples; ++k)
+        {
+            const int centre = static_cast<int>(std::lround(static_cast<double>(k) * estimate));
+            const double search = static_cast<double>(k) * estimate * kMultipleSearch
+                                / static_cast<double>(std::max(1, k - 1));
+            const int reach = std::max(2, static_cast<int>(std::ceil(search)));
+            const int span = n - (centre + reach) - 1;
+            const int count = 2 * reach + 1;
+            if (span < windowSize_ / 8 || count > capacity) break;
+            // Every step-th lag first, then every lag within a step of the
+            // best of them: the peak near k periods is several lags wide.
+            const int step = std::max(1, reach / kSearchStepDivisor);
+            int best = -1;
+            const auto evaluate = [&](int j) noexcept {
+                values[j] = historyCorrelation(x, centre - reach + j, span);
+                if (best < 0 || values[j] > values[best]) best = j;
+            };
+            for (int j = 0; j < count; j += step) evaluate(j);
+            if (step > 1)
+            {
+                const int coarse = best;
+                for (int j = std::max(0, coarse - step + 1); j <= std::min(count - 1, coarse + step - 1); ++j)
+                    if (j % step != 0) evaluate(j);
+            }
+            double peak = static_cast<double>(centre - reach + best);
+            if (best > 0 && best + 1 < count)
+            {
+                const double a = values[best - 1], b = values[best], c = values[best + 1];
+                const double curvature = a - 2.0 * b + c;
+                if (curvature < -1e-30) peak += std::clamp(0.5 * (a - c) / curvature, -0.5, 0.5);
+            }
+            const double w = static_cast<double>(k) * static_cast<double>(k);
+            weighted += w * peak / static_cast<double>(k);
+            weight += w;
+            estimate = weighted / weight;
+        }
+        return estimate;
+    }
+
+    /**
      * @brief True when the input repeats at the multiples of `period` about
      *        as strongly as at `period` itself, over the last kHistoryWindows
      *        windows of input (the analysis window and the one before it).
@@ -759,43 +1055,37 @@ private:
      * of every period the detector reads, so the lowest notes are tested too,
      * and the longer span and the extra multiples make a narrow band of noise
      * less likely to pass than over the window alone.
-     * @param history The input history, kHistoryWindows windows, oldest first.
-     * @param period  The period under test, in samples.
+     * @param history  The input history, kHistoryWindows windows, oldest first.
+     * @param period   The period under test, in samples.
+     * @param contrast Receives the periodic part of the correlation at one
+     *                 period (0 when the test cannot run).
      */
-    [[nodiscard]] bool periodPersists(const T* history, double period) noexcept
+    [[nodiscard]] bool periodPersists(const T* history, double period, double& contrast) noexcept
     {
+        contrast = 0.0;
+        historyEnergy(history);
         if (!(period >= 2.0)) return false;
         const auto reach = [&](int k) noexcept {
             return static_cast<int>(std::lround((static_cast<double>(k) + 0.5) * period)) + 2;
         };
         const int minSpan = windowSize_ / 8;
-        const T* x = history;
         const int n = historySize_;
         int kmax = kMaxMultiple;
         while (kmax >= 2 && n - reach(kmax) < minSpan) --kmax;
         if (kmax < 2) return false;
         const int span = n - reach(kmax);
-
-        // Energies from prefix sums; one dot product per lag.
-        double* sq = persistSq_.data();
-        sq[0] = 0.0;
-        for (int i = 0; i < n; ++i)
-            sq[i + 1] = sq[i] + static_cast<double>(x[i]) * static_cast<double>(x[i]);
-        const auto corr = [&](int lag) noexcept {
-            const double e = sq[span] + sq[lag + span] - sq[lag];
-            const double r = static_cast<double>(simd::dotProductT(x, x + lag, span));
-            return e > 0.0 ? 2.0 * r / e : 0.0;
-        };
-        const auto contrast = [&](int k) noexcept {
+        const auto corr = [&](int lag) noexcept { return historyCorrelation(history, lag, span); };
+        const auto periodic = [&](int k) noexcept {
             const int c = static_cast<int>(std::lround(static_cast<double>(k) * period));
             const int h = static_cast<int>(std::lround(0.5 * period));
             const double peak = std::max({ corr(c - 1), corr(c), corr(c + 1) });
             return peak - 0.5 * (corr(c - h) + corr(c + h));
         };
-        const double first = contrast(1);
+        const double first = periodic(1);
+        contrast = first;
         if (!(first > 0.0)) return false;
         double sum = 0.0;
-        for (int k = 2; k <= kmax; ++k) sum += contrast(k);
+        for (int k = 2; k <= kmax; ++k) sum += periodic(k);
         return sum >= kPersistRatio * first * static_cast<double>(kmax - 1);
     }
 
@@ -846,7 +1136,7 @@ private:
      * The prior is Beta(2, b) on [0, 1], whose survival function has the
      * closed form (1 - x)^b (1 + b x) for any real b > 0.
      */
-    [[nodiscard]] double priorSurvival(double x) const noexcept
+    [[nodiscard]] double exactSurvival(double x) const noexcept
     {
         if (!(x > 0.0)) return 1.0;
         if (!(x < 1.0)) return 0.0;
@@ -854,21 +1144,51 @@ private:
     }
 
     /**
+     * @brief exactSurvival() from a table built by updatePrior(): cubic
+     *        Hermite interpolation on kSurvivalSteps intervals with the exact
+     *        derivative, -b (b + 1) x (1 - x)^(b - 1), at each node.
+     *
+     * The error is below 1e-9 at the default prior and 1e-5 at the
+     * strictest. chooseDip() evaluates it at every record and barrier, where
+     * a pow each cost a noisy window about a microsecond.
+     */
+    [[nodiscard]] double priorSurvival(double x) const noexcept
+    {
+        if (!(x > 0.0)) return 1.0;
+        if (!(x < 1.0)) return 0.0;
+        const double u = x * static_cast<double>(kSurvivalSteps);
+        const int i = std::min(static_cast<int>(u), kSurvivalSteps - 1);
+        const double t = u - static_cast<double>(i), h = 1.0 / static_cast<double>(kSurvivalSteps);
+        const double* s = survivalTable_.data();
+        const double* d = survivalSlope_.data();
+        const double t2 = t * t, t3 = t2 * t;
+        return (2.0 * t3 - 3.0 * t2 + 1.0) * s[i] + (t3 - 2.0 * t2 + t) * h * d[i]
+             + (3.0 * t2 - 2.0 * t3) * s[i + 1] + (t3 - t2) * h * d[i + 1];
+    }
+
+    /**
      * @brief Rebuilds the threshold prior for a new mean (audio thread, on a
-     *        threshold change only): Beta(2, b) with mean 2 / (2 + b), and the
-     *        CMND ceiling x where its survival falls to kVoicedSurvival, never
-     *        above kMaxVoicingCeiling.
+     *        threshold change only): Beta(2, b) with mean 2 / (2 + b), its
+     *        survival table, and the CMND ceiling x where its survival falls
+     *        to kVoicedSurvival, never above kMaxVoicingCeiling.
      */
     void updatePrior(T threshold) noexcept
     {
         cachedThreshold_ = threshold;
         const double mean = static_cast<double>(threshold);
         priorB_ = 2.0 * (1.0 - mean) / mean;
+        for (int i = 0; i <= kSurvivalSteps; ++i)
+        {
+            const double x = static_cast<double>(i) / static_cast<double>(kSurvivalSteps);
+            survivalTable_[static_cast<size_t>(i)] = (i == 0) ? 1.0 : exactSurvival(x);
+            survivalSlope_[static_cast<size_t>(i)] = (i == kSurvivalSteps) ? 0.0
+                : -priorB_ * (priorB_ + 1.0) * x * std::pow(1.0 - x, priorB_ - 1.0);
+        }
         double lo = 0.0, hi = 1.0;   // survival falls monotonically from 1 to 0
         for (int i = 0; i < 48; ++i)
         {
             const double mid = 0.5 * (lo + hi);
-            if (priorSurvival(mid) > kVoicedSurvival) lo = mid; else hi = mid;
+            if (exactSurvival(mid) > kVoicedSurvival) lo = mid; else hi = mid;
         }
         voicingCeiling_ = std::min(lo, kMaxVoicingCeiling);
     }
@@ -910,6 +1230,35 @@ private:
     static constexpr double kOverSubtraction = 2.0;
     /// Windows of input history kept for periodPersists().
     static constexpr int kHistoryWindows = 2;
+    /// Search span, as a fraction of k times the period, for the correlation
+    /// peak near each multiple in refineByMultiples().
+    static constexpr double kMultipleSearch = 0.03;
+    /// Highest multiple refineByMultiples() reads (more add CPU, not accuracy).
+    static constexpr int kRefineMultiples = 4;
+    /// Its coarse search steps over the span / this many lags each side.
+    static constexpr int kSearchStepDivisor = 16;
+    /// Deepest input dip a fallback reading may have (white noise bottoms out
+    /// near 0.85; a tone at 0 dB SNR dips to about 0.5).
+    static constexpr double kFallbackCeiling = 0.8;
+    /// Relative distance within which the input's own dip is the candidate
+    /// the cleaned window already found (and is not read twice).
+    static constexpr double kSameCandidate = 0.02;
+    /// Periodic correlation contrast at one period a fallback reading needs:
+    /// a tone at 0 dB SNR measures about 0.9 (0.35 to 1.3); low-passed noise
+    /// alone mostly below 0.25, a narrow band of noise at Q 5 to 10 up to 1.8.
+    static constexpr double kMinFallbackContrast = 0.35;
+    static constexpr double kMaxFallbackContrast = 1.3;
+    /// Detections remembered for agreesWithRecent().
+    static constexpr int kRecentCandidates = 3;
+    /// Of them, how many must agree with a reading taken through the noise.
+    static constexpr int kAgreementsNeeded = 2;
+    /// Agreement tolerance for that test, in cents per detection of age (a
+    /// 50-cent vibrato at 5.5 Hz moves up to 18.5 cents per detection).
+    static constexpr double kAgreementCents = 25.0;
+    /// Intervals of the prior survival table (priorSurvival()).
+    static constexpr int kSurvivalSteps = 1024;
+    /// Margin of the settling test in chooseDip() (prior mass).
+    static constexpr double kSettleMargin = 1.0e-9;
 
     /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
     /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
@@ -931,6 +1280,8 @@ private:
     T cachedThreshold_ = T(-1);
     double priorB_ = 18.0;
     double voicingCeiling_ = 0.0;
+    std::vector<double> survivalTable_;   // Size: kSurvivalSteps + 1 (priorSurvival())
+    std::vector<double> survivalSlope_;   // Its derivative at the same nodes
 
     // Thread-safe outputs
     std::atomic<T> frequency_{T(0)};
@@ -960,7 +1311,29 @@ private:
     std::vector<T> cleanScratch_; // Size: kFloorBins
     std::vector<T> yinClean_;     // Size: halfWindow_
     std::vector<T> rawClean_;     // Size: halfWindow_
-    std::vector<double> persistSq_; // Size: historySize_ + 1 (periodPersists())
+    std::vector<double> persistSq_; // Size: historySize_ + 1 (historyEnergy())
+    bool historySumsReady_ = false;       // persistSq_ holds this detection's sums
+    std::vector<double> multipleScratch_; // Correlations around one multiple (refineByMultiples())
+
+    /// One record of chooseDip()'s scan: a minimum deeper than every earlier one.
+    struct DipRecord
+    {
+        int lag = 0;
+        double value = 0.0, survival = 0.0;          ///< vertex value, prior survival there
+        double barrier = 0.0, barrierSurvival = 0.0; ///< highest CMND sample before the next record
+        double mass = 0.0;                           ///< prior mass of the thresholds it holds
+        double prefix = 0.0;                         ///< sum of the earlier records' survivals
+    };
+    std::vector<DipRecord> dipRecords_;   // Size: halfWindow_ / 2 + 2 (chooseDip())
+    /// Records of chooseDip() that share the highest barrier up to the newest one.
+    struct DipGroup
+    {
+        int first = 0;        ///< first record of the group (the next group's first ends it)
+        double gate = 0.0;    ///< the barrier they share
+        double mass = 0.0;    ///< the prior mass they pass on
+    };
+    std::vector<DipGroup> dipGroups_;     // Same size as dipRecords_ (chooseDip())
+    std::array<double, kRecentCandidates> recent_ {}; // Last detections' periods (agreesWithRecent())
 };
 
 } // namespace dspark

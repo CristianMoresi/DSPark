@@ -16,28 +16,49 @@
  * - **Confidence gating** - readings below the confidence threshold (or
  *   outside the configured frequency range) never move the output; the last
  *   reliable pitch is held through consonants and silence.
- * - **Octave-jump correction** - a reading ~1-2 octaves away from the tracked
- *   pitch is folded back to the closest octave of the current target before
- *   being considered (the classic YIN 2x/0.5x failure on transients).
- * - **Jump confirmation** - a genuinely large interval must persist for three
- *   consecutive readings before the target moves (one bad frame never jerks
- *   the output). A reading is one detector detection, whatever the host's
- *   block size, so the block size changes neither what is rejected nor how
- *   long a real interval takes to arrive.
+ * - **Octave-jump correction** - a single reading ~1-2 octaves away from
+ *   the tracked pitch is folded back to the closest octave of the current
+ *   target (the classic YIN 2x/0.5x failure on transients).
+ * - **Jump confirmation** - a large interval, an octave leap among them,
+ *   must persist for two consecutive readings before the target moves (one
+ *   bad frame never jerks the output). A reading is one detector detection,
+ *   whatever the host's block size, so the block size changes neither what
+ *   is rejected nor how long a real interval takes to arrive. Folding every
+ *   octave-away reading instead never let a melody's octave leap through,
+ *   and locked onto a wrong octave the detector read at a note's start:
+ *   measured on legato melodies with an octave leap in one step of eight,
+ *   21.9% of voiced frames an octave off (0.7% now), and 28.6% on notes
+ *   with a fundamental 15 dB below its partials (0.7% now).
  * - **Glide in semitone domain** - the public value slews toward the target
  *   at a constant rate expressed in milliseconds per octave, so the movement
  *   is musically uniform across the whole range (Hz-domain smoothing is
  *   faster at high pitches and sluggish at low ones).
+ * - **Voicing** - isVoiced() tells whether the latest detection passed the
+ *   gates; isTracking() holds for 250 ms after the last one that did.
+ *
+ * Measured against an HMM note tracker (the second stage of Mauch & Dixon
+ * 2014, decoded causally by its forward filter) on the same material,
+ * 48 kHz, legato melodies of 80 to 700 Hz with 25 ms glides,
+ * readings within 50 cents of voiced frames (RPA), voicing false alarms
+ * (VFA) and the time from a note change to a reading within 50 cents,
+ * with setGlide(0), setConfidence(0.5) and isVoiced(): clean 93.7% / 1.9%
+ * / 22 ms against 93.5% / 5.1% / 24 ms; 100 cents of vibrato 94.6% against
+ * 94.1%; 5 dB SNR white noise 93.6% against 71.0%; with
+ * setNoiseSuppression() and setConfidence(0.45), 0 dB 86.2% where the HMM
+ * reads nothing. The default gate (0.85) holds the last clean pitch
+ * through noisy passages, and the default glide trades latency for a
+ * smooth control signal.
  *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with processing).
  * - processBlock() / pushSamples() / reset(): audio thread (stream owner).
- * - setRange() / setConfidence() / setGlide(): control thread (ONE
- *   non-audio writer; independent single-word relaxed atomics -- a torn
- *   min/max pair from concurrent setRange() calls is prevented by the
- *   single-writer contract; non-finite values are ignored).
- * - getSmoothedHz() / getRawHz() / getConfidence() / isTracking() and the
- *   parameter getters: any thread, lock-free.
+ * - setRange() / setConfidence() / setGlide() / setNoiseSuppression():
+ *   control thread (ONE non-audio writer; independent single-word relaxed
+ *   atomics -- a torn min/max pair from concurrent setRange() calls is
+ *   prevented by the single-writer contract; non-finite values are
+ *   ignored).
+ * - getSmoothedHz() / getRawHz() / getConfidence() / isTracking() /
+ *   isVoiced() and the parameter getters: any thread, lock-free.
  *
  * @code
  *   follower.prepare(spec);
@@ -129,6 +150,7 @@ public:
         samplesSinceValid_ = std::numeric_limits<int64_t>::max() / 2;
         smoothedHz_.store(T(0), std::memory_order_relaxed);
         tracking_.store(false, std::memory_order_relaxed);
+        voiced_.store(false, std::memory_order_relaxed);
     }
 
     // -- Parameters (thread-safe) ------------------------------------------------
@@ -191,6 +213,20 @@ public:
      *          sampleRate/(getWindowSize()/2 - 1). */
     [[nodiscard]] int getWindowSize() const noexcept { return detector_.getWindowSize(); }
 
+    /**
+     * @brief Reads tones through broadband noise (opt-in, default off): the
+     *        wrapped detector's PitchDetector::setNoiseSuppression().
+     *
+     * Those readings carry the honest, low confidence of a reading taken
+     * through the noise (about 0.5 at 0 dB SNR), so the confidence gate
+     * (setConfidence()) must be lowered for the follower to use them.
+     * Control thread; relaxed atomic.
+     */
+    void setNoiseSuppression(bool on) noexcept { detector_.setNoiseSuppression(on); }
+
+    /** @brief Whether the detector's noise suppression is on. */
+    [[nodiscard]] bool getNoiseSuppression() const noexcept { return detector_.getNoiseSuppression(); }
+
     // -- Readout (lock-free, any thread) ------------------------------------------
 
     /** @return Smoothed pitch in Hz; 0 until the first reliable reading. */
@@ -209,6 +245,16 @@ public:
     [[nodiscard]] bool isTracking() const noexcept
     {
         return tracking_.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @return True when the latest detection passed the confidence and range
+     *         gates: a per-detection voicing flag, without isTracking()'s
+     *         250 ms hold.
+     */
+    [[nodiscard]] bool isVoiced() const noexcept
+    {
+        return voiced_.load(std::memory_order_relaxed);
     }
 
     // -- Processing ----------------------------------------------------------------
@@ -285,6 +331,7 @@ private:
                         && raw >= minHz_.load(std::memory_order_relaxed)
                         && raw <= maxHz_.load(std::memory_order_relaxed);
 
+        if (freshReading) voiced_.store(valid, std::memory_order_relaxed);
         if (!freshReading)
         {
             samplesSinceValid_ += numSamples;
@@ -298,45 +345,43 @@ private:
                 targetSt_ = currentSt_ = st;   // first lock: no sweep-in
                 hasTarget_ = true;
             }
+            else if (std::abs(st - targetSt_) <= 7.0)
+            {
+                targetSt_ = st;
+                pendingCount_ = 0;
+            }
             else
             {
-                double dev = st - targetSt_;
-                if (std::abs(dev) > 7.0)
+                // A large interval, an octave leap among them, is taken once
+                // kIntervalReadings consecutive readings agree on it; one odd
+                // reading never moves the target. Meanwhile a reading whole
+                // octaves away from the target (the classic 2x / 0.5x
+                // detector error) still updates it, folded back to the
+                // target's octave.
+                if (pendingCount_ > 0 && std::abs(st - pendingSt_) < 1.0)
                 {
-                    // Octave folding: a 2x/0.5x detector error lands within
-                    // ~1.5 st of the target after removing whole octaves.
+                    ++pendingCount_;
+                }
+                else
+                {
+                    pendingSt_ = st;
+                    pendingCount_ = 1;
+                }
+                if (pendingCount_ >= kIntervalReadings)
+                {
+                    targetSt_ = st;
+                    pendingCount_ = 0;
+                }
+                else
+                {
                     for (const double oct : { -24.0, -12.0, 12.0, 24.0 })
                     {
                         if (std::abs(st + oct - targetSt_) < 1.5)
                         {
-                            st += oct;
-                            dev = st - targetSt_;
+                            targetSt_ = st + oct;
                             break;
                         }
                     }
-                }
-
-                if (std::abs(dev) > 7.0)
-                {
-                    // A real large interval: require three consistent readings.
-                    if (pendingCount_ > 0 && std::abs(st - pendingSt_) < 1.0)
-                    {
-                        if (++pendingCount_ >= 3)
-                        {
-                            targetSt_ = st;
-                            pendingCount_ = 0;
-                        }
-                    }
-                    else
-                    {
-                        pendingSt_ = st;
-                        pendingCount_ = 1;
-                    }
-                }
-                else
-                {
-                    targetSt_ = st;
-                    pendingCount_ = 0;
                 }
             }
             samplesSinceValid_ = 0;
@@ -370,6 +415,8 @@ private:
     }
 
     // -- Members --------------------------------------------------------------------
+    /// Consecutive readings that confirm a large interval or an octave leap.
+    static constexpr int kIntervalReadings = 2;
     double sampleRate_ = 48000.0;
     std::atomic<bool> prepared_{ false };
 
@@ -391,6 +438,7 @@ private:
 
     std::atomic<T> smoothedHz_ { T(0) };
     std::atomic<bool> tracking_ { false };
+    std::atomic<bool> voiced_ { false };
 };
 
 } // namespace dspark

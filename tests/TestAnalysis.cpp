@@ -1184,14 +1184,15 @@ struct NoiseSource
     }
 };
 
-/// Readings of 40 harmonic tones (80 Hz to 1 kHz, spectral tilt -3 to
-/// -12 dB/octave, random partial phases) in white noise at `snrDb`, each
-/// read once after 6000 samples at 48 kHz. Counts readings within 50 cents,
-/// readings an octave or two off, and wrong readings at confidence 0.85 or
-/// more.
+/// Readings of 40 harmonic tones (80 Hz to 1 kHz unless given, spectral tilt
+/// -3 to -12 dB/octave, random partial phases) in white noise at `snrDb`,
+/// each read once after 6000 samples at 48 kHz. Counts readings within 50
+/// cents, readings an octave or two off, and wrong readings at confidence
+/// 0.85 or more.
 struct NoisyToneScore { int correct = 0, octave = 0, confidentWrong = 0, voiced = 0; };
 
-NoisyToneScore scoreNoisyTones(double snrDb, bool suppression = false)
+NoisyToneScore scoreNoisyTones(double snrDb, bool suppression = false, double lowHz = 80.0,
+                               double highHz = 1000.0)
 {
     NoisyToneScore score;
     NoiseSource rng { 2024u };
@@ -1200,7 +1201,7 @@ NoisyToneScore scoreNoisyTones(double snrDb, bool suppression = false)
     std::vector<float> x(static_cast<size_t>(n));
     for (int k = 0; k < 40; ++k)
     {
-        const double f0 = 80.0 * std::pow(1000.0 / 80.0, k / 39.0);
+        const double f0 = lowHz * std::pow(highHz / lowHz, k / 39.0);
         const double tilt = 3.0 + 9.0 * rng.uniform();
         std::fill(tone.begin(), tone.end(), 0.0);
         for (int h = 1; h <= 40 && h * f0 < 20000.0; ++h)
@@ -1237,7 +1238,8 @@ NoisyToneScore scoreNoisyTones(double snrDb, bool suppression = false)
 // One threshold of 0.1 on the normalised difference read every frame of a
 // tone at 5 dB SNR as unvoiced (its dip sits near the noise share of the
 // power, 0.24): 0 of 40 correct. The vote over a threshold prior (Mauch &
-// Dixon 2014) with a voicing ceiling of 0.30 reads 36 of 40 (a clean-room
+// Dixon 2014) with a voicing ceiling of 0.30 reads 36 of 40, and all 40 now
+// that each threshold reads the deepest minimum of its dip (a clean-room
 // port of that frame stage scores 87% on such tones). Noisy readings carry
 // an honest confidence below 0.85, so a confidence gate such as
 // PitchFollower's still ignores them.
@@ -1383,8 +1385,10 @@ DSPARK_TEST(PitchDetector_legato_change_reads_no_shared_period)
 // that always reads is wrong two times in three there. With noise floor
 // suppression a steady window that reads unvoiced is read again with its
 // noise removed, the period taken from the input next to the cleaned dip:
-// 37 of these 40 tones read right and none wrong (84.5% and 0.2% of 400
-// measured), at the input's own confidence, about 0.5. Off, nothing changes.
+// 37 of these 40 tones read right (84.5% and 0.2% wrong of 400 measured);
+// with the period refined over its multiples and confirmed by the detections
+// before it, all 40 (99.8% and none), at the input's own confidence, about
+// 0.5. Off, nothing changes.
 DSPARK_TEST(PitchDetector_noise_suppression_reads_through_0_db_noise)
 {
     const NoisyToneScore off = scoreNoisyTones(0.0, false);
@@ -1465,7 +1469,7 @@ int bandNoiseVoicedWindows(double centreHz, double q, bool suppression, uint64_t
 // suppression path now keeps a reading only when the input's periodic
 // correlation at the multiples holds up. Of 179 windows of a Q 5 band at
 // 1 kHz, 67 read voiced through the second read and 5 by the first alone;
-// now 8. A Q 2 band at 300 Hz: 16, against 0, now 6.
+// then 8, now 5. A Q 2 band at 300 Hz: 16, against 0, then 6, now 1.
 DSPARK_TEST(PitchDetector_noise_suppression_ignores_narrow_band_noise)
 {
     const int q5Off = bandNoiseVoicedWindows(1000.0, 5.0, false, 6u);
@@ -1482,7 +1486,9 @@ DSPARK_TEST(PitchDetector_noise_suppression_ignores_narrow_band_noise)
 // not over the analysis window alone: a narrow band of noise has more
 // multiples to decorrelate at, over a longer span. Over 20 s of four bands
 // (Q 5 at 1 kHz and 300 Hz, Q 2 at 300 and 120 Hz) the second read added 182
-// windows to those the first read voices; now 65.
+// windows to those the first read voices; then 65. A reading taken through
+// the noise must now also agree with the detections before it, which a
+// narrow band of noise, wandering in pitch, rarely does: 4.
 DSPARK_TEST(PitchDetector_noise_suppression_tests_multiples_over_two_windows)
 {
     int excess = 0;
@@ -1496,13 +1502,14 @@ DSPARK_TEST(PitchDetector_noise_suppression_tests_multiples_over_two_windows)
     }
     std::cout << "  [pitch noise] band noise, 20 s of four bands: second read adds " << excess
               << " voiced windows\n";
-    EXPECT_LT(excess, 100);
+    EXPECT_LT(excess, 16);
 }
 
 // Notes below 67 Hz leave no multiple of their period inside the 48 kHz
 // window, so the second read used to drop them: 50, 55 and 62 Hz harmonic
 // tones at 2 dB SNR read 0 of 513 detections. Two windows of history hold
-// three periods of the lowest note the detector reads; now 280, none wrong.
+// three periods of the lowest note the detector reads: 280, none wrong;
+// refined over the multiples and confirmed by recent detections, 513.
 DSPARK_TEST(PitchDetector_noise_suppression_reads_notes_below_67_hz)
 {
     const double fs = 48000.0;
@@ -1543,6 +1550,197 @@ DSPARK_TEST(PitchDetector_noise_suppression_reads_notes_below_67_hz)
               << " right, " << wrong << " wrong\n";
     EXPECT_GT(correct, 200);
     EXPECT_EQ(wrong, 0);
+}
+
+// A broad dip of a low note carries dozens of small minima that noise
+// leaves on its walls. Each threshold of the vote used to pick its first
+// minimum, so the dip's mass split across them and one on the wall won:
+// 47 to 67 Hz tones at 10 dB SNR read 50 to 140 cents sharp at confidence
+// 0.81 to 0.89 (31.5% of 200). A threshold now picks the deepest minimum of
+// the stretch below it.
+DSPARK_TEST(PitchDetector_low_notes_in_noise_read_their_period)
+{
+    const NoisyToneScore s = scoreNoisyTones(10.0, false, 47.0, 67.0);
+    std::cout << "  [pitch noise] 47-67 Hz at 10 dB SNR: " << s.correct << "/40 correct, "
+              << s.voiced - s.correct << " wrong\n";
+    EXPECT_GT(s.correct, 37);
+    EXPECT_EQ(s.voiced - s.correct, 0);
+}
+
+// Where the cleaned window of a low note does not dip below the threshold
+// (its partials crowd the floor estimate), the input's own dip is now the
+// candidate, refined over the period's multiples and confirmed by the
+// detections before it: 47 to 67 Hz tones at 0 dB SNR in white noise read
+// 40.5% right before, 99.5% now (200 tones), none wrong.
+DSPARK_TEST(PitchDetector_noise_suppression_reads_low_notes_at_0_db)
+{
+    const NoisyToneScore s = scoreNoisyTones(0.0, true, 47.0, 67.0);
+    std::cout << "  [pitch noise] 47-67 Hz at 0 dB SNR: " << s.correct << "/40 correct, "
+              << s.voiced - s.correct << " wrong\n";
+    EXPECT_GT(s.correct, 35);
+    EXPECT_LT(s.voiced - s.correct, 2);
+    EXPECT_EQ(s.confidentWrong, 0);
+}
+
+// A reading through the noise must agree with the detections before it,
+// within a tolerance that grows with their age, so a 50-cent vibrato keeps
+// agreeing: continuous notes of 70 to 880 Hz with 50 cents of vibrato at
+// 5.5 Hz and 2 dB SNR read 83.4% of detections right before, 99.6% now.
+DSPARK_TEST(PitchDetector_noise_suppression_follows_vibrato)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 1.5);
+    int correct = 0, wrong = 0, total = 0;
+    for (const double f0 : { 110.0, 330.0, 880.0 })
+    {
+        NoiseSource rng { 41u };
+        std::vector<double> tone(static_cast<size_t>(n), 0.0), inst(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            inst[static_cast<size_t>(i)] = f0 * std::pow(2.0, 0.5 / 12.0 * std::sin(2.0 * pi<double> * 5.5 * i / fs));
+        for (int h = 1; h <= 40 && h * f0 < 20000.0; ++h)
+        {
+            const double amp = std::pow(10.0, -6.0 * std::log2(static_cast<double>(h)) / 20.0);
+            double phase = 2.0 * pi<double> * rng.uniform();
+            for (int i = 0; i < n; ++i)
+            {
+                phase += 2.0 * pi<double> * inst[static_cast<size_t>(i)] * h / fs;
+                tone[static_cast<size_t>(i)] += amp * std::sin(phase);
+            }
+        }
+        double power = 0.0;
+        for (const double v : tone) power += v * v;
+        const double sigma = std::sqrt(power / n / std::pow(10.0, 2.0 / 10.0));
+        std::vector<float> x(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            x[static_cast<size_t>(i)] = static_cast<float>(0.2 * (tone[static_cast<size_t>(i)] + sigma * rng.gauss()));
+        PitchDetector<float> pd;
+        pd.prepare(fs);
+        pd.setNoiseSuppression(true);
+        for (int at = 0; at + 512 <= n; at += 512)
+        {
+            pd.pushSamples(std::span<const float>(x.data() + at, 512));
+            const int end = at + 512;
+            if (end < 4096) continue;
+            ++total;
+            double mean = 0.0;
+            for (int i = end - 2048; i < end; ++i) mean += inst[static_cast<size_t>(i)];
+            mean /= 2048.0;
+            const double hz = static_cast<double>(pd.getFrequencyHz());
+            if (hz <= 0.0) continue;
+            if (std::abs(1200.0 * std::log2(hz / mean)) < 50.0) ++correct;
+            else ++wrong;
+        }
+    }
+    std::cout << "  [pitch noise] 50-cent vibrato at 2 dB SNR: " << correct << " of " << total
+              << " right, " << wrong << " wrong\n";
+    EXPECT_GT(correct, (total * 95) / 100);
+    EXPECT_EQ(wrong, 0);
+}
+
+namespace {
+
+/// A phase-continuous harmonic tone (10 partials, 1/k) of `hz` into `x`.
+void harmonicTone(std::vector<float>& x, int from, int to, double hz, double& phase, double fs)
+{
+    for (int i = from; i < to; ++i)
+    {
+        phase += 2.0 * pi<double> * hz / fs;
+        double s = 0.0;
+        for (int k = 1; k <= 10; ++k) s += std::sin(k * phase) / k;
+        x[static_cast<size_t>(i)] = static_cast<float>(0.25 * s);
+    }
+}
+
+} // namespace
+
+// Every reading whole octaves from the target used to be folded back to it,
+// so a melody's octave leap never came through: a 220 Hz note followed by
+// 440 Hz kept reading 220 Hz for as long as the second note lasted (21.9% of
+// voiced frames an octave off on legato melodies with an octave leap in one
+// step of eight). An octave leap now arrives like any large interval, once
+// two consecutive readings agree on it.
+DSPARK_TEST(PitchFollower_follows_an_octave_leap)
+{
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 1.2);
+    std::vector<float> x(static_cast<size_t>(n));
+    double phase = 0.0;
+    harmonicTone(x, 0, n / 2, 220.0, phase, fs);
+    harmonicTone(x, n / 2, n, 440.0, phase, fs);
+    for (const float glide : { 0.0f, 60.0f })
+    {
+        PitchFollower<float> pf;
+        pf.prepare(spec(fs, 512, 1));
+        pf.setGlide(glide);
+        int arrival = -1;
+        for (int at = 0; at + 512 <= n; at += 512)
+        {
+            pf.pushSamples(std::span<const float>(x.data() + at, 512));
+            if (at >= n / 2 && arrival < 0 && std::abs(1200.0 * std::log2(pf.getSmoothedHz() / 440.0)) < 50.0)
+                arrival = at + 512 - n / 2;
+        }
+        std::cout << "  [pitch follower] octave leap, glide " << glide << " ms: "
+                  << pf.getSmoothedHz() << " Hz at the end, arrived after " << arrival << " samples\n";
+        EXPECT_NEAR(pf.getSmoothedHz(), 440.0f, 4.0f);
+        EXPECT_TRUE(arrival > 0 && arrival < 6000);
+    }
+}
+
+// isVoiced() follows each detection, where isTracking() holds for 250 ms;
+// setNoiseSuppression() reaches the wrapped detector, so with a lower gate
+// the follower reads a tone through 0 dB of white noise.
+DSPARK_TEST(PitchFollower_reports_voicing_and_reads_through_noise)
+{
+    const double fs = 48000.0;
+    {
+        const int n = static_cast<int>(fs * 0.6);
+        std::vector<float> x(static_cast<size_t>(n), 0.0f);
+        double phase = 0.0;
+        harmonicTone(x, 0, static_cast<int>(fs * 0.5), 220.0, phase, fs);
+        PitchFollower<float> pf;
+        pf.prepare(spec(fs, 512, 1));
+        bool voicedInTone = false;
+        for (int at = 0; at + 512 <= n; at += 512)
+        {
+            pf.pushSamples(std::span<const float>(x.data() + at, 512));
+            if (at + 512 == 23552) voicedInTone = pf.isVoiced();
+        }
+        EXPECT_TRUE(voicedInTone);
+        EXPECT_FALSE(pf.isVoiced());   // 4600 samples of silence
+        EXPECT_TRUE(pf.isTracking());  // still within the 250 ms hold
+        pf.reset();
+        EXPECT_FALSE(pf.isVoiced());
+    }
+    {
+        const int n = static_cast<int>(fs * 1.5);
+        NoiseSource rng { 5u };
+        std::vector<float> tone(static_cast<size_t>(n));
+        double phase = 0.0;
+        harmonicTone(tone, 0, n, 220.0, phase, fs);
+        double power = 0.0;
+        for (const float v : tone) power += static_cast<double>(v) * v;
+        const double sigma = std::sqrt(power / n);   // 0 dB SNR
+        std::vector<float> x(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            x[static_cast<size_t>(i)] = static_cast<float>(0.5 * (tone[static_cast<size_t>(i)] + sigma * rng.gauss()));
+        PitchFollower<float> pf;
+        pf.prepare(spec(fs, 512, 1));
+        pf.setNoiseSuppression(true);
+        EXPECT_TRUE(pf.getNoiseSuppression());
+        pf.setConfidence(0.45f);
+        pf.setGlide(0.0f);
+        int good = 0, total = 0;
+        for (int at = 0; at + 512 <= n; at += 512)
+        {
+            pf.pushSamples(std::span<const float>(x.data() + at, 512));
+            if (at < 9600) continue;
+            ++total;
+            if (pf.isVoiced() && std::abs(1200.0 * std::log2(pf.getSmoothedHz() / 220.0)) < 50.0) ++good;
+        }
+        std::cout << "  [pitch follower] 220 Hz at 0 dB SNR with noise suppression: " << good << " of "
+                  << total << " detections voiced and right\n";
+        EXPECT_GT(good, (total * 9) / 10);
+    }
 }
 
 DSPARK_TEST(PitchFollower_tracks_glide_without_jumps)

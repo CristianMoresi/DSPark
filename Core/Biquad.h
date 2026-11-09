@@ -1106,10 +1106,13 @@ public:
      *
      * Channels beyond MaxChannels are left untouched (pass-through): only
      * the first min(numChannels, MaxChannels) channels are filtered. Pairs of
-     * channels run in lock step in one two-lane register where the target has
-     * one: the recursion is latency bound, so the second channel is almost
-     * free (stereo 4.04 -> 1.96 ns per frame measured, SSE2). The lanes do the
-     * scalar loop's operations in its order, so the output is the same.
+     * channels run in lock step in one two-lane register on 64-bit targets:
+     * the recursion is latency bound, so the second channel is almost free
+     * (stereo 4.04 -> 1.96 ns per frame measured, SSE2). The lanes do the
+     * scalar loop's operations in its order, so the output is the same. On
+     * 32-bit x86 the loop needs more vector registers than the eight it has,
+     * and a stereo block measured anywhere from 1.05x to 2.32x a mono block
+     * across CPUs, so channels run one at a time there.
      *
      * A non-finite filter state (a NaN or Inf sample reached the recursion)
      * is cleared at the end of the block, so the channel recovers on the next
@@ -1133,7 +1136,7 @@ public:
         const BiquadCoeffs c = activeCoeffs_;
 
         int ch = 0;
-        if constexpr (simd::kVecDoubleNarrow == 2)
+        if constexpr (kPairChannels)
             for (; ch + 1 < numChannels; ch += 2)
                 processPair<simd::kVecDoubleNarrow>(buffer.getChannel(ch), buffer.getChannel(ch + 1),
                                                     numSamples, c, state_[ch], state_[ch + 1]);
@@ -1257,6 +1260,10 @@ private:
     {
         if (!std::isfinite(z1 + z2)) { z1 = 0.0; z2 = 0.0; }
     }
+
+    /// Whether processBlock() runs channel pairs in one two-lane register: a
+    /// two-lane double vector exists and the target has 16 vector registers.
+    static constexpr bool kPairChannels = simd::kVecDoubleNarrow == 2 && sizeof(void*) == 8;
 
     /** @brief Two channels of the block loop in the lanes of one register. */
     template <int W>

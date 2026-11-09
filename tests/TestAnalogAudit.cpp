@@ -689,8 +689,8 @@ DSPARK_TEST(AnalogAudit_clipper_second_order_antialiasing)
 }
 
 // Saturation stopped at first-order antialiasing: SoftClip at 2x and +24 dB
-// aliased at -29.7 dBc (-15.2 off). SecondOrder reaches -42.1 dBc, adds one
-// sample that getLatency() reports and the dry path matches.
+// aliased at -29.7 dBc (-15.2 off). SecondOrder reaches -42.1 dBc and adds
+// two base samples at 2x that getLatency() reports and the dry path matches.
 DSPARK_TEST(AnalogAudit_saturation_second_order_antialiasing)
 {
     using Sat = Saturation<double>;
@@ -711,7 +711,7 @@ DSPARK_TEST(AnalogAudit_saturation_second_order_antialiasing)
     EXPECT_LT(second, -40.0);
     EXPECT_LT(second, first - 8.0);
     EXPECT_EQ(make(Sat::Antialiasing::SecondOrder, 0.0, 1.0)()->getLatency(),
-              make(Sat::Antialiasing::Off, 0.0, 1.0)()->getLatency() + 1);
+              make(Sat::Antialiasing::Off, 0.0, 1.0)()->getLatency() + 2);
     EXPECT_NEAR(toneGain(make(Sat::Antialiasing::SecondOrder, 0.0, 0.5), 15000.0),
                 0.5 * (1.0 + toneGain(make(Sat::Antialiasing::SecondOrder, 0.0, 1.0), 15000.0)), 1e-3);
 }
@@ -722,7 +722,7 @@ DSPARK_TEST(AnalogAudit_saturation_second_order_antialiasing)
 // they aliased at -9.8, -7.7 and -6.8 dBc (worst over 1-19.25 kHz tones at
 // -6/-18 dBFS). The Exciter kernel is exact per piece, the Tape kernel uses
 // tabulated antiderivatives, and MultiStage antialiases every stage within
-// the common second-order delay; the latency stays one base sample.
+// the common second-order delay (two base samples at 2x, one otherwise).
 DSPARK_TEST(AnalogAudit_saturation_exciter_tape_multistage_second_order)
 {
     using Sat = Saturation<double>;
@@ -744,12 +744,13 @@ DSPARK_TEST(AnalogAudit_saturation_exciter_tape_multistage_second_order)
     EXPECT_LT(worstToneSpurDbc(make(Sat::Algorithm::MultiStage, 4, Sat::Antialiasing::SecondOrder)), -45.0);
     for (int factor : { 1, 2, 4, 8 })
         EXPECT_EQ(make(Sat::Algorithm::MultiStage, factor, Sat::Antialiasing::SecondOrder)()->getLatency(),
-                  make(Sat::Algorithm::MultiStage, factor, Sat::Antialiasing::Off)()->getLatency() + 1);
+                  make(Sat::Algorithm::MultiStage, factor, Sat::Antialiasing::Off)()->getLatency()
+                      + (factor == 2 ? 2 : 1));
 
     // The common delay keeps every algorithm aligned: at a low level, where
     // the kernels are transparent at 200 Hz, the SecondOrder output is the
-    // Off output one base sample later (a slip of one processing sample
-    // would leave a -37 dB residual at 2x).
+    // Off output two base samples later at 2x and one at the other factors
+    // (a slip of one processing sample would leave a -37 dB residual at 2x).
     const auto quiet = [](Sat::Algorithm algo, int factor, Sat::Antialiasing order) {
         auto s = std::make_unique<Sat>();
         s->setAlgorithm(algo);
@@ -765,14 +766,102 @@ DSPARK_TEST(AnalogAudit_saturation_exciter_tape_multistage_second_order)
         {
             const auto off = quiet(algo, factor, Sat::Antialiasing::Off);
             const auto second = quiet(algo, factor, Sat::Antialiasing::SecondOrder);
+            const size_t shift = factor == 2 ? 2 : 1;
             double err = 0.0, ref = 0.0;
             for (size_t i = 12000; i < off.size(); ++i)
             {
-                err += (second[i] - off[i - 1]) * (second[i] - off[i - 1]);
+                err += (second[i] - off[i - shift]) * (second[i] - off[i - shift]);
                 ref += off[i] * off[i];
             }
             EXPECT_LT(10.0 * std::log10(err / ref), -55.0);
         }
+}
+
+// Within one base sample of second-order delay, MultiStage at 2x had to keep
+// its transformer stage at first order and aliased at -28.0 dBc at +24 dB
+// (worst over 1-19.25 kHz tones at -6/-18 dBFS). With two base samples the
+// transformer kernel and a 1.5-sample interpolator fit from +16 dB of drive
+// (-36.2 dBc at +24 dB), while the two-sample cascade stays in use below
+// +14 dB. Every algorithm takes the same delay, so getLatency() reports two
+// samples at once, and the dry, Delta, unprocessed M/S and crossfade paths
+// stay aligned.
+DSPARK_TEST(AnalogAudit_saturation_multistage_second_order_two_samples)
+{
+    using Sat = Saturation<double>;
+    const auto make = [](double drive) {
+        return [drive] {
+            auto s = std::make_unique<Sat>();
+            s->setAlgorithm(Sat::Algorithm::MultiStage);
+            s->setDrive(drive);
+            s->setDcBlocking(false);
+            s->setAntialiasing(Sat::Antialiasing::SecondOrder);
+            s->prepare(spec(48000.0, 512, 1));
+            return s;
+        };
+    };
+    EXPECT_LT(worstToneSpurDbc(make(24.0)), -33.0);
+    EXPECT_LT(worstToneSpurDbc(make(36.0)), -32.0);
+    EXPECT_LT(worstToneSpurDbc(make(12.0)), -35.0);
+
+    // Every algorithm reports the new latency as soon as the order is set.
+    for (int a = 0; a <= static_cast<int>(Sat::Algorithm::MultiStage); ++a)
+    {
+        Sat s;
+        s.setAlgorithm(static_cast<Sat::Algorithm>(a));
+        s.prepare(spec(48000.0, 512, 1));
+        const int off = s.getLatency();
+        s.setAntialiasing(Sat::Antialiasing::SecondOrder);
+        EXPECT_EQ(s.getLatency(), off + 2);
+        EXPECT_EQ(s.getLatencySamples(), off + 2);
+    }
+
+    // Dry, Delta, unprocessed M/S and crossfade paths: at a low level the
+    // kernels are transparent at 200 Hz, so each mode's SecondOrder output
+    // is its Off output two base samples later (a slip of one processing
+    // sample would leave about -37 dB, of half a sample about -43 dB).
+    enum class Case { Switch, MidOnly, Delta, HalfMix };
+    const auto run = [](Case c, Sat::Antialiasing order) {
+        Sat s;
+        s.setAlgorithm(c == Case::Switch ? Sat::Algorithm::SoftClip : Sat::Algorithm::MultiStage);
+        s.setDcBlocking(false);
+        if (c == Case::MidOnly) s.setProcessingMode(Sat::ProcessingMode::MidOnly);
+        if (c == Case::Delta) s.setOutputMode(Sat::OutputMode::Delta);
+        if (c == Case::HalfMix) s.setMix(0.5);
+        s.setAntialiasing(order);
+        s.prepare(spec(48000.0, 512, 2));
+        std::vector<double> l(512), r(512), out;
+        long long t = 0;
+        for (int b = 0; b < 60; ++b)
+        {
+            if (c == Case::Switch && b == 20) s.setAlgorithm(Sat::Algorithm::MultiStage);
+            for (int i = 0; i < 512; ++i, ++t)
+            {
+                const double ph = kTwoPi * 200.0 * static_cast<double>(t) / 48000.0;
+                l[static_cast<size_t>(i)] = 0.01 * std::sin(ph);
+                r[static_cast<size_t>(i)] = 0.004 * std::sin(ph + 1.3);
+            }
+            double* ch[2] = { l.data(), r.data() };
+            s.processBlock(AudioBufferView<double>(ch, 2, 512));
+            for (int i = 0; i < 512; ++i)
+            {
+                out.push_back(l[static_cast<size_t>(i)]);
+                out.push_back(r[static_cast<size_t>(i)]);
+            }
+        }
+        return out;
+    };
+    for (auto c : { Case::Switch, Case::MidOnly, Case::Delta, Case::HalfMix })
+    {
+        const auto off = run(c, Sat::Antialiasing::Off);
+        const auto second = run(c, Sat::Antialiasing::SecondOrder);
+        double err = 0.0, ref = 0.0;
+        for (size_t i = 2 * 4000; i < off.size(); ++i)
+        {
+            err += (second[i] - off[i - 4]) * (second[i] - off[i - 4]);
+            ref += off[i] * off[i];
+        }
+        EXPECT_LT(10.0 * std::log10(err / ref), -55.0);
+    }
 }
 
 // The Exciter kernel is the exact average of its clamped cubic over the
@@ -955,12 +1044,24 @@ DSPARK_TEST(AnalogAudit_wdf_low_drive_series_roots_are_exact)
 // RC circuit). The output must stay the root to rounding: 50-digit roots of
 // s + 2c sinh(s) = x (pair) and s + c (e^s - 1) = x (single), nVt = 1 and
 // R = 1 so that c = Is and x is the source, across every table region (below
-// and above omega = 0.57, and the octave cells beyond ln c + x = 32).
+// and above omega = 0.57, and the octave cells beyond ln c + x = 32). For
+// 1e-4 < c <= 0.02 the pair's table now starts where c^2 / (omega (1 + omega))
+// reaches 3.5e-3 instead of 3e-5 (behind 94 k ohm, 0.5 V peak: 28.6 -> 22.6 ns),
+// so the points at c = 0.00525, 0.01 and 0.0195 below 5 nVt come from it.
 DSPARK_TEST(AnalogAudit_wdf_table_roots_are_exact)
 {
     using namespace dspark::wdf;
     struct Point { int pair; double c, x, s; };
     static constexpr Point kPoints[] = {
+        { 1, 0.00525, 0.7, 0.69213823836038093 },
+        { 1, 0.00525, 1.5, 1.4781763352734014 },
+        { 1, 0.00525, 3.0, 2.9044479806151392 },
+        { 1, 0.00525, 5.0, 4.5185965423662986 },
+        { 1, 0.00525, 10.0, 6.5017828948455905 },
+        { 1, 0.01, 1.2, 1.1708535808709835 },
+        { 1, 0.01, 2.5, 2.391604626842606 },
+        { 1, 0.0195, 1.6, 1.5155238207326209 },
+        { 1, 0.0195, 4.0, 3.4102967120194546 },
         { 1, 3.93e-05, 1.5, 1.4998326695717819 },
         { 1, 3.93e-05, 3.0, 2.9992132173824881 },
         { 1, 3.93e-05, 7.25, 7.1974922424195151 },
@@ -1220,4 +1321,51 @@ DSPARK_TEST(AnalogAudit_tube_conduction_reference_is_continuous)
     };
     EXPECT_LT(worst(2, 19250.0), -71.0);
     EXPECT_LT(worst(1, 20000.0), -71.0);
+}
+
+// The coupling capacitor's charge by grid current was a linear ramp across
+// each interval (aimed at a predicted end), and one cubic spanned the six
+// decades of plate current between cutoff and 3 V below the cathode, where
+// the colder-biased stage starts its pulses. At 2x and +24 dB a high tone's
+// harmonics came back folded at -74.1 dBc (one stage, 19.25 kHz) and
+// -73.1 dBc (two stages, 16 kHz), against -80.6 and -83.0 for Clamp over
+// the documented sweep. The charge is now integrated over each piece from
+// its grid currents, the stage-1 leak is exact in the source polynomial and
+// stage 1 is split once more in that region: -90.8 and -90.1 dBc.
+DSPARK_TEST(AnalogAudit_tube_conduction_charge_is_integrated)
+{
+    const double fs = 48000.0;
+    const int n = 16384;
+    const auto worst = [&](int stages, double drive, double hz) {
+        int b = static_cast<int>(std::lround(hz / fs * n));
+        if ((b & 1) == 0) ++b;
+        TubePreamp<double> amp;
+        amp.setGridModel(TubePreamp<double>::GridModel::Conduction);
+        amp.setStages(stages);
+        amp.setDrive(drive);
+        amp.prepare(spec(fs, 512, 1));
+        const size_t settle = 48000 + static_cast<size_t>(amp.getLatency());
+        const size_t total = (settle + static_cast<size_t>(n) + 511) / 512 * 512;
+        std::vector<double> y(total);
+        for (size_t i = 0; i < total; ++i)
+            y[i] = 0.5 * std::sin(kTwoPi * (b * fs / n) * static_cast<double>(i) / fs);
+        for (size_t pos = 0; pos < total; pos += 512)
+        {
+            double* ch[] = { y.data() + pos };
+            amp.processBlock({ ch, 1, 512 });
+        }
+        std::vector<double> frame(y.begin() + static_cast<std::ptrdiff_t>(settle),
+                                  y.begin() + static_cast<std::ptrdiff_t>(settle) + n);
+        FFTReal<double> fft(static_cast<size_t>(n));
+        std::vector<double> spectrum(static_cast<size_t>(n) + 2);
+        fft.forward(frame.data(), spectrum.data());
+        const auto mag = [&](size_t k) { return std::hypot(spectrum[2 * k], spectrum[2 * k + 1]); };
+        double w = 0.0;
+        for (size_t k = static_cast<size_t>(std::ceil(20.0 / fs * n)); k <= static_cast<size_t>(20000.0 / fs * n); ++k)
+            if (k % static_cast<size_t>(b) != 0) w = std::max(w, mag(k));
+        return toDb(w / mag(static_cast<size_t>(b)));
+    };
+    EXPECT_LT(worst(1, 24.0, 19250.0), -86.0);
+    EXPECT_LT(worst(2, 24.0, 16000.0), -86.0);
+    EXPECT_LT(worst(2, 36.0, 15250.0), -81.0);
 }

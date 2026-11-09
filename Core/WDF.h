@@ -68,7 +68,7 @@
  * reactive states; the next finite input continues from rest.
  *
  * Memory: the omega tables (detail::WrightOmega, 22 KB, and
- * detail::DiodeOmegaTable, 83 KB) are built once per process when the first
+ * detail::DiodeOmegaTable, 99 KB) are built once per process when the first
  * diode root is constructed; nothing is allocated afterwards.
  *
  * Dependencies: DspMath.h.
@@ -612,9 +612,10 @@ private:
  *   -omega (the root is A plus the expansion), above it ln(omega) = z - omega
  *   (the root is the expansion minus ln c, free of the cancellation between
  *   A and a large omega). Every
- *   node also expands R = 1 / (omega (1 + omega)) to degree 7 and
- *   1 / (1 + omega)^2 to degree 1, which give the antiparallel pair's
- *   reverse-diode correction (see DiodePairRoot).
+ *   node also expands R = 1 / (omega (1 + omega)) to degree 9 and
+ *   H = 1 / (1 + omega)^2 to degree 6, which give the antiparallel pair's
+ *   reverse-diode correction (see DiodePairRoot; the lower degrees serve the
+ *   small corrections, the full ones the larger corrections of c > 1e-4).
  * - z in [32, 2^20): ln(omega) to degree 9 and R to degree 7 about the
  *   midpoint of each of 16 cells per octave, indexed by the exponent and
  *   leading mantissa bits of z.
@@ -622,7 +623,7 @@ private:
  * 6e-17 of the root, and below 1e-16 for the pair's correction terms up to
  * c = 0.02. The coefficients follow from the Taylor recurrences of
  * P = 1 / (1 + omega) and R at each node, computed once per process on first
- * use (instance(), 83 KB); thread-safe and allocation free afterwards.
+ * use (instance(), 99 KB); thread-safe and allocation free afterwards.
  */
 class DiodeOmegaTable
 {
@@ -633,7 +634,7 @@ public:
     static constexpr double kOctaveMax = 1048576.0;
     static constexpr int kCells = 16 * 15;                        ///< 32 .. 2^20.
 
-    struct Node { double p[10]; double r[8]; double h[2]; };      ///< Scaled to t in [-0.5, 0.5].
+    struct Node { double p[10]; double r[10]; double h[7]; };     ///< Scaled to t in [-0.5, 0.5].
     struct Cell { double mid; double p[10]; double r[8]; };
 
     [[nodiscard]] static const DiodeOmegaTable& instance() noexcept
@@ -712,13 +713,14 @@ private:
 
     /**
      * Taylor coefficients about z (unscaled, degree kOrder) of omega (w),
-     * ln omega (l) and R = 1 / (omega (1 + omega)) (r). They follow from
+     * ln omega (l), R = 1 / (omega (1 + omega)) (r) and, when @p h is set,
+     * 1 / (1 + omega)^2 (degree kOrder - 1). They follow from
      * P = 1 / (1 + omega), which obeys P' = -P^2 (1 - P), and R' = -R P (2 - P):
      * every product is of terms of one sign, so the coefficients keep their
      * relative accuracy where omega is large (the recurrence of omega itself,
      * omega' (1 + omega) = omega, cancels there).
      */
-    static void series(double z, double* w, double* l, double* r) noexcept
+    static void series(double z, double* w, double* l, double* r, double* h = nullptr) noexcept
     {
         const double y = solve(z);
         double p[kOrder + 1], q[kOrder + 1], pp[kOrder + 1], rp[kOrder + 1];
@@ -741,6 +743,8 @@ private:
             for (int j = 0; j <= n; ++j) s += rp[j] * q[n - j];
             r[n + 1] = -s / (n + 1);
         }
+        if (h)
+            for (int n = 0; n < kOrder; ++n) h[n] = pp[n];
         w[0] = y;
         l[0] = std::log(y);
         for (int n = 0; n < kOrder; ++n)
@@ -752,19 +756,21 @@ private:
 
     DiodeOmegaTable() noexcept
     {
-        double w[kOrder + 1], l[kOrder + 1], r[kOrder + 1];
+        double w[kOrder + 1], l[kOrder + 1], r[kOrder + 1], hh[kOrder + 1];
         for (int i = 0; i < kNodes; ++i)
         {
-            series(kLo + 0.25 * i, w, l, r);
+            series(kLo + 0.25 * i, w, l, r, hh);
             Node& n = nodes_[static_cast<size_t>(i)];
             double scale = 1.0;
             for (int k = 0; k < 10; ++k, scale *= 0.25)
                 n.p[k] = (i < kFirstLogNode ? -w[k] : l[k]) * scale;
             scale = 1.0;
-            for (int k = 0; k < 8; ++k, scale *= 0.25) n.r[k] = r[k] * scale;
+            for (int k = 0; k < 10; ++k, scale *= 0.25) n.r[k] = r[k] * scale;
             const double u = 1.0 / (1.0 + w[0]);
             n.h[0] = u * u;
             n.h[1] = -2.0 * w[0] * u * u * u * u * 0.25;
+            scale = 0.0625;
+            for (int k = 2; k < 7; ++k, scale *= 0.25) n.h[k] = hh[k] * scale;
         }
         for (int c = 0; c < kCells; ++c)
         {
@@ -947,17 +953,19 @@ private:
  * s1 = x - omega(ln c + x) to double precision, plus the reverse diode's
  * correction from the same table point, with no exponential and no division
  * per sample; for c > 1e-4 this starts where the correction is small enough
- * (c^2 / (omega (1 + omega)) <= 3e-5), and the estimate with its correction
- * step covers the drives between. Against
+ * (c^2 / (omega (1 + omega)) <= 3.5e-3, which reaches down to the series
+ * limit up to c of about 6e-3, 94 k ohm with the default constants), and
+ * the estimate with its correction step covers the drives between. Against
  * 50-digit roots for c from 1e-15 to 0.02 and drives up to 1e6 nVt the
  * table root is within one unit in the last place. Cost for an RC clipper
  * on the development machine (MSVC x64), default constants: 13.4-13.7 ns
  * per sample at low drive (0.01-0.05 V peak) and 19-20 ns above (0.5-8 V
- * peak) behind 707 ohm, 23-25 ns behind 5-9 k ohm, and behind 94 k ohm 25 ns
- * at 8 V but 29 ns at 0.5 V peak, where most of the waveform lies below the
- * table's start; against 26-32 ns with the estimate and its correction step
- * everywhere, and 20-27 ns for the single-omega approximation that ignores
- * the reverse diode (-46 to -82 dB error).
+ * peak) behind 707 ohm, and behind 94 k ohm 22.6 ns at 0.5 V, 24.0 ns at
+ * 2 V and 24.5 ns at 8 V peak (with the reverse-diode correction of
+ * degree three and the estimate below its range: 28.6, 27.2 and 24.9 ns);
+ * against 20-27 ns for the single-omega approximation that ignores the
+ * reverse diode (-46 to -82 dB error; 21.7, 23.1 and 26.4 ns behind
+ * 94 k ohm).
  */
 template <FloatType T, typename Tree>
 class DiodePairRoot
@@ -1048,12 +1056,21 @@ private:
         seriesLimit_ = cPlus_ * detail::DiodeSeries::pair(2.0 * c_ * bound_, series_);
         // The table root holds where q = c^2 / (omega (1 + omega)) <= kTableQ:
         // above the series limit for c <= 1e-4; from omega(1 + omega) =
-        // c^2 / kTableQ up to c = 0.02.
+        // c^2 / kWideTableQ up to c = 0.02, with the correction series of
+        // solveTableWide() scaled by powers of c^2.
         tableFrom_ = seriesLimit_;
         if (mode_ == Mode::Halley)
         {
-            const double w = 0.5 * (std::sqrt(1.0 + 4.0 * c2_ / kTableQ) - 1.0);
+            const double w = 0.5 * (std::sqrt(1.0 + 4.0 * c2_ / kWideTableQ) - 1.0);
             tableFrom_ = std::max(seriesLimit_, w + std::log(w) - logC_);
+            int o = 0;
+            for (int j = 0; j < 5; ++j)
+            {
+                double scale = 1.0;
+                for (int m = 0; m <= j; ++m) scale *= c2_;
+                for (int m = 0; m < 7 - j; ++m, scale *= c2_)
+                    wide_[o++] = kWideCoefficients[j][m] * scale;
+            }
         }
         else if (mode_ == Mode::Iterate)
             tableFrom_ = std::numeric_limits<double>::infinity();
@@ -1134,10 +1151,16 @@ private:
     }
 
     /**
-     * Table root for 1e-4 < c <= 0.02, where q is bounded by kTableQ instead of
-     * by the series limit: the full second and third order of d in q, with
-     * w = omega / (1 + omega) = 1 - omega R:
-     * d = q - q^2 (1 + w/2) + q^3 (3/2 + 4w/3 + w^2/2) + O(8.75 q^4).
+     * Table root for 1e-4 < c <= 0.02, where q = c^2 R is bounded by
+     * kWideTableQ instead of by the series limit. With r = c^2 H = q w
+     * (w = omega / (1 + omega)), d = sum a_nj r^j q^(n-j) over n <= 7 and
+     * j <= 4, the reversion of d + w (e^d - 1 - d) = q e^-d; where q is
+     * large w is small (q w <= c^2), and the omitted terms stay below 9e-18 of
+     * the root for c up to 0.02 from the table start (checked against
+     * 40-digit solutions). Evaluated as R (B0(R) + H (B1(R) + ...)) with the
+     * powers of c^2 in the instance's coefficients, so the correction does
+     * not wait for omega. Above z = 32 (q < c^2 / 818) the series stops at
+     * q^2.
      */
     [[nodiscard]] double solveTableWide(double x, double z4) const noexcept
     {
@@ -1149,12 +1172,19 @@ private:
             int index = 0;
             const auto& n = exact_->node(z4, t, index);
             const double rest = Table::poly9Rest(n.p, t);
-            const double R = Table::poly7(n.r, t);
+            const double R = n.r[0] + Table::poly9Rest(n.r, t);
+            const double t2 = t * t, t4 = t2 * t2;
+            const double H = ((n.h[0] + n.h[1] * t) + t2 * (n.h[2] + n.h[3] * t))
+                           + t4 * ((n.h[4] + n.h[5] * t) + t2 * n.h[6]);
+            const double* a = wide_;
+            const double R2 = R * R, R4 = R2 * R2, H2 = H * H;
+            const double B0 = ((a[0] + a[1] * R) + R2 * (a[2] + a[3] * R)) + R4 * ((a[4] + a[5] * R) + R2 * a[6]);
+            const double B1 = ((a[7] + a[8] * R) + R2 * (a[9] + a[10] * R)) + R4 * (a[11] + a[12] * R);
+            const double B2 = ((a[13] + a[14] * R) + R2 * (a[15] + a[16] * R)) + R4 * a[17];
+            const double B3 = (a[18] + a[19] * R) + R2 * (a[20] + a[21] * R);
+            const double B4 = (a[22] + a[23] * R) + R2 * a[24];
+            const double d = R * ((B0 + H * B1) + H2 * ((B2 + H * B3) + H2 * B4));
             const bool logForm = index >= Table::kFirstLogNode;
-            const double omega = logForm ? 0.25 * z4 - (n.p[0] + rest) : -(n.p[0] + rest);
-            const double w = 1.0 - omega * R;
-            const double q = c2_ * R, q2 = q * q;
-            const double d = (q - q2 * (1.0 + 0.5 * w)) + (q2 * q) * (1.5 + w * (4.0 / 3.0 + 0.5 * w));
             const double base = logForm ? -logC_ : x;
             const double s0 = base + n.p[0];
             const double e0 = n.p[0] - (s0 - base);
@@ -1216,6 +1246,15 @@ private:
     double logC4_ = 0.0;                ///< 4 logC_ (table index).
     double tableFrom_ = 0.0;            ///< Table root from this x on (see updateConstants()).
     static constexpr double kTableQ = 3e-5;   ///< 8.75 kTableQ^4 < 1e-17.
+    static constexpr double kWideTableQ = 3.5e-3;   ///< Table start of solveTableWide().
+    /// a_nj of the correction series, by power j of r and then of q.
+    static constexpr double kWideCoefficients[5][7] = {
+        {1.0, -1.0, 1.5, -8.0 / 3.0, 125.0 / 24.0, -54.0 / 5.0, 16807.0 / 720.0},
+        {-0.5, 4.0 / 3.0, -27.0 / 8.0, 128.0 / 15.0, -3125.0 / 144.0, 1944.0 / 35.0, 0.0},
+        {0.5, -25.0 / 12.0, 85.0 / 12.0, -8057.0 / 360.0, 5451.0 / 80.0, 0.0, 0.0},
+        {-0.625, 3.5, -1057.0 / 72.0, 4927.0 / 90.0, 0.0, 0.0, 0.0},
+        {0.875, -6.125, 485.0 / 16.0, 0.0, 0.0, 0.0, 0.0}};
+    double wide_[25] {};   ///< kWideCoefficients times powers of c^2 (Halley mode).
     enum class Mode { Newton, Halley, Iterate };
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0, bound_ = 1.0, cPlus_ = 3.0;
     double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.

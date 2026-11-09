@@ -11,8 +11,9 @@
  * algorithms ranging from soft clipping to complex magnetic tape and
  * transformer modeling. It oversamples 2x by default, so its latency is the
  * oversampler's group delay (see getLatency()); at 1x it is zero. Second-order
- * antialiasing (setAntialiasing(Antialiasing::SecondOrder), opt-in) adds one
- * sample, which the dry path matches.
+ * antialiasing (setAntialiasing(Antialiasing::SecondOrder), opt-in) adds two
+ * samples at the default 2x and one at the other factors, which the dry path
+ * matches.
  *
  * @details
  * **Architecture & Performance:**
@@ -108,7 +109,8 @@ public:
     /**
      * @brief Latches the order for the coming block (audio thread, before
      * update()) and the common second-order delay in processing samples
-     * (1 to kMaxDelay; Saturation passes min(factor, 3)). Entering order 2
+     * (1 to kMaxDelay; Saturation passes 1 at 1x, 4 at 2x and 3 from 4x).
+     * Entering order 2
      * arms every channel: its first sample seeds the kernel history and the
      * delay line with the current input, so the delay is inserted as held
      * samples instead of a step from stale history. The off and first-order
@@ -117,7 +119,7 @@ public:
     void latchOrder(int commonDelay = 1) noexcept
     {
         const int o = antialias_.load(std::memory_order_relaxed);
-        if (o == 2 && order_ != 2) { armMask_ = ~0u; delayArm_ = ~0u; }
+        if (o == 2 && order_ != 2) { armMask_ = ~0u; delayArm_ = ~0u; halfArm_ = ~0u; }
         order_ = o;
         delay_ = std::clamp(commonDelay, 1, kMaxDelay);
     }
@@ -134,7 +136,7 @@ public:
     /** The common delay less the one sample of a second-order kernel. */
     T padKernel(T y, int ch) noexcept { return delay_ > 1 ? delayBy(y, ch, delay_ - 1) : y; }
 
-    static constexpr int kMaxDelay = 3;
+    static constexpr int kMaxDelay = 4;
 
 protected:
     std::atomic<int> antialias_ { 0 };
@@ -142,6 +144,7 @@ protected:
     int delay_ = 1;            ///< Latched common second-order delay.
     unsigned armMask_ = ~0u;   ///< Channels whose order-2 history must be seeded.
     unsigned delayArm_ = ~0u;  ///< Channels whose delay line must be seeded.
+    unsigned halfArm_ = ~0u;   ///< Channels whose interpolator must be seeded.
 
     /** True once per channel after entering order 2 (or a reset). */
     bool takeArm(int c) noexcept
@@ -169,13 +172,41 @@ protected:
         return out;
     }
 
+    /**
+     * Delays y by 1.5 samples on channel ch with a linear-phase 4-tap
+     * interpolator (its own history, seeded like the delay line).
+     * Coefficients -a, 0.5 + a, 0.5 + a, -a with a = 0.0824, the minimax
+     * choice for a flat response to 20 kHz at 96 kHz: within +0.10/-0.11 dB
+     * there, -0.54 dB at 24 kHz, a zero at half the rate.
+     */
+    T delayHalfSample(T y, int ch) noexcept
+    {
+        constexpr T kOuter = T(-0.0824), kInner = T(0.5824);
+        const auto c = static_cast<size_t>(ch & (kAaCh - 1));
+        auto& line = halfHold_[c];
+        const unsigned bit = 1u << c;
+        if (halfArm_ & bit) [[unlikely]]
+        {
+            halfArm_ &= ~bit;
+            line.fill(y);
+        }
+        const T out = kOuter * (y + line[2]) + kInner * (line[0] + line[1]);
+        line[2] = line[1];
+        line[1] = line[0];
+        line[0] = y;
+        return out;
+    }
+
     void resetAlign() noexcept
     {
         for (auto& line : alignHold_) line.fill(T(0));
+        for (auto& line : halfHold_) line.fill(T(0));
         armMask_ = ~0u;
         delayArm_ = ~0u;
+        halfArm_ = ~0u;
     }
     std::array<std::array<T, kMaxDelay>, kAaCh> alignHold_ {};
+    std::array<std::array<T, 3>, kAaCh> halfHold_ {};
 };
 
 // -- SoftClip (tanh) ---------------------------------------------------------
@@ -1154,6 +1185,7 @@ class TransformerAlgorithm final : public SaturationAlgorithm<T>
     std::array<detail::Adaa2, kMaxCh> adaaLow_ {}, adaaHigh_ {};
     std::array<double, kMaxCh> prevRestLow_ {}, prevRestHigh_ {};
     std::array<double, kMaxCh> firstLow_ {}, firstHigh_ {};   ///< First-order history (MultiStage).
+    std::array<double, kMaxCh> firstLowF_ {}, firstHighF_ {}; ///< logCosh() of that history.
     int numChannels_ = 0;
     double lastSampleRate_ = 0.0;
 
@@ -1173,6 +1205,8 @@ public:
         prevRestHigh_.fill(0.0);
         firstLow_.fill(0.0);
         firstHigh_.fill(0.0);
+        firstLowF_.fill(0.0);
+        firstHighF_.fill(0.0);
         this->resetAlign();
     }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Transformer; }
@@ -1214,18 +1248,74 @@ public:
         const double uLo = static_cast<double>((low + bias) * kLo);
         const double uHi = static_cast<double>((high + bias) * kHi);
         if (this->takeArm(static_cast<int>(c))) [[unlikely]]
+            armSecond(c, uLo, uHi, bias, kLo, kHi);
+        return static_cast<T>(secondBands(c, uLo, uHi, bias, kLo, kHi));
+    }
+
+    /** Both forms from one band split, for the MultiStage blend at 2x:
+     *  @p first as processFirst() (half a sample of delay) and @p second as
+     *  processSecond() (one sample), each with its own history. */
+    inline void processBoth(T sample, T drive, T character, int ch, T& first, T& second) noexcept
+    {
+        const T low  = lpFilters_[ch].processSample(sample, 0);
+        const T high = sample - low;
+        const T bias = character * T(0.2);
+        const T kLo  = drive * T(1.4);
+        const T kHi  = drive * T(0.85);
+        const auto c = static_cast<size_t>(ch & (kMaxCh - 1));
+        const double uLo = static_cast<double>((low + bias) * kLo);
+        const double uHi = static_cast<double>((high + bias) * kHi);
+        if (this->takeArm(static_cast<int>(c))) [[unlikely]]
         {
-            adaaLow_[c].reset(uLo);
-            adaaHigh_[c].reset(uHi);
-            prevRestLow_[c] = static_cast<double>(bias * kLo);
-            prevRestHigh_[c] = static_cast<double>(bias * kHi);
+            armSecond(c, uLo, uHi, bias, kLo, kHi);
+            armFirst(c, uLo, uHi);
         }
+        first = static_cast<T>(firstBands(c, uLo, uHi, bias, kLo, kHi));
+        second = static_cast<T>(secondBands(c, uLo, uHi, bias, kLo, kHi));
+    }
+
+private:
+    void armSecond(size_t c, double uLo, double uHi, T bias, T kLo, T kHi) noexcept
+    {
+        adaaLow_[c].reset(uLo);
+        adaaHigh_[c].reset(uHi);
+        prevRestLow_[c] = static_cast<double>(bias * kLo);
+        prevRestHigh_[c] = static_cast<double>(bias * kHi);
+    }
+    void armFirst(size_t c, double uLo, double uHi) noexcept
+    {
+        firstLow_[c] = uLo;
+        firstHigh_[c] = uHi;
+        firstLowF_[c] = logCosh(uLo);
+        firstHighF_[c] = logCosh(uHi);
+    }
+    double secondBands(size_t c, double uLo, double uHi, T bias, T kLo, T kHi) noexcept
+    {
         const double yLo = adaaLow_[c].template process<detail::AdaaTanh>(uLo) - std::tanh(prevRestLow_[c]);
         const double yHi = adaaHigh_[c].template process<detail::AdaaTanh>(uHi) - std::tanh(prevRestHigh_[c]);
         prevRestLow_[c] = static_cast<double>(bias * kLo);
         prevRestHigh_[c] = static_cast<double>(bias * kHi);
-        return static_cast<T>(yLo / 1.4 + yHi / 0.85);
+        return yLo / 1.4 + yHi / 0.85;
     }
+    /** First-order means of each band's tanh; the antiderivative at the
+     *  previous input is kept, so each band costs one logCosh(). */
+    double firstBands(size_t c, double uLo, double uHi, T bias, T kLo, T kHi) noexcept
+    {
+        const auto mean = [](double u, double u0, double f, double f0) noexcept {
+            const double d = u - u0;
+            return std::abs(d) > 1e-7 ? (f - f0) / d : std::tanh(0.5 * (u + u0));
+        };
+        const double fLo = logCosh(uLo), fHi = logCosh(uHi);
+        const double yLo = mean(uLo, firstLow_[c], fLo, firstLowF_[c]) - std::tanh(static_cast<double>(bias * kLo));
+        const double yHi = mean(uHi, firstHigh_[c], fHi, firstHighF_[c]) - std::tanh(static_cast<double>(bias * kHi));
+        firstLow_[c] = uLo;
+        firstHigh_[c] = uHi;
+        firstLowF_[c] = fLo;
+        firstHighF_[c] = fHi;
+        return yLo / 1.4 + yHi / 0.85;
+    }
+
+public:
 
     /** First-order sample (first-order antiderivative of each band's tanh,
      *  half a sample of delay), for the MultiStage cascade at 2x: with the
@@ -1242,19 +1332,8 @@ public:
         const double uLo = static_cast<double>((low + bias) * kLo);
         const double uHi = static_cast<double>((high + bias) * kHi);
         if (this->takeArm(static_cast<int>(c))) [[unlikely]]
-        {
-            firstLow_[c] = uLo;
-            firstHigh_[c] = uHi;
-        }
-        const auto mean = [](double u, double u0) noexcept {
-            const double d = u - u0;
-            return std::abs(d) > 1e-7 ? (logCosh(u) - logCosh(u0)) / d : std::tanh(0.5 * (u + u0));
-        };
-        const double yLo = mean(uLo, firstLow_[c]) - std::tanh(static_cast<double>(bias * kLo));
-        const double yHi = mean(uHi, firstHigh_[c]) - std::tanh(static_cast<double>(bias * kHi));
-        firstLow_[c] = uLo;
-        firstHigh_[c] = uHi;
-        return static_cast<T>(yLo / 1.4 + yHi / 0.85);
+            armFirst(c, uLo, uHi);
+        return static_cast<T>(firstBands(c, uLo, uHi, bias, kLo, kHi));
     }
 
     inline T processSample(T sample, T drive, T character, int ch) noexcept
@@ -1333,7 +1412,7 @@ public:
         tape_.prepare(spec);
         xfmr_.prepare(spec);
     }
-    void reset() noexcept override { tube_.reset(); tape_.reset(); xfmr_.reset(); }
+    void reset() noexcept override { tube_.reset(); tape_.reset(); xfmr_.reset(); this->resetAlign(); }
     typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::MultiStage; }
 
     /// processSecond() delays by exactly the common delay (no padding).
@@ -1346,7 +1425,7 @@ public:
         // that processSecond() needs for the common delay (see there).
         const bool second = this->order_ == 2;
         const int delay = this->delay_;
-        tube_.setAntialias(second ? (delay == 2 ? 1 : 2) : this->order_);
+        tube_.setAntialias(second ? (delay == 2 || delay == 4 ? 1 : 2) : this->order_);
         tube_.latchOrder();
         tape_.setAntialias(second && delay >= 2 ? 2 : 0);
         tape_.latchOrder();
@@ -1375,16 +1454,24 @@ public:
      * aliasing reaches it (a stage's fold-back lands near DC), so every stage
      * needs a kernel; the cascade's delay must equal the common delay:
      * - 1 (1x): the tube kernel only (one sample);
-     * - 2 (2x): first-order tube, tape kernel, first-order transformer
-     *   (0.5 + 1 + 0.5 samples). Every other split of the two samples
-     *   aliases more (worst at +24 dB: -14.5 dBc with the tape at first
-     *   order, -1.3 to -19.2 with a plain stage or the tube at second
-     *   order); the transformer at second order as well (-36.3 dBc at
-     *   +24 dB, -33.5 at +12) needs 2.5 samples, which only a pad to four
-     *   (a second base sample of latency) aligns with the dry path;
+     * - 2: first-order tube, tape kernel, first-order transformer
+     *   (0.5 + 1 + 0.5 samples; the low-drive chain of delay 4);
+     * - 4 (2x): two chains on a first-order tube and the tape kernel,
+     *   blended by drive (smoothstep from +14 to +16 dB): below, the
+     *   first-order transformer padded by two samples (the cascade of
+     *   delay 2, alias -83.3/-48.2/-37.1 dBc at 0/+6/+12 dB); above, the
+     *   transformer kernel (2.5 samples) and a 1.5-sample linear-phase
+     *   interpolator (delayHalfSample()), -33.1/-36.2/-33.4 dBc at
+     *   +18/+24/+36 dB where the first chain reaches -31.1/-28.0/-28.4.
+     *   The kernel chain aliases more below +15 dB (+12 dB: -33.5) because
+     *   its extra droop lowers high fundamentals. With all three kernels
+     *   (three samples, padded to four) +24 dB reaches -29.1 dBc, with the
+     *   tube kernel and a first-order transformer -28.4, and any split of
+     *   two samples aliases more still (-14.5 with the tape at first order,
+     *   -1.3 to -19.2 with a plain stage);
      * - 3 (4x and above): second-order kernels on all three stages.
      * Worst alias over 1-19.25 kHz tones at -6/-18 dBFS, +12/+24 dB:
-     * -37.1/-28.0 dBc at 2x and -70.6/-49.7 dBc at 4x, against
+     * -37.1/-36.2 dBc at 2x and -70.6/-49.7 dBc at 4x, against
      * -16.0/-6.8 and -32.4/-6.0 with the tube kernel alone.
      */
     inline T processSecond(T sample, T drive, T character, int ch) noexcept
@@ -1401,6 +1488,23 @@ public:
             T tubeOut  = tube_.processSample(sample, drive * T(0.5), character, ch) * T(2);
             T tapeOut  = tape_.processSecond(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
             return       xfmr_.processFirst(tapeOut, drive * T(0.8), character, ch) * (T(1) / T(0.8));
+        }
+        if (delay == 4)
+        {
+            // Both transformer forms run on every sample, so the blend
+            // between them never meets stale history.
+            T tubeOut  = tube_.processSample(sample, drive * T(0.5), character, ch) * T(2);
+            T tapeOut  = tape_.processSecond(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
+            T first = T(0), second = T(0);
+            xfmr_.processBoth(tapeOut, drive * T(0.8), character, ch, first, second);
+            const T low  = this->delayBy(first * (T(1) / T(0.8)), ch, 2);
+            const T high = this->delayHalfSample(second * (T(1) / T(0.8)), ch);
+            // Smoothstep in drive gain from +14 to +16 dB, where the two
+            // chains alias alike; the blend is a sum of the two outputs, so
+            // no component exceeds the larger of the two.
+            constexpr T kFrom = T(5.011872336272722), kSpan = T(6.309573444801933 - 5.011872336272722);
+            const T u = std::clamp((drive - kFrom) / kSpan, T(0), T(1));
+            return low + (u * u * (T(3) - T(2) * u)) * (high - low);
         }
         T tubeOut  = tube_.processSecond(sample, drive * T(0.5), character, ch) * T(2);
         T tapeOut  = tape_.processSecond(tubeOut, drive * T(0.6), character, ch) * (T(1) / T(0.6));
@@ -1421,8 +1525,8 @@ public:
  * This class provides a high-quality saturation pipeline featuring 10 distinct
  * algorithms ranging from soft clipping to complex magnetic tape and
  * transformer modeling. Zero latency at 1x; with oversampling enabled the
- * latency equals the oversampler group delay, plus one sample with
- * second-order antialiasing (see getLatency()).
+ * latency equals the oversampler group delay, plus two samples at 2x (one at
+ * the other factors) with second-order antialiasing (see getLatency()).
  *
  * Channel handling: the saturation stage processes up to 16 channels and no
  * more than the prepared spec's channel count; any further channels in the
@@ -1472,20 +1576,25 @@ public:
      *   every curve except the Bitcrusher and Downsample
      *   (SoftClip/Tube/HardClip/Wavefolder/Transformer/Exciter/Tape), and on
      *   all three MultiStage stages from 2x (the tube stage only at 1x).
-     *   Every algorithm is delayed by the same min(factor, 3) processing
-     *   samples and the wet path is padded to one base sample, which
-     *   getLatency() reports and the dry path matches. -1.3 dB at 10 kHz and
+     *   Every algorithm is delayed by the same number of processing
+     *   samples: four at 2x (two base samples, room for the MultiStage
+     *   kernels), otherwise min(factor, 3) with the wet path padded to one
+     *   base sample. getLatency() reports it at once and the dry, Delta and
+     *   unprocessed M/S paths match. -1.3 dB at 10 kHz and
      *   -5.9 dB at 20 kHz at 2x (-1.3 dB at 20 kHz at 4x); MultiStage -2.3
      *   and -9.9 dB at 2x, -3.9 dB at 20 kHz at 4x. Worst alias over
      *   1-19.25 kHz tones at -6/-18 dBFS, 2x, +24 dB drive: SoftClip
      *   -42.1 dBc against -29.7 for FirstOrder and -15.2 off; Transformer
      *   -43.2 against -15.7; Tape -38.0 against -7.7; Exciter -27.5 against
-     *   -9.8; MultiStage -28.0 against -5.5 (at 4x -49.7 against -5.7).
+     *   -9.8; MultiStage -36.2 against -5.5 (at 4x -49.7 against -5.7; the
+     *   MultiStage figures at 2x hold from +16 dB of drive, below it the
+     *   cascade keeps its two-sample form, see the MultiStage notes).
      *   Meant for oversampled use: at 1x the kernel's -12 dB at 20 kHz lowers
      *   high fundamentals more than it removes alias (SoftClip +24 dB:
      *   -2.1 dBc against -10.0 off over the same tones). Cost at 2x, stereo
-     *   float, ns per frame: Tape 510 against 300 plain, MultiStage 820
-     *   against 260 plain, Exciter 150 against 35.
+     *   float, ns per frame: Tape 510 against 300 plain, MultiStage 950
+     *   against 260 plain (both of its transformer forms run), Exciter 150
+     *   against 35.
      */
     enum class Antialiasing { Off, FirstOrder, SecondOrder };
 
@@ -1669,9 +1778,10 @@ public:
 private:
     void processChunk(AudioBufferView<SampleType> buffer) noexcept
     {
-        // Second-order antialiasing delays the wet path by one base sample
-        // (one processing sample inside the algorithms, the rest padded
-        // below); the dry capture and the untouched M/S channel follow.
+        // Second-order antialiasing delays the wet path by whole base
+        // samples (two at 2x, one otherwise; inside the algorithms and
+        // padded after them); the dry capture and the untouched M/S
+        // channel follow.
         const bool second = antialiasOrder_.load(std::memory_order_relaxed) == 2;
         if (second != secondActive_)
         {
@@ -1689,6 +1799,18 @@ private:
                 const SampleType* in = buffer.getChannel(ch);
                 SampleType* out = dryAligned_.getChannel(ch);
                 SampleType& hold = dryHold_[static_cast<size_t>(ch)];
+                if (secondOrderBaseDelay() == 2)
+                {
+                    SampleType& older = dryHold2_[static_cast<size_t>(ch)];
+                    if (seed && nS > 0) hold = older = in[0];
+                    for (int i = 0; i < nS; ++i)
+                    {
+                        out[i] = older;
+                        older = hold;
+                        hold = in[i];
+                    }
+                    continue;
+                }
                 if (seed && nS > 0) hold = in[0];
                 for (int i = 0; i < nS; ++i)
                 {
@@ -2040,13 +2162,14 @@ public:
     /**
      * @brief Reports the processor's algorithmic latency in samples.
      * @note The oversampler group delay (0 when oversampling is off), plus
-     *       one sample with second-order antialiasing. Report this to the
-     *       host for plugin delay compensation (PDC).
+     *       with second-order antialiasing two samples at the default 2x and
+     *       one at the other factors. Report this to the host for plugin
+     *       delay compensation (PDC).
      */
     [[nodiscard]] int getLatency() const noexcept
     {
         return ((oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0)
-             + (antialiasOrder_.load(std::memory_order_relaxed) == 2 ? 1 : 0);
+             + (antialiasOrder_.load(std::memory_order_relaxed) == 2 ? secondOrderBaseDelay() : 0);
     }
 
     /** @brief Compatibility alias of getLatency(), in prepared-rate samples. */
@@ -2305,9 +2428,19 @@ protected:
         }
     }
 
-    /** Processing samples of second-order delay inside the algorithms:
-     *  min(factor, 3), padded to one base sample by alignSecondOrder(). */
-    [[nodiscard]] int secondOrderDelay() const noexcept { return std::clamp(oversamplingFactor_, 1, 3); }
+    /** Processing samples of second-order delay inside the algorithms: 4 at
+     *  2x (two base samples, the MultiStage split), otherwise min(factor, 3),
+     *  padded to one base sample by alignSecondOrder(). */
+    [[nodiscard]] int secondOrderDelay() const noexcept
+    {
+        return oversamplingFactor_ == 2 ? 4 : std::clamp(oversamplingFactor_, 1, 3);
+    }
+
+    /** Base samples that second-order antialiasing adds: 2 at 2x, else 1. */
+    [[nodiscard]] int secondOrderBaseDelay() const noexcept
+    {
+        return (oversampler_ && oversamplingFactor_ == 2) ? 2 : 1;
+    }
 
     // Data-Oriented Pipeline to eliminate per-sample virtual dispatch
     void processSaturationPipeline(AudioBufferView<SampleType> buffer) noexcept
@@ -2449,12 +2582,12 @@ protected:
     }
 
     /**
-     * @brief Completes the second-order delay to one base sample.
+     * @brief Completes the second-order delay to whole base samples.
      *
-     * The algorithms delay by min(N, 3) processing samples
-     * (secondOrderDelay()), so a factor-N stage adds the rest of N to every
+     * The algorithms delay by secondOrderDelay() processing samples, so a
+     * factor-N stage adds the rest of N (of 2N = 4 at 2x) to every
      * saturated channel; the M/S snapshot that is restored unprocessed is
-     * delayed by the full N. Rings hold 16 samples;
+     * delayed by all of it. Rings hold 32 samples;
      * @p seed fills them with each channel's first sample (no step from
      * stale or zero history when the order is switched on).
      */
@@ -2463,7 +2596,8 @@ protected:
     {
         const int nCh = std::min({view.getNumChannels(), kMaxCh, spec_.numChannels});
         const int nS = view.getNumSamples();
-        const int pad = std::clamp(factor, 1, kAlignRing) - std::clamp(factor, 1, 3);
+        const int target = factor == 2 ? 4 : std::clamp(factor, 1, kAlignRing - 1);
+        const int pad = target - (factor == 2 ? 4 : std::clamp(factor, 1, 3));
         int pos = alignPos_;
         if (pad > 0)
             for (int ch = 0; ch < nCh; ++ch)
@@ -2486,7 +2620,7 @@ protected:
             auto& ring = keepRing_;
             if (seed) ring.fill(d[0]);
             pos = alignPos_;
-            const int delay = std::clamp(factor, 1, kAlignRing - 1);
+            const int delay = target;
             for (int i = 0; i < keepSamples; ++i)
             {
                 ring[static_cast<size_t>(pos)] = d[i];
@@ -2671,6 +2805,7 @@ protected:
     std::array<SampleType, kAlignRing> keepRing_ {};
     int alignPos_ = 0;
     std::array<SampleType, kMaxCh> dryHold_ {};
+    std::array<SampleType, kMaxCh> dryHold2_ {};   ///< Second dry sample (2x).
     AudioBuffer<SampleType> dryAligned_;
 };
 

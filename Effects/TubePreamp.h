@@ -1057,17 +1057,19 @@ public:
      * burst the supply reads 277.4 V against 264.4 V without the coupling
      * network (less plate current). Against the point circuit at 32x the
      * core error stays within 1.8 dB of the Clamp figure (worst -56.6 dB,
-     * Clamp -58.4). At 2x the coupling capacitor's voltage ramps across each
-     * internal sample from where the previous one ended (held at its
-     * predicted midpoint, it stepped at every boundary under grid current, a
-     * step train the output kernel cannot remove). Worst alias over the
-     * documented sweep at 2x (after 2 s of settling): -85.5/-74.0/-74.0 dBc
+     * Clamp -58.4). Inside each internal sample the coupling capacitor
+     * follows its equation: the leak toward the source exactly (stage 1; a
+     * predicted ramp in stage 2) and the grid current's charge integrated
+     * piece by piece from the currents at the integration nodes (a linear
+     * ramp, or a held value, bent or stepped at every boundary under grid
+     * current, which the output kernel cannot remove). Worst alias over the
+     * documented sweep at 2x (after 2 s of settling): -102.8/-88.2/-83.2 dBc
      * at one stage, +12/+24/+36 dB (Clamp -87.7/-80.6/-80.6) and
-     * -81.6/-73.1/-73.1 at two stages (Clamp -83.0/-83.0/-84.8), against
-     * -83.4/-72.7/-68.3 and -77.1/-68.2/-65.5 with the held capacitor; at 4x,
-     * where the held midpoint measured lower and is kept, the worst is -84.9
-     * (one stage, +36 dB) and -84.0 dBc (two stages, +24 dB). CPU rises
-     * 3-23 %, most at +24..+36 dB drive.
+     * -90.5/-88.1/-84.1 at two stages (Clamp -83.0/-83.0/-84.8), against
+     * -85.5/-74.0/-74.0 and -81.6/-73.1/-73.1 with the capacitor ramped across
+     * each sample; at 4x -88.9/-86.6 (one stage, +24/+36 dB) and
+     * -89.3/-84.9 dBc (two stages). CPU rises 14-66 % against Clamp, most
+     * for high tones at +24..+36 dB drive.
      */
     void setGridModel(GridModel model)
     {
@@ -1543,8 +1545,9 @@ private:
     struct ContinuousCore
     {
         /// Clamp model: cutoff, A-3, A-1, +1 V, +6 V. Conduction model:
-        /// cutoff, A-3, A-1 and four knees around the conduction onset.
-        static constexpr int kMaxLevels = 7;
+        /// cutoff, A-3, A-1 and four knees around the conduction onset, and
+        /// in stage 1 a level halfway between cutoff and A-3.
+        static constexpr int kMaxLevels = 8;
         static constexpr int kMaxPieces = 48;
         static constexpr int kOrder = detail::TubePreampCoreDesign::kKernelOrder;
         static constexpr double kKneeRange = 1.0;   ///< Volts of x needed to split at knees.
@@ -1552,6 +1555,10 @@ private:
         static constexpr double kSmallZ = 0.3, kStiffZ = 40.0;
         static constexpr double kLongPiece = 0.5;    ///< Samples; longer stage-2 pieces use 4 nodes.
         static constexpr double kShortPiece = 0.03;  ///< Samples; shorter stage-2 pieces use 2 nodes.
+        /// Grid-to-cathode source below which the grid current (under 1e-9 A)
+        /// moves the coupling capacitor by less than 1 uV per sample: the
+        /// charge is then held across the piece.
+        static constexpr double kChargeFloor = -0.8;
 
         const LoadTable* table = nullptr;
         const detail::TubePreampCoreDesign* design = nullptr;
@@ -1561,9 +1568,14 @@ private:
         static constexpr double kConductionKnees[4] = {-0.6, -0.3, 0.1, 1.0};
         double gridIntegral1 = 0.0, gridIntegral2 = 0.0;
         /// Coupling capacitor voltages and interval-average grid sources (conduction).
-        double vc1 = 0.0, vc2 = 0.0, x1Prev = 0.0, x2Prev = 0.0, x2Integral = 0.0;
-        double vcSlope2 = 0.0;   ///< Change of the stage-2 grid reference over the interval.
-        double vcRamp1 = 0.0, vcRamp2 = 0.0;   ///< Grid reference ramps at the interval start.
+        double vc1 = 0.0, vc2 = 0.0, x2Prev = 0.0, x2Integral = 0.0;
+        double vcSlope2 = 0.0;   ///< Predicted change of the stage-2 grid reference over the interval.
+        double vcRamp2 = 0.0;    ///< Stage-2 grid reference at the interval start.
+        /// Conduction model: coupling-capacitor charge by grid current since
+        /// the interval start (V), the predicted charge slopes that place the
+        /// level crossings, the stage-2 leak ramp and the latest grid currents.
+        double charge1 = 0.0, charge2 = 0.0, chargeSlope1 = 0.0, chargeSlope2 = 0.0;
+        double leakSlope2 = 0.0, leakEnd2 = 0.0, chargeRise = 0.0, lastIg1 = 0.0, lastIg2 = 0.0;
         double couplingDecay = 1.0;
         detail::TubePreampToneModes modes;
         std::array<double, 16> ring {};
@@ -1577,7 +1589,7 @@ private:
         typename LoadTable::Slice slice1, slice2;
         double supply = 0.0, a1 = 0.0, a2 = 0.0, s1 = 0.0, s2 = 0.0, ref1 = 0.0, ref2 = 0.0;
         double lev1[kMaxLevels] {}, lev2[kMaxLevels] {};
-        int levels = 5;                         ///< Levels in use (5 Clamp, 7 Conduction).
+        int levels1 = 5, levels2 = 5;           ///< Levels in use (5 Clamp; 8 and 7 Conduction).
         double integral1 = 0.0, integral2 = 0.0, moments[kOrder] {};
         double hi1 = 0.0, hi2 = 0.0;
         bool haveHi1 = false, haveHi2 = false;
@@ -1591,6 +1603,10 @@ private:
         static constexpr double kG3w[3] = {5.0 / 18.0, 4.0 / 9.0, 5.0 / 18.0};
         double lagrange4[4][4] {};              ///< Monomial coefficients of the node basis.
         double lagrange3[3][3] {};
+        static constexpr double kG2x[2] = {0.21132486540518713, 0.78867513459481287};
+        /// Integrals from 0 to each node of the node basis, and its values at 1.
+        double nodeIntegral4[4][4] {}, nodeIntegral3[3][3] {}, nodeIntegral2[2][2] {};
+        double endWeight4[4] {}, endWeight3[3] {}, endWeight2[2] {};
 
         void init(double sampleRate, const LoadTable* tableIn,
                   const detail::TubePreampCoreDesign* designIn) noexcept
@@ -1628,6 +1644,80 @@ private:
                 lagrange3[k][0] = kG3x[o1] * kG3x[o2] / den;
                 lagrange3[k][1] = -(kG3x[o1] + kG3x[o2]) / den;
                 lagrange3[k][2] = 1.0 / den;
+            }
+            chargeRise = (1.0 - couplingDecay) * Conduction::kRg;
+            for (int j = 0; j < 4; ++j)
+                for (int k = 0; k < 4; ++k)
+                {
+                    double acc = 0.0, xp = kG4x[j];
+                    for (int e = 0; e < 4; ++e) { acc += lagrange4[k][e] * xp / (e + 1); xp *= kG4x[j]; }
+                    nodeIntegral4[j][k] = acc;
+                }
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                {
+                    double acc = 0.0, xp = kG3x[j];
+                    for (int e = 0; e < 3; ++e) { acc += lagrange3[k][e] * xp / (e + 1); xp *= kG3x[j]; }
+                    nodeIntegral3[j][k] = acc;
+                }
+            for (int k = 0; k < 4; ++k)
+                endWeight4[k] = lagrange4[k][0] + lagrange4[k][1] + lagrange4[k][2] + lagrange4[k][3];
+            for (int k = 0; k < 3; ++k) endWeight3[k] = lagrange3[k][0] + lagrange3[k][1] + lagrange3[k][2];
+            const double g0 = kG2x[0], g1 = kG2x[1];
+            for (int j = 0; j < 2; ++j)
+            {
+                const double x = kG2x[j];
+                nodeIntegral2[j][0] = (0.5 * x * x - g1 * x) / (g0 - g1);
+                nodeIntegral2[j][1] = (0.5 * x * x - g0 * x) / (g1 - g0);
+            }
+            endWeight2[0] = (1.0 - g1) / (g0 - g1);
+            endWeight2[1] = (1.0 - g0) / (g1 - g0);
+        }
+
+        /**
+         * Coupling-capacitor charge at the N nodes of a piece (conduction
+         * model): @p charge at its start plus the integral of the grid
+         * current over the piece, Rg (1 - e^(-T / (Rg Cc))) per internal
+         * sample and ampere, from the node basis of the currents. The
+         * currents depend on the charge, so a prediction from @p lastIg is
+         * corrected once with the currents it gives (the correction shrinks
+         * the error by about 300x: the capacitor moves a few tenths of a volt
+         * per sample while the grid source resistance is 68 k ohm).
+         * @param src Grid sources at the nodes without the charge.
+         * @param cathode Grid reference (cathode and capacitor start).
+         * @param charge Charge at the piece start.
+         * @param len Piece length in internal samples.
+         * @param lastIg Grid current at the end of the previous piece.
+         * @param weights Node-basis integrals (nodeIntegral4/3/2).
+         * @param nodes Node positions in the piece.
+         * @param offset Receives the charge at each node.
+         */
+        template <int N>
+        void chargeAtNodes(const double* src, double cathode, double charge, double len, double lastIg,
+                           const double (&weights)[N][N], const double* nodes, double* offset) const noexcept
+        {
+            // Below kChargeFloor at every node the grid current is negligible
+            // (and smaller still at a larger charge): the nodes keep the charge.
+            double top = src[0];
+            for (int j = 1; j < N; ++j) top = std::max(top, src[j]);
+            if (top - charge - cathode <= kChargeFloor)
+            {
+                for (int j = 0; j < N; ++j) offset[j] = charge;
+                return;
+            }
+            const double k = chargeRise * len;
+            for (int j = 0; j < N; ++j) offset[j] = charge + k * lastIg * nodes[j];
+            double ig[N];
+            for (int j = 0; j < N; ++j)
+            {
+                const double d = src[j] - offset[j] - cathode;
+                ig[j] = (d - grid->eval(d)) * (1.0 / Conduction::kRs);
+            }
+            for (int j = 0; j < N; ++j)
+            {
+                double acc = 0.0;
+                for (int m = 0; m < N; ++m) acc += weights[j][m] * ig[m];
+                offset[j] = charge + k * acc;
             }
         }
 
@@ -1670,8 +1760,10 @@ private:
             ipLP = i1 * numStages;
             i1Prev = i2Prev = i1;
             g1Prev = g2Prev = 0.0;
-            vc1 = vc2 = x1Prev = x2Prev = x2Integral = 0.0;
-            vcRamp1 = vcRamp2 = vcSlope2 = 0.0;
+            vc1 = vc2 = x2Prev = x2Integral = 0.0;
+            vcRamp2 = vcSlope2 = 0.0;
+            charge1 = charge2 = chargeSlope1 = chargeSlope2 = leakSlope2 = leakEnd2 = 0.0;
+            lastIg1 = lastIg2 = 0.0;
             q[0] = q[1] = q[2] = 0.0;
             ring.fill(0.0);
             ringPos = 0;
@@ -1734,13 +1826,13 @@ private:
             return r;
         }
 
-        int classify(const double* lev, double v) const noexcept
+        static int classify(const double* lev, int levels, double v) noexcept
         {
             int k = 0;
             while (k < levels && v > lev[k]) ++k;
             return k;
         }
-        int classifyEdges(const double* lev, double v) const noexcept
+        static int classifyEdges(const double* lev, int levels, double v) noexcept
         {
             return v <= lev[0] ? 0 : (v > lev[levels - 1] ? levels : 1);
         }
@@ -1961,7 +2053,8 @@ private:
                 }
             }
             const bool edges = hi - lo < (grid ? kConductionKneeRange : kKneeRange);
-            const auto cls = [&](double v) { return edges ? classifyEdges(lev2, v) : classify(lev2, v); };
+            const int levels = levels2;
+            const auto cls = [&](double v) { return edges ? classifyEdges(lev2, levels, v) : classify(lev2, levels, v); };
             double pt = 0.0, pv = sv[0];
             int pc = cls(pv);
             const int first = pc;
@@ -2012,6 +2105,7 @@ private:
                         i2 = hi2;
                     }
                     integral2 += h * len * i2;
+                    if (grid) lastIg2 = 0.0;
                     addConstantMoments(a + h * xa, a + h * xb, supply - kRL * i2 - vp2);
                     continue;
                 }
@@ -2021,6 +2115,7 @@ private:
                     // near 0.8 cycles/sample from leaking past the kernel.
                     double xs[4], is[4], gs[4], y[4], poly[4];
                     for (int j = 0; j < 4; ++j) xs[j] = src(xa + len * kG4x[j]);
+                    if (grid) chargeNodes2<4>(xs, a, h, xa, len, nodeIntegral4, kG4x);
                     currents<4>(slice2, ref2, xs, is, gs);
                     for (int j = 0; j < 4; ++j)
                     {
@@ -2028,7 +2123,13 @@ private:
                         y[j] = supply - kRL * is[j] - vp2;
                     }
                     if (grid)
-                        for (int j = 0; j < 4; ++j) gridIntegral2 += h * len * kG4w[j] * gs[j];
+                    {
+                        double sum = 0.0, end = 0.0;
+                        for (int j = 0; j < 4; ++j) { sum += kG4w[j] * gs[j]; end += endWeight4[j] * gs[j]; }
+                        gridIntegral2 += h * len * sum;
+                        charge2 += chargeRise * h * len * sum;
+                        lastIg2 = std::max(end, 0.0);
+                    }
                     for (int e = 0; e < 4; ++e)
                         poly[e] = lagrange4[0][e] * y[0] + lagrange4[1][e] * y[1]
                                 + lagrange4[2][e] * y[2] + lagrange4[3][e] * y[3];
@@ -2039,11 +2140,17 @@ private:
                 {
                     // Short piece: two nodes and the exact moments of their
                     // linear interpolant.
-                    constexpr double g0 = 0.21132486540518713, g1 = 0.78867513459481287;
+                    constexpr double g0 = kG2x[0], g1 = kG2x[1];
                     double xs[2] = {src(xa + len * g0), src(xa + len * g1)}, is[2], gs[2];
+                    if (grid) chargeNodes2<2>(xs, a, h, xa, len, nodeIntegral2, kG2x);
                     currents<2>(slice2, ref2, xs, is, gs);
                     integral2 += h * len * 0.5 * (is[0] + is[1]);
-                    if (grid) gridIntegral2 += h * len * 0.5 * (gs[0] + gs[1]);
+                    if (grid)
+                    {
+                        gridIntegral2 += h * len * 0.5 * (gs[0] + gs[1]);
+                        charge2 += chargeRise * h * len * 0.5 * (gs[0] + gs[1]);
+                        lastIg2 = std::max(endWeight2[0] * gs[0] + endWeight2[1] * gs[1], 0.0);
+                    }
                     const double y0 = supply - kRL * is[0] - vp2, y1 = supply - kRL * is[1] - vp2;
                     double poly[2];
                     poly[1] = (y1 - y0) / (g1 - g0);
@@ -2053,9 +2160,16 @@ private:
                 }
                 double xs[3], is[3], gs[3];
                 for (int j = 0; j < 3; ++j) xs[j] = src(xa + len * kG3x[j]);
+                if (grid) chargeNodes2<3>(xs, a, h, xa, len, nodeIntegral3, kG3x);
                 currents<3>(slice2, ref2, xs, is, gs);
                 if (grid)
-                    for (int j = 0; j < 3; ++j) gridIntegral2 += h * len * kG3w[j] * gs[j];
+                {
+                    double sum = 0.0, end = 0.0;
+                    for (int j = 0; j < 3; ++j) { sum += kG3w[j] * gs[j]; end += endWeight3[j] * gs[j]; }
+                    gridIntegral2 += h * len * sum;
+                    charge2 += chargeRise * h * len * sum;
+                    lastIg2 = std::max(end, 0.0);
+                }
                 // Exact moments of the plate interpolant through the three
                 // nodes: Gauss weights alone are not exact for the quintic
                 // kernel weights times a curved plate trajectory.
@@ -2069,6 +2183,18 @@ private:
                     poly[e] = lagrange3[0][e] * y[0] + lagrange3[1][e] * y[1] + lagrange3[2][e] * y[2];
                 addPolynomialMoments(a + h * xa, h * len, poly, 2);
             }
+        }
+
+        /** Stage-2 grid sources at the nodes of a piece with the capacitor
+         *  charge in place of its predicted ramp (conduction model). */
+        template <int N>
+        void chargeNodes2(double* xs, double a, double h, double xa, double len,
+                          const double (&weights)[N][N], const double* nodes) const noexcept
+        {
+            double src[N], offset[N];
+            for (int j = 0; j < N; ++j) src[j] = xs[j] + chargeSlope2 * (a + h * (xa + len * nodes[j]));
+            chargeAtNodes<N>(src, ref2, charge2, h * len, lastIg2, weights, nodes, offset);
+            for (int j = 0; j < N; ++j) xs[j] = src[j] - offset[j];
         }
 
         void plate(double a, double h, const double* u, int terms) noexcept
@@ -2107,7 +2233,8 @@ private:
         void interval(double sagR) noexcept
         {
             // Stage-1 grid polynomial on the interval [n, n+1].
-            const int taps = design->taps, deg = design->degree;
+            const int taps = design->taps;
+            int deg = design->degree;
             double c[16] {};
             int idx = ringPos;
             for (int j = 0; j < taps; ++j)
@@ -2139,37 +2266,33 @@ private:
             ref1 = a1;
             ref2 = a2;
             double x1Avg = 0.0;
-            if (grid && design->osFactor == 2)
+            if (grid)
             {
-                // At 2x the capacitor voltage ramps linearly across the
-                // interval, from where the previous interval's ramp ended to
-                // the predicted end of this one: the grid reference is
-                // continuous, with only a change of slope at the boundary (the
-                // prediction error goes into the next slope). Held at its
-                // midpoint it stepped by the whole interval's change at every
-                // boundary, which the output kernel cannot remove. The source
-                // polynomial (stage 1) and vcSlope2 (stage 2) carry the slope.
+                // The coupling capacitor follows Cc dvc/dt = (x - vc) / Rg + Ig
+                // inside the interval: vc(t) = vc + rise (X(t) - vc t) + Q(t)
+                // to first order in rise = 1 - e^(-T / (Rg Cc)), with X the
+                // integral of the source and Q the grid-current charge. Stage
+                // 1: the leak is exact in the source polynomial (one degree
+                // more), the charge is integrated piece by piece
+                // (chargeAtNodes()); the predicted charge slope only places
+                // the level crossings. Stage 2: the leak ramps from where the
+                // previous reference ended to its predicted end (its source is
+                // known only piece by piece), the charge as in stage 1. A held
+                // or ramped capacitor stepped or bent at every boundary under
+                // grid current, which the output kernel cannot remove.
                 for (int p = 0; p <= deg; ++p) x1Avg += c[p] / (p + 1);
                 const double rise = 1.0 - couplingDecay;
-                const double end1 = vc1 + rise * ((x1Avg + Conduction::kRg * g1Prev) - vc1);
-                const double end2 = vc2 + rise * ((x2Prev + Conduction::kRg * g2Prev) - vc2);
-                ref1 += vcRamp1;
+                chargeSlope1 = chargeRise * g1Prev;
+                ref1 += vc1;
+                for (int p = deg + 1; p >= 1; --p) c[p] -= rise * c[p - 1] / p;
+                c[1] += rise * vc1 - chargeSlope1;
+                ++deg;
+                leakEnd2 = vc2 + rise * (x2Prev - vc2);
+                leakSlope2 = leakEnd2 - vcRamp2;
+                chargeSlope2 = chargeRise * g2Prev;
+                vcSlope2 = leakSlope2 + chargeSlope2;
                 ref2 += vcRamp2;
-                c[1] -= end1 - vcRamp1;
-                vcSlope2 = end2 - vcRamp2;
-                vcRamp1 = end1;
-                vcRamp2 = end2;
-            }
-            else if (grid)
-            {
-                // From 4x the held midpoint measured lower (two stages,
-                // +24 dB: -84.0 against -77.7 dBc for the ramp), so the
-                // references are held at their predicted midpoints there.
-                for (int p = 0; p <= deg; ++p) x1Avg += c[p] / (p + 1);
-                const double half = 0.5 * (1.0 - couplingDecay);
-                ref1 += vc1 + half * ((x1Prev + Conduction::kRg * g1Prev) - vc1);
-                ref2 += vc2 + half * ((x2Prev + Conduction::kRg * g2Prev) - vc2);
-                vcSlope2 = 0.0;
+                charge1 = charge2 = 0.0;
             }
             lev1[0] = ref1 + cutVgk[0]; lev1[1] = ref1 - 3.0; lev1[2] = ref1 - 1.0; lev1[3] = 1.0; lev1[4] = 6.0;
             lev2[0] = ref2 + cutVgk[1]; lev2[1] = ref2 - 3.0; lev2[2] = ref2 - 1.0; lev2[3] = 1.0; lev2[4] = 6.0;
@@ -2178,19 +2301,24 @@ private:
                 // Conduction knee relative to the cathode, where the grid
                 // slope falls from 1 to 0.2 (source -0.6 .. +0.3 V against
                 // the cathode); no saturated top region, the grid keeps
-                // rising slowly with the source.
-                levels = kMaxLevels;
+                // rising slowly with the source. Stage 1 is also split
+                // halfway between cutoff and A-3, where the plate current
+                // grows about six decades: with the stage biased colder by
+                // the charged capacitor its pulses start there, and one cubic
+                // across it aliased (-81.4 against -90.3 dBc, two stages,
+                // +24 dB, 16 kHz).
+                levels1 = 8;
+                levels2 = 7;
+                for (int k = 7; k >= 2; --k) lev1[k] = lev1[k - 1];
+                lev1[1] = 0.5 * (lev1[0] + lev1[2]);
                 for (int k = 0; k < 4; ++k)
                 {
-                    lev1[3 + k] = ref1 + kConductionKnees[k];
+                    lev1[4 + k] = ref1 + kConductionKnees[k];
                     lev2[3 + k] = ref2 + kConductionKnees[k];
                 }
             }
-            for (int j = 1; j < levels; ++j)
-            {
-                lev1[j] = std::max(lev1[j], lev1[j - 1] + 1e-6);
-                lev2[j] = std::max(lev2[j], lev2[j - 1] + 1e-6);
-            }
+            for (int j = 1; j < levels1; ++j) lev1[j] = std::max(lev1[j], lev1[j - 1] + 1e-6);
+            for (int j = 1; j < levels2; ++j) lev2[j] = std::max(lev2[j], lev2[j - 1] + 1e-6);
             // Split the interval where the grid crosses the stage-1 levels;
             // interior knees only when the interval spans at least 1 V.
             double qv[5];
@@ -2202,7 +2330,8 @@ private:
                 hi = std::max(hi, qv[k]);
             }
             const bool edges = hi - lo < (grid ? kConductionKneeRange : kKneeRange);
-            const auto cls = [&](double v) { return edges ? classifyEdges(lev1, v) : classify(lev1, v); };
+            const int levels = levels1;
+            const auto cls = [&](double v) { return edges ? classifyEdges(lev1, levels, v) : classify(lev1, levels, v); };
             double cuts[kMaxPieces];
             int count = 0;
             cuts[count++] = 0.0;
@@ -2262,6 +2391,7 @@ private:
                         i1 = hi1;
                     }
                     integral1 += h * i1;
+                    if (grid) lastIg1 = 0.0;
                     const double u[1] = {supply - kRL * i1 - vp1};
                     plate(a, h, u, 1);
                     continue;
@@ -2280,6 +2410,13 @@ private:
                     }
                     xs[0] = v0; xs[1] = v1; xs[2] = v2; xs[3] = v3;
                 }
+                if (grid)
+                {
+                    double src[4], offset[4];
+                    for (int j = 0; j < 4; ++j) src[j] = xs[j] + chargeSlope1 * (a + h * kG4x[j]);
+                    chargeAtNodes<4>(src, ref1, charge1, h, lastIg1, nodeIntegral4, kG4x, offset);
+                    for (int j = 0; j < 4; ++j) xs[j] = src[j] - offset[j];
+                }
                 double gs[4];
                 currents<4>(slice1, ref1, xs, is, gs);
                 double y[4];
@@ -2289,7 +2426,13 @@ private:
                     integral1 += h * kG4w[j] * is[j];
                 }
                 if (grid)
-                    for (int j = 0; j < 4; ++j) gridIntegral1 += h * kG4w[j] * gs[j];
+                {
+                    double sum = 0.0, end = 0.0;
+                    for (int j = 0; j < 4; ++j) { sum += kG4w[j] * gs[j]; end += endWeight4[j] * gs[j]; }
+                    gridIntegral1 += h * sum;
+                    charge1 += chargeRise * h * sum;
+                    lastIg1 = std::max(end, 0.0);
+                }
                 double u[4];
                 for (int e = 0; e < 4; ++e)
                     u[e] = lagrange4[0][e] * y[0] + lagrange4[1][e] * y[1]
@@ -2311,11 +2454,11 @@ private:
                 // Coupling capacitors: Cc dvc/dt = (x - vc) / Rg + Ig, exact for
                 // the interval-average source x and grid current Ig.
                 vc1 = vc1 * couplingDecay + (1.0 - couplingDecay) * (x1Avg + Conduction::kRg * gridIntegral1);
-                x1Prev = x1Avg;
                 if (stages > 1)
                 {
                     vc2 = vc2 * couplingDecay + (1.0 - couplingDecay) * (x2Integral + Conduction::kRg * gridIntegral2);
                     x2Prev = x2Integral;
+                    vcRamp2 = leakEnd2 + charge2;   // the reference where this interval ended
                 }
             }
             ipLP = ipLP * sagDecay + (1.0 - sagDecay) * (integral1 + (stages > 1 ? integral2 : 0.0));

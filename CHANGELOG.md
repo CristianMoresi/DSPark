@@ -382,6 +382,57 @@ All notable user-facing changes to DSPark are documented here.
   stays at -165.6 dB for the saw, and for a flat spectrum it is -149.0 to
   -153.4 dB inside the pairs (before -148.2 to -151.2) and -141.1 dB at
   their tops (before -136.5).
+- `Saturation` `Antialiasing::SecondOrder` at the default 2x adds two base
+  samples instead of one (48 kHz: getLatency() 65 -> 66, reported as soon as
+  the order is set; 1x and 4x and above unchanged). Every algorithm takes
+  the same delay, so crossfades between algorithms, the dry path, Delta and
+  the unprocessed M/S channel stay aligned; Off and FirstOrder are
+  bit-identical, and the other algorithms' SecondOrder output is the
+  previous one a sample later. The room lets MultiStage use the transformer
+  kernel with a 1.5-sample linear-phase interpolator from +16 dB of drive,
+  blended by drive from +14 dB (the previous two-sample cascade below, its
+  output a sample later). Worst alias over 1-19.25 kHz tones at
+  -6/-18 dBFS: +24 dB -28.0 -> -36.2 dBc, +18 dB -31.1 -> -33.1, +36 dB
+  -28.4 -> -33.4, +16 dB -33.3 -> -34.1, unchanged to +14 dB (-37.1 at
+  +12). Harmonic error at 1 kHz against the curve at 16x: +12 dB
+  unchanged (-47.4 dB), +24 dB -38.4 -> -38.0. The fundamental at
+  19.25 kHz under +24 dB drive is 1.3 dB lower (the kernel's droop). Both
+  transformer forms run on every sample: MultiStage costs 860 -> 1000 ns
+  per stereo frame at 2x.
+- `TubePreamp` `GridModel::Conduction` (opt-in) at 2x and above: inside each
+  internal sample the coupling capacitor's charge by grid current is
+  integrated piece by piece from the grid currents at the integration nodes
+  (predicted, then corrected once), the stage-1 leak toward the source is
+  exact in the source polynomial, and stage 1 is split once more halfway
+  between cutoff and 3 V below the cathode (where the colder-biased stage
+  starts its plate-current pulses). Before, the capacitor ramped linearly
+  across each sample at 2x and was held at its predicted midpoint from 4x.
+  Worst alias over the documented sweep at 2x (2 s of settling), one stage
+  +12/+24/+36 dB: -85.5/-74.0/-74.0 -> -102.8/-88.2/-83.2 dBc (Clamp
+  -87.7/-80.6/-80.6); two stages -81.6/-73.1/-73.1 -> -90.5/-88.1/-84.1
+  (Clamp -83.0/-83.0/-84.8); at 4x one stage +24/+36 -88.0/-84.9 ->
+  -88.9/-86.6, two stages -84.0/-81.7 -> -89.3/-84.9. The core error
+  against the point circuit at 32x is unchanged (worst -56.7 dB against
+  -56.6). Cost, stereo float at 2x: +9..+33 % against the previous
+  Conduction model (most for high tones at +24 dB); against Clamp +14..+49 %
+  on a 1 kHz + 7.3 kHz program (before +3..+25 %) and +66 % on a 16 kHz
+  tone at +24 dB, two stages (before +26 %). 1x and the Clamp default are
+  bit-identical.
+- `wdf::DiodePairRoot` for 1e-4 < c <= 0.02 (silicon diodes behind about
+  1.8 k to 0.36 M ohm with the default constants): the table root starts
+  where the reverse-diode correction q = c^2 / (omega (1 + omega)) reaches
+  3.5e-3 instead of 3e-5,
+  with that correction to seventh order (in q and c^2 / (1 + omega)^2,
+  scaled by the instance) and the table's R and 1 / (1 + omega)^2 terms
+  extended to degrees 9 and 6 (`detail::DiodeOmegaTable` 83 -> 99 KB); up
+  to c of about 6e-3 (110 k ohm) the table now reaches the low-drive
+  series, so the omega estimate and its correction step are no longer used
+  there. Cost
+  per sample on an RC clipper behind 94 k ohm: 28.6 -> 22.6 ns at 0.5 V
+  peak, 27.2 -> 24.0 ns at 2 V, 24.9 -> 24.5 ns at 8 V. The roots stay
+  within the previous error against 45-digit roots (worst 2.7e-16 relative
+  for c from 1.5e-4 to 0.0195; 9.3e-16 before at c = 0.0195); c <= 1e-4
+  (707 ohm with the default constants) is bit-identical.
 - `wdf::DiodePairRoot` and `wdf::DiodeRoot` above the low-drive series
   evaluate the diode's closed form with a full-precision omega table
   (`detail::DiodeOmegaTable`, 83 KB, built once per process) instead of an

@@ -345,6 +345,43 @@ All notable user-facing changes to DSPark are documented here.
   to 74.8% right, 3.0% to 1.8% wrong; continuous notes at 2 dB 88.7% as
   before, 86.8% to 83.4% with 50 cents of vibrato. Off, the output is
   unchanged, bit for bit.
+- FFT engine (`FFTReal`, `FFTComplex` and the split engine the two-stage
+  resampler runs on): between passes the data sits in blocks of 4 double or
+  8 float real parts followed by the same elements' imaginary parts, so a
+  pass keeps one pointer per stream; an odd log2 size closes with one
+  twiddle-free radix-8 pass instead of a radix-4 and a radix-2 pass while the
+  radix-8 rows stay under 4 KiB apart (complex sizes 32 or 128 to 2048); the
+  real transforms take bins k and N/2 - k together in their pre and post
+  passes, on a twiddle table that is an exact mirror (w^(N/2-k) =
+  -conj(w^k)), with one shared product per pair. Double, forward plus
+  inverse, ns per real point at 64 / 1024 / 4096 / 65536 points: SSE2
+  2.0 / 2.4 / 2.8 / 3.7 -> 1.5 / 1.9 / 2.3 / 3.2, AVX2 dispatch
+  1.5 / 1.3 / 1.5 / 2.7 -> 1.1 / 1.0 / 1.2 / 2.2; float SSE2
+  1.4 / 1.3 / 1.5 / 1.9 -> 1.2 / 1.0 / 1.2 / 1.6, AVX2 dispatch
+  1.4 / 0.85 / 0.88 / 1.3 -> 1.0 / 0.62 / 0.66 / 1.0. The two-stage
+  resampler's transforms are 15% cheaper with the AVX2 dispatch and 4-9% on
+  SSE2 (Ultra 96 -> 44.1 kHz 2.83 -> 2.66 ns per input sample). Output: the
+  double real transforms move at rounding level (at most 1.7 ulp of the
+  spectrum's peak) through the mirrored twiddles, and the sizes that close
+  with the radix-8 pass (and the real transforms of twice those sizes) move
+  by at most 3 ulp of the peak in either type; everything else is
+  bit-identical where the arithmetic is not fused, and moves by at most
+  1.2 ulp of the peak in a few bins where it is (the vectorised pre and post
+  passes now cover every bin). The RMS error against an exact transform is
+  unchanged or lower at every size (double round trip at 65536 points 2.41
+  -> 2.36 epsilon); the two-stage resampler's double output moves by at
+  most -303 dB re its peak, its float output not at all.
+- `WavetableBank`: the two bass pairs whose level sizes differ (8192 and
+  4096 samples, 4096 and 2048) keep a copy of the duller level on the
+  brighter one's grid, so their crossfade blends the samples and
+  interpolates once like every other pair. `readBlock()` float at 33 and
+  60 Hz, SSE2: 2.99 -> 2.35-2.42 ns per sample (the 4-point cubic reader of
+  one table: 2.38-2.42); AVX2: 2.10 -> 1.71. Memory 229 -> 279 KB per frame.
+  Output moves only in those two pairs (27.4-38.7 and 54.7-77.4 Hz at
+  48 kHz), by at most -138 dB re full scale; the worst inharmonic component
+  stays at -165.6 dB for the saw, and for a flat spectrum it is -149.0 to
+  -153.4 dB inside the pairs (before -148.2 to -151.2) and -141.1 dB at
+  their tops (before -136.5).
 - `wdf::DiodePairRoot` and `wdf::DiodeRoot` above the low-drive series
   evaluate the diode's closed form with a full-precision omega table
   (`detail::DiodeOmegaTable`, 83 KB, built once per process) instead of an

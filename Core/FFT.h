@@ -5,21 +5,25 @@
 
 /**
  * @file FFT.h
- * @brief Fast Fourier Transform: Stockham radix-4 on split complex data, SIMD.
+ * @brief Fast Fourier Transform: Stockham radix-4 on blocked complex data, SIMD.
  *
  * Provides forward and inverse FFT for both complex and real-valued signals,
  * for power-of-two sizes.
  *
  * Engine:
- * - **Stockham autosort, radix 4**: log4(N) passes (plus one radix-2 pass
- *   when log2(N) is odd) with no bit-reversal permutation; each pass reads
- *   one buffer and writes the other in natural order.
- * - **Split complex layout inside**: the real and imaginary parts live in
- *   separate arrays while the passes run, so every butterfly is plain vector
- *   arithmetic (no shuffles in the complex multiplies). The interleaved API
- *   layout is read by the first pass and written by the last, so converting it
- *   costs no pass over memory of its own. The closing pass needs no table
- *   twiddles.
+ * - **Stockham autosort, radix 4**: log4(N) passes with no bit-reversal
+ *   permutation; each pass reads one buffer and writes the other in natural
+ *   order. An odd log2(N) closes with one radix-8 pass (twiddle-free, the
+ *   eighth roots entering as sqrt(1/2)) in place of a radix-4 and a radix-2
+ *   pass, or with that pair where the radix-8 pass's rows would sit 4 KiB
+ *   apart or more and share cache sets.
+ * - **Blocked complex layout inside**: between passes the data is stored in
+ *   blocks of 4 double or 8 float real parts followed by the same elements'
+ *   imaginary parts, so every butterfly is plain vector arithmetic (no
+ *   shuffles in the complex multiplies) and a pass keeps one pointer per
+ *   stream. The interleaved or split API layouts are read by the first pass
+ *   and written by the last, so converting them costs no pass over memory of
+ *   its own. The closing pass needs no table twiddles.
  * - **SIMD at the widest width a pass allows**: AVX (8 float / 4 double
  *   lanes, with FMA when enabled) where the build targets it, and in x86-64
  *   builds below AVX on CPUs with AVX2 and FMA through the run-time dispatch
@@ -33,14 +37,17 @@
  * - **Inverse by conjugation**: ifft(x) = conj(fft(conj(x))) / N, folded into
  *   the conversion passes, so both directions share one set of kernels.
  * - **Real transforms** run a half-size complex FFT on the (even, odd) sample
- *   pairs and split its spectrum with a vectorised post-pass.
+ *   pairs and split its spectrum with a vectorised post-pass that takes bins
+ *   k and N/2 - k together (their twiddles are exact mirrors, so they share
+ *   one product); the inverse packs its input the same way.
  * - **Zero allocations** after construction; forward()/inverse() are
  *   noexcept and accept pointers of any alignment.
  *
- * Measured on one core of a 2.1 GHz Xeon, float: a 1024-point real FFT takes
- * about 2.0 us on SSE2 and 1.0 us with AVX2/FMA (-march=x86-64-v3, /arch:AVX2
- * or the run-time dispatch), against 3.9 us and 4.6 us for the
- * radix-2 engine this replaced; sizes past the L2 cache gain about 2.5x.
+ * Measured on one desktop x86-64 core, double, forward plus inverse, ns
+ * per real point, 64 / 1024 / 4096 / 65536 points: 1.5 / 1.9 / 2.3 / 3.2 on
+ * SSE2 and 1.1 / 1.0 / 1.2 / 2.2 with the AVX2 dispatch (the previous engine:
+ * 2.0 / 2.4 / 2.8 / 3.7 and 1.5 / 1.3 / 1.5 / 2.7). Float: 1.2 / 1.0 / 1.2 /
+ * 1.6 and 1.0 / 0.6 / 0.7 / 1.0.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
  * thread at a time; give each thread its own instance.
@@ -50,6 +57,8 @@
 
 #include "SimdOps.h"
 
+#include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -100,8 +109,9 @@ struct TwiddleSpan
     const T* w3r; const T* w3i;
 };
 
-/// One pass of the plan: its length, stride and twiddle offset.
-struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; };
+/// One pass of the plan: its length, stride and twiddle offset. radix2 and
+/// radix8 mark the closing passes of length 2 and 8 (radix 4 otherwise).
+struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; bool radix8; };
 
 /// The two ping-pong buffers, [re | im] each: x is read, y is written.
 template <typename T>
@@ -112,6 +122,10 @@ struct Buffers { T* xr; T* xi; T* yr; T* yi; };
 using plan::TwiddleSpan;
 using plan::Pass;
 using plan::Buffers;
+
+/// Block of the work layout between passes (detail/FftKernels.inl): the
+/// widest vector any copy of the kernels uses, the same in every copy.
+template <typename T> inline constexpr size_t kBlock = std::is_same_v<T, double> ? 4 : 8;
 
 // The passes, compiled for the build's baseline (detail/FftKernels.inl).
 template <typename T, int W> using Vec = simd::Vec<T, W>;
@@ -159,23 +173,33 @@ public:
         bufA_.assign(2 * n_, T(0));
         bufB_.assign(2 * n_, T(0));
 
-        // Plan: radix-4 passes of length n, 4n', ... with stride 1, 4, ...;
-        // a radix-2 pass closes an odd log2(N).
+        // Plan: radix-4 passes of length n, n/4, ... with stride 1, 4, ...;
+        // an odd log2(N) closes with a radix-8 pass in place of a length-8
+        // radix-4 pass and a radix-2 one, or with that pair where the
+        // radix-8 pass's eight output rows would sit 4 KiB apart or more
+        // (they then share cache sets and the pass slows down several
+        // times), where its rows would not fill a block of the work layout,
+        // and where it would be the first pass.
+        const bool odd = (std::countr_zero(n_) & 1) != 0;
+        const bool radix8 = odd && n_ >= 32 && n_ / 8 >= kBlock<T>
+                         && (n_ / 8) * sizeof(T) < 4096;
         size_t len = n_, stride = 1, offset = 0;
-        while (len >= 4)
+        while (len >= 4 && !(radix8 && len == 8))
         {
-            passes_.push_back({ len, stride, offset, false });
+            passes_.push_back({ len, stride, offset, false, false });
             offset += 6 * (len / 4);
             len /= 4;
             stride *= 4;
         }
-        if (len == 2)
-            passes_.push_back({ 2, stride, offset, true });
+        if (len == 8)
+            passes_.push_back({ 8, stride, offset, false, true });
+        else if (len == 2)
+            passes_.push_back({ 2, stride, offset, true, false });
 
         twiddles_.assign(offset, T(0));
         for (const Pass& pass : passes_)
         {
-            if (pass.radix2) continue;
+            if (pass.radix2 || pass.radix8) continue;
             const size_t n1 = pass.len / 4;
             T* w = twiddles_.data() + pass.twOffset;
             for (size_t p = 0; p < n1; ++p)
@@ -413,16 +437,19 @@ private:
         return fft::readScaledSwap(passes_.data(), passes_.size(), n_, twiddles_.data(), re, im, gain, mask, b);
     }
 
+    // The closing pass reads the blocked layout after other passes, and the
+    // split input buffers when it is the only one.
     void close(const Buffers<T>& b, T* out, T scaleRe, T scaleIm) const noexcept
     {
+        const bool blocked = passes_.size() > 1;
 #if defined(DSPARK_SIMD_DISPATCH_AVX2)
         if (simd::isRuntimeDispatchActive())
         {
-            avx2::closeInterleaved(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
+            avx2::closeInterleaved(passes_.back(), b.xr, b.xi, blocked, out, scaleRe, scaleIm);
             return;
         }
 #endif
-        fft::closeInterleaved(passes_.back(), b.xr, b.xi, out, scaleRe, scaleIm);
+        fft::closeInterleaved(passes_.back(), b.xr, b.xi, blocked, out, scaleRe, scaleIm);
     }
 
     size_t n_;
@@ -580,9 +607,10 @@ public:
     void inverse(const T* freqData, T* timeData) noexcept
     {
         // Pack into the conjugated half-size spectrum, run the forward engine,
-        // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M.
+        // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M,
+        // and by the pack's factor 2 (see inverseScale()).
         packInverseConj(freqData, engine_.inRe(), engine_.inIm());
-        const T scale = T(1) / static_cast<T>(halfSize_);
+        const T scale = inverseScale();
         engine_.runTo(timeData, scale, -scale);
     }
 
@@ -613,7 +641,7 @@ public:
             packInverseConj(freqData, engine_.inRe(), engine_.inIm());
             return;
         }
-        const T scale = T(1) / static_cast<T>(halfSize_);
+        const T scale = inverseScale();
         engine_.runToStep(static_cast<size_t>(step - 1), timeData, scale, -scale);
     }
 
@@ -707,14 +735,27 @@ private:
 
     void computePostTwiddles()
     {
-        twRe_.resize(halfSize_);
-        twIm_.resize(halfSize_);
-        for (size_t k = 0; k < halfSize_; ++k)
+        // The pre and post passes pair bin k <= M/2 with M - k and take
+        // w^(M-k) = -conj(w^k) from w^k, so the table is built to satisfy it
+        // exactly: computed up to M/2 (where the real part is exactly 0) and
+        // mirrored past it, as far as a vector starting at or below M/2 reads.
+        const size_t m = halfSize_;
+        const size_t used = std::min(m, m / 2 + detail::fft::kBlock<T>);
+        twRe_.resize(used);
+        twIm_.resize(used);
+        for (size_t k = 0; k <= m / 2; ++k)
         {
             const double angle = -2.0 * std::numbers::pi_v<double> * static_cast<double>(k)
                                / static_cast<double>(realSize_);
             twRe_[k] = static_cast<T>(std::cos(angle));
             twIm_[k] = static_cast<T>(std::sin(angle));
+        }
+        twRe_[m / 2] = T(0);
+        twIm_[m / 2] = T(-1);
+        for (size_t k = m / 2 + 1; k < used; ++k)
+        {
+            twRe_[k] = -twRe_[m - k];
+            twIm_[k] = twIm_[m - k];
         }
     }
 
@@ -731,18 +772,23 @@ private:
         detail::fft::unpackRealForward(zr, zi, out, halfSize_, twRe_.data(), twIm_.data());
     }
 
-    /// Packs the real spectrum into the conjugated half-size one (FftKernels.inl).
+    /// Packs the real spectrum into the conjugated half-size one, at twice its
+    /// value (FftKernels.inl).
     void packInverseConj(const T* in, T* zr, T* zi) const noexcept
     {
 #if defined(DSPARK_SIMD_DISPATCH_AVX2)
         if (simd::isRuntimeDispatchActive())
         {
-            detail::fft::avx2::packRealInverseConj(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
+            detail::fft::avx2::packRealSpectrum(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
             return;
         }
 #endif
-        detail::fft::packRealInverseConj(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
+        detail::fft::packRealSpectrum(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
     }
+
+    /// The inverse's 1/M, halved for the half-size spectrum packed at twice
+    /// its value (a power of two: the result is exact either way).
+    [[nodiscard]] T inverseScale() const noexcept { return T(0.5) / static_cast<T>(halfSize_); }
 
     size_t realSize_;
     size_t halfSize_;

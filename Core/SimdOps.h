@@ -145,6 +145,9 @@
 #endif
 #if defined(DSPARK_SIMD_AVX)
     #define DSPARK_VEC_AVX 1
+    #if defined(__AVX2__)
+        #define DSPARK_VEC_AVX2 1
+    #endif
 #endif
 #if defined(DSPARK_SIMD_FMA)
     #define DSPARK_VEC_FMA 1
@@ -157,6 +160,7 @@ namespace simd {
 #undef DSPARK_VEC_SSE2
 #undef DSPARK_VEC_NEON
 #undef DSPARK_VEC_AVX
+#undef DSPARK_VEC_AVX2
 #undef DSPARK_VEC_FMA
 
 #if defined(DSPARK_SIMD_DISPATCH_AVX2)
@@ -164,6 +168,7 @@ namespace simd {
 DSPARK_SIMD_AVX2_BEGIN
 #define DSPARK_VEC_SSE2 1
 #define DSPARK_VEC_AVX 1
+#define DSPARK_VEC_AVX2 1
 #define DSPARK_VEC_FMA 1
 namespace dspark {
 namespace simd {
@@ -174,6 +179,7 @@ namespace avx2 {
 } // namespace dspark
 #undef DSPARK_VEC_SSE2
 #undef DSPARK_VEC_AVX
+#undef DSPARK_VEC_AVX2
 #undef DSPARK_VEC_FMA
 DSPARK_SIMD_AVX2_END
 

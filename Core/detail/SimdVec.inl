@@ -7,8 +7,8 @@
 // and, in x86-64 builds below AVX, again into dspark::simd::avx2 inside an
 // AVX2+FMA target region, so each copy has its own symbols and the AVX2 code
 // runs only after the run-time CPU check. The includer defines the features of
-// the copy: DSPARK_VEC_SSE2, DSPARK_VEC_NEON, DSPARK_VEC_AVX and
-// DSPARK_VEC_FMA. This file includes nothing; the intrinsic headers come from
+// the copy: DSPARK_VEC_SSE2, DSPARK_VEC_NEON, DSPARK_VEC_AVX, DSPARK_VEC_AVX2
+// and DSPARK_VEC_FMA. This file includes nothing; the intrinsic headers come from
 // SimdOps.h.
 
 // ============================================================================
@@ -35,10 +35,16 @@ struct Vec<T, 1>
     static V madd(V a, V b, V c) noexcept { return a * b + c; }
     static V reverse(V v) noexcept { return v; }
     static void loadDeinterleave(const T* p, V& re, V& im) noexcept { re = p[0]; im = p[1]; }
+    static void loadDeinterleaveReversed(const T* p, V& re, V& im) noexcept { re = p[0]; im = p[1]; }
     static void storeInterleave2(T* p, V re, V im) noexcept { p[0] = re; p[1] = im; }
+    static void storeInterleave2Reversed(T* p, V re, V im) noexcept { p[0] = re; p[1] = im; }
     static void storeInterleave4(T* p, V a, V b, V c, V d) noexcept
     {
         p[0] = a; p[1] = b; p[2] = c; p[3] = d;
+    }
+    static void storeInterleave4To(T* p0, T* p1, T* p2, T* p3, V a, V b, V c, V d) noexcept
+    {
+        *p0 = a; *p1 = b; *p2 = c; *p3 = d;
     }
 };
 
@@ -77,11 +83,24 @@ struct Vec<float, 4>
         _mm_storeu_ps(p, _mm_unpacklo_ps(re, im));
         _mm_storeu_ps(p + 4, _mm_unpackhi_ps(re, im));
     }
+    static void loadDeinterleaveReversed(const float* p, V& re, V& im) noexcept
+    {
+        loadDeinterleave(p, re, im);
+        re = reverse(re);
+        im = reverse(im);
+    }
+    static void storeInterleave2Reversed(float* p, V re, V im) noexcept { storeInterleave2(p, reverse(re), reverse(im)); }
     static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
     {
         _MM_TRANSPOSE4_PS(a, b, c, d);
         _mm_storeu_ps(p, a); _mm_storeu_ps(p + 4, b);
         _mm_storeu_ps(p + 8, c); _mm_storeu_ps(p + 12, d);
+    }
+    static void storeInterleave4To(float* p0, float* p1, float* p2, float* p3, V a, V b, V c, V d) noexcept
+    {
+        _MM_TRANSPOSE4_PS(a, b, c, d);
+        _mm_storeu_ps(p0, a); _mm_storeu_ps(p1, b);
+        _mm_storeu_ps(p2, c); _mm_storeu_ps(p3, d);
     }
 };
 
@@ -119,12 +138,32 @@ struct Vec<double, 2>
         _mm_storeu_pd(p, _mm_unpacklo_pd(re, im));
         _mm_storeu_pd(p + 2, _mm_unpackhi_pd(re, im));
     }
+    /// loadDeinterleave() with the lanes reversed, in the same two shuffles.
+    static void loadDeinterleaveReversed(const double* p, V& re, V& im) noexcept
+    {
+        const V a = _mm_loadu_pd(p), b = _mm_loadu_pd(p + 2);
+        re = _mm_unpacklo_pd(b, a);
+        im = _mm_unpackhi_pd(b, a);
+    }
+    /// storeInterleave2() of the lanes reversed, in the same two shuffles.
+    static void storeInterleave2Reversed(double* p, V re, V im) noexcept
+    {
+        _mm_storeu_pd(p, _mm_unpackhi_pd(re, im));
+        _mm_storeu_pd(p + 2, _mm_unpacklo_pd(re, im));
+    }
     static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
     {
         _mm_storeu_pd(p,     _mm_unpacklo_pd(a, b));
         _mm_storeu_pd(p + 2, _mm_unpacklo_pd(c, d));
         _mm_storeu_pd(p + 4, _mm_unpackhi_pd(a, b));
         _mm_storeu_pd(p + 6, _mm_unpackhi_pd(c, d));
+    }
+    static void storeInterleave4To(double* p0, double* p1, double* p2, double* p3, V a, V b, V c, V d) noexcept
+    {
+        _mm_storeu_pd(p0, _mm_unpacklo_pd(a, b));
+        _mm_storeu_pd(p1, _mm_unpacklo_pd(c, d));
+        _mm_storeu_pd(p2, _mm_unpackhi_pd(a, b));
+        _mm_storeu_pd(p3, _mm_unpackhi_pd(c, d));
     }
 };
 #elif defined(DSPARK_VEC_NEON)
@@ -157,10 +196,25 @@ struct Vec<float, 4>
         float32x4x2_t v; v.val[0] = re; v.val[1] = im;
         vst2q_f32(p, v);
     }
+    static void loadDeinterleaveReversed(const float* p, V& re, V& im) noexcept
+    {
+        loadDeinterleave(p, re, im);
+        re = reverse(re);
+        im = reverse(im);
+    }
+    static void storeInterleave2Reversed(float* p, V re, V im) noexcept { storeInterleave2(p, reverse(re), reverse(im)); }
     static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
     {
         float32x4x4_t v; v.val[0] = a; v.val[1] = b; v.val[2] = c; v.val[3] = d;
         vst4q_f32(p, v);
+    }
+    static void storeInterleave4To(float* p0, float* p1, float* p2, float* p3, V a, V b, V c, V d) noexcept
+    {
+        const float32x4x2_t ab = vtrnq_f32(a, b), cd = vtrnq_f32(c, d);
+        vst1q_f32(p0, vcombine_f32(vget_low_f32(ab.val[0]), vget_low_f32(cd.val[0])));
+        vst1q_f32(p1, vcombine_f32(vget_low_f32(ab.val[1]), vget_low_f32(cd.val[1])));
+        vst1q_f32(p2, vcombine_f32(vget_high_f32(ab.val[0]), vget_high_f32(cd.val[0])));
+        vst1q_f32(p3, vcombine_f32(vget_high_f32(ab.val[1]), vget_high_f32(cd.val[1])));
     }
 };
 
@@ -191,10 +245,28 @@ struct Vec<double, 2>
         float64x2x2_t v; v.val[0] = re; v.val[1] = im;
         vst2q_f64(p, v);
     }
+    static void loadDeinterleaveReversed(const double* p, V& re, V& im) noexcept
+    {
+        const V a = vld1q_f64(p), b = vld1q_f64(p + 2);
+        re = vzip1q_f64(b, a);
+        im = vzip2q_f64(b, a);
+    }
+    static void storeInterleave2Reversed(double* p, V re, V im) noexcept
+    {
+        vst1q_f64(p, vzip2q_f64(re, im));
+        vst1q_f64(p + 2, vzip1q_f64(re, im));
+    }
     static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
     {
         float64x2x4_t v; v.val[0] = a; v.val[1] = b; v.val[2] = c; v.val[3] = d;
         vst4q_f64(p, v);
+    }
+    static void storeInterleave4To(double* p0, double* p1, double* p2, double* p3, V a, V b, V c, V d) noexcept
+    {
+        vst1q_f64(p0, vzip1q_f64(a, b));
+        vst1q_f64(p1, vzip1q_f64(c, d));
+        vst1q_f64(p2, vzip2q_f64(a, b));
+        vst1q_f64(p3, vzip2q_f64(c, d));
     }
 };
 #else
@@ -227,8 +299,12 @@ struct Vec<float, 8>
 #endif
     static V reverse(V v) noexcept
     {
+#if defined(DSPARK_VEC_AVX2)
+        return _mm256_permutevar8x32_ps(v, _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0));
+#else
         const V swapped = _mm256_permute2f128_ps(v, v, 1);
         return _mm256_permute_ps(swapped, _MM_SHUFFLE(0, 1, 2, 3));
+#endif
     }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
@@ -245,6 +321,13 @@ struct Vec<float, 8>
         _mm256_storeu_ps(p,     _mm256_permute2f128_ps(lo, hi, 0x20));
         _mm256_storeu_ps(p + 8, _mm256_permute2f128_ps(lo, hi, 0x31));
     }
+    static void loadDeinterleaveReversed(const float* p, V& re, V& im) noexcept
+    {
+        loadDeinterleave(p, re, im);
+        re = reverse(re);
+        im = reverse(im);
+    }
+    static void storeInterleave2Reversed(float* p, V re, V im) noexcept { storeInterleave2(p, reverse(re), reverse(im)); }
     static void storeInterleave4(float* p, V a, V b, V c, V d) noexcept
     {
         const V t0 = _mm256_unpacklo_ps(a, b), t1 = _mm256_unpackhi_ps(a, b);
@@ -257,6 +340,19 @@ struct Vec<float, 8>
         _mm256_storeu_ps(p + 8,  _mm256_permute2f128_ps(u2, u3, 0x20));
         _mm256_storeu_ps(p + 16, _mm256_permute2f128_ps(u0, u1, 0x31));
         _mm256_storeu_ps(p + 24, _mm256_permute2f128_ps(u2, u3, 0x31));
+    }
+    static void storeInterleave4To(float* p0, float* p1, float* p2, float* p3, V a, V b, V c, V d) noexcept
+    {
+        const V t0 = _mm256_unpacklo_ps(a, b), t1 = _mm256_unpackhi_ps(a, b);
+        const V t2 = _mm256_unpacklo_ps(c, d), t3 = _mm256_unpackhi_ps(c, d);
+        const V u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+        const V u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+        const V u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+        const V u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+        _mm256_storeu_ps(p0, _mm256_permute2f128_ps(u0, u1, 0x20));
+        _mm256_storeu_ps(p1, _mm256_permute2f128_ps(u2, u3, 0x20));
+        _mm256_storeu_ps(p2, _mm256_permute2f128_ps(u0, u1, 0x31));
+        _mm256_storeu_ps(p3, _mm256_permute2f128_ps(u2, u3, 0x31));
     }
 };
 
@@ -281,8 +377,12 @@ struct Vec<double, 4>
 #endif
     static V reverse(V v) noexcept
     {
+#if defined(DSPARK_VEC_AVX2)
+        return _mm256_permute4x64_pd(v, _MM_SHUFFLE(0, 1, 2, 3));
+#else
         const V swapped = _mm256_permute2f128_pd(v, v, 1);
         return _mm256_permute_pd(swapped, 0x5);
+#endif
     }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {
@@ -299,6 +399,23 @@ struct Vec<double, 4>
         _mm256_storeu_pd(p,     _mm256_permute2f128_pd(lo, hi, 0x20));
         _mm256_storeu_pd(p + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
     }
+    /// loadDeinterleave() with the lanes reversed, in the same four shuffles.
+    static void loadDeinterleaveReversed(const double* p, V& re, V& im) noexcept
+    {
+        const V a = _mm256_loadu_pd(p), b = _mm256_loadu_pd(p + 4);
+        const V lo = _mm256_permute2f128_pd(b, a, 0x31);   // x3 y3 | x1 y1
+        const V hi = _mm256_permute2f128_pd(b, a, 0x20);   // x2 y2 | x0 y0
+        re = _mm256_unpacklo_pd(lo, hi);
+        im = _mm256_unpackhi_pd(lo, hi);
+    }
+    /// storeInterleave2() of the lanes reversed, in the same four shuffles.
+    static void storeInterleave2Reversed(double* p, V re, V im) noexcept
+    {
+        const V lo = _mm256_unpacklo_pd(re, im);   // r0 i0 | r2 i2
+        const V hi = _mm256_unpackhi_pd(re, im);   // r1 i1 | r3 i3
+        _mm256_storeu_pd(p,     _mm256_permute2f128_pd(hi, lo, 0x31));
+        _mm256_storeu_pd(p + 4, _mm256_permute2f128_pd(hi, lo, 0x20));
+    }
     static void storeInterleave4(double* p, V a, V b, V c, V d) noexcept
     {
         const V t0 = _mm256_unpacklo_pd(a, b), t1 = _mm256_unpackhi_pd(a, b);
@@ -307,6 +424,15 @@ struct Vec<double, 4>
         _mm256_storeu_pd(p + 4,  _mm256_permute2f128_pd(t1, t3, 0x20));
         _mm256_storeu_pd(p + 8,  _mm256_permute2f128_pd(t0, t2, 0x31));
         _mm256_storeu_pd(p + 12, _mm256_permute2f128_pd(t1, t3, 0x31));
+    }
+    static void storeInterleave4To(double* p0, double* p1, double* p2, double* p3, V a, V b, V c, V d) noexcept
+    {
+        const V t0 = _mm256_unpacklo_pd(a, b), t1 = _mm256_unpackhi_pd(a, b);
+        const V t2 = _mm256_unpacklo_pd(c, d), t3 = _mm256_unpackhi_pd(c, d);
+        _mm256_storeu_pd(p0, _mm256_permute2f128_pd(t0, t2, 0x20));
+        _mm256_storeu_pd(p1, _mm256_permute2f128_pd(t1, t3, 0x20));
+        _mm256_storeu_pd(p2, _mm256_permute2f128_pd(t0, t2, 0x31));
+        _mm256_storeu_pd(p3, _mm256_permute2f128_pd(t1, t3, 0x31));
     }
 };
 #else

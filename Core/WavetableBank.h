@@ -23,7 +23,10 @@
  * own response at its table frequency, computed when the bank is built: the
  * played amplitudes are the frame's amplitudes. The interpolator is linear in
  * the samples, so frames, and levels of equal size, are blended before one
- * polynomial evaluation.
+ * polynomial evaluation. The two bass pairs whose sizes differ (8192 and
+ * 4096, 4096 and 2048 samples) keep a copy of the duller level on the
+ * brighter one's grid, so every crossfade that selectMip() chooses blends
+ * the samples and interpolates once; the copies cost 21% of the storage.
  *
  * Measured at 48 kHz, worst inharmonic component below 20 kHz relative to the
  * strongest harmonic, 27.5 Hz to 5 kHz: about -165 dB for 1/h and 1/sqrt(h)
@@ -44,15 +47,16 @@
  * operation. Measured on x86-64 at 440 Hz with the level crossfade active,
  * float: read() 14 ns per sample, readBlock() 1.8 ns with AVX2 and 2.4 ns
  * with SSE2, phase accumulation included, against 2.45 ns for a 4-point
- * cubic reader of one table (no crossfade) in the same loop; 3.2 ns with
- * AVX2 when the frame position moves every sample. On one level 1.5 and
- * 1.9 ns. The SSE2, NEON and AVX2 kernels are one source,
+ * cubic reader of one table (no crossfade) in the same loop, and the same
+ * in the bass, where the crossfade reads a level's copy; 3.2 ns with AVX2
+ * when the frame position moves every sample. On one level 1.5 and 1.9 ns.
+ * The SSE2, NEON and AVX2 kernels are one source,
  * detail/WavetableKernels.inl, over each instruction set's lane operations;
  * each group of samples derives its table indices while the previous one
  * is interpolated, so its loads do not wait on that arithmetic.
  *
  * Storage is float whatever the reader's sample type, with guard samples
- * around every table so a read never wraps. A bank costs 229 KB per frame.
+ * around every table so a read never wraps. A bank costs 279 KB per frame.
  * The four built-in banks (builtin()) are built once per process, on first
  * use, and shared.
  *
@@ -1031,7 +1035,7 @@ public:
 
     /**
      * @brief A built-in bank, built on the first call and shared by the process.
-     * @note The first call per bank allocates about 1.4 to 2.1 MB and runs the
+     * @note The first call per bank allocates about 1.7 to 2.5 MB and runs the
      *       synthesis: make it from a setup thread.
      */
     [[nodiscard]] static const WavetableBank& builtin(Builtin which)
@@ -1128,13 +1132,15 @@ public:
             return interpolate(ya, xa);
 
         T yb[6];
-        const T xb = gather<T>(b, f0, f1, t, phase, yb);
-        if (levelSize_[static_cast<size_t>(a)] == levelSize_[static_cast<size_t>(b)])
+        if (levelSize_[static_cast<size_t>(a)] == levelSize_[static_cast<size_t>(b)] || hasGridCopy(a, b))
         {
-            // Same grid: blend the samples, interpolate once.
+            // Same grid (b itself or its copy on a's grid): blend the
+            // samples, interpolate once.
+            (void)gather<T>(b, f0, f1, t, phase, yb, levelSize_[static_cast<size_t>(a)]);
             for (int k = 0; k < 6; ++k) ya[k] = yb[k] + w * (ya[k] - yb[k]);
             return interpolate(ya, xa);
         }
+        const T xb = gather<T>(b, f0, f1, t, phase, yb);
         const T sa = interpolate(ya, xa);
         const T sb = interpolate(yb, xb);
         return sb + w * (sa - sb);
@@ -1311,28 +1317,42 @@ private:
         const int b = std::clamp(mip.next, 0, kMipLevels - 1);
         s.two = !(a == b || w >= T(1));
         const auto la = static_cast<size_t>(a), lb = static_cast<size_t>(b);
-        s.same = levelSize_[la] == levelSize_[lb];
+        const bool copy = levelSize_[la] != levelSize_[lb] && hasGridCopy(a, b);
+        const int sizeB = copy ? copySize_[lb] : levelSize_[lb];
+        s.same = levelSize_[la] == sizeB;
         s.sizeA = static_cast<double>(levelSize_[la]);
-        s.sizeB = static_cast<double>(levelSize_[lb]);
+        s.sizeB = static_cast<double>(sizeB);
         s.strideA = static_cast<size_t>(levelSize_[la] + 2 * kGuard);
-        s.strideB = static_cast<size_t>(levelSize_[lb] + 2 * kGuard);
+        s.strideB = static_cast<size_t>(sizeB + 2 * kGuard);
         s.baseA = data_.data() + levelOffset_[la] + static_cast<size_t>(kGuard - 2);
-        s.baseB = data_.data() + levelOffset_[lb] + static_cast<size_t>(kGuard - 2);
+        s.baseB = data_.data() + (copy ? copyOffset_[lb] : levelOffset_[lb]) + static_cast<size_t>(kGuard - 2);
         return s;
     }
 #endif
 
-    /** Six frame-blended samples around the phase on one level; returns the fraction. */
+    /// True when level b has a copy on level a's grid (b follows a and their
+    /// own grids differ).
+    [[nodiscard]] bool hasGridCopy(int a, int b) const noexcept
+    {
+        return b == a + 1 && copySize_[static_cast<size_t>(b)] == levelSize_[static_cast<size_t>(a)];
+    }
+
+    /**
+     * Six frame-blended samples around the phase on one level; returns the
+     * fraction. `grid` selects the level's copy on that grid instead of its
+     * own table (see hasGridCopy()); 0 reads its own.
+     */
     template <FloatType T>
-    T gather(int level, int f0, int f1, T t, double phase, T* y) const noexcept
+    T gather(int level, int f0, int f1, T t, double phase, T* y, int grid = 0) const noexcept
     {
         const auto L = static_cast<size_t>(level);
-        const int size = levelSize_[L];
+        const bool copy = grid != 0 && grid != levelSize_[L];
+        const int size = copy ? grid : levelSize_[L];
         const double p = phase * static_cast<double>(size);
         const int i = std::min(static_cast<int>(p), size - 1);
         const size_t stride = static_cast<size_t>(size + 2 * kGuard);
-        const float* ta = data_.data() + levelOffset_[L] + static_cast<size_t>(f0) * stride
-                        + static_cast<size_t>(kGuard + i - 2);
+        const float* ta = data_.data() + (copy ? copyOffset_[L] : levelOffset_[L])
+                        + static_cast<size_t>(f0) * stride + static_cast<size_t>(kGuard + i - 2);
         if (t == T(0))
         {
             for (int k = 0; k < 6; ++k) y[k] = static_cast<T>(ta[k]);
@@ -1364,6 +1384,19 @@ private:
             offsets[l] = total;
             total += static_cast<size_t>(numFrames) * static_cast<size_t>(size + 2 * kGuard);
         }
+        // A level whose grid differs from the brighter level it is blended
+        // with also gets a copy on that level's grid, so the pair blends its
+        // samples and interpolates once (see read()).
+        std::array<int, kMipLevels> copySizes {};
+        std::array<size_t, kMipLevels> copyOffsets {};
+        for (int L = 1; L < kMipLevels; ++L)
+        {
+            const auto l = static_cast<size_t>(L);
+            if (sizes[l] == sizes[l - 1]) continue;
+            copySizes[l] = sizes[l - 1];
+            copyOffsets[l] = total;
+            total += static_cast<size_t>(numFrames) * static_cast<size_t>(copySizes[l] + 2 * kGuard);
+        }
 
         // Pre-emphasis per (table size, harmonic): the inverse interpolator
         // response at h / size cycles per sample.
@@ -1381,6 +1414,11 @@ private:
                 emphasis[l][static_cast<size_t>(h)] =
                     1.0 / interpolatorResponse(static_cast<double>(h) / static_cast<double>(sizes[l]));
         }
+        // A copy sits on the grid of the level before it, which holds more
+        // harmonics: that level's emphasis covers it.
+        const auto emphasisOf = [&](size_t l, bool copy) -> const std::vector<double>& {
+            return copy ? emphasis[l - 1] : emphasis[l];
+        };
 
         std::vector<double> spec, cycle;
         std::vector<FFTReal<double>> ffts;
@@ -1394,10 +1432,11 @@ private:
         };
         for (int L = 0; L < kMipLevels; ++L) (void)fftFor(sizes[static_cast<size_t>(L)]);
 
-        // One level of one frame into `cycle`, scaled by `gain`.
-        auto synthesize = [&](int frame, int L) {
+        // One level of one frame (or its copy) into `cycle`.
+        auto synthesize = [&](int frame, int L, bool copy = false) {
             const auto l = static_cast<size_t>(L);
-            const int size = sizes[l];
+            const int size = copy ? copySizes[l] : sizes[l];
+            const std::vector<double>& emph = emphasisOf(l, copy);
             spec.assign(static_cast<size_t>(size + 2), 0.0);
             cycle.resize(static_cast<size_t>(size));
             const double half = 0.5 * static_cast<double>(size);
@@ -1406,7 +1445,7 @@ private:
             {
                 // x = sum a cos + b sin has X[h] = (N/2)(a - j b) under the
                 // inverse transform's 1/N scaling.
-                const double e = emphasis[l][static_cast<size_t>(h)];
+                const double e = emph[static_cast<size_t>(h)];
                 spec[static_cast<size_t>(2 * h)]     =  half * c[h - 1].cosine * e;
                 spec[static_cast<size_t>(2 * h + 1)] = -half * c[h - 1].sine * e;
             }
@@ -1414,7 +1453,8 @@ private:
         };
 
         // Pass 1: peak per frame over all its levels (in practice the
-        // richest). Pass 2: write the scaled tables with their guards.
+        // richest; the copies take their level's scale). Pass 2: write the
+        // scaled tables with their guards.
         std::vector<double> peak(static_cast<size_t>(numFrames), 0.0);
         for (int f = 0; f < numFrames; ++f)
             for (int L = 0; L < kMipLevels; ++L)
@@ -1435,31 +1475,35 @@ private:
                 ? (framePeak > 0.0 ? 1.0 / framePeak : 0.0)
                 : 1.0 / bankPeak;
             for (int L = 0; L < kMipLevels; ++L)
-            {
-                synthesize(f, L);
-                const auto l = static_cast<size_t>(L);
-                const int size = sizes[l];
-                float* dst = data.data() + offsets[l]
-                           + static_cast<size_t>(f) * static_cast<size_t>(size + 2 * kGuard);
-                for (int i = 0; i < size; ++i)
+                for (const bool copy : { false, true })
                 {
-                    // No negative zeros: the block kernels blend frames with t = 0
-                    // arithmetically, and -0 + 0 would read back as +0.
-                    const float v = static_cast<float>(cycle[static_cast<size_t>(i)] * gain);
-                    dst[kGuard + i] = (v == 0.0f) ? 0.0f : v;
+                    const auto l = static_cast<size_t>(L);
+                    if (copy && copySizes[l] == 0) continue;
+                    synthesize(f, L, copy);
+                    const int size = copy ? copySizes[l] : sizes[l];
+                    float* dst = data.data() + (copy ? copyOffsets[l] : offsets[l])
+                               + static_cast<size_t>(f) * static_cast<size_t>(size + 2 * kGuard);
+                    for (int i = 0; i < size; ++i)
+                    {
+                        // No negative zeros: the block kernels blend frames with t = 0
+                        // arithmetically, and -0 + 0 would read back as +0.
+                        const float v = static_cast<float>(cycle[static_cast<size_t>(i)] * gain);
+                        dst[kGuard + i] = (v == 0.0f) ? 0.0f : v;
+                    }
+                    for (int g = 0; g < kGuard; ++g)
+                    {
+                        dst[g] = dst[size + g];                     // wraps of the cycle's end
+                        dst[kGuard + size + g] = dst[kGuard + g];   // and of its start
+                    }
                 }
-                for (int g = 0; g < kGuard; ++g)
-                {
-                    dst[g] = dst[size + g];                     // wraps of the cycle's end
-                    dst[kGuard + size + g] = dst[kGuard + g];   // and of its start
-                }
-            }
         }
 
         data_ = std::move(data);
         levelHarmonics_ = harmonics;
         levelSize_ = sizes;
         levelOffset_ = offsets;
+        copySize_ = copySizes;
+        copyOffset_ = copyOffsets;
         numFrames_ = numFrames;
         return true;
     }
@@ -1558,6 +1602,8 @@ private:
     std::array<int, kMipLevels> levelHarmonics_ {};   ///< Harmonic budget per level.
     std::array<int, kMipLevels> levelSize_ {};        ///< Table samples per level.
     std::array<size_t, kMipLevels> levelOffset_ {};   ///< Start of each level's frame block.
+    std::array<int, kMipLevels> copySize_ {};         ///< Grid of a level's copy (0: none).
+    std::array<size_t, kMipLevels> copyOffset_ {};    ///< Start of the copy's frame block.
     std::vector<float> data_;                         ///< [level][frame][guard, table, guard].
 };
 

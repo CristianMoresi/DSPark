@@ -2326,8 +2326,60 @@ DSPARK_TEST(WavetableBank_builtins_have_their_frames)
     EXPECT_EQ(B::builtin(B::Builtin::Formant).getNumFrames(), 9);
     EXPECT_EQ(B::builtin(B::Builtin::Fm).getNumFrames(), 8);
     EXPECT_EQ(B::builtin(B::Builtin::Basic).getNumHarmonics(), B::kMaxHarmonics);
-    // 57344 table samples plus guards per frame, in float.
-    EXPECT_LT(B::builtin(B::Builtin::Basic).getMemoryBytes(), 6u * 230000u);
+    // Per frame, in float: 57344 table samples, the copies of the two bass
+    // levels on their brighter neighbour's grid (8192 + 4096), and 6 guard
+    // samples on each of the 22 tables; 2 floats of tail after the last frame.
+    EXPECT_EQ(B::builtin(B::Builtin::Basic).getMemoryBytes(),
+              sizeof(float) * (6u * (57344u + 12288u + 22u * 6u) + 2u));
+}
+
+// The two bass pairs whose grids differ (8192 and 4096 samples, 4096 and
+// 2048) blend on one grid through a copy of the duller level, as every other
+// pair does: inside both pairs the crossfade keeps the floor of a single
+// level, and the block reader still returns read()'s values.
+// (Near a pair's top, where the duller level dominates, the flat spectrum's
+// floor is -141 dB, -136 dB before the copies.)
+DSPARK_TEST(WavetableBank_bass_crossfades_blend_on_one_grid)
+{
+    WavetableBank flat;
+    EXPECT_TRUE(flat.buildFromHarmonics(1, WavetableBank::kMaxHarmonics, [](int, int) {
+        return WavetableBank::Harmonic { 0.0, 1.0 };
+    }));
+    const auto& basic = WavetableBank::builtin(WavetableBank::Builtin::Basic);
+    const double fs = 48000.0;
+    double worstSaw = -400.0, worstFlat = -400.0, worstBlock = 0.0;
+    for (double hz : { 30.0, 33.0, 36.0, 60.0, 70.0 })
+    {
+        const double f0 = binPitch(hz, fs);
+        for (int c = 0; c < 2; ++c)
+        {
+            const WavetableBank& bank = (c == 0) ? basic : flat;
+            const auto mip = bank.selectMip(f0, fs);
+            EXPECT_TRUE(mip.next == mip.level + 1 && mip.weight > 0.0f && mip.weight < 1.0f);
+            const double pos = (c == 0) ? 2.0 : 0.0;
+            double ph = 0.0;
+            const double db = inharmonicFloorDb([&] {
+                const double v = bank.read<double>(ph, pos, mip);
+                ph += f0 / fs;
+                if (ph >= 1.0) ph -= 1.0;
+                return v;
+            }, f0, fs);
+            (c == 0 ? worstSaw : worstFlat) = std::max(c == 0 ? worstSaw : worstFlat, db);
+
+            std::vector<double> phases(256);
+            std::vector<float> block(256);
+            double q = 0.37;
+            for (auto& p : phases) { p = q; q += f0 / fs; if (q >= 1.0) q -= 1.0; }
+            bank.readBlock<float>(phases.data(), pos, mip, block.data(), 256);
+            for (size_t i = 0; i < phases.size(); ++i)
+                worstBlock = std::max(worstBlock, std::abs(static_cast<double>(block[i])
+                                      - static_cast<double>(bank.read<float>(phases[i], pos, mip))));
+        }
+    }
+    std::cout << "  bass crossfades: saw " << worstSaw << " dB, flat spectrum " << worstFlat << " dB\n";
+    EXPECT_LT(worstSaw, -160.0);
+    EXPECT_LT(worstFlat, -147.0);
+    EXPECT_LT(worstBlock, 1e-6);   // bit for bit unless read() is contracted into FMAs
 }
 
 DSPARK_TEST(WavetableBank_floor_holds_from_lowest_to_highest_pitch)
@@ -2375,29 +2427,35 @@ DSPARK_TEST(WavetableBank_pre_emphasis_restores_exact_harmonic_levels)
     const auto& basic = WavetableBank::builtin(WavetableBank::Builtin::Basic);
     EXPECT_NEAR(WavetableBank::interpolatorResponse(0.0), 1.0, 1e-8);
     EXPECT_LT(WavetableBank::interpolatorResponse(0.125), 0.999);   // the droop is real
-    const double fs = 48000.0, f0 = binPitch(55.0, fs);
-    const auto mip = basic.selectMip(f0, fs);
-    std::vector<double> win(kFloorFft), t(kFloorFft), f(kFloorFft + 2);
-    WindowFunctions<double>::blackmanHarris(win.data(), static_cast<int>(kFloorFft), false);
-    double ph = 0.0;
-    for (size_t i = 0; i < kFloorFft; ++i)
-    {
-        t[i] = basic.read<double>(ph, 2.0, mip) * win[i];
-        ph += f0 / fs;
-        if (ph >= 1.0) ph -= 1.0;
-    }
-    FFTReal<double> fft(kFloorFft);
-    fft.forward(t.data(), f.data());
-    auto mag = [&](int n) {
-        const auto k = static_cast<size_t>(std::llround(n * f0 / (fs / kFloorFft)));
-        return std::hypot(f[2 * k], f[2 * k + 1]);
-    };
     // At 55 Hz the pair is the 362- and 256-harmonic levels: harmonics above
     // 256 fade with the crossfade by design, those below are in both levels
-    // (the 256-harmonic one at the 0.125 cycles/sample band edge).
+    // (the 256-harmonic one read from its copy on the 4096-sample grid). At
+    // 90 Hz it is the 256- and 181-harmonic levels, the first at the 0.125
+    // cycles/sample band edge of its 2048-sample table.
     double worst = 0.0;
-    for (int n = 2; n <= 256; ++n)
-        worst = std::max(worst, std::abs(20.0 * std::log10(mag(n) * n / mag(1))));
+    for (const double hz : { 55.0, 90.0 })
+    {
+        const double fs = 48000.0, f0 = binPitch(hz, fs);
+        const auto mip = basic.selectMip(f0, fs);
+        std::vector<double> win(kFloorFft), t(kFloorFft), f(kFloorFft + 2);
+        WindowFunctions<double>::blackmanHarris(win.data(), static_cast<int>(kFloorFft), false);
+        double ph = 0.0;
+        for (size_t i = 0; i < kFloorFft; ++i)
+        {
+            t[i] = basic.read<double>(ph, 2.0, mip) * win[i];
+            ph += f0 / fs;
+            if (ph >= 1.0) ph -= 1.0;
+        }
+        FFTReal<double> fft(kFloorFft);
+        fft.forward(t.data(), f.data());
+        auto mag = [&](int n) {
+            const auto k = static_cast<size_t>(std::llround(n * f0 / (fs / kFloorFft)));
+            return std::hypot(f[2 * k], f[2 * k + 1]);
+        };
+        const int top = (hz < 60.0) ? 256 : 181;
+        for (int n = 2; n <= top; ++n)
+            worst = std::max(worst, std::abs(20.0 * std::log10(mag(n) * n / mag(1))));
+    }
     std::cout << "  worst harmonic error " << worst << " dB\n";
     EXPECT_LT(worst, 0.002);
 }

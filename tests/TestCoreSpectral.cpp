@@ -15,6 +15,7 @@
 #include <chrono>
 #include <thread>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -429,6 +430,109 @@ DSPARK_TEST(FFT_fused_split_runs_match_their_unfused_forms)
 {
     checkFusedSplitRuns<float>();
     checkFusedSplitRuns<double>();
+}
+
+// The passes keep the data in blocks of real parts followed by imaginary
+// parts, and an odd log2 size closes with a radix-8 pass where its rows stay
+// under 4 KiB apart (a radix-4 and a radix-2 pass further up): every size
+// from 2 to 65536, complex and real, forward and inverse, against a plain
+// radix-2 reference in double, with the vector kernels and with the
+// baseline ones. The real inverse also ignores the imaginary parts of its
+// DC and Nyquist bins, bit for bit, as a real signal has none there.
+template <typename T>
+static void checkFftAgainstReference(double tolerance)
+{
+    using C = std::complex<double>;
+    const auto reference = [](std::vector<C>& a) {
+        const size_t n = a.size();
+        for (size_t i = 1, j = 0; i < n; ++i)
+        {
+            size_t bit = n >> 1;
+            for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) std::swap(a[i], a[j]);
+        }
+        for (size_t len = 2; len <= n; len <<= 1)
+            for (size_t k = 0; k < len / 2; ++k)
+            {
+                const double angle = -2.0 * 3.14159265358979323846 * static_cast<double>(k)
+                                   / static_cast<double>(len);
+                const C w(std::cos(angle), std::sin(angle));
+                for (size_t i = 0; i < n; i += len)
+                {
+                    const C u = a[i + k], v = a[i + k + len / 2] * w;
+                    a[i + k] = u + v;
+                    a[i + k + len / 2] = u - v;
+                }
+            }
+    };
+    // RMS difference relative to the RMS of the reference.
+    const auto relative = [](const std::vector<C>& got, const std::vector<C>& ref, size_t count) {
+        double err = 0.0, sum = 0.0;
+        for (size_t k = 0; k < count; ++k)
+        {
+            err += std::norm(got[k] - ref[k]);
+            sum += std::norm(ref[k]);
+        }
+        return std::sqrt(err / sum);
+    };
+    unsigned int rng = 2024u;
+    auto next = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+    };
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool wide : { true, false })
+    {
+        simd::setRuntimeDispatch(wide && dispatch);
+        for (size_t n = 2; n <= 65536; n *= 2)
+        {
+            std::vector<T> z(2 * n);
+            for (auto& v : z) v = next();
+            std::vector<C> ref(n), got(n);
+            for (size_t i = 0; i < n; ++i) ref[i] = C(z[2 * i], z[2 * i + 1]);
+            const std::vector<T> z0 = z;
+            reference(ref);
+            FFTComplex<T> fc(n);
+            fc.forward(z.data());
+            for (size_t k = 0; k < n; ++k) got[k] = C(z[2 * k], z[2 * k + 1]);
+            EXPECT_LT(relative(got, ref, n), tolerance);
+            fc.inverse(z.data());
+            double back = 0.0;
+            for (size_t i = 0; i < 2 * n; ++i) back = std::max(back, std::abs(double(z[i]) - double(z0[i])));
+            EXPECT_LT(back, 16.0 * tolerance);
+
+            if (n < 4) continue;
+            std::vector<T> x(n), spec(n + 2), y(n), y0(n);
+            for (auto& v : x) v = next();
+            for (size_t i = 0; i < n; ++i) ref[i] = C(x[i], 0.0);
+            reference(ref);
+            FFTReal<T> fr(n);
+            fr.forward(x.data(), spec.data());
+            for (size_t k = 0; k <= n / 2; ++k) got[k] = C(spec[2 * k], spec[2 * k + 1]);
+            EXPECT_LT(relative(got, ref, n / 2 + 1), tolerance);
+            fr.inverse(spec.data(), y.data());
+            back = 0.0;
+            for (size_t i = 0; i < n; ++i) back = std::max(back, std::abs(double(y[i]) - double(x[i])));
+            EXPECT_LT(back, 16.0 * tolerance);
+
+            for (auto& v : spec) v = next();
+            spec[1] = T(0);
+            spec[n + 1] = T(0);
+            fr.inverse(spec.data(), y0.data());
+            spec[1] = next();
+            spec[n + 1] = next();
+            fr.inverse(spec.data(), y.data());
+            EXPECT_EQ(std::memcmp(y.data(), y0.data(), n * sizeof(T)), 0);
+        }
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
+DSPARK_TEST(FFT_blocked_engine_matches_a_reference_at_every_size)
+{
+    checkFftAgainstReference<float>(1e-6);
+    checkFftAgainstReference<double>(1e-14);
 }
 
 // ============================================================================

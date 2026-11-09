@@ -65,6 +65,7 @@
 #include "SimdOps.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <cmath>
@@ -198,28 +199,12 @@ public:
         bufA_.assign(2 * n_, T(0));
         bufB_.assign(2 * n_, T(0));
 
-        // Plan: radix-4 passes of length n, n/4, ... with stride 1, 4, ...;
-        // an odd log2(N) closes with a radix-8 pass in place of a length-8
-        // radix-4 pass and a radix-2 one, or with that pair where the
-        // radix-8 pass's eight output rows would sit 4 KiB apart or more
-        // (they then share cache sets and the pass slows down several
-        // times), where its rows would not fill a block of the work layout,
-        // and where it would be the first pass.
-        const bool odd = (std::countr_zero(n_) & 1) != 0;
-        const bool radix8 = odd && n_ >= 32 && n_ / 8 >= kBlock<T>
-                         && (n_ / 8) * sizeof(T) < 4096;
-        size_t len = n_, stride = 1, offset = 0;
-        while (len >= 4 && !(radix8 && len == 8))
-        {
-            passes_.push_back({ len, stride, offset, false, false });
-            offset += 6 * (len / 4);
-            len /= 4;
-            stride *= 4;
-        }
-        if (len == 8)
-            passes_.push_back({ 8, stride, offset, false, true });
-        else if (len == 2)
-            passes_.push_back({ 2, stride, offset, true, false });
+        PlanPasses steps;
+        const size_t passCount = buildPlan(n_, steps);
+        passes_.assign(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(passCount));
+        const Pass& last = passes_.back();
+        const size_t offset = last.radix2 || last.radix8 ? last.twOffset
+                                                         : last.twOffset + 6 * (last.len / 4);
 
         twiddles_.assign(offset, T(0));
         for (const Pass& pass : passes_)
@@ -244,18 +229,12 @@ public:
         // lane (see FftKernels.inl, kInLaneDeinterleave): within each block of
         // butterflies, its four runs of kBlock / 4 in the order (0, 2, 1, 3).
         // Only builds with a kernel set that reads that way keep them.
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-        constexpr bool inLaneReader = true;
-#else
-        constexpr bool inLaneReader = kInLaneDeinterleave<T, kWide<T>>;
-#endif
-        const Pass& first = passes_.front();
-        if (inLaneReader && interleavedInput && passes_.size() > 1 && !first.radix2 && !first.radix8
-            && (first.len / 4) % kBlock<T> == 0)
+        if (const size_t inLane = inLaneTwiddleCount(steps, passCount, interleavedInput); inLane > 0)
         {
+            const Pass& first = passes_.front();
             constexpr size_t B = kBlock<T>, q = B / 4;
             const size_t n1 = first.len / 4;
-            inLaneTwiddles_.assign(6 * n1, T(0));
+            inLaneTwiddles_.assign(inLane, T(0));
             const T* w = twiddles_.data() + first.twOffset;
             for (size_t row = 0; row < 6; ++row)
                 for (size_t p = 0; p < n1; ++p)
@@ -265,6 +244,30 @@ public:
                     inLaneTwiddles_[row * n1 + p] = w[row * n1 + from];
                 }
         }
+    }
+
+    /// Room a standard library may add to one allocation request for its own
+    /// alignment bookkeeping (one library requests 39 more bytes for every
+    /// vector of 4 KiB or more).
+    static constexpr size_t kAllocationOverhead = 64;
+
+    /**
+     * @brief Upper bound of the bytes the constructor requests for a
+     *        power-of-two size n: the two work buffers, the twiddle tables and
+     *        the pass plan, one allocation each, plus kAllocationOverhead per
+     *        allocation. Allocates nothing.
+     */
+    [[nodiscard]] static size_t allocationBytes(size_t n, bool interleavedInput) noexcept
+    {
+        PlanPasses steps;
+        const size_t passCount = buildPlan(n, steps);
+        const Pass& last = steps[passCount - 1];
+        const size_t twiddles = last.radix2 || last.radix8 ? last.twOffset
+                                                           : last.twOffset + 6 * (last.len / 4);
+        const size_t inLane = inLaneTwiddleCount(steps, passCount, interleavedInput);
+        const size_t allocations = 3 + (twiddles > 0 ? 1 : 0) + (inLane > 0 ? 1 : 0);
+        return (4 * n + twiddles + inLane) * sizeof(T) + passCount * sizeof(Pass)
+             + allocations * kAllocationOverhead;
     }
 
     [[nodiscard]] size_t size() const noexcept { return n_; }
@@ -549,6 +552,52 @@ private:
                  inLaneTwiddles_.empty() ? nullptr : inLaneTwiddles_.data() };
     }
 
+    /// Room for every plan up to 2^63 points (one pass per factor of four).
+    using PlanPasses = std::array<Pass, 40>;
+
+    // Plan: radix-4 passes of length n, n/4, ... with stride 1, 4, ...; an
+    // odd log2(N) closes with a radix-8 pass in place of a length-8 radix-4
+    // pass and a radix-2 one, or with that pair where the radix-8 pass's
+    // eight output rows would sit 4 KiB apart or more (they then share cache
+    // sets and the pass slows down several times), where its rows would not
+    // fill a block of the work layout, and where it would be the first pass.
+    // The constructor and allocationBytes() both build it here.
+    static size_t buildPlan(size_t n, PlanPasses& out) noexcept
+    {
+        const bool odd = (std::countr_zero(n) & 1) != 0;
+        const bool radix8 = odd && n >= 32 && n / 8 >= kBlock<T>
+                         && (n / 8) * sizeof(T) < 4096;
+        size_t len = n, stride = 1, offset = 0, count = 0;
+        while (len >= 4 && !(radix8 && len == 8))
+        {
+            out[count++] = { len, stride, offset, false, false };
+            offset += 6 * (len / 4);
+            len /= 4;
+            stride *= 4;
+        }
+        if (len == 8)
+            out[count++] = { 8, stride, offset, false, true };
+        else if (len == 2)
+            out[count++] = { 2, stride, offset, true, false };
+        return count;
+    }
+
+    /// Size of the first pass's in-lane twiddle copy (zero when not built).
+    static size_t inLaneTwiddleCount(const PlanPasses& steps, size_t count,
+                                     bool interleavedInput) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        constexpr bool inLaneReader = true;
+#else
+        constexpr bool inLaneReader = kInLaneDeinterleave<T, kWide<T>>;
+#endif
+        const Pass& first = steps[0];
+        if (inLaneReader && interleavedInput && count > 1 && !first.radix2 && !first.radix8
+            && (first.len / 4) % kBlock<T> == 0)
+            return 6 * (first.len / 4);
+        return 0;
+    }
+
     size_t n_;
     std::vector<T> bufA_, bufB_;   ///< Ping-pong buffers, [re | im] each.
     std::vector<T> twiddles_;
@@ -594,6 +643,23 @@ public:
      * @return The size provided at construction.
      */
     [[nodiscard]] size_t getSize() const noexcept { return engine_.size(); }
+
+    /**
+     * @brief Upper bound of the heap bytes a constructor of this size
+     *        requests, excluding the object itself, with up to 64 bytes per
+     *        allocation for standard-library bookkeeping. Allocates nothing;
+     *        use it to budget memory before constructing. The count depends on
+     *        the build's kernel sets.
+     * @param size Number of complex samples: a power of two >= 2 (other
+     *             sizes return 0).
+     * @return At least the sum of the constructor's allocation requests.
+     */
+    [[nodiscard]] static size_t allocationBytes(size_t size) noexcept
+    {
+        if (size < 2 || (size & (size - 1)) != 0)
+            return 0;
+        return detail::fft::SplitFFT<T>::allocationBytes(size, true);
+    }
 
     /**
      * @brief Performs a forward (time->frequency) FFT in-place.
@@ -683,6 +749,25 @@ public:
 
     /** @brief Returns the number of frequency bins (N/2 + 1) including DC and Nyquist. */
     [[nodiscard]] size_t getNumBins() const noexcept { return halfSize_ + 1; }
+
+    /**
+     * @brief Upper bound of the heap bytes a constructor of this size
+     *        requests, excluding the object itself, with up to 64 bytes per
+     *        allocation for standard-library bookkeeping. Allocates nothing;
+     *        use it to budget memory before constructing. The count depends on
+     *        the build's kernel sets.
+     * @param size Number of real samples: a power of two >= 4 (other sizes
+     *             return 0).
+     * @return At least the sum of the constructor's allocation requests.
+     */
+    [[nodiscard]] static size_t allocationBytes(size_t size) noexcept
+    {
+        if (size < 4 || (size & (size - 1)) != 0)
+            return 0;
+        return detail::fft::SplitFFT<T>::allocationBytes(size / 2, true)
+             + 2 * (postTwiddleCount(size / 2) * sizeof(T)
+                    + detail::fft::SplitFFT<T>::kAllocationOverhead);
+    }
 
     /**
      * @brief Forward transform: real time-domain -> complex frequency-domain.
@@ -832,6 +917,12 @@ private:
         return size;
     }
 
+    /// Post-pass twiddles kept for a half size m (see computePostTwiddles()).
+    [[nodiscard]] static size_t postTwiddleCount(size_t m) noexcept
+    {
+        return std::min(m, m / 2 + detail::fft::kBlock<T>);
+    }
+
     void computePostTwiddles()
     {
         // The pre and post passes pair bin k <= M/2 with M - k and take
@@ -839,7 +930,7 @@ private:
         // exactly: computed up to M/2 (where the real part is exactly 0) and
         // mirrored past it, as far as a vector starting at or below M/2 reads.
         const size_t m = halfSize_;
-        const size_t used = std::min(m, m / 2 + detail::fft::kBlock<T>);
+        const size_t used = postTwiddleCount(m);
         twRe_.resize(used);
         twIm_.resize(used);
         for (size_t k = 0; k <= m / 2; ++k)

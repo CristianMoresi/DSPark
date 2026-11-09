@@ -22,6 +22,7 @@
 #include "../Analysis/OnsetDetector.h"
 #include "../Analysis/OfflineTransientAnalyzer.h"
 #include "../Analysis/OfflineTempoAnalyzer.h"
+#include "../Core/FFT.h"
 #include "../Core/FIRFilter.h"
 #include "../Core/detail/OfflineProduct.h"
 #include "../Core/Resampler.h"
@@ -1739,4 +1740,40 @@ DSPARK_TEST(OfflineStereoBalance_allocation_failures_and_exact_payload_budget)
     EXPECT_TRUE(effect.run(input, output, 8000, options, job).succeeded());
     --job.memoryBudgetBytes;
     EXPECT_TRUE(effect.run(input, output, 8000, options, job).status == OfflineStatus::MemoryLimit);
+}
+
+DSPARK_TEST(FFT_allocationBytes_covers_what_construction_requests)
+{
+    // Every memory budget that owns an FFT charges allocationBytes(); a plan
+    // or twiddle table the count misses would let a budget pass on paper and
+    // fail in the allocator.
+    namespace fa = dspark_test_failing_alloc;
+    // The bound may exceed the requests only by the per-allocation allowance
+    // for standard-library bookkeeping.
+    const auto covers = [&](auto construct, std::size_t bound) {
+        fa::count.store(0, std::memory_order_relaxed);
+        fa::bytes.store(0, std::memory_order_relaxed);
+        fa::failAt.store(std::numeric_limits<int>::max(), std::memory_order_relaxed);
+        construct();
+        const auto bytes = fa::bytes.load(std::memory_order_relaxed);
+        const auto calls = static_cast<std::size_t>(fa::count.load(std::memory_order_relaxed));
+        fa::failAt.store(-1, std::memory_order_relaxed);
+        return calls > 0 && bytes <= bound && bound - bytes <= 64 * calls;
+    };
+    const auto check = [&]<typename T>() {
+        for (std::size_t n = 2; n <= (std::size_t{ 1 } << 17); n *= 2)
+        {
+            EXPECT_TRUE(covers([n] { FFTComplex<T> fft(n); (void)fft.getSize(); },
+                               FFTComplex<T>::allocationBytes(n)));
+            if (n >= 4)
+                EXPECT_TRUE(covers([n] { FFTReal<T> fft(n); (void)fft.getSize(); },
+                                   FFTReal<T>::allocationBytes(n)));
+        }
+        EXPECT_EQ(FFTReal<T>::allocationBytes(2), std::size_t{ 0 });
+        EXPECT_EQ(FFTReal<T>::allocationBytes(96), std::size_t{ 0 });
+        EXPECT_EQ(FFTComplex<T>::allocationBytes(1), std::size_t{ 0 });
+        EXPECT_EQ(FFTComplex<T>::allocationBytes(48), std::size_t{ 0 });
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
 }

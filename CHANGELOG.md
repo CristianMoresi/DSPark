@@ -973,6 +973,17 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- Offline transient analysis, the offline sinc stages, the offline clippers
+  and StereoGenerator charged their FFTs from a fixed estimate (fewer than 4N
+  scalars for a real transform of size N), which the faster transforms of
+  this release outgrew (up to about 4.25N): StereoGenerator at 8 kHz with 16x
+  oversampling prepared 4.4 KB more than `getPrepareMemoryBound()` reported,
+  and a job given exactly its reported `memoryBytes` could hit its limit.
+  `FFTReal::allocationBytes()` and `FFTComplex::allocationBytes()` now report
+  an upper bound of what a constructor requests (including standard-library
+  bookkeeping), every budget charges that, and the pass plan is one exact
+  allocation.
+
 - AU: MIDI from several threads at once (a host's MIDI thread, its render
   thread, an on-screen keyboard) is no longer lost: the MIDI queue takes any
   number of producers (one compare-exchange per event). The single-producer

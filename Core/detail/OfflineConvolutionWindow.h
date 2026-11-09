@@ -35,9 +35,9 @@ class OfflineConvolutionWindow final
         time_ = job.allocateScratch<double>(size + 2);
         spectrum_ = job.allocateScratch<double>(size + 2);
         kernel_ = job.allocateScratch<double>(size + 2);
-        // The Core real FFT requests <4N doubles. Include cumulative Stockham
-        // plan-vector growth and implementation-specific allocation bookkeeping.
-        job.charge(offlineBytes(4 * size, sizeof(double)) + 2048);
+        // The Core real FFT reports its own requests; the allowance covers
+        // implementation-specific allocation bookkeeping.
+        job.charge(FFTReal<double>::allocationBytes(static_cast<std::size_t>(size)) + 2048);
         fft_.emplace(static_cast<std::size_t>(size));
         for (int i = 0; i < 4 * block; ++i)
         {

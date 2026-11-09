@@ -114,11 +114,11 @@ template <FloatType T> class OnsetSpectrum final
      * instance. */
     [[nodiscard]] static std::size_t preparationBytes(int fftSize) noexcept
     {
-        // Five frontend arrays: 4*N+4 scalars. FFTReal owns fewer than 4*N
-        // scalars plus its short Stockham pass plan. The 2048-byte allowance
-        // covers cumulative plan-vector growth through N=65536 on the tested
-        // standard libraries, including construction temporaries.
-        return (8 * static_cast<std::size_t>(fftSize) + 4) * sizeof(T) + sizeof(FFTReal<T>) + 2048;
+        // Five frontend arrays: 4*N+4 scalars; the FFT reports its own
+        // requests. The 2048-byte allowance covers construction temporaries.
+        return (4 * static_cast<std::size_t>(fftSize) + 4) * sizeof(T) +
+               FFTReal<T>::allocationBytes(static_cast<std::size_t>(fftSize)) + sizeof(FFTReal<T>) +
+               2048;
     }
     /** @brief Allocates a valid power-of-two frame; the caller owns frame timing.
      */

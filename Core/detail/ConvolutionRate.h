@@ -62,12 +62,16 @@ class ConvolutionRate final
                (buffers + 1) * convolutionAllocationBound(block, length);
     }
 
-    // Shared preflight for a fresh Core Convolver, including temporary FFT plans.
+    // Shared preflight for a fresh uniform Core Convolver: its partition
+    // spectra, delay line and work buffers ((4P + 9)B + 4P + 2 doubles), the
+    // FFT of size 2B as that FFT reports it, and an allowance for vector
+    // bookkeeping.
     [[nodiscard]] static std::size_t convolutionAllocationBound(std::size_t block,
                                                                 std::size_t length) noexcept
     {
         const auto partitions = (length + block - 1) / block;
-        return ((4 * partitions + 17) * block + 4 * partitions + 2) * sizeof(double) +
+        return ((4 * partitions + 9) * block + 4 * partitions + 2) * sizeof(double) +
+               FFTReal<double>::allocationBytes(2 * block) +
                2 * partitions * sizeof(std::vector<double>) + sizeof(FFTReal<double>) + 2048 +
                (2 * partitions + 12) * 64;
     }

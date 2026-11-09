@@ -71,6 +71,9 @@
  *   cleared), and that property's listeners hear of it on the main thread.
  *   kAudioUnitProperty_ShouldAllocateBuffer is kept per element; an input
  *   set to false is pulled without lent buffers (its source supplies them).
+ *   With the main input and the output both false the unit holds no main
+ *   pull buffers at all: the host supplies every output buffer (a render
+ *   without one is refused) and the input lands in them.
  * - Reset clears the plugin's history and drops the MIDI queued before it.
  * - Host bypass maps to kAudioUnitProperty_BypassEffect with the same
  *   crossfade as the other backends. The bypass is also a parameter: a
@@ -497,11 +500,24 @@ struct Plugin
 
     /// kAudioUnitProperty_ShouldAllocateBuffer of each element (input 0 and
     /// 1, output 0). With false on an input, its source supplies the buffers
-    /// (the pull passes none); the unit keeps its own fallback buffers either
-    /// way (MaximumFramesPerSlice floats per channel), so a host that passes
-    /// no output buffer still renders. Fixed while initialized.
+    /// (the pull passes none). The main pull buffers (MaximumFramesPerSlice
+    /// floats per channel) exist only when something can need them: lending
+    /// to the main input, or standing in for an output buffer the host may
+    /// leave out; with both false the host's output buffers take the input
+    /// (see ownsMainBuffers). The sidechain keeps its own buffers either way:
+    /// a missing or failing key falls back to silence there, never taking
+    /// the main path down. Fixed while initialized.
     bool allocateInput[2] = { true, true };
     bool allocateOutput = true;
+
+    /** True when initialize() gives the main path its own pull buffers. */
+    [[nodiscard]] bool ownsMainBuffers() const noexcept
+    {
+        if constexpr (kIsInstrument)
+            return allocateOutput;
+        else
+            return allocateInput[0] || allocateOutput;
+    }
 
 #if defined(DSPARK_PLUGIN_WEBVIEW)
     webview_ui::Editor<P> editor;
@@ -944,8 +960,18 @@ struct Plugin
         if constexpr (HasOfflineMode<P>)
             user.setOfflineRendering(offlineRender != 0);
         applyAllShadows();
-        pullL.assign(maxFrames, 0.0f);
-        pullR.assign(maxFrames, 0.0f);
+        if (ownsMainBuffers())
+        {
+            pullL.assign(maxFrames, 0.0f);
+            pullR.assign(maxFrames, 0.0f);
+        }
+        else
+        {
+            // ShouldAllocateBuffer false on the main input and the output:
+            // the memory is released, not just left unused.
+            std::vector<float>().swap(pullL);
+            std::vector<float>().swap(pullR);
+        }
         dryL.assign(maxFrames, 0.0f);
         dryR.assign(maxFrames, 0.0f);
         if constexpr (HasSidechain<P>)
@@ -2343,7 +2369,7 @@ struct Plugin
         // Bound by the property and by what initialize() allocated (the
         // property cannot change while initialized; the second test is a
         // last guard for the buffers).
-        if (frames > maxFrames || frames > pullL.size())
+        if (frames > maxFrames || frames > dryL.size())
             return refuse(kAudioUnitErr_TooManyFramesToProcess);
         // A host buffer shorter than the slice is refused, as the format requires:
         // the old code wrote `frames` samples into it regardless.
@@ -2351,6 +2377,17 @@ struct Plugin
         for (UInt32 b = 0; b < ioData->mNumberBuffers; ++b)
             if (ioData->mBuffers[b].mData != nullptr && ioData->mBuffers[b].mDataByteSize < bytes)
                 return refuse(kAudio_ParamError);
+        // ShouldAllocateBuffer false on the output (and the main input): the
+        // unit holds no buffer to render into, so the host must pass one per
+        // channel it reads, as the format's reference implementation requires.
+        if (pullL.empty())
+        {
+            const UInt32 width = static_cast<UInt32>(currentChannels);
+            const UInt32 used = ioData->mNumberBuffers < width ? ioData->mNumberBuffers : width;
+            for (UInt32 b = 0; b < used; ++b)
+                if (ioData->mBuffers[b].mData == nullptr)
+                    return refuse(kAudioUnitErr_InvalidPropertyValue);
+        }
 
         callRenderNotifies(flags | kPre, timeStamp, busNumber, frames, ioData);
         OSStatus status = noErr;
@@ -2468,6 +2505,15 @@ struct Plugin
         // into our own buffers (instruments have no input: silence), then
         // process and write to the host's buffers.
         float* pull[2] = { pullL.data(), pullR.data() };
+        if (pullL.empty())
+        {
+            // No main pull buffers (ShouldAllocateBuffer false on the main
+            // input and the output): the source supplies its buffers and the
+            // host's output buffers, checked by render(), take the silence of
+            // a missing source.
+            pull[0] = static_cast<float*>(ioData->mBuffers[0].mData);
+            pull[1] = outCh > 1 ? static_cast<float*>(ioData->mBuffers[1].mData) : pull[0];
+        }
         if constexpr (!kIsInstrument)
         {
             const OSStatus pullStatus = pullInput(0, pull, timeStamp, frames);

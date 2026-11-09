@@ -128,7 +128,7 @@ DSPARK_TEST(AudioInterval_finite_tail_matches_direct_meter_without_outside_peaks
     const auto result = measure(audio, {}, { 7, 48007 }, 1024, A::Context::IncludeContinuous);
     EXPECT_TRUE(result.complete());
     EXPECT_EQ(result.samplePeak.value, static_cast<double>(.9f));
-    EXPECT_NEAR(result.truePeakDbtp.value, -0.244683381, 0.000002);
+    EXPECT_NEAR(result.truePeakDbtp.value, -0.105038434, 0.000002);
     LoudnessMeter<float> direct;
     direct.prepare(48000, 1);
     direct.process(audio.data() + 7, 48000);

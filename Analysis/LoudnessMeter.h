@@ -8,13 +8,15 @@
  * @brief Thread-safe EBU R128 / ITU-R BS.1770 loudness meter.
  *
  * Momentary (400 ms), short-term (3 s), integrated (two-pass gated),
- * loudness range (EBU Tech 3342) and true peak (BS.1770 4x estimate).
+ * loudness range (EBU Tech 3342) and true peak (the BS.1770 Annex 2
+ * procedure, read by the long-kernel TruePeakEstimator).
  * Integrated loudness and LRA use constant-memory histograms: no allocation
  * and O(bins) readout, real-time safe. Integrated loudness keeps the exact
  * energy of every bin, so it reads the block energies themselves rather than
- * a 0.1 LU grid. Tech 3341/3342 tone programmes are checked by the conformance
- * suite on every target, and the official EBU files when DSPARK_EBU_TEST_SET
- * points at them.
+ * a 0.1 LU grid; LRA keeps every short-term value to 0.005 LU and the exact
+ * energy of its relative gate. Tech 3341/3342 tone programmes are checked by
+ * the conformance suite on every target, and the official EBU files when
+ * DSPARK_EBU_TEST_SET points at them.
  *
  * Threading:
  * - prepare() / reset(): setup thread / stream owner (not concurrent with
@@ -160,21 +162,11 @@ public:
         if (!prepared_.load(std::memory_order_relaxed) || data == nullptr || numSamples <= 0)
             return;
 
-        T tpMax = truePeakMax_.load(std::memory_order_relaxed);
+        truePeakMax_.store(measureTruePeak(data, 0, numSamples,
+                                           truePeakMax_.load(std::memory_order_relaxed)),
+                           std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
-            // Only fold FINITE estimates into the max-hold: a single Inf/NaN
-            // sample would otherwise pin the peak at +Inf forever (std::max
-            // with +Inf latches, and the raw |NaN| leaks through the ring),
-            // leaving getTruePeakDb() stuck at +Inf dBTP until reset() -- the
-            // K-filter / histogram path already self-recovers, so the true
-            // peak must too (same non-finite robustness contract).
-            const T tp0 = truePeak_.processSample(data[i], 0);
-            if (std::isfinite(tp0))
-                tpMax = std::max(tpMax, tp0);
-            else
-                invalidateMeasurement();
-
             double filtered = applyKWeighting(static_cast<double>(data[i]), 0);
             currentBlockPower_ += filtered * filtered;
             if (!std::isfinite(currentBlockPower_))
@@ -183,7 +175,6 @@ public:
             if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
         }
-        truePeakMax_.store(tpMax, std::memory_order_relaxed);
     }
 
     /**
@@ -198,22 +189,11 @@ public:
             || left == nullptr || right == nullptr || numSamples <= 0)
             return;
 
-        T tpMax = truePeakMax_.load(std::memory_order_relaxed);
+        const T peakLeft = measureTruePeak(left, 0, numSamples,
+                                           truePeakMax_.load(std::memory_order_relaxed));
+        truePeakMax_.store(measureTruePeak(right, 1, numSamples, peakLeft), std::memory_order_relaxed);
         for (int i = 0; i < numSamples; ++i)
         {
-            // Fold only FINITE true-peak estimates (see the mono path): a lone
-            // Inf/NaN sample must not latch the max-hold at +Inf forever.
-            const T tpL = truePeak_.processSample(left[i], 0);
-            const T tpR = truePeak_.processSample(right[i], 1);
-            if (std::isfinite(tpL))
-                tpMax = std::max(tpMax, tpL);
-            else
-                invalidateMeasurement();
-            if (std::isfinite(tpR))
-                tpMax = std::max(tpMax, tpR);
-            else
-                invalidateMeasurement();
-
             double filtL = applyKWeighting(static_cast<double>(left[i]), 0);
             double filtR = applyKWeighting(static_cast<double>(right[i]), 1);
 
@@ -224,7 +204,6 @@ public:
             if (++currentBlockSamples_ >= blockSamples_)
                 commitBlock();
         }
-        truePeakMax_.store(tpMax, std::memory_order_relaxed);
     }
 
     /**
@@ -302,7 +281,16 @@ public:
 
     /**
      * @brief Returns the maximum true peak observed since the last reset.
-     * @return True peak in dBTP (ITU-R BS.1770-4, 4x oversampled estimate).
+     *
+     * The BS.1770 Annex 2 procedure read with Core's TruePeakEstimator (the
+     * reconstruction at the quarter points of every sample interval with
+     * 64-tap phases, each crest refined): steady sines read within 0.003 dB
+     * of their true peak up to 0.49 fs (transients and content above 0.45 fs:
+     * see TruePeakEstimator). A sample's own magnitude counts at once; the
+     * reconstruction around it is read TruePeakEstimator::getDelay() samples
+     * later, and the end of a finite programme by finalizeTruePeak().
+     *
+     * @return True peak in dBTP.
      */
     [[nodiscard]] T getTruePeakDb() const noexcept
     {
@@ -311,7 +299,7 @@ public:
 
     /** @brief Includes the final interpolation tail of a finite programme.
      * Call after the last input block, from the stream owner; readers may remain
-     * concurrent. Repeated calls are idempotent. The Core detector evaluates
+     * concurrent. Repeated calls are idempotent. The Core estimator evaluates
      * zero extension on copied state: programme duration, loudness windows,
      * integrated/LRA gates and live filter history are unchanged. No allocation.
      * Do not call after each block of one continuous programme: the zero-ended
@@ -324,7 +312,7 @@ public:
         T peak = truePeakMax_.load(std::memory_order_relaxed);
         for (int channel = 0; channel < kMaxChannels; ++channel)
         {
-            const T tail = truePeak_.getTailPeak(channel);
+            const T tail = truePeak_.getTailPeak(tpChannels_[static_cast<size_t>(channel)]);
             if (std::isfinite(tail))
                 peak = std::max(peak, tail);
             else
@@ -336,22 +324,30 @@ public:
     /**
      * @brief Computes the EBU R128 Loudness Range (EBU Tech 3342).
      *
-     * Short-term (3 s) loudness sampled at 10 Hz (every 100 ms, as Tech 3342
-     * V3 and later require), gated at -70 LUFS absolute and -20 LU relative; LRA is the spread between the 10th and
-     * 95th percentiles. O(bins) and real-time safe like the integrated gate.
+     * Short-term (3 s) loudness sampled at 10 Hz (every 100 ms: Tech 3342 has
+     * required at least 10 Hz since V3), gated at -70 LUFS absolute and -20 LU
+     * relative; LRA is the spread between the 10th and 95th percentiles.
+     * O(bins) and real-time safe like the integrated gate.
      *
-     * Percentiles follow the Tech 3342 reference code:
-     * among the n gated short-term values sorted ascending, P is the value
-     * at 0-based rank round((n - 1) * P). Values are held at 0.1 LU
-     * resolution. The first short-term value exists after 3 s of input, so a
-     * programme shorter than that reads 0; a steady programme reads 0 at any
-     * length.
+     * The rate matters on programmes whose level steps: a 1 Hz series reads
+     * a 3 s stepped programme 1.0 LU higher, and moves by up to 1.5 LU when the
+     * programme starts a fraction of a second later; at 10 Hz the reading
+     * agrees with a 100 Hz series within 0.1 LU.
+     *
+     * Percentiles follow the Tech 3342 reference code: among the n gated
+     * short-term values sorted ascending, P is the value at 0-based rank
+     * round((n - 1) * P). Every short-term value is held to 0.005 LU (the
+     * reading agrees with the reference code run on the exact series within
+     * 0.005 LU) and the relative gate is set from the exact mean energy. The
+     * first short-term value exists after 3 s of input, so a programme
+     * shorter than that reads 0; a steady programme reads 0 at any length.
      *
      * @return Loudness range in LU (0 if not enough material yet).
      */
     [[nodiscard]] T getLoudnessRange() const noexcept
     {
-        // Pass 1: relative gate from the mean of absolute-gated ST values.
+        // Pass 1: relative gate from the exact mean energy of the
+        // absolute-gated short-term values.
         double sumPower = 0.0;
         uint64_t count = 0;
         for (int i = 0; i < kNumBins; ++i)
@@ -359,18 +355,27 @@ public:
             const uint32_t c = lraHistogram_[i].load(std::memory_order_relaxed);
             if (c > 0)
             {
-                sumPower += lufsToPower(kMinHistogramLUFS + i * kBinWidth) * c;
+                sumPower += lraEnergy_[i].load(std::memory_order_relaxed);
                 count += c;
             }
         }
         if (count == 0) return T(0);
 
-        const double relGateLUFS = powerToLUFS(sumPower / count) - 20.0;
-        const int gateBin = firstBinAtOrAbove(relGateLUFS);
+        // A value takes part when the centre of its 0.005 LU cell clears the
+        // gate (as a block does for the integrated gate).
+        const double relGateLUFS = powerToLUFS(sumPower / static_cast<double>(count)) - 20.0;
+        const int gateCell = firstRangeCellAtOrAbove(relGateLUFS);
+        const int gateBin = gateCell / kRangeCells;
+
+        uint64_t gateCells[kRangeCells];
+        rangeCellCounts(gateBin, gateCells);
+        uint64_t gateBinCount = 0;
+        for (int s = gateCell % kRangeCells; s < kRangeCells; ++s)
+            gateBinCount += gateCells[s];
 
         // Pass 2: 10th / 95th percentiles above the relative gate.
-        uint64_t gatedCount = 0;
-        for (int i = gateBin; i < kNumBins; ++i)
+        uint64_t gatedCount = gateBinCount;
+        for (int i = gateBin + 1; i < kNumBins; ++i)
             gatedCount += lraHistogram_[i].load(std::memory_order_relaxed);
         if (gatedCount == 0) return T(0);
 
@@ -381,25 +386,49 @@ public:
         const auto rank10 = static_cast<uint64_t>(std::llround(0.10 * static_cast<double>(gatedCount - 1)));
         const auto rank95 = static_cast<uint64_t>(std::llround(0.95 * static_cast<double>(gatedCount - 1)));
 
+        // The 0.1 LU bins locate each rank; the bin's 0.005 LU cells place it.
+        auto valueAt = [&](int bin, uint64_t rankInBin) noexcept {
+            uint64_t cells[kRangeCells];
+            const int first = bin == gateBin ? gateCell % kRangeCells : 0;
+            if (bin == gateBin)
+                std::copy(gateCells, gateCells + kRangeCells, cells);
+            else
+                rangeCellCounts(bin, cells);
+            uint64_t seen = 0;
+            int lastFilled = -1;
+            for (int s = first; s < kRangeCells; ++s)
+            {
+                if (cells[s] == 0) continue;
+                lastFilled = s;
+                seen += cells[s];
+                if (seen > rankInBin) break;
+            }
+            // A reader that raced the writer may find the bin count ahead of
+            // its cells: the last filled cell then stands in.
+            const int cell = lastFilled >= 0 ? lastFilled : kRangeCells / 2;
+            return rangeCellCentre(bin * kRangeCells + cell);
+        };
+
         double p10 = 0.0, p95 = 0.0;
         uint64_t running = 0;
         bool have10 = false;
         for (int i = gateBin; i < kNumBins; ++i)
         {
-            const uint32_t c = lraHistogram_[i].load(std::memory_order_relaxed);
+            const uint64_t c = i == gateBin ? gateBinCount
+                                            : lraHistogram_[i].load(std::memory_order_relaxed);
             if (c == 0) continue;
-            running += c;
-            // `running` values sit at or below this bin: ranks 0 .. running-1.
-            if (!have10 && running > rank10)
+            // `running` values sit below this bin: ranks running .. running+c-1 here.
+            if (!have10 && running + c > rank10)
             {
-                p10 = kMinHistogramLUFS + i * kBinWidth;
+                p10 = valueAt(i, rank10 - running);
                 have10 = true;
             }
-            if (running > rank95)
+            if (running + c > rank95)
             {
-                p95 = kMinHistogramLUFS + i * kBinWidth;
+                p95 = valueAt(i, rank95 - running);
                 break;
             }
+            running += c;
         }
         return static_cast<T>(std::max(0.0, p95 - p10));
     }
@@ -428,8 +457,13 @@ public:
             energy.store(0.0, std::memory_order_relaxed);
         for (auto& bin : lraHistogram_)
             bin.store(0, std::memory_order_relaxed);
+        for (auto& energy : lraEnergy_)
+            energy.store(0.0, std::memory_order_relaxed);
+        for (auto& cell : lraCells_)
+            cell.store(0, std::memory_order_relaxed);
 
-        truePeak_.reset();
+        for (auto& state : tpChannels_)
+            state = {};
         truePeakMax_.store(T(0), std::memory_order_relaxed);
 
         blockWritePos_.store(0, std::memory_order_relaxed);
@@ -447,6 +481,16 @@ private:
     static constexpr double kMaxHistogramLUFS = 30.0;
     static constexpr double kBinWidth = 0.1;
     static constexpr int kNumBins = 1000;
+
+    // Loudness range cells: each 0.1 LU bin split in 20 cells of 0.005 LU
+    // (16-bit counts; the bin's 32-bit count stays authoritative).
+    static constexpr int kRangeCells = 20;
+    static constexpr double kRangeCellWidth = kBinWidth / kRangeCells;
+    static constexpr int kNumRangeCells = kNumBins * kRangeCells;
+    static constexpr uint16_t kRangeCellMax = std::numeric_limits<uint16_t>::max();
+
+    // True-peak estimator chunk (the most samples one estimator call takes).
+    static constexpr int kTruePeakChunk = TruePeakEstimator<T>::kChunk;
 
     // Filters state (Forced to double to prevent DF2T precision issues)
     struct BiquadState { double z1 = 0.0, z2 = 0.0; };
@@ -551,23 +595,116 @@ private:
         // EBU Tech 3342 loudness range: short-term (3 s) values sampled at
         // 10 Hz - every 100 ms sub-block, the 2.9 s minimum window overlap
         // Tech 3342 has required since V3 (2016) - absolute-gated at -70 LUFS
-        // into a histogram.
+        // into a histogram of 0.005 LU cells, with the exact energy per bin.
         if (totalCommittedBlocks_ >= 30)
         {
-            const double stLufs = static_cast<double>(calculateLUFSFromBlocks(30));
-            if (!std::isfinite(stLufs))
+            const double stPower = meanPowerOfBlocks(30);
+            const double stLufs = powerToLUFS(stPower);
+            if (!std::isfinite(stPower) || !std::isfinite(stLufs))
             {
                 invalidateMeasurement();
             }
             else if (stLufs >= kMinHistogramLUFS)
             {
-                int binIndex = static_cast<int>(std::round((stLufs - kMinHistogramLUFS) / kBinWidth));
-                if (binIndex >= kNumBins)
+                const double position = std::floor((stLufs - kMinHistogramLUFS + 0.5 * kBinWidth)
+                                                   / kRangeCellWidth);
+                if (position >= static_cast<double>(kNumRangeCells))
                     invalidateMeasurement();
-                binIndex = std::clamp(binIndex, 0, kNumBins - 1);
-                incrementHistogram(lraHistogram_[binIndex]);
+                const int cell = static_cast<int>(std::clamp(position, 0.0,
+                                                             static_cast<double>(kNumRangeCells - 1)));
+                const int bin = cell / kRangeCells;
+                if (lraHistogram_[bin].load(std::memory_order_relaxed)
+                    == std::numeric_limits<uint32_t>::max())
+                {
+                    invalidateMeasurement();
+                }
+                else
+                {
+                    auto& cellCount = lraCells_[static_cast<size_t>(cell)];
+                    const uint16_t c = cellCount.load(std::memory_order_relaxed);
+                    if (c < kRangeCellMax) // a full cell hands the rest to its bin count
+                        cellCount.store(static_cast<uint16_t>(c + 1), std::memory_order_relaxed);
+                    auto& energy = lraEnergy_[static_cast<size_t>(bin)];
+                    energy.store(energy.load(std::memory_order_relaxed) + stPower,
+                                 std::memory_order_relaxed);
+                    lraHistogram_[bin].fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
+    }
+
+    /// Mean K-weighted power of the last numBlocks committed sub-blocks.
+    [[nodiscard]] double meanPowerOfBlocks(int numBlocks) const noexcept
+    {
+        double sum = 0.0;
+        const int currentPos = blockWritePos_.load(std::memory_order_acquire);
+        for (int i = 0; i < numBlocks; ++i)
+        {
+            const int idx = (currentPos - 1 - i + 30) % 30;
+            sum += blockPowers_[idx].load(std::memory_order_relaxed);
+        }
+        return sum / numBlocks;
+    }
+
+    /// Effective counts of the 0.005 LU cells of one 0.1 LU bin. A cell that
+    /// filled its 16-bit count takes the bin's remainder (one full cell per
+    /// bin is exact; that needs 65535 short-term values, 1.8 h, in 0.005 LU).
+    void rangeCellCounts(int bin, uint64_t (&out)[kRangeCells]) const noexcept
+    {
+        uint64_t sum = 0;
+        int full = -1;
+        for (int s = 0; s < kRangeCells; ++s)
+        {
+            const uint16_t v = lraCells_[static_cast<size_t>(bin * kRangeCells + s)]
+                                   .load(std::memory_order_relaxed);
+            out[s] = v;
+            sum += v;
+            if (v == kRangeCellMax && full < 0) full = s;
+        }
+        const uint64_t total = lraHistogram_[static_cast<size_t>(bin)].load(std::memory_order_relaxed);
+        if (full >= 0 && total > sum)
+            out[full] += total - sum;
+    }
+
+    /// First range cell whose centre is at or above `lufs`.
+    [[nodiscard]] static int firstRangeCellAtOrAbove(double lufs) noexcept
+    {
+        const double position
+            = std::ceil((lufs - kMinHistogramLUFS + 0.5 * kBinWidth) / kRangeCellWidth - 0.5);
+        return static_cast<int>(std::clamp(position, 0.0, static_cast<double>(kNumRangeCells - 1)));
+    }
+
+    /// Loudness at the centre of a range cell.
+    [[nodiscard]] static double rangeCellCentre(int cell) noexcept
+    {
+        return kMinHistogramLUFS - 0.5 * kBinWidth + (static_cast<double>(cell) + 0.5) * kRangeCellWidth;
+    }
+
+    /// Feeds one channel's samples to the true-peak estimator and returns
+    /// `peak` raised to its finite readings. A sample's own magnitude counts
+    /// at once.
+    [[nodiscard]] T measureTruePeak(const T* x, int channel, int numSamples, T peak) noexcept
+    {
+        auto& state = tpChannels_[static_cast<size_t>(channel)];
+        for (int start = 0; start < numSamples; start += kTruePeakChunk)
+        {
+            const int n = std::min(kTruePeakChunk, numSamples - start);
+            // Only FINITE values join the max-hold: one Inf/NaN sample would
+            // otherwise pin it at +Inf until reset() (the K-filter / histogram
+            // path already self-recovers, so the true peak must too).
+            for (int i = 0; i < n; ++i)
+            {
+                const T a = std::abs(x[start + i]);
+                if (!std::isfinite(a))
+                    invalidateMeasurement();
+                else if (a > peak)
+                    peak = a;
+            }
+            const T chunkPeak = truePeak_.processMax(state, x + start, n, peak);
+            if (chunkPeak > peak)
+                peak = chunkPeak;
+        }
+        return peak;
     }
 
     void invalidateMeasurement() noexcept
@@ -614,11 +751,6 @@ private:
         return std::max(-100.0, -0.691 + 10.0 * std::log10(meanPower));
     }
 
-    [[nodiscard]] static double lufsToPower(double lufs) noexcept
-    {
-        return std::pow(10.0, (lufs + 0.691) / 10.0);
-    }
-
     double sampleRate_ = 48000.0;
     std::atomic<bool> prepared_{ false };
 
@@ -639,14 +771,18 @@ private:
     std::array<std::atomic<uint32_t>, kNumBins> histogram_;
     std::array<std::atomic<double>, kNumBins> histogramPower_;
 
-    // EBU Tech 3342 loudness-range histogram (short-term values, 100 ms hop)
+    // EBU Tech 3342 loudness-range histogram (short-term values, 100 ms hop):
+    // per 0.1 LU bin the count, the exact energy and the 0.005 LU cells.
     std::array<std::atomic<uint32_t>, kNumBins> lraHistogram_;
+    std::array<std::atomic<double>, kNumBins> lraEnergy_;
+    std::array<std::atomic<uint16_t>, kNumRangeCells> lraCells_;
 
     // Sticky for one reset-to-reset measurement transaction.
     std::atomic<bool> measurementValid_ { true };
 
-    // ITU-R BS.1770-4 true-peak (dBTP) tracking
-    TruePeakDetector<T, kMaxChannels> truePeak_;
+    // BS.1770 true-peak (dBTP) tracking
+    TruePeakEstimator<T> truePeak_;
+    std::array<typename TruePeakEstimator<T>::Channel, kMaxChannels> tpChannels_ {};
     std::atomic<T> truePeakMax_ { T(0) };
 };
 

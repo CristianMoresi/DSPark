@@ -600,9 +600,12 @@ void checkFiniteTruePeak()
         const T integrated = meter.getIntegratedLUFS();
         const T range = meter.getLoudnessRange();
         meter.finalizeTruePeak();
-        // Direct Annex 2 interpolation of the finite hard ending: the largest
-        // phase evaluates to 0.972222900390625 for double-valued input.
-        EXPECT_NEAR(meter.getTruePeakDb(), 20.0 * std::log10(0.972222900390625), 0.000002);
+        // The finite hard ending reconstructs to 0.990809 (-0.0802 dB, the
+        // exact band-limited sum of the zero-extended programme). The
+        // long-kernel reading is 0.987980; the BS.1770 Annex 2 table alone
+        // read 0.972223 (-0.2447 dB).
+        EXPECT_NEAR(meter.getTruePeakDb(), -0.1050385, 0.000002);
+        EXPECT_NEAR(meter.getTruePeakDb(), -0.0802, 0.03);
         const T finalPeak = meter.getTruePeakDb();
         meter.finalizeTruePeak();
         EXPECT_EQ(meter.getTruePeakDb(), finalPeak);
@@ -698,6 +701,113 @@ DSPARK_TEST(TruePeakDetector_tail_query_preserves_live_channel_history)
         detector.reset();
         EXPECT_EQ(detector.getTailPeak(0), T(0));
         EXPECT_EQ(detector.getTailPeak(1), T(0));
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
+namespace {
+
+/// Raised-cosine faded sine, amplitude 0.5, `pad` zeros either side. Its
+/// exact band-limited reconstruction peaks at `exact` dB (measured on the
+/// zero-extended sum with a +-2048-tap kernel).
+template <class T>
+std::vector<T> fadedTone(double cyclesPerSample, int fade, int steady, int pad = 64)
+{
+    const int n = 2 * fade + steady;
+    std::vector<T> x(static_cast<size_t>(n + 2 * pad), T(0));
+    for (int i = 0; i < n; ++i)
+    {
+        double e = 1.0;
+        if (i < fade)
+            e = 0.5 - 0.5 * std::cos(pi<double> * i / fade);
+        else if (i >= n - fade)
+            e = 0.5 - 0.5 * std::cos(pi<double> * (n - 1 - i) / fade);
+        const double c = cyclesPerSample * i;
+        x[static_cast<size_t>(i + pad)] = static_cast<T>(static_cast<float>(
+            0.5 * e * std::sin(twoPi<double> * (c - std::floor(c)) + 0.7)));
+    }
+    return x;
+}
+
+struct ToneCase { double cyclesPerSample; int fade, steady; double exactDb; };
+
+// Steady tones (30 ms fades) and 1 ms bursts. The BS.1770 Annex 2 table
+// reads the first three 0.16 to 0.22 dB above their true peak and the
+// bursts up to 0.04 dB below it.
+constexpr ToneCase kToneCases[] = {
+    { 0.085, 1440, 4800, -6.02060 }, { 0.25, 1440, 4800, -6.02060 },
+    { 0.39,  1440, 4800, -6.02060 }, { 0.45, 1440, 4800, -6.02058 },
+    { 0.49,  1440, 4800, -6.02059 },
+    { 0.30, 48, 96, -6.02016 }, { 0.42, 48, 96, -6.01436 }, { 0.45, 48, 96, -6.00346 },
+};
+
+}   // namespace
+
+// The long-kernel estimator reads the reconstruction peak, keeps the live
+// history across a tail query, and with the Annex 2 guard never reads below
+// the Annex 2 table.
+DSPARK_TEST(TruePeakEstimator_reads_the_reconstruction_peak)
+{
+    const auto check = []<class T>()
+    {
+        using E = TruePeakEstimator<T>;
+        for (const ToneCase& c : kToneCases)
+        {
+            const std::vector<T> x = fadedTone<T>(c.cyclesPerSample, c.fade, c.steady);
+            E estimator, guarded, runningMax;
+            typename E::Channel state, guardedState, runningState;
+            TruePeakDetector<T, 1> annex;
+            T peak = T(0), guardedPeak = T(0), annexPeak = T(0), running = T(0);
+            T readings[E::kChunk], guardedReadings[E::kChunk];
+            for (size_t start = 0; start < x.size(); start += E::kChunk)
+            {
+                const int n = static_cast<int>(std::min<size_t>(E::kChunk, x.size() - start));
+                std::fill(readings, readings + n, T(0));
+                std::fill(guardedReadings, guardedReadings + n, T(0));
+                estimator.process(state, x.data() + start, n, readings);
+                guarded.process(guardedState, x.data() + start, n, guardedReadings, true);
+                const T chunkPeak = runningMax.processMax(runningState, x.data() + start, n, running);
+                if (chunkPeak > running) running = chunkPeak;
+                for (int i = 0; i < n; ++i)
+                {
+                    peak = std::max(peak, readings[i]);
+                    guardedPeak = std::max(guardedPeak, guardedReadings[i]);
+                    annexPeak = std::max(annexPeak, annex.processSample(x[start + static_cast<size_t>(i)], 0));
+                }
+            }
+            // The running-maximum form skips refinements that cannot win: same result.
+            EXPECT_EQ(running, peak);
+            EXPECT_TRUE(std::equal(std::begin(state.history), std::end(state.history), std::begin(runningState.history)));
+            const typename E::Channel before = state;
+            peak = std::max(peak, estimator.getTailPeak(state));
+            guardedPeak = std::max(guardedPeak, guarded.getTailPeak(guardedState));
+            annexPeak = std::max(annexPeak, annex.getTailPeak(0));
+            EXPECT_TRUE(std::equal(std::begin(before.history), std::end(before.history), std::begin(state.history)));
+            EXPECT_NEAR(20.0 * std::log10(static_cast<double>(peak)), c.exactDb, 0.008);
+            EXPECT_TRUE(guardedPeak >= annexPeak);
+        }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
+// The meter's true-peak readout is the long-kernel reading: steady tones read
+// their true peak where the Annex 2 table read up to 0.22 dB high.
+DSPARK_TEST(LoudnessMeter_true_peak_reads_steady_sines_at_their_peak)
+{
+    const auto check = []<class T>()
+    {
+        for (const ToneCase& c : kToneCases)
+        {
+            const std::vector<T> x = fadedTone<T>(c.cyclesPerSample, c.fade, c.steady);
+            LoudnessMeter<T> meter;
+            meter.prepare(48000.0, 1);
+            for (size_t start = 0; start < x.size(); start += 1000)
+                meter.process(x.data() + start, static_cast<int>(std::min<size_t>(1000, x.size() - start)));
+            meter.finalizeTruePeak();
+            EXPECT_NEAR(static_cast<double>(meter.getTruePeakDb()), c.exactDb, 0.008);
+        }
     };
     check.template operator()<float>();
     check.template operator()<double>();
@@ -891,22 +1001,50 @@ DSPARK_TEST(LoudnessMeter_LRA_EBU_3342_tone_vectors)
 
 // A music-like programme against the Tech 3342 reference code on the same
 // samples: rank round((n - 1) * p) applied verbatim to short-term values
-// taken every 100 ms by an independent BS.1770 implementation. It binds at
-// 0.1 LU, the resolution at which the meter holds its values.
+// taken every 100 ms by an independent BS.1770 implementation. The meter
+// holds every short-term value to 0.005 LU; held at 0.1 LU it was off by
+// 0.056 to 0.075 LU here.
 DSPARK_TEST(LoudnessMeter_LRA_music_fragment_matches_the_reference)
 {
     struct Case { double seconds; double spec; };
     const Case cases[] = {
-        { 8.0,  1.640 },
-        { 35.2, 12.356 },
-        { 42.0, 11.926 },
+        { 8.0,  1.6404 },
+        { 35.2, 12.3559 },
+        { 42.0, 11.9255 },
     };
     for (const auto& c : cases)
     {
         std::vector<float> L, R;
         lraMusicFragment(c.seconds, L, R);
-        EXPECT_NEAR(lraOf(L, R), c.spec, 0.1);
+        EXPECT_NEAR(lraOf(L, R), c.spec, 0.01);
     }
+}
+
+// Tech 3342 requires the short-term series at 10 Hz or more (since V3). A
+// programme whose level steps every 3 s, against the reference code applied
+// to short-term values taken every 100 ms (16.6027 LU) and every second
+// (17.5869 LU) by an independent BS.1770 implementation: the meter reads the
+// 10 Hz value (held at 0.1 LU it read 16.700), far from the 1 Hz one.
+DSPARK_TEST(LoudnessMeter_LRA_stepped_programme_reads_the_10_Hz_series)
+{
+    const int fs = 48000;
+    const auto n = static_cast<size_t>(30 * fs);
+    std::vector<float> L(n), R(n);
+    uint32_t a = 5u, b = 6u;
+    double la = 0.0, lb = 0.0;
+    auto uni = [](uint32_t& s) { s = s * 1664525u + 1013904223u; return static_cast<double>(s >> 8) / 8388608.0 - 1.0; };
+    for (size_t i = 0; i < n; ++i)
+    {
+        const int step = static_cast<int>(i / static_cast<size_t>(3 * fs)) % 5;
+        const double gain = std::pow(10.0, (-30.0 + 5.0 * step) / 20.0);
+        la = 0.7 * la + 0.3 * uni(a);
+        lb = 0.7 * lb + 0.3 * uni(b);
+        L[i] = static_cast<float>(gain * 2.0 * la);
+        R[i] = static_cast<float>(gain * 2.0 * lb);
+    }
+    const double lra = lraOf(L, R);
+    EXPECT_NEAR(lra, 16.6027, 0.01);
+    EXPECT_LT(lra, 17.5869 - 0.5);
 }
 
 

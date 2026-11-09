@@ -23,6 +23,12 @@ All notable user-facing changes to DSPark are documented here.
   count)` bit for bit. The AVX kernels load the shared operand once for the
   four products and share their reductions; other builds run four
   `dotProduct()` calls.
+- `TruePeakEstimator` (Core/TruePeakDetector.h): a block reader of the
+  band-limited reconstruction peak (the BS.1770 Annex 2 procedure with
+  64-tap Kaiser-windowed sinc phases and the crest of every 4x grid maximum
+  refined), with a tail query for finite programmes and a running-maximum
+  form. It is the long-kernel estimator the Limiter's true-peak mode already
+  ran, moved to Core; the Limiter's output is bit-identical.
 - Plugin layer, VST3 note expressions: a class that declares
   `static constexpr uint32_t noteExpressions = dspark::plugin::expressions(...)`
   offers those expressions (volume, pan, tuning, vibrato, expression,
@@ -411,6 +417,36 @@ All notable user-facing changes to DSPark are documented here.
   3.74, 44.1 -> 48 5.15 -> 4.88, 44.1 -> 96 8.11 -> 7.75, 96 -> 48 1.41 ->
   1.30; High 2.47 -> 2.30, 4.19 -> 3.87, 4.25 -> 3.58, 6.33 -> 5.33, 1.27 ->
   1.18.
+- `LoudnessMeter` true peak (and `AudioIntervalAnalyzer`'s, which reads it):
+  read with `TruePeakEstimator` instead of the BS.1770 Annex 2 example table.
+  Against the exact band-limited reconstruction (the table in brackets):
+  steady sines within 0.003 dB up to 0.49 fs (up to +0.22 dB near 0.09 and
+  0.25 fs); tones up to 0.45 fs that start abruptly -0.24 / +0.07 dB
+  (-0.78 / +0.19); noise band-limited to 0.45 fs -0.03 / +0.01 dB
+  (-0.37 / +0.04). Default readings move by up to -0.22 dB on steady tones.
+  Content between 0.45 fs and Nyquist, which the table attenuates, now
+  reads -1.1 / +0.75 dB for tones that start abruptly there (-2.8 / +0.23)
+  and -0.55 / +0.47 dB for white noise (-1.08 / +0.40). A sample's own
+  magnitude still counts at once; the reconstruction around it is read 33
+  samples later and at the end by `finalizeTruePeak()`. CPU 0.49 to 0.78 ms
+  per second of 48 kHz stereo with all measures (0.89 while the level keeps
+  rising; 1.03 and 1.14 on SSE2) and 4 KB more per meter.
+- `LoudnessMeter` loudness range: every short-term value is held to 0.005 LU
+  (was 0.1 LU) and the relative gate is set from the exact mean energy, so
+  LRA matches the EBU Tech 3342 reference code run on the meter's own 10 Hz
+  short-term series within 0.005 LU (was up to 0.1 LU: 0.056 to 0.097 on the
+  test programmes). Default readings move by up to 0.1 LU. The short-term
+  rate stays 10 Hz, as Tech 3342 has required since V3: a 1 Hz series reads
+  a programme stepping every 3 s 1.0 LU higher and moves by up to 1.5 LU
+  when it starts a fraction of a second later. 48 KB more per meter, still
+  constant and held in the object.
+- AU: with `kAudioUnitProperty_ShouldAllocateBuffer` false on the main input
+  and on the output, the unit releases its main pull buffers (two channels
+  of MaximumFramesPerSlice floats: 9.2 KB at 1156 frames); the source's
+  buffers reach the host's directly, a missing source renders silence into
+  them, and a render without a host output buffer is refused with
+  `kAudioUnitErr_InvalidPropertyValue`, as the format's reference
+  implementation does. Other combinations keep the buffers they can need.
 - `OnsetDetector` gated picker (the default; analysis readout, no audio): a
   peak whose frame energy falls across the release test is also kept when
   bands it raised at least double their amplitude over anything they or

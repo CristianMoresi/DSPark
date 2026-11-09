@@ -13,7 +13,8 @@
 //   [metrics] objective quality numbers (resampler SNR, EQ linear-phase
 //             level, oscillator levels, filter DC rejection, ...)
 //   [r128]    EBU R128 tone programmes generated here from the levels and
-//             durations of Tech 3341 and Tech 3342 table 1, so gating, windows
+//             durations of Tech 3341 and Tech 3342 table 1, plus a stepped
+//             programme for the Tech 3342 short-term rate, so gating, windows
 //             and true peak are measured on every target
 //   [ebu]     EBU R128 conformance against the official EBU loudness test
 //             set: integrated loudness (Tech 3341-2023 table 1), loudness
@@ -31,6 +32,7 @@
 
 #include "DSPark.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -1512,6 +1514,49 @@ void runR128ToneTests()
         const ToneMeasurement m = measureToneProgramme(programme);
         std::snprintf(d, sizeof(d), "(got %.2f LU, expected %.1f)", m.range, c.range);
         check(std::abs(m.range - c.range) <= kToleranceLu, "r128", c.name, d);
+    }
+
+    // Tech 3342 has required a short-term series of at least 10 Hz since V3:
+    // on a programme stepping every 3 s the rate decides the reading. The
+    // expected value is the Tech 3342 reference code applied to the
+    // short-term series of the programme's 100 ms block powers taken every
+    // 100 ms; at 1 Hz the same code reads about 1 LU more.
+    {
+        const double stepLevels[] = { -30.0, -25.0, -20.0, -15.0, -10.0 };
+        std::vector<ToneSegment> programme;
+        std::vector<double> blockPower;
+        for (int cycle = 0; cycle < 2; ++cycle)
+            for (double level : stepLevels)
+            {
+                programme.push_back({ level, 3.0 });
+                for (int b = 0; b < 30; ++b)
+                    blockPower.push_back(std::pow(10.0, level / 10.0));
+            }
+        auto rangeOfSeries = [&](size_t hopBlocks) {
+            std::vector<double> st;
+            for (size_t end = 30; end <= blockPower.size(); end += hopBlocks)
+            {
+                double sum = 0.0;
+                for (size_t b = end - 30; b < end; ++b)
+                    sum += blockPower[b];
+                st.push_back(10.0 * std::log10(sum / 30.0));
+            }
+            double mean = 0.0;
+            for (double v : st)
+                mean += std::pow(10.0, v / 10.0);
+            const double gate = 10.0 * std::log10(mean / static_cast<double>(st.size())) - 20.0;
+            std::vector<double> gated;
+            for (double v : st)
+                if (v >= gate) gated.push_back(v);
+            std::sort(gated.begin(), gated.end());
+            const double last = static_cast<double>(gated.size() - 1);
+            return gated[static_cast<size_t>(std::llround(last * 0.95))]
+                 - gated[static_cast<size_t>(std::llround(last * 0.10))];
+        };
+        const double at10Hz = rangeOfSeries(1), at1Hz = rangeOfSeries(10);
+        const ToneMeasurement m = measureToneProgramme(programme);
+        std::snprintf(d, sizeof(d), "(got %.3f LU, expected %.3f; a 1 Hz series reads %.3f)", m.range, at10Hz, at1Hz);
+        check(std::abs(m.range - at10Hz) <= kToleranceLu, "r128", "3342 stepped tones LRA, 10 Hz short-term series", d);
     }
 
     // Tech 3341 true-peak tolerance is +0.2/-0.4 dB. Each sine reaches its true

@@ -77,7 +77,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <numbers>
 #include <vector>
 
 // Keeps the gain computer's rare paths (once per hold block, once per 2^16
@@ -170,9 +169,9 @@ public:
         rHist_.assign(static_cast<size_t>(holdHist), 1.0);
         sufMin_.assign(static_cast<size_t>(holdHist) + 1, 1.0);
 
-        // Long-kernel true-peak estimator: kernel and per-channel histories.
-        designTruePeakKernel();
-        tpHist_.assign(static_cast<size_t>(numChannels_) * kTpStride, T(0));
+        // Long-kernel true-peak estimator: per-channel histories (the kernel
+        // is designed by the estimator itself).
+        tpChannels_.assign(static_cast<size_t>(numChannels_), typename TpEstimator::Channel {});
 
         if (std::isfinite(initialLookaheadMs) && initialLookaheadMs > 0.0)
             lookaheadMs_.store(std::clamp(static_cast<T>(initialLookaheadMs),
@@ -393,9 +392,7 @@ public:
     void reset() noexcept
     {
         for (auto& dl : delayLines_) dl.reset();
-        std::fill(tpHist_.begin(), tpHist_.end(), T(0));
-        std::fill(tpFill_, tpFill_ + kMaxChannels, 0);
-        std::fill(tpLast_, tpLast_ + kMaxChannels, T(0));
+        for (auto& state : tpChannels_) state = {};
         currentGain_ = T(1);
         publishedGain_.store(T(1), std::memory_order_relaxed);
         limitingDuration_ = 0;
@@ -628,130 +625,29 @@ protected:
 
     // ---- Long-kernel true-peak estimator ------------------------------------
     //
-    // The BS.1770 interpolator has 12 taps per phase; its pass band ends well
-    // below Nyquist, so it under-reads peaks formed by content near the top
-    // of the band (measured up to 0.8 dB on a hard-clipped 5 kHz tone and on
-    // dense mixes once the limiter has flattened the low end). This estimator
-    // evaluates the reconstruction at the quarter, half and three-quarter
-    // points of every sample interval with a 64-tap Kaiser-windowed sinc per
-    // phase (beta 8, cut at Nyquist, each phase normalised to unity at DC),
-    // and refines every local maximum of that 4x grid with the vertex of the
-    // parabola through it and its neighbours, which removes the grid error
-    // (up to 0.7 dB at 24 kHz on a 4x grid alone). The phases run as block
-    // FIRs over a per-channel history; the reading at sample n describes the
-    // interval x[n - 32] .. x[n - 31] and the half grid step before it.
-    static constexpr int kTpTaps = 64;                    ///< Taps per interpolation phase.
-    static constexpr int kTpPhases = 3;                   ///< Quarter, half and three-quarter points.
-    static constexpr int kTpDelay = kTpTaps / 2 + 1;      ///< Samples a reading reaches back.
-    static constexpr int kTpMinLookahead = kTpDelay + 16; ///< Leaves at least a 16-sample ramp.
-    static constexpr int kTpStride = kTpTaps - 1 + kChunk;
+    // The BS.1770 Annex 2 example interpolator has 12 taps per phase; its pass
+    // band ends well below Nyquist, so it under-reads peaks formed by content
+    // near the top of the band (measured up to 0.8 dB on a hard-clipped 5 kHz
+    // tone and on dense mixes once the limiter has flattened the low end).
+    // The shared TruePeakEstimator (Core/TruePeakDetector.h) evaluates the
+    // reconstruction with 64-tap phases and refines every crest of its 4x
+    // grid; its Annex 2 guard also holds the table's own reading at or below
+    // the ceiling, so an Annex 2 meter reads the output there too. The reading
+    // at sample n describes the interval x[n - 32] .. x[n - 31] and the half
+    // grid step before it.
+    using TpEstimator = TruePeakEstimator<T>;
+    static constexpr int kTpDelay = TpEstimator::getDelay();  ///< Samples a reading reaches back.
+    static constexpr int kTpMinLookahead = kTpDelay + 16;     ///< Leaves at least a 16-sample ramp.
+    static_assert(kChunk <= TpEstimator::kChunk, "one processBlock() chunk per estimator call");
 
-    /** Designs the three interpolation phases (setup thread). */
-    void designTruePeakKernel() noexcept
-    {
-        constexpr double kBeta = 8.0;
-        constexpr double tpPi = std::numbers::pi_v<double>;
-        const auto besselI0 = [](double x) noexcept {
-            double sum = 1.0, term = 1.0;
-            for (int k = 1; k < 64; ++k)
-            {
-                const double h = x / (2.0 * k);
-                term *= h * h;
-                sum += term;
-                if (term < 1e-17 * sum) break;
-            }
-            return sum;
-        };
-        const double norm = besselI0(kBeta);
-        constexpr double halfTaps = kTpTaps / 2;
-        for (int p = 0; p < kTpPhases; ++p)
-        {
-            const double frac = static_cast<double>(p + 1) / 4.0;
-            double taps[kTpTaps];
-            double sum = 0.0;
-            for (int j = 0; j < kTpTaps; ++j)
-            {
-                // Distance from tap j to the interpolation point, which sits
-                // frac past the window's sample halfTaps - 1.
-                const double d = static_cast<double>(j) - (halfTaps - 1.0) - frac;
-                const double sinc = std::sin(tpPi * d) / (tpPi * d);
-                const double u = d / halfTaps;
-                const double w = besselI0(kBeta * std::sqrt(std::max(0.0, 1.0 - u * u))) / norm;
-                taps[j] = sinc * w;
-                sum += taps[j];
-            }
-            for (int j = 0; j < kTpTaps; ++j)
-                tpCoeffs_[p][j] = static_cast<T>(taps[j] / sum);
-        }
-    }
-
-    /** Raises m to the vertex of the parabola through (a, b, c) when b is a
-     *  local maximum of the magnitude there. No multiply feeds an add, so the
-     *  result does not depend on floating-point contraction. */
-    [[nodiscard]] static inline T refineVertex(T a, T b, T c, T m) noexcept
-    {
-        const T ab = std::abs(b);
-        const T d = (a + c) - (b + b);
-        if (ab >= std::abs(a) && ab >= std::abs(c) && b * d < T(0))
-        {
-            const T q = c - a;
-            const T v = std::abs(b - (q * q) / (T(8) * d));
-            if (v > m) m = v;
-        }
-        return m;
-    }
-
-    /** Appends n (<= kChunk) samples of channel ch to its estimator history
-     *  and raises peak[i] to the true-peak reading of each: the long-kernel
-     *  estimate and the ITU-R BS.1770 Annex 2 one (so an Annex 2 meter also
-     *  reads the output at or below the ceiling; the shared coefficients come
-     *  from Core/TruePeakDetector.h). The per-sample path calls it with
-     *  n == 1; every output runs the same arithmetic either way. */
+    /** Raises peak[i] to the true-peak reading of each of n (<= kChunk)
+     *  samples of channel ch: the long-kernel estimate and the ITU-R BS.1770
+     *  Annex 2 one. The per-sample path calls it with n == 1; every output
+     *  runs the same arithmetic either way. */
     void detectTruePeak(const T* x, int n, int ch, T* peak) noexcept
     {
-        T* h = tpHist_.data() + static_cast<size_t>(ch) * kTpStride;
-        int& fill = tpFill_[ch];
-        if (fill + n > kChunk)
-        {
-            std::copy(h + fill, h + fill + (kTpTaps - 1), h); // keep the last kTpTaps - 1 samples
-            fill = 0;
-        }
-        std::copy(x, x + n, h + (kTpTaps - 1) + fill);
-        const T* base = h + fill;
-        for (int p = 0; p < kTpPhases; ++p)
-            simd::firCorrelate(base, tpCoeffs_[p], kTpTaps, tpPhase_[p], n, T(1));
-
-        // BS.1770 Annex 2 phases over the newest kAnnexTaps samples.
-        const T* annexBase = base + (kTpTaps - kAnnexTaps);
-        for (int p = 0; p < kAnnexPhases; ++p)
-        {
-            simd::firCorrelate(annexBase, Annex::getReversedPhase(p), kAnnexTaps, tpPhase_[kTpPhases], n, T(1));
-            for (int i = 0; i < n; ++i)
-                peak[i] = std::max(peak[i], std::abs(tpPhase_[kTpPhases][i])); // NaN is ignored
-        }
-        T last = tpLast_[ch];
-        for (int i = 0; i < n; ++i)
-        {
-            const T a0 = base[i + kTpTaps / 2 - 1];
-            const T a4 = base[i + kTpTaps / 2];
-            const T y1 = tpPhase_[0][i], y2 = tpPhase_[1][i], y3 = tpPhase_[2][i];
-            T m = std::max(std::max(std::abs(a0), std::abs(a4)),
-                           std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
-            m = refineVertex(last, a0, y1, m);
-            m = refineVertex(a0, y1, y2, m);
-            m = refineVertex(y1, y2, y3, m);
-            m = refineVertex(y2, y3, a4, m);
-            last = y3;
-            peak[i] = std::max(peak[i], m); // NaN is ignored
-        }
-        tpLast_[ch] = last;
-        fill += n;
+        tpEstimator_.process(tpChannels_[static_cast<size_t>(ch)], x, n, peak, true);
     }
-
-    using Annex = TruePeakDetector<T, 1>;
-    static constexpr int kAnnexTaps = Annex::getTaps();
-    static constexpr int kAnnexPhases = Annex::getPhases();
-    static_assert(kAnnexTaps <= kTpTaps, "the BS.1770 window must fit the estimator history");
 
     /** Refills the estimator histories from the delay lines when true-peak
      *  detection is switched on mid-stream (they hold every recent input
@@ -759,22 +655,20 @@ protected:
     void seedTruePeakHistory() noexcept
     {
         const int nCh = std::min(numChannels_, static_cast<int>(delayLines_.size()));
-        if (tpHist_.size() < static_cast<size_t>(nCh) * kTpStride) return;
+        if (tpChannels_.size() < static_cast<size_t>(nCh)) return;
+        constexpr int kHistory = TpEstimator::kTaps - 1;
         for (int ch = 0; ch < nCh; ++ch)
         {
-            T* h = tpHist_.data() + static_cast<size_t>(ch) * kTpStride;
-            for (int k = 0; k < kTpTaps - 1; ++k)
-                h[kTpTaps - 2 - k] = delayLines_[static_cast<size_t>(ch)].read(k);
-            tpFill_[ch] = 0;
-            tpLast_[ch] = T(0);
+            auto& state = tpChannels_[static_cast<size_t>(ch)];
+            for (int k = 0; k < kHistory; ++k)
+                state.history[kHistory - 1 - k] = delayLines_[static_cast<size_t>(ch)].read(k);
+            state.fill = 0;
+            state.last = T(0);
         }
     }
 
-    T tpCoeffs_[kTpPhases][kTpTaps] = {};
-    T tpPhase_[kTpPhases + 1][kChunk] = {};  ///< Phase outputs (+ one Annex 2 phase).
-    std::vector<T> tpHist_;          ///< Per channel: kTpTaps - 1 history + one chunk.
-    int tpFill_[kMaxChannels] = {};  ///< Samples past the history prefix, per channel.
-    T tpLast_[kMaxChannels] = {};    ///< Last three-quarter point, per channel.
+    TpEstimator tpEstimator_;                                  ///< Kernel and phase scratch.
+    std::vector<typename TpEstimator::Channel> tpChannels_;    ///< Per channel history.
 
     /** Lookahead in samples for a given ms parameter and detection mode
      *  (shared by the audio-side recompute and getLatency() so both always

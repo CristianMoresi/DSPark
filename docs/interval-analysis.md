@@ -18,14 +18,16 @@ See the compilable `examples/interval_analysis.cpp` example and the
 | `LoudnessMeter<T>::process/processBlock` and loudness readouts | K-weighting, complete 400 ms gating windows, integrated energy gating, 3 s short-term windows and LRA histograms. The interval adapter supplies only the selected fragment to its regional meter. |
 | `LoudnessMeter<T>::finalizeTruePeak()` | Completes the finite interpolation tail without advancing loudness duration, filters, windows or gates. |
 | `LoudnessMeter<T>::getMeasurementInfo()` | Stream-owner snapshot of committed/pending frames, hop length and counts passing each absolute gate. Used to reject incomplete readouts. |
-| `TruePeakDetector<T>::getTailPeak(channel)` | Evaluates eleven zero frames on a copy of one Core detector history, without allocation or live-state mutation. Shared by the meter. |
+| `TruePeakEstimator<T>::getTailPeak(state)` | Evaluates 64 zero frames on a copy of one Core estimator channel history, without allocation or live-state mutation. Shared by the meter. |
 | `OfflineEnergyAnalyzer<T>::analyze()` | Full-source 100 ms RMS/peak bins. Bin summaries cannot recover arbitrary sub-bin intervals. Its overflow-safe energy accumulator was extracted to shared Core and is reused here. |
 | `LevelFollower<T>` | Exponential peak/RMS envelopes. These ballistics are useful for live displays but do not provide rectangular interval RMS. |
 
-There is one loudness implementation and one true-peak filter. Integrated
+There is one loudness implementation and one true-peak estimator. Integrated
 loudness is obtained from the meter's gated power histogram; LUFS readings are
-never averaged to obtain regional loudness. Existing histogram quantization is
-0.1 LU, so this API does not promise exact unquantized integrated/LRA results.
+never averaged to obtain regional loudness. The integrated gate decides per
+0.1 LU bin (with the exact energy of each bin) and LRA holds each short-term
+value to 0.005 LU, so this API does not promise bit-exact unquantized
+integrated/LRA results.
 
 ## Numeric and temporal contract
 
@@ -121,7 +123,7 @@ instance. Copy the finished value result for publication to another thread.
 | Stereo four-frame fixture in `AudioInterval_exact_RMS_and_peaks_at_half_open_boundaries` | RMS `sqrt(0.46875/8)`, sample peak `0.5`; outside peaks of magnitude 10 excluded. |
 | One mono sample `0.5` | RMS/peak `0.5`, true peak `-6.0205999133 dBTP`; M/I/S/LRA unavailable as too short. |
 | Three seconds of digital silence at 48 kHz | Explicit silence, RMS/peak zero, I `-100 LUFS`, LRA zero. |
-| One-second finite ending `...0.05,+0.9,-0.9` | Final true peak approximately `-0.244683381 dBTP` for float, including the interpolation tail. |
+| One-second finite ending `...0.05,+0.9,-0.9` | Final true peak approximately `-0.105038434 dBTP` for float, including the interpolation tail (the exact reconstruction peaks at -0.0802 dBTP). |
 | Equal 16 s stereo 997 Hz sections at -20 and -30 LUFS | Integrated approximately `-22.5964 LUFS` within 0.1 LU, LRA 10 LU; not the LUFS arithmetic mean -25. |
 | 19199/19200 and 143999/144000 frames at 48 kHz | M/I and S/LRA respectively cross their complete-window validity boundaries. |
 

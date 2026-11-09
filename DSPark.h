@@ -467,7 +467,7 @@
  * | `WaveshapeTable<T>`      | Core/WaveshapeTable.h     | Table-lookup waveshaper with presets              |
  * | `Hilbert<T>`             | Core/Hilbert.h            | FIR Hilbert transform, sample-aligned analytic pair |
  * | `HilbertIIR<T>`          | Core/Hilbert.h            | Zero-latency allpass analytic pair (envelopes)    |
- * | `TruePeakDetector<T>`    | Core/TruePeakDetector.h   | Shared ITU-R BS.1770-4 inter-sample peak detector |
+ * | `TruePeakDetector<T>`    | Core/TruePeakDetector.h   | Shared BS.1770 true-peak readers (Annex 2 table, long-kernel estimator) |
  * | `AnalogConstants`        | Core/AnalogConstants.h    | Analog-hardware reference constants (zero runtime cost) |
  * | `SpinLock`               | Core/SpinLock.h           | RT-safe spinlock for thread-safe parameters       |
  * | `SpscQueue<T>`           | Core/SpscQueue.h          | Lock-free single-producer/single-consumer queue   |

@@ -955,17 +955,18 @@ private:
  * per sample; for c > 1e-4 this starts where the correction is small enough
  * (c^2 / (omega (1 + omega)) <= 3.5e-3, which reaches down to the series
  * limit up to c of about 6e-3, 94 k ohm with the default constants), and
- * the estimate with its correction step covers the drives between. Against
- * 50-digit roots for c from 1e-15 to 0.02 and drives up to 1e6 nVt the
- * table root is within one unit in the last place. Cost for an RC clipper
- * on the development machine (MSVC x64), default constants: 13.4-13.7 ns
- * per sample at low drive (0.01-0.05 V peak) and 19-20 ns above (0.5-8 V
- * peak) behind 707 ohm, and behind 94 k ohm 22.6 ns at 0.5 V, 24.0 ns at
- * 2 V and 24.5 ns at 8 V peak (with the reverse-diode correction of
- * degree three and the estimate below its range: 28.6, 27.2 and 24.9 ns);
- * against 20-27 ns for the single-omega approximation that ignores the
- * reverse diode (-46 to -82 dB error; 21.7, 23.1 and 26.4 ns behind
- * 94 k ohm).
+ * the estimate with its correction step covers the drives between; where
+ * the correction has become small (from z = 0 on at 94 k ohm) it keeps
+ * three orders instead of seven. Against 50-digit roots for c from 1e-15
+ * to 0.02 and drives up to 1e6 nVt the table root is within one unit in
+ * the last place. Cost for an RC clipper on the development machine (MSVC
+ * x64), default constants: 13.4-13.7 ns per sample at low drive
+ * (0.01-0.05 V peak) and 19-20 ns above (0.5-8 V peak) behind 707 ohm,
+ * and behind 94 k ohm (the port of a 1 pF capacitor in parallel) 23.8 ns
+ * at 0.5 V, 23.3 ns at 2 V and 23.7 ns at 8 V peak (with the full
+ * correction everywhere: 24.7, 25.0 and 24.1 ns); against 20-29 ns for the
+ * single-omega approximation that ignores the reverse diode (-46 to -82 dB
+ * error; 23.8, 28.2 and 29.1 ns behind 94 k ohm).
  */
 template <FloatType T, typename Tree>
 class DiodePairRoot
@@ -1050,6 +1051,21 @@ private:
         mode_ = c_ <= 1e-4 ? Mode::Newton : (c_ <= 0.02 ? Mode::Halley : Mode::Iterate);
         c2_ = c_ * c_;
         halfC2_ = 0.5 * c2_;
+        // First node of solveTableWide() whose whole cell has q <= kShortQ,
+        // r <= kShortR and a root above 1.25 (R and H fall with z): with
+        // omega(1 + omega) >= c^2 / kShortQ, 1 + omega >= c / sqrt(kShortR)
+        // and x = z - ln c >= 1.25 there, the omitted terms (largest
+        // (8/3) q^4 and (27/8) r q^3) total under 1.1e-17.
+        shortFrom_ = std::numeric_limits<int>::max();
+        if (mode_ == Mode::Halley)
+        {
+            const double wq = 0.5 * (std::sqrt(1.0 + 4.0 * c2_ / kShortQ) - 1.0);
+            const double wr = c_ / std::sqrt(kShortR) - 1.0;
+            const double w = std::max({wq, wr, 1e-300});
+            const double z = std::max(w + std::log(w), 1.25 + logC_);
+            const double from = std::ceil((z + 0.125 - detail::DiodeOmegaTable::kLo) * 4.0);
+            shortFrom_ = static_cast<int>(std::clamp(from, 0.0, double(detail::DiodeOmegaTable::kNodes)));
+        }
         // ln c = logC_ + ln(c e^-logC_): the residual, to about 1e-16.
         logCLow_ = std::fma(c_, std::exp(-logC_), -1.0);
         invBeta_ = bound_;
@@ -1159,8 +1175,10 @@ private:
      * the root for c up to 0.02 from the table start (checked against
      * 40-digit solutions). Evaluated as R (B0(R) + H (B1(R) + ...)) with the
      * powers of c^2 in the instance's coefficients, so the correction does
-     * not wait for omega. Above z = 32 (q < c^2 / 818) the series stops at
-     * q^2.
+     * not wait for omega. From the node shortFrom_ on (q <= kShortQ and
+     * r <= kShortR over the whole node) the series stops at q^3, r q^2 and
+     * r^2 q, three multiply-adds after R. Above z = 32 (q < c^2 / 818) the
+     * series stops at q^2.
      */
     [[nodiscard]] double solveTableWide(double x, double z4) const noexcept
     {
@@ -1176,19 +1194,30 @@ private:
             const double t2 = t * t, t4 = t2 * t2;
             const double H = ((n.h[0] + n.h[1] * t) + t2 * (n.h[2] + n.h[3] * t))
                            + t4 * ((n.h[4] + n.h[5] * t) + t2 * n.h[6]);
-            const double* a = wide_;
-            const double R2 = R * R, R4 = R2 * R2, H2 = H * H;
-            const double B0 = ((a[0] + a[1] * R) + R2 * (a[2] + a[3] * R)) + R4 * ((a[4] + a[5] * R) + R2 * a[6]);
-            const double B1 = ((a[7] + a[8] * R) + R2 * (a[9] + a[10] * R)) + R4 * (a[11] + a[12] * R);
-            const double B2 = ((a[13] + a[14] * R) + R2 * (a[15] + a[16] * R)) + R4 * a[17];
-            const double B3 = (a[18] + a[19] * R) + R2 * (a[20] + a[21] * R);
-            const double B4 = (a[22] + a[23] * R) + R2 * a[24];
-            const double d = R * ((B0 + H * B1) + H2 * ((B2 + H * B3) + H2 * B4));
             const bool logForm = index >= Table::kFirstLogNode;
             const double base = logForm ? -logC_ : x;
             const double s0 = base + n.p[0];
             const double e0 = n.p[0] - (s0 - base);
-            return s0 + (((rest + e0) - (logForm ? logCLow_ : 0.0)) + d);
+            const double tail = (rest + e0) - (logForm ? logCLow_ : 0.0);
+            if (index >= shortFrom_)
+            {
+                // q <= kShortQ and r <= kShortR on this node (see
+                // updateConstants()): every term past q^3, r q^2 and r^2 q
+                // stays below 9e-18 of the root, and the correction is three
+                // multiply-adds deep after R instead of seven.
+                const double q = c2_ * R, r = c2_ * H;
+                return s0 + (tail + q * (((1.0 - q) + 1.5 * (q * q)) + r * ((-0.5 + (4.0 / 3.0) * q) + 0.5 * r)));
+            }
+            {
+                const double* a = wide_;
+                const double R2 = R * R, R4 = R2 * R2, H2 = H * H;
+                const double B0 = ((a[0] + a[1] * R) + R2 * (a[2] + a[3] * R)) + R4 * ((a[4] + a[5] * R) + R2 * a[6]);
+                const double B1 = ((a[7] + a[8] * R) + R2 * (a[9] + a[10] * R)) + R4 * (a[11] + a[12] * R);
+                const double B2 = ((a[13] + a[14] * R) + R2 * (a[15] + a[16] * R)) + R4 * a[17];
+                const double B3 = (a[18] + a[19] * R) + R2 * (a[20] + a[21] * R);
+                const double B4 = (a[22] + a[23] * R) + R2 * a[24];
+                return s0 + (tail + R * ((B0 + H * B1) + H2 * ((B2 + H * B3) + H2 * B4)));
+            }
         }
         double t = 0.0;
         const auto& cl = exact_->cell(0.25 * z4, t);
@@ -1255,6 +1284,10 @@ private:
         {-0.625, 3.5, -1057.0 / 72.0, 4927.0 / 90.0, 0.0, 0.0, 0.0},
         {0.875, -6.125, 485.0 / 16.0, 0.0, 0.0, 0.0, 0.0}};
     double wide_[25] {};   ///< kWideCoefficients times powers of c^2 (Halley mode).
+    /// Bounds of q and r for the short correction of solveTableWide() (the
+    /// values at z = 0 for c = 6e-3).
+    static constexpr double kShortQ = 4.05e-5, kShortR = 1.47e-5;
+    int shortFrom_ = std::numeric_limits<int>::max();   ///< First node with the short correction.
     enum class Mode { Newton, Halley, Iterate };
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0, bound_ = 1.0, cPlus_ = 3.0;
     double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.

@@ -1468,8 +1468,13 @@ public:
      *   (three samples, padded to four) +24 dB reaches -29.1 dBc, with the
      *   tube kernel and a first-order transformer -28.4, and any split of
      *   two samples aliases more still (-14.5 with the tape at first order,
-     *   -1.3 to -19.2 with a plain stage);
-     * - 3 (4x and above): second-order kernels on all three stages.
+     *   -1.3 to -19.2 with a plain stage). At +18 dB both chains reach the
+     *   same limit on a 19.25 kHz tone at -18 dBFS (-33.1 and -33.4 dBc);
+     * - 3 (4x and above): second-order kernels on all three stages. The
+     *   delay-4 chains at 4x and 8x alias 0.2-3.2 dB more at every drive
+     *   from +12 to +36 dB; at 1x each further kernel lowers a 19.25 kHz
+     *   fundamental by 13.8 dB, and the delay-2 chain aliases 12-25 dB more
+     *   than the tube kernel alone (+12 dB: -0.7 against -12.9 dBc).
      * Worst alias over 1-19.25 kHz tones at -6/-18 dBFS, +12/+24 dB:
      * -37.1/-36.2 dBc at 2x and -70.6/-49.7 dBc at 4x, against
      * -16.0/-6.8 and -32.4/-6.0 with the tube kernel alone.

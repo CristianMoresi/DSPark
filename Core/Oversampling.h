@@ -21,6 +21,9 @@
  *   has to protect what the first stage keeps, so it is designed to be no
  *   worse than the first stage over that band, never to a fixed tap count.
  *   The round trip is an exact integer delay at every frequency.
+ *   Depth::Deep (opt-in) keeps a preset's band and makes every stage at
+ *   least 100 dB deep, for nonlinear processing whose harmonics fill the
+ *   oversampled band.
  * - **Polyphase IIR (opt-in, Mode::PolyphaseIir).** Elliptic half-band
  *   filters realised as two first-order allpass cascades in z^-2
  *   (Valenzuela and Constantinides, IEE Proc. 1983), the coefficients
@@ -35,7 +38,7 @@
  *   low audio range. getLatency() reports it rounded at low frequencies.
  *
  * Features:
- * - Factors 1/2/4/8/16 with four quality presets.
+ * - Factors 1/2/4/8/16 with four quality presets and two stopband depths.
  * - Block-based streaming; variable block sizes are supported and give
  *   bit-identical output for any partition of the stream.
  * - Zero allocations after prepare(); upsample()/downsample() are noexcept.
@@ -82,8 +85,9 @@ namespace dspark {
  * Threading: prepare() and reset() belong to the setup thread (prepare
  * allocates). upsample() and downsample() belong to the audio thread and are
  * noexcept and allocation-free. There are no runtime setters -- factor,
- * quality and mode are fixed at construction and all filter state is only
- * touched by the audio thread -- so no cross-thread synchronisation is needed.
+ * quality, mode and depth are fixed at construction and all filter state is
+ * only touched by the audio thread -- so no cross-thread synchronisation is
+ * needed.
  *
  * @tparam T           Sample type (float or double).
  * @tparam MaxChannels Maximum number of channels supported.
@@ -119,17 +123,41 @@ public:
     };
 
     /**
+     * @brief Stopband depth of the cascade (see the constructor).
+     *
+     * - Preset (default): the depth of the quality preset, as above.
+     * - Deep: every stage at least 100 dB deep over the band it protects,
+     *   with the preset's transition band (the same passband edge and stop
+     *   edge). A nonlinear process at the high rate leaves harmonics across
+     *   the whole band above the base Nyquist at close to their full level,
+     *   and the preset's depth is then the floor of what folds back.
+     *   Linear-phase FIR taps per stage (first stage first): Low 91/35/23/31,
+     *   Medium 115/31/23/31, High 163/31/23/31 (with Preset 31/11/7/15,
+     *   63/19/15/15 and 127/23/23/15). Round-trip latency at High:
+     *   82/90/93/95 base samples at 2x/4x/8x/16x (Preset 64/70/73/74).
+     *   Maximum already has that depth and is unchanged. In
+     *   Mode::PolyphaseIir every stage gets the coefficient count that
+     *   reaches 100 dB over its band (104 dB or deeper for every preset).
+     */
+    enum class Depth
+    {
+        Preset, ///< The quality preset's depth (default).
+        Deep    ///< At least 100 dB in every stage, with the preset's band.
+    };
+
+    /**
      * @brief Constructs the oversampling engine.
      * @param factor  Oversampling factor. Must be a power of two (1, 2, 4, 8, 16).
      * @param quality Filter quality preset. Default is High (-80 dB).
      * @param mode    Filter family. Default is the linear-phase FIR.
+     * @param depth   Stopband depth. Default is the preset's (Depth::Preset).
      * @pre factor >= 1 and is a power of 2.
      * @note Release builds normalise an invalid factor into range and round it
      *       down to a power of two (debug builds assert).
      */
     explicit Oversampling(int factor = 2, Quality quality = Quality::High,
-                          Mode mode = Mode::LinearPhaseFir)
-        : quality_(quality), mode_(mode)
+                          Mode mode = Mode::LinearPhaseFir, Depth depth = Depth::Preset)
+        : quality_(quality), mode_(mode), depth_(depth)
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0 && "Factor must be a power of 2");
         assert(factor <= (1 << kMaxStages) && "Factor must be <= 16 (kMaxStages stages)");
@@ -148,7 +176,7 @@ public:
         if (mode_ == Mode::PolyphaseIir)
         {
             for (int s = 0; s < numStages_; ++s)
-                iir_[static_cast<size_t>(s)].design(iirCoefficientCount(quality_, s),
+                iir_[static_cast<size_t>(s)].design(iirCoefficientCount(quality_, depth_, s),
                                                     iirTransition(quality_, s));
         }
         computeDelays();
@@ -174,7 +202,7 @@ public:
             }
             else
             {
-                const StageDesign d = firStageDesign(quality_, stage);
+                const StageDesign d = firStageDesign(quality_, depth_, stage);
                 filters_[static_cast<size_t>(stage)].design(d.taps, static_cast<T>(d.beta),
                                                             spec.numChannels, stageMaxSamples);
             }
@@ -205,6 +233,9 @@ public:
 
     /** @brief Returns the half-band filter family. */
     [[nodiscard]] Mode getMode() const noexcept { return mode_; }
+
+    /** @brief Returns the stopband depth (Depth::Preset or Depth::Deep). */
+    [[nodiscard]] Depth getDepth() const noexcept { return depth_; }
 
     /**
      * @brief Round-trip (upsample + downsample) delay at the BASE rate, in samples.
@@ -859,20 +890,27 @@ private:
      * a multiple of 2^s so the round-trip delay stays an exact integer.
      * Stopband peaks (stage 0 / 1 / 2 / 3), dB: Low -38.9/-43.7/-44.8/-91.9,
      * Medium -59.5/-64.0/-78.0/-92.5, High -79.2/-80.3/-122.9/-93.1,
-     * Maximum -100.1/-109.4/-124.1/-159.3.
+     * Maximum -100.1/-109.4/-124.1/-159.3. Depth::Deep keeps each preset's
+     * stop edge and takes, per stage, the shortest kernel (same delay rule)
+     * reaching -100.1 dB over the same band: Low -104.0/-111.3/-117.7/-159.0,
+     * Medium -103.6/-102.2/-119.8/-159.4, High -100.7/-106.3/-122.3/-160.1.
      */
-    static constexpr StageDesign firStageDesign(Quality q, int stage) noexcept
+    static constexpr StageDesign firStageDesign(Quality q, Depth depth, int stage) noexcept
     {
         constexpr StageDesign kLow[kMaxStages]  = { { 31, 3.395 },  { 11, 2.90 },  { 7, 2.35 },   { 15, 9.45 } };
         constexpr StageDesign kMed[kMaxStages]  = { { 63, 5.653 },  { 19, 6.25 },  { 15, 7.90 },  { 15, 9.50 } };
         constexpr StageDesign kHigh[kMaxStages] = { { 127, 7.857 }, { 23, 7.95 },  { 23, 12.55 }, { 15, 9.50 } };
         constexpr StageDesign kMax[kMaxStages]  = { { 255, 10.056 },{ 31, 11.20 }, { 23, 12.70 }, { 31, 15.65 } };
+        constexpr StageDesign kLowDeep[kMaxStages]  = { { 91, 10.45 },  { 35, 11.35 }, { 23, 12.30 }, { 31, 15.65 } };
+        constexpr StageDesign kMedDeep[kMaxStages]  = { { 115, 10.45 }, { 31, 10.40 }, { 23, 12.40 }, { 31, 15.65 } };
+        constexpr StageDesign kHighDeep[kMaxStages] = { { 163, 10.10 }, { 31, 10.85 }, { 23, 12.55 }, { 31, 15.65 } };
         const int s = std::clamp(stage, 0, kMaxStages - 1);
+        const bool deep = depth == Depth::Deep;
         switch (q)
         {
-            case Quality::Low:     return kLow[s];
-            case Quality::Medium:  return kMed[s];
-            case Quality::High:    return kHigh[s];
+            case Quality::Low:     return deep ? kLowDeep[s] : kLow[s];
+            case Quality::Medium:  return deep ? kMedDeep[s] : kMed[s];
+            case Quality::High:    return deep ? kHighDeep[s] : kHigh[s];
             case Quality::Maximum: return kMax[s];
         }
         return kHigh[s];
@@ -901,8 +939,9 @@ private:
     }
 
     /// Smallest even coefficient count at least as deep as the FIR preset's
-    /// first stage (stage-0 depths: Low 62, Medium 84, High 99, Maximum 109 dB).
-    static int iirCoefficientCount(Quality q, int stage) noexcept
+    /// first stage (stage-0 depths: Low 62, Medium 84, High 99, Maximum 109 dB),
+    /// or as Maximum's with Depth::Deep.
+    static int iirCoefficientCount(Quality q, Depth depth, int stage) noexcept
     {
         double target = 79.2;
         switch (q)
@@ -912,6 +951,7 @@ private:
             case Quality::High:    target = 79.2; break;
             case Quality::Maximum: target = 100.1; break;
         }
+        if (depth == Depth::Deep) target = 100.1;
         const double t = iirTransition(q, stage);
         int n = 2;
         while (n < 2 * PolyphaseIirHalfBand::kMaxPairs && PolyphaseIirHalfBand::attenuationDb(n, t) < target)
@@ -959,7 +999,7 @@ private:
         int latency = 0, decimation = 0;
         for (int s = 0; s < numStages_; ++s)
         {
-            const int halfOrder = (firStageDesign(quality_, s).taps - 1) / 2;
+            const int halfOrder = (firStageDesign(quality_, depth_, s).taps - 1) / 2;
             latency += (halfOrder + 1) / (1 << s);                  // exact by design
             decimation += halfOrder * (factor_ >> (s + 1));
         }
@@ -971,6 +1011,7 @@ private:
     int numStages_;
     Quality quality_;
     Mode mode_;
+    Depth depth_;
     int latency_ = 0;
     int decimationDelay_ = 0;
     AudioSpec baseSpec_ {};

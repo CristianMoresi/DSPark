@@ -29,6 +29,19 @@ All notable user-facing changes to DSPark are documented here.
   refined), with a tail query for finite programmes and a running-maximum
   form. It is the long-kernel estimator the Limiter's true-peak mode already
   ran, moved to Core; the Limiter's output is bit-identical.
+- `Oversampling` stopband depth: a fourth constructor argument,
+  `Depth::Deep`, keeps a quality preset's band (passband and stop edge) and
+  makes every half-band stage at least 100 dB deep over the band it
+  protects (`getDepth()`). The later stages of the presets are only as deep
+  as their first stage (High: 80 dB), so harmonics a nonlinear stage leaves
+  near the top of the oversampled band fold back at that level; with Deep a
+  line at 80 kHz at 4x comes back below -100 dB. Taps per stage (first
+  first): Low 91/35/23/31, Medium 115/31/23/31, High 163/31/23/31 (Preset
+  31/11/7/15, 63/19/15/15, 127/23/23/15); High latency at 2x/4x/8x/16x
+  82/90/93/95 base samples (Preset 64/70/73/74). Maximum is unchanged.
+  The polyphase IIR mode gives every stage the coefficient count that
+  reaches 100 dB (104 dB or deeper for every preset). The default
+  (`Depth::Preset`) is unchanged.
 - Plugin layer, VST3 note expressions: a class that declares
   `static constexpr uint32_t noteExpressions = dspark::plugin::expressions(...)`
   offers those expressions (volume, pan, tuning, vibrato, expression,
@@ -566,6 +579,43 @@ All notable user-facing changes to DSPark are documented here.
   within the previous error against 45-digit roots (worst 2.7e-16 relative
   for c from 1.5e-4 to 0.0195; 9.3e-16 before at c = 0.0195); c <= 1e-4
   (707 ohm with the default constants) is bit-identical.
+- `TubePreamp` at 4x and above decimates through `Oversampling::Depth::Deep`
+  (every stage at least 100 dB deep; 2x keeps the High preset): latency at
+  4x/8x/16x 73/74/75 -> 93/94/96 base samples, the dry path follows. The
+  later decimation stages were only 80 dB deep and set the alias floor
+  there; worst alias over the documented sweep (2 s of settling), Clamp at
+  4x, one stage +12/+24/+36 dB -101.4/-93.0/-92.1 -> -102.0/-96.4/-96.4 dBc
+  and two stages -91.3/-89.4/-88.9 -> -93.9/-93.9/-105.8 (8x: one stage
+  -101.4/-92.1/-91.2 -> -118.7/-109.9/-96.8, two stages
+  -92.1/-90.3/-89.9 -> -109.6/-105.7/-105.7); `GridModel::Conduction` at
+  4x one stage -102.8/-88.9/-86.6 -> -120.2/-114.1/-105.5 and two stages
+  -94.4/-89.3/-84.9 -> -115.2/-103.1/-102.6. Cost at 4x within 1 % (Clamp)
+  and 6 % lower (Conduction, with the changes below). 1x and 2x, and so the
+  default, are bit-identical.
+- `TubePreamp` cost: the tone circuit's phi functions of a whole internal
+  sample are kept per mode instead of recomputed (bit-identical, both grid
+  models), the conduction model's grid table stores each cell's cubic
+  (bit-identical), and the conduction model integrates stage-1 pieces
+  shorter than 0.03 internal samples on two nodes and those shorter than
+  0.1 on three, as stage 2 already did. Stereo float at 2x, % of one core,
+  Conduction on 1 kHz + 7.3 kHz / 16 kHz / white noise at +0..+36 dB:
+  3-15 % lower (16 kHz, one stage, +36 dB: 10.33 -> 8.82; previous
+  conduction model 7.94), so its cost over the previous conduction model
+  falls from up to +35 % to up to +24 %; Clamp 0-8 % lower. The
+  conduction model's output at 2x moves at the level of its numerical
+  error: worst alias over the documented sweep unchanged within 0.1 dB
+  except two stages at +36 dB, -84.1 -> -84.5 dBc.
+- `wdf::DiodePairRoot` for 1e-4 < c <= 0.02: on the table nodes where the
+  reverse-diode correction q is below 4.05e-5 and c^2 / (1 + omega)^2
+  below 1.47e-5 (from z = 0 on behind 94 k ohm) the correction keeps
+  q^3, r q^2 and r^2 q, three multiply-adds after R instead of seven
+  (omitted terms below 9e-18 of the root). Cost per sample on an RC
+  clipper behind a 94 k ohm port: 24.7 -> 23.8 ns at 0.5 V peak, 25.0 ->
+  23.3 at 2 V, 24.1 -> 23.7 at 8 V (single-omega approximation 23.8, 28.2,
+  29.1); 22 k ohm 24.4 -> 23.0, 25.0 -> 23.2, 24.0 -> 23.6. The roots stay
+  within the previous error against 45-digit roots (worst 2.9e-16 relative
+  for c from 1.5e-4 to 0.0195, unchanged at every c); the other nodes are
+  bit-identical.
 - `wdf::DiodePairRoot` and `wdf::DiodeRoot` above the low-drive series
   evaluate the diode's closed form with a full-precision omega table
   (`detail::DiodeOmegaTable`, 83 KB, built once per process) instead of an

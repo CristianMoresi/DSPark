@@ -243,6 +243,13 @@ os.downsample(buffer);             // back to host rate, band-limited
 // by the factor) as plugin latency.
 ```
 
+A hard nonlinearity at 4x and above leaves harmonics across the whole
+oversampled band at close to their full level, and the presets' later
+stages are only as deep as their first (80 dB at High). For that case
+construct the oversampler with `Oversampling<float>::Depth::Deep` as the
+fourth argument: the same passband, every stage at least 100 dB deep, for
+20 more samples of latency at 4x High (90 instead of 70).
+
 Measure before reaching for this: DSPark's own nonlinear stages
 (Saturation, TapeMachine, Clipper) already oversample internally where the
 algorithm needs it, and the Compressor's gain path stays at or below
@@ -282,7 +289,7 @@ is setup-thread only - it reallocates and may re-calibrate like
   reconstructed by a Farrow polynomial, each interval is split at the triode
   knees and the tone circuit is propagated in its analog modal form; the
   plate voltage is band-limited once, at the output. `getLatency()` reports
-  71/99/113/121 samples respectively, independent of the active stage count;
+  71/93/94/96 samples respectively, independent of the active stage count;
   the dry path includes the same delay. Factor 1 retains the point circuit
   without resampling and reports zero: use it inside an already oversampled
   host chain. At 2x the header's frequency/drive sweep stays at or below

@@ -75,8 +75,11 @@
  *   per-interval moments, followed by a fixed linear-phase FIR that
  *   compensates its passband droop. Because the kernel acts only on the
  *   final output, the compensation is exact at every signal level.
+ * - From 4x the plate's harmonics reach the internal Nyquist at close to
+ *   their full level, so every decimation stage is at least 100 dB deep
+ *   (Oversampling::Depth::Deep; at 2x the stage keeps the High preset).
  *
- * Total latency for 1/2/4/8/16x is 0/71/73/74/75 base samples,
+ * Total latency for 1/2/4/8/16x is 0/71/93/94/96 base samples,
  * independent of setStages(); the dry path includes the same delay.
  * getLatency() always reflects the ACTIVE factor (0 at 1x) so hosts get
  * correct PDC. At 1x the original point circuit is retained: use 1x only
@@ -91,26 +94,28 @@
  *
  * Measured at 48 kHz over tones from 1 to 20 kHz in 1 kHz steps, plus
  * 12.75/15.25/19.25 kHz, at -6 and -18 dBFS: each tone is moved to the
- * nearest odd bin of a 16384-point FFT. After settling, coherent
+ * nearest odd bin of a 16384-point FFT. After 2 s of settling, coherent
  * rectangular DFT measurements exclude only DC and exact physical harmonic
  * bins. In particular, adjacent folded lines are retained. The worst
  * component below 20 kHz, relative to the tone, is:
  *
  *   stages, drive     2x (default)   4x          8x
- *   1, -12 dB        -121.5         -134.3       -134.3
- *   1, 0 dB           -96.7         -115.0       -115.0
- *   1, +12 dB         -87.7         -101.4       -101.4
- *   1, +24 dB         -80.6          -96.4        -96.8
- *   1, +36 dB         -80.6          -96.4        -96.6
- *   2, -12 dB        -104.7         -120.8       -120.8
- *   2, 0 dB           -86.9         -101.5       -103.1
- *   2, +12 dB         -83.0          -93.9        -96.9
- *   2, +24 dB         -83.0          -93.9        -96.4
- *   2, +36 dB         -84.8          -96.4        -96.4
+ *   1, -12 dB        -121.5         -146.0       -152.4
+ *   1, 0 dB           -96.7         -121.4       -132.3
+ *   1, +12 dB         -87.7         -102.0       -118.7
+ *   1, +24 dB         -80.6          -96.4       -109.9
+ *   1, +36 dB         -80.6          -96.4        -96.8
+ *   2, -12 dB        -104.7         -128.4       -138.2
+ *   2, 0 dB           -86.9         -101.5       -120.5
+ *   2, +12 dB         -83.0          -93.9       -109.6
+ *   2, +24 dB         -83.0          -93.9       -105.7
+ *   2, +36 dB         -84.8         -105.8       -105.7
  *
- * On the same sweep the former antiderivative-antialiased core reached
- * -19.2 dBc (two stages, +36 dB, 2x). At 2x the worst value over all
- * drives is -81.8 dBc at 44.1 kHz and -96.1 dBc at 96 kHz.
+ * With the decimation stages only as deep as the High preset's first stage,
+ * 4x and 8x reached -88.9 and -89.9 dBc at worst. On the same sweep the
+ * former antiderivative-antialiased core reached -19.2 dBc (two stages,
+ * +36 dB, 2x). At 2x the worst value over all drives is -81.8 dBc at
+ * 44.1 kHz and -96.1 dBc at 96 kHz.
  *
  * Against independent dense solutions of the same circuit equations (the
  * point circuit at 512x and 1024x the base rate, 78 settings of drive,
@@ -126,7 +131,8 @@
  * or low-frequency material, and 9-11 % for high-frequency or broadband
  * material at +12..+36 dB: 1.1-2.9x the former core at 2x, and less than
  * that core needed at 8x. At 4x, 8x and 16x the cost is 1.2-2.1x,
- * 1.2-1.6x and about 1.4x the former core at the same factor.
+ * 1.2-1.6x and about 1.4x the former core at the same factor (the deeper
+ * decimation from 4x is within that).
  *
  * The plate-current table is 156672 bytes shared by all channels in an
  * instance. Preparation builds the table, designs the modal tone circuit
@@ -274,12 +280,15 @@ namespace detail {
         static constexpr int kFine = 64, kCoarse = 8;
         static constexpr int kFineCells = static_cast<int>((kMid - kLo) * kFine);
         static constexpr int kCells = kFineCells + static_cast<int>((kHi - kMid) * kCoarse);
-        std::vector<double> w, dw;
+        /// The cubic of one cell in its offset t in [0, 1]: ((a3 t + a2) t + a1) t + a0.
+        struct Cell { double a3, a2, a1, a0; };
+        std::vector<Cell> cells;
         double rs = TubePreampGridConduction::kRs;   ///< Source resistance the table solves for.
 
         explicit TubePreampGridTable(double sourceResistance = TubePreampGridConduction::kRs)
-            : w(static_cast<size_t>(kCells + 1)), dw(static_cast<size_t>(kCells + 1)), rs(sourceResistance)
+            : cells(static_cast<size_t>(kCells)), rs(sourceResistance)
         {
+            std::vector<double> w(static_cast<size_t>(kCells + 1)), dw(static_cast<size_t>(kCells + 1));
             for (int i = 0; i <= kCells; ++i)
             {
                 const double d = i <= kFineCells ? kLo + double(i) / kFine
@@ -290,6 +299,16 @@ namespace detail {
                 w[static_cast<size_t>(i)] = root;
                 dw[static_cast<size_t>(i)] = 1.0 / (1.0 + rs * slope);
             }
+            // Each cell's Hermite cubic through the node values and slopes,
+            // in the monomial form eval() reads with one load.
+            for (int i = 0; i < kCells; ++i)
+            {
+                const double h = i < kFineCells ? 1.0 / kFine : 1.0 / kCoarse;
+                const double w0 = w[static_cast<size_t>(i)], w1 = w[static_cast<size_t>(i + 1)];
+                const double m0 = h * dw[static_cast<size_t>(i)], m1 = h * dw[static_cast<size_t>(i + 1)];
+                const double diff = w1 - w0;
+                cells[static_cast<size_t>(i)] = {m0 + m1 - 2.0 * diff, 3.0 * diff - 2.0 * m0 - m1, m0, w0};
+            }
         }
 
         /** Grid-to-cathode voltage for a source-minus-cathode voltage d. */
@@ -297,15 +316,11 @@ namespace detail {
         {
             if (d <= kLo) return d;
             if (!(d < kHi)) return TubePreampGridConduction::solve(d, rs);
-            double pos = 0.0, h = 0.0;
-            if (d < kMid) { pos = (d - kLo) * kFine; h = 1.0 / kFine; }
-            else { pos = kFineCells + (d - kMid) * kCoarse; h = 1.0 / kCoarse; }
+            const double pos = d < kMid ? (d - kLo) * kFine : kFineCells + (d - kMid) * kCoarse;
             const int i = std::min(static_cast<int>(pos), kCells - 1);
             const double t = pos - i;
-            const double w0 = w[static_cast<size_t>(i)], w1 = w[static_cast<size_t>(i + 1)];
-            const double m0 = h * dw[static_cast<size_t>(i)], m1 = h * dw[static_cast<size_t>(i + 1)];
-            const double diff = w1 - w0;
-            return (((m0 + m1 - 2.0 * diff) * t + (3.0 * diff - 2.0 * m0 - m1)) * t + m0) * t + w0;
+            const Cell& c = cells[static_cast<size_t>(i)];
+            return ((c.a3 * t + c.a2) * t + c.a1) * t + c.a0;
         }
     };
 
@@ -703,10 +718,41 @@ namespace detail {
         }
     };
 
+    /** phi_k(w) = sum_j w^j/(j+k)!, k = 0..4 (phi_0 = exp). Small |w|: a
+     *  length-adapted Taylor series of phi_4 and the exact downward
+     *  recurrence; otherwise the upward recurrence from exp. */
+    inline void tubePreampPhi(double w, double* p) noexcept
+    {
+        const double aw = std::abs(w);
+        if (aw < 0.5)
+        {
+            static constexpr double inv[16] = {1.0, 1.0, 1.0 / 2, 1.0 / 6, 1.0 / 24, 1.0 / 120,
+                1.0 / 720, 1.0 / 5040, 1.0 / 40320, 1.0 / 362880, 1.0 / 3628800,
+                1.0 / 39916800, 1.0 / 479001600, 1.0 / 6227020800.0,
+                1.0 / 87178291200.0, 1.0 / 1307674368000.0};
+            const int n = aw < 1e-3 ? 3 : (aw < 0.02 ? 5 : (aw < 0.1 ? 7 : 10));
+            double v = inv[4 + n];
+            for (int j = n - 1; j >= 0; --j) v = v * w + inv[4 + j];
+            p[4] = v;
+            p[3] = w * v + inv[3];
+            p[2] = w * p[3] + inv[2];
+            p[1] = w * p[2] + 1.0;
+            p[0] = w * p[1] + 1.0;
+        }
+        else
+        {
+            p[0] = std::exp(w);
+            p[1] = (p[0] - 1.0) / w;
+            p[2] = (p[1] - 1.0) / w;
+            p[3] = (p[2] - 0.5) / w;
+            p[4] = (p[3] - 1.0 / 6.0) / w;
+        }
+    }
     /** Modal form of the FMV analog state space (symmetric similarity). */
     struct TubePreampToneModes
     {
         double lambda[3] {};      ///< Poles per internal sample (lambda * T).
+        double unitPhi[3][5] {};  ///< tubePreampPhi(lambda): the phi values of a whole-interval piece.
         double beta[3] {};        ///< Input gain per internal sample.
         double gamma[3] {};       ///< Output gain.
         double direct = 0.0;      ///< Feedthrough.
@@ -774,6 +820,7 @@ namespace detail {
             for (int m = 0; m < 3; ++m)
             {
                 lambda[m] = s[m][m] * period;
+                tubePreampPhi(lambda[m], unitPhi[m]);
                 double bm = 0.0, gm = 0.0;
                 for (int i = 0; i < 3; ++i)
                 {
@@ -789,36 +836,6 @@ namespace detail {
         }
     };
 
-    /** phi_k(w) = sum_j w^j/(j+k)!, k = 0..4 (phi_0 = exp). Small |w|: a
-     *  length-adapted Taylor series of phi_4 and the exact downward
-     *  recurrence; otherwise the upward recurrence from exp. */
-    inline void tubePreampPhi(double w, double* p) noexcept
-    {
-        const double aw = std::abs(w);
-        if (aw < 0.5)
-        {
-            static constexpr double inv[16] = {1.0, 1.0, 1.0 / 2, 1.0 / 6, 1.0 / 24, 1.0 / 120,
-                1.0 / 720, 1.0 / 5040, 1.0 / 40320, 1.0 / 362880, 1.0 / 3628800,
-                1.0 / 39916800, 1.0 / 479001600, 1.0 / 6227020800.0,
-                1.0 / 87178291200.0, 1.0 / 1307674368000.0};
-            const int n = aw < 1e-3 ? 3 : (aw < 0.02 ? 5 : (aw < 0.1 ? 7 : 10));
-            double v = inv[4 + n];
-            for (int j = n - 1; j >= 0; --j) v = v * w + inv[4 + j];
-            p[4] = v;
-            p[3] = w * v + inv[3];
-            p[2] = w * p[3] + inv[2];
-            p[1] = w * p[2] + 1.0;
-            p[0] = w * p[1] + 1.0;
-        }
-        else
-        {
-            p[0] = std::exp(w);
-            p[1] = (p[0] - 1.0) / w;
-            p[2] = (p[1] - 1.0) / w;
-            p[3] = (p[2] - 0.5) / w;
-            p[4] = (p[3] - 1.0 / 6.0) / w;
-        }
-    }
 } // namespace detail
 /// @endcond
 
@@ -865,8 +882,12 @@ public:
 
         if (osFactor_ > 1)
         {
+            // From 4x the core leaves harmonics up to the internal Nyquist at
+            // close to their full level, so the preset's 80 dB is no longer
+            // enough to decimate them: every stage is made 100 dB deep.
             oversampler_ = std::make_unique<Oversampling<T>>(
-                osFactor_, Oversampling<T>::Quality::High);
+                osFactor_, Oversampling<T>::Quality::High, Oversampling<T>::Mode::LinearPhaseFir,
+                osFactor_ >= 4 ? Oversampling<T>::Depth::Deep : Oversampling<T>::Depth::Preset);
             oversampler_->prepare(spec);
             design_ = std::make_unique<detail::TubePreampCoreDesign>(osFactor_);
         }
@@ -1065,11 +1086,15 @@ public:
      * current, which the output kernel cannot remove). Worst alias over the
      * documented sweep at 2x (after 2 s of settling): -102.8/-88.2/-83.2 dBc
      * at one stage, +12/+24/+36 dB (Clamp -87.7/-80.6/-80.6) and
-     * -90.5/-88.1/-84.1 at two stages (Clamp -83.0/-83.0/-84.8), against
+     * -90.5/-88.1/-84.5 at two stages (Clamp -83.0/-83.0/-84.8), against
      * -85.5/-74.0/-74.0 and -81.6/-73.1/-73.1 with the capacitor ramped across
-     * each sample; at 4x -88.9/-86.6 (one stage, +24/+36 dB) and
-     * -89.3/-84.9 dBc (two stages). CPU rises 14-66 % against Clamp, most
-     * for high tones at +24..+36 dB drive.
+     * each sample. The two-stage +36 dB figure is the output kernel's
+     * leakage of the fifth harmonic, which the conduction circuit makes
+     * 1.5 dB stronger (-12.6 against -14.1 dBc at 15.25 kHz). At 4x
+     * -120.2/-114.1/-105.5 (one stage) and -115.2/-103.1/-102.6 dBc (two
+     * stages; Clamp -102.0/-96.4/-96.4 and -93.9/-93.9/-105.8), at 8x
+     * -120.2/-114.1/-111.9 and -115.2/-110.5/-109.7. CPU at 2x rises
+     * 13-64 % against Clamp, most for high tones at +24..+36 dB drive.
      */
     void setGridModel(GridModel model)
     {
@@ -1554,7 +1579,8 @@ private:
         static constexpr double kConductionKneeRange = 0.25;   ///< Same, conduction knees.
         static constexpr double kSmallZ = 0.3, kStiffZ = 40.0;
         static constexpr double kLongPiece = 0.5;    ///< Samples; longer stage-2 pieces use 4 nodes.
-        static constexpr double kShortPiece = 0.03;  ///< Samples; shorter stage-2 pieces use 2 nodes.
+        static constexpr double kShortPiece = 0.03;  ///< Samples; shorter pieces use 2 nodes (stage 1: conduction model).
+        static constexpr double kMediumPiece = 0.1;  ///< Samples; shorter stage-1 pieces use 3 nodes (conduction model).
         /// Grid-to-cathode source below which the grid current (under 1e-9 A)
         /// moves the coupling capacitor by less than 1 uV per sample: the
         /// charge is then held across the piece.
@@ -1984,8 +2010,11 @@ private:
                     q[m] = -bt * iz * endValue;
                     continue;
                 }
-                double p[5];
-                detail::tubePreampPhi(z, p);
+                // A whole interval (h == 1) reads the values kept per mode.
+                double pz[5];
+                const double* p = pz;
+                if (h == 1.0) p = modes.unitPhi[m];
+                else detail::tubePreampPhi(z, pz);
                 double forced = 0.0;
                 for (int e = 0; e < terms; ++e) forced += u[e] * fact[e] * p[e + 1];
                 const double qEnd = p[0] * q[m] + bt * forced;
@@ -2394,6 +2423,61 @@ private:
                     if (grid) lastIg1 = 0.0;
                     const double u[1] = {supply - kRL * i1 - vp1};
                     plate(a, h, u, 1);
+                    continue;
+                }
+                if (grid && h < kShortPiece)
+                {
+                    // Short piece (conduction model): two nodes and the exact
+                    // moments of the plate's linear interpolant, as in stage 2.
+                    constexpr double g0 = kG2x[0], g1 = kG2x[1];
+                    const double ta = a + h * g0, tb = a + h * g1;
+                    double va = c[deg], vb = c[deg];
+                    for (int p = deg - 1; p >= 0; --p) { va = va * ta + c[p]; vb = vb * tb + c[p]; }
+                    double src[2] = {va + chargeSlope1 * ta, vb + chargeSlope1 * tb}, offset[2];
+                    chargeAtNodes<2>(src, ref1, charge1, h, lastIg1, nodeIntegral2, kG2x, offset);
+                    double x2[2] = {src[0] - offset[0], src[1] - offset[1]}, i2[2], q2[2];
+                    currents<2>(slice1, ref1, x2, i2, q2);
+                    integral1 += h * 0.5 * (i2[0] + i2[1]);
+                    gridIntegral1 += h * 0.5 * (q2[0] + q2[1]);
+                    charge1 += chargeRise * h * 0.5 * (q2[0] + q2[1]);
+                    lastIg1 = std::max(endWeight2[0] * q2[0] + endWeight2[1] * q2[1], 0.0);
+                    const double y0 = supply - kRL * i2[0] - vp1, y1 = supply - kRL * i2[1] - vp1;
+                    double u2[2];
+                    u2[1] = (y1 - y0) / (g1 - g0);
+                    u2[0] = y0 - u2[1] * g0;
+                    plate(a, h, u2, 2);
+                    continue;
+                }
+                if (grid && h < kMediumPiece)
+                {
+                    // Medium piece (conduction model): three nodes and the
+                    // exact moments of their quadratic interpolant.
+                    double x3[3], src[3], offset[3], i3[3], q3[3];
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        const double tj = a + h * kG3x[j];
+                        double v = c[deg];
+                        for (int p = deg - 1; p >= 0; --p) v = v * tj + c[p];
+                        src[j] = v + chargeSlope1 * tj;
+                    }
+                    chargeAtNodes<3>(src, ref1, charge1, h, lastIg1, nodeIntegral3, kG3x, offset);
+                    for (int j = 0; j < 3; ++j) x3[j] = src[j] - offset[j];
+                    currents<3>(slice1, ref1, x3, i3, q3);
+                    double y3[3], sum = 0.0, end = 0.0;
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        integral1 += h * kG3w[j] * i3[j];
+                        y3[j] = supply - kRL * i3[j] - vp1;
+                        sum += kG3w[j] * q3[j];
+                        end += endWeight3[j] * q3[j];
+                    }
+                    gridIntegral1 += h * sum;
+                    charge1 += chargeRise * h * sum;
+                    lastIg1 = std::max(end, 0.0);
+                    double u3[3];
+                    for (int e = 0; e < 3; ++e)
+                        u3[e] = lagrange3[0][e] * y3[0] + lagrange3[1][e] * y3[1] + lagrange3[2][e] * y3[2];
+                    plate(a, h, u3, 3);
                     continue;
                 }
                 double xs[4], is[4];

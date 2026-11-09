@@ -336,6 +336,70 @@ DSPARK_TEST(CoreReg_oversampling_later_stages_are_shorter)
     }
 }
 
+// The later stages were only as deep as the first one (-80 dB at High), so
+// harmonics a nonlinear stage leaves near the top of the oversampled band
+// folded back at that level: an 80 kHz line at the 4x rate came back at
+// 16 kHz -84 dB down. Depth::Deep keeps the preset's band and makes every
+// stage at least 100 dB deep; the round trip stays an exact integer delay.
+DSPARK_TEST(CoreReg_oversampling_deep_stages_stop_the_whole_band)
+{
+    using OS = Oversampling<double, 1>;
+    for (auto q : { OS::Quality::Low, OS::Quality::Medium, OS::Quality::High, OS::Quality::Maximum })
+        for (int factor : { 2, 4, 8, 16 })
+        {
+            OS os(factor, q, OS::Mode::LinearPhaseFir, OS::Depth::Deep);
+            EXPECT_TRUE(os.getDepth() == OS::Depth::Deep);
+            constexpr int bs = 2048;
+            os.prepare(spec(48000.0, bs, 1));
+            std::vector<double> x(bs, 0.0);
+            x[64] = 1.0;
+            double* p[1] = { x.data() };
+            (void)os.upsample(AudioBufferView<const double>(p, 1, bs));
+            os.downsample(AudioBufferView<double>(p, 1, bs));
+            int argmax = 0;
+            for (int i = 0; i < bs; ++i) if (std::fabs(x[i]) > std::fabs(x[argmax])) argmax = i;
+            EXPECT_EQ(argmax, 64 + os.getLatency());
+        }
+    EXPECT_EQ(OS(4, OS::Quality::High).getLatency(), 70);
+    EXPECT_EQ(OS(4, OS::Quality::High, OS::Mode::LinearPhaseFir, OS::Depth::Deep).getLatency(), 90);
+
+    // A line rendered at the high rate in each later stage's stop band (the
+    // band that folds into the base band) comes back below -100 dB with Deep;
+    // the preset's later stage lets it through about 80 dB down.
+    const auto leak = [](int factor, OS::Quality q, OS::Depth depth, double hz) {
+        OS os(factor, q, OS::Mode::LinearPhaseFir, depth);
+        os.prepare(spec(48000.0, 256, 1));
+        const double rate = 48000.0 * factor;
+        std::vector<double> out;
+        double base[256];
+        for (int b = 0; b < 96; ++b)
+        {
+            auto hi = os.getHighRateBlock(256);
+            for (int i = 0; i < hi.getNumSamples(); ++i)
+                hi.getChannel(0)[i] = std::sin(2.0 * kRegPi * hz * static_cast<double>(b * 256 * factor + i) / rate);
+            double* ch[1] = { base };
+            os.downsample(AudioBufferView<double>(ch, 1, 256));
+            if (b >= 32) out.insert(out.end(), base, base + 256);
+        }
+        double folded = hz;
+        while (folded > 24000.0) folded = std::abs(folded - 48000.0 * std::round(folded / 48000.0));
+        double c = 0.0, s = 0.0;
+        const double w = 2.0 * kRegPi * folded / 48000.0;
+        for (size_t i = 0; i < out.size(); ++i)
+        {
+            c += out[i] * std::cos(w * static_cast<double>(i));
+            s += out[i] * std::sin(w * static_cast<double>(i));
+        }
+        return 20.0 * std::log10(2.0 * std::hypot(c, s) / static_cast<double>(out.size()) + 1e-30);
+    };
+    for (auto q : { OS::Quality::Low, OS::Quality::Medium, OS::Quality::High })
+        for (double hz : { 76000.0, 80000.0, 88500.0 })
+            EXPECT_LT(leak(4, q, OS::Depth::Deep, hz), -100.0);
+    EXPECT_GT(leak(4, OS::Quality::High, OS::Depth::Preset, 80000.0), -95.0);
+    EXPECT_LT(leak(8, OS::Quality::High, OS::Depth::Deep, 180000.0), -100.0);
+    EXPECT_LT(leak(2, OS::Quality::High, OS::Depth::Deep, 28500.0), -100.0);
+}
+
 // ============================================================================
 // 4. Oversampling: opt-in polyphase IIR mode
 // ============================================================================

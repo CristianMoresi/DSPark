@@ -1062,6 +1062,13 @@ DSPARK_TEST(AnalogAudit_wdf_table_roots_are_exact)
         { 1, 0.01, 2.5, 2.391604626842606 },
         { 1, 0.0195, 1.6, 1.5155238207326209 },
         { 1, 0.0195, 4.0, 3.4102967120194546 },
+        // The first table nodes on which the wide root takes its short
+        // correction (45-digit roots).
+        { 1, 0.00525, 5.144058772540771, 4.6142971866928367 },
+        { 1, 0.00525, 5.370317963702527, 4.7584166104719260 },
+        { 1, 0.008, 6.309573444801933, 5.0550834853291726 },
+        { 1, 0.0195, 9.586318637548251, 5.3751115742403040 },
+        { 1, 0.0195, 9.804753956715794, 5.4163305803934470 },
         { 1, 3.93e-05, 1.5, 1.4998326695717819 },
         { 1, 3.93e-05, 3.0, 2.9992132173824881 },
         { 1, 3.93e-05, 7.25, 7.1974922424195151 },
@@ -1368,4 +1375,58 @@ DSPARK_TEST(AnalogAudit_tube_conduction_charge_is_integrated)
     EXPECT_LT(worst(1, 24.0, 19250.0), -86.0);
     EXPECT_LT(worst(2, 24.0, 16000.0), -86.0);
     EXPECT_LT(worst(2, 36.0, 15250.0), -81.0);
+}
+
+// From 4x the continuous core leaves the plate's harmonics up to the
+// internal Nyquist at close to their full level, and the decimator's later
+// stages were only as deep as its first (80 dB): at 4x a 20 kHz tone's
+// fourth and fifth harmonics came back at -86.6 dBc (conduction, one stage,
+// +36 dB), -84.9 dBc (two stages) and -93.0 dBc (Clamp, one stage, +24 dB).
+// From 4x every decimation stage is now at least 100 dB deep: -109.4,
+// -107.4 and -96.5 dBc; 19 kHz with two Clamp stages at +24 dB went from
+// -89.4 to -109.6 dBc.
+DSPARK_TEST(AnalogAudit_tube_decimation_is_deep_from_4x)
+{
+    const double fs = 48000.0;
+    const int n = 16384;
+    const auto worst = [&](bool conduction, int stages, double drive, double hz) {
+        int b = static_cast<int>(std::lround(hz / fs * n));
+        if ((b & 1) == 0) ++b;
+        TubePreamp<double> amp;
+        if (conduction) amp.setGridModel(TubePreamp<double>::GridModel::Conduction);
+        amp.setOversampling(4);
+        amp.setStages(stages);
+        amp.setDrive(drive);
+        amp.prepare(spec(fs, 512, 1));
+        const size_t settle = 48000 + static_cast<size_t>(amp.getLatency());
+        const size_t total = (settle + static_cast<size_t>(n) + 511) / 512 * 512;
+        std::vector<double> y(total);
+        for (size_t i = 0; i < total; ++i)
+            y[i] = 0.5 * std::sin(kTwoPi * (b * fs / n) * static_cast<double>(i) / fs);
+        for (size_t pos = 0; pos < total; pos += 512)
+        {
+            double* ch[] = { y.data() + pos };
+            amp.processBlock({ ch, 1, 512 });
+        }
+        std::vector<double> frame(y.begin() + static_cast<std::ptrdiff_t>(settle),
+                                  y.begin() + static_cast<std::ptrdiff_t>(settle) + n);
+        FFTReal<double> fft(static_cast<size_t>(n));
+        std::vector<double> spectrum(static_cast<size_t>(n) + 2);
+        fft.forward(frame.data(), spectrum.data());
+        const auto mag = [&](size_t k) { return std::hypot(spectrum[2 * k], spectrum[2 * k + 1]); };
+        double w = 0.0;
+        for (size_t k = static_cast<size_t>(std::ceil(20.0 / fs * n)); k <= static_cast<size_t>(20000.0 / fs * n); ++k)
+            if (k % static_cast<size_t>(b) != 0) w = std::max(w, mag(k));
+        return toDb(w / mag(static_cast<size_t>(b)));
+    };
+    EXPECT_LT(worst(true, 1, 36.0, 20000.0), -100.0);
+    EXPECT_LT(worst(true, 2, 36.0, 20000.0), -100.0);
+    EXPECT_LT(worst(false, 1, 24.0, 20000.0), -95.0);
+    EXPECT_LT(worst(false, 2, 24.0, 19000.0), -100.0);
+
+    // The deeper stages add 20 base samples at 4x; the dry path follows.
+    TubePreamp<double> amp;
+    amp.setOversampling(4);
+    amp.prepare(spec(fs, 512, 1));
+    EXPECT_EQ(amp.getLatency(), 93);
 }

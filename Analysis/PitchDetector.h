@@ -24,18 +24,34 @@
  * 0.10 the window must also be steady (its halves within a 0.6 energy
  * ratio), so note starts and ends read as before.
  *
- * Measured at 48 kHz on harmonic tones (random spectral tilt) in white
- * noise, readings within 50 cents of the fundamental, 400 tones of 70 to
- * 1000 Hz: 100% at 10 dB SNR and 97.0% at 5 dB with 2.0% octave errors
- * (the method's frame stage, as a clean-room port, 92.0% and 86.8% with
- * 6.0%); 200 tones of 47 to 67 Hz at 10 dB: 100% (the frame stage 74.0%;
- * reading each threshold's first minimum, 31.5% read 50 to 140 cents
- * sharp). At 0 dB SNR the detector reads unvoiced rather than guess (that
- * frame stage is right 29% of the time there and wrong 71%);
- * setNoiseSuppression() (opt-in) reads those tones 99.8% right and none
- * wrong. Noisy readings report their honest confidence, about 0.76 at 5 dB,
- * so a confidence gate keeps ignoring them. Steady clean tones read exactly
- * as before. Across a legato note change two notes can share a longer
+ * Three more looks keep a noisy window from reading wrong or not at all. A
+ * choice above the threshold yields to the first separate dip about as deep
+ * (in noise the dips at a period and at its multiples are equally deep, and
+ * the deepest is as often a multiple). A window that reads unvoiced and
+ * holds power below the lowest note it can read is looked at again without
+ * that band (clearHistory()): rumble and the bottom of pink or brown noise
+ * fill the difference function at the lags where low notes dip. And a steady
+ * window that still reads unvoiced is read once more with its noise floor
+ * removed (setNoiseSuppression(), on by default). None of them runs on a
+ * window that reads voiced at once, so a clean tone costs what it did.
+ *
+ * Measured at 48 kHz frame by frame on sustained harmonic notes (40
+ * partials, spectral tilt 3 to 12 dB/octave, gaps in between) in continuous
+ * noise: windows within 50 cents of the note, at the defaults, against the
+ * frame stage of that method followed by its HMM decoded causally (a
+ * clean-room port, in brackets). Notes of 70 to 1000 Hz in white noise at
+ * 10, 5 and 0 dB SNR: 100, 99.3 and 97.5% (89.4, 32.7, 7.0); in pink noise
+ * 99.6, 98.7 and 85.3% (98.4, 80.5, 13.4). Notes of 47 to 67 Hz in white
+ * noise at 5 and 0 dB: 99.5 and 95.7% (47.8, 14.0); in pink noise at 10, 5
+ * and 0 dB: 97.1, 87.6 and 68.3% (83.5, 56.5, 17.1); in brown noise at 5
+ * dB: 87.8% (85.7). Windows read wrong: under 1% from 70 Hz up, 1.4 to 4.3%
+ * below it in pink and brown noise (the port 0 to 16.3%). Gaps between the
+ * notes read as a note in 0.2% of their windows in brown noise, none in
+ * white or pink. With setNoiseSuppression(false) the 0 dB rows read 0.4 to
+ * 12.4% and the 5 dB ones 74.9 to 94.4%. Noisy readings report their honest
+ * confidence, about 0.76 at 5 dB and 0.5 at 0 dB, so a confidence gate keeps
+ * ignoring them. Steady clean tones read exactly as before. Across a legato
+ * note change two notes can share a longer
  * period (four periods of one, five of the other); a window whose dip lies
  * there reads unvoiced, not that period: on clean tones, sweeps and stepped
  * melodies at three rates the wrong readings fall from 184 to 46 of 66090,
@@ -163,12 +179,18 @@ public:
         // Mirrored buffer technique: the last kHistoryWindows windows of
         // input, written twice, so the analysis window (the newest of them)
         // and the whole history are both contiguous without modulo
-        // operations. The history is read only by the opt-in noise
-        // suppression, for periods whose multiples the window cannot hold.
+        // operations. The history is read by the looks a noisy window gets
+        // (the persistence tests and the noise suppression), for periods
+        // whose multiples the window cannot hold.
         historySize_ = windowSize_ * kHistoryWindows;
         buffer_.assign(static_cast<size_t>(historySize_) * 2, T(0));
+        clearBuffer_.assign(static_cast<size_t>(historySize_) * 2, T(0));
+        clearPending_ = 0;
+        designRumbleFilter();
         yinBuffer_.assign(static_cast<size_t>(halfWindow_), T(0));
         rawDiff_.assign(static_cast<size_t>(halfWindow_), T(0));
+        yinClear_.assign(static_cast<size_t>(halfWindow_), T(0));
+        rawClear_.assign(static_cast<size_t>(halfWindow_), T(0));
 
         // YIN-FFT resources: the difference function is computed via one
         // cross-correlation in the frequency domain (3 FFTs) instead of the
@@ -233,7 +255,7 @@ public:
      * absolute numbers vary by machine, the growth tracks N log N). Against
      * the old fixed-2048 default at the SAME rate the automatic window costs
      * roughly 5% more (30.5 vs 28.9 ms at 192 kHz). prepare()-time heap grows
-     * the same way: ~260 KB at 44.1/48 kHz, ~515 KB at 88.2/96 kHz, ~1030 KB
+     * the same way: ~300 KB at 44.1/48 kHz, ~600 KB at 88.2/96 kHz, ~1190 KB
      * at 176.4/192 kHz (float); the audio path stays allocation-free. Budget
      * from these figures, not from the rate alone. For very low-latency
      * callbacks you can still feed an SPSC queue (Core/SpscQueue.h) and
@@ -251,6 +273,9 @@ public:
             // Write into mirrored buffer
             buffer_[static_cast<size_t>(writePos_)] = sample;
             buffer_[static_cast<size_t>(writePos_ + historySize_)] = sample;
+            // One more sample the rumble-free copy has not seen (the count
+            // saturates once the history no longer holds them all).
+            if (clearPending_ <= historySize_) ++clearPending_;
 
             writePos_++;
             if (writePos_ >= historySize_)
@@ -327,9 +352,10 @@ public:
     }
 
     /**
-     * @brief Reads a tone through broadband noise (opt-in, default off).
+     * @brief Reads a tone through broadband noise (on by default).
      *
-     * On: a steady window that reads unvoiced is read a second time with its
+     * On: a steady window that still reads unvoiced, and whose own dip is
+     * not at the floor noise alone reaches, is read once more with its
      * noise floor removed by spectral subtraction (the floor estimated per
      * band from the window itself, so white, pink and other smooth noises
      * alike). A dip of the cleaned window below the threshold locates the
@@ -349,27 +375,22 @@ public:
      * 0 dB SNR, so a confidence gate keeps ignoring it. A reading through
      * the noise therefore starts one or two detections after the tone.
      *
-     * Measured at 48 kHz on harmonic tones (random spectral tilt), readings
-     * within 50 cents, at 0 dB SNR: 70 to 1000 Hz in white noise 99.8% right
-     * and none wrong (off: unvoiced; the frame stage of the
-     * probabilistic-threshold method 29% and 71%), 80 to 1000 Hz in pink
-     * noise 80.8% and 1.8%; 47 to 67 Hz 99.5% and none in white noise, 51.5%
-     * and 1.5% in pink. That frame stage reads 95.5% and 83.5% of the low
-     * tones right because it reads every window: at any threshold on its own
-     * voicing probability that keeps band-limited noise from reading voiced
-     * every time, it reads none of them. Continuous notes of 70 to 880 Hz at
-     * 2 dB SNR: 99.6% of detections right and none wrong, also with 50
-     * cents of vibrato.
+     * The file description gives the frame-by-frame figures. With it on, a
+     * note of 70 to 1000 Hz at 0 dB SNR reads right in 97.5% of its windows
+     * in white noise and 85.3% in pink (0.4 and 11.0% with it off), a note
+     * of 47 to 67 Hz in 95.7 and 68.3% (2.6 and 12.4%), and notes of 70 to
+     * 1000 Hz at 2 dB SNR with 50 cents of vibrato in 96.5% (12.2%).
      *
-     * Noise alone: white and pink still read unvoiced, and band-limited
-     * noise stays within 0.1% of windows of what the first reading alone
-     * voices, over 20 s at 60 Hz to 3 kHz and Q 2 to 10: a Q 2 band at 60 Hz
-     * 8.9% (off 8.8%), at 120 and 300 Hz as off, a Q 5 band at 120 Hz 18.8%
-     * (off 18.7%), at 300 Hz and 1 kHz as off. The second read costs more than a
-     * detection: about 90 ns per sample on noise, 110 on a tone in white
-     * noise and 91 on a low note in pink noise, against 17 to 20 off; voiced
-     * windows are not read twice. Off, the output is that of the first read.
-     * Control thread; relaxed atomic.
+     * Noise alone reads the same on or off, within 0.3% of windows over
+     * 20 s: white and pink none, brown 0.4% (off 0.1%), and a band of noise
+     * what the first looks read of it (Q 2 at 60 Hz 10.4%, at 120 Hz 4.7%;
+     * Q 5 at 60 Hz 25.1%, at 300 Hz 10.1%; Q 10 from 60 Hz to 1 kHz 33 to
+     * 47%). The read costs more than a detection, and only where it runs:
+     * about 145 ns per sample on a tone at 0 dB SNR and 100 on pink or brown
+     * noise alone, against 18 and 38 with it off. White noise alone, whose
+     * dip stays at the noise floor, costs 17 either way, and a window that
+     * reads voiced at once is not read again (15 to 18). Off, the output is
+     * that of the first looks. Control thread; relaxed atomic.
      */
     void setNoiseSuppression(bool on) noexcept
     {
@@ -399,6 +420,9 @@ public:
     void reset() noexcept
     {
         std::fill(buffer_.begin(), buffer_.end(), T(0));
+        std::fill(clearBuffer_.begin(), clearBuffer_.end(), T(0));
+        for (RumbleSection& section : rumble_) section.s1 = section.s2 = 0.0;
+        clearPending_ = 0;
         recent_.fill(0.0);
         writePos_ = 0;
         samplesSinceLastDetect_ = 0;
@@ -423,35 +447,89 @@ private:
             return;
         }
 
+        // Share of the window's power in the three lowest bins of its
+        // spectrum, which reach up to the lowest note the window can hold.
+        const double lowShare = lowBandPower_ / static_cast<double>(energy);
+        const double subShare = subBandPower_ / static_cast<double>(energy);
+
         const T threshold = threshold_.load(std::memory_order_relaxed);
         if (threshold != cachedThreshold_) updatePrior(threshold);
-        int partial[kMaxPartials];
-        int numPartial = 0;
-        const int tauEstimate = chooseDip(yinBuffer_.data(), partial, numPartial);
+        WindowReading reading = readWindow(currentWindow, energy, e1, threshold);
+        double secondCandidate = 0.0;   // period the second look could not confirm
+        // Slow wander alone dips at the long lags: brown noise read as a
+        // note in 0.75% of its windows. Where the window is mostly below its
+        // lowest note (kSubRumbleShare of its power in the two lowest bins),
+        // a dip above the threshold must also repeat at its multiples, as a
+        // tone does (periodPersists()); 0.11% of those windows then read.
+        if (reading.voiced && reading.dip >= static_cast<double>(threshold) && subShare >= kSubRumbleShare)
+        {
+            historySumsReady_ = false;
+            double contrast = 0.0;
+            const double period = static_cast<double>(parabolicInterp(rawDiff_.data(), reading.tau));
+            reading.voiced = periodPersists(history, period, contrast);
+        }
 
-        // Voicing: the chosen dip must be one the threshold prior accepts
-        // with probability at least kVoicedSurvival, a ceiling on its CMND
-        // value (0.30 at the default prior mean of 0.1). A periodic signal in
-        // white noise dips to about the noise share of the power (0.24 at
-        // 5 dB SNR); noise without a period has no dip near the ceiling
-        // (white noise bottoms out near 0.85). A dip above the threshold
-        // itself also needs a steady window, its two halves within
-        // kMinHalfEnergyRatio of each other in energy: across a note's start
-        // or end the dip is shallow for another reason, and the period read
-        // there is biased (measured 9 cents high a hop after a 220 Hz note
-        // stopped), so those windows stay unvoiced as under the single
-        // threshold. Nor may it be a period two notes of the window share
-        // (sharesItsPeriod()).
-        const double dip = (tauEstimate < 0) ? 1.0
-                         : static_cast<double>(yinBuffer_[static_cast<size_t>(tauEstimate)]);
-        const double firstHalf = static_cast<double>(e1);
-        const double secondHalf = static_cast<double>(energy) - firstHalf;
-        const bool steady = std::min(firstHalf, secondHalf)
-                          >= kMinHalfEnergyRatio * std::max(firstHalf, secondHalf);
-        const bool voiced = tauEstimate >= 0 && dip < voicingCeiling_
-            && (dip < static_cast<double>(threshold)
-                || (steady && !sharesItsPeriod(currentWindow, tauEstimate, partial, numPartial)));
-        if (voiced)
+        // A window that reads unvoiced is looked at once more without what
+        // lies below the lowest note it can hold. Rumble, hum's subharmonics
+        // and the bottom of pink or brown noise carry no period the detector
+        // could report, yet they fill the difference function at the long
+        // lags where low notes dip: 47 to 67 Hz tones in brown noise at 5 dB
+        // SNR read in 57% of their windows, and in 89% without that band.
+        // The look is taken only when the high-pass removes kRumbleShare of
+        // the window's power, and it stands only when it reads a note or dips
+        // deeper than the first (the filter also takes a little of a
+        // fundamental next to its corner): a clean tone or one in white noise
+        // is read as before. When it stands, everything after this point (the
+        // noise suppression included) works on the rumble-free
+        // history. The filter itself is only run when those lowest bins hold
+        // half that share or more, so a window with nothing down there (a
+        // consonant, hiss, a mid tone in white noise) costs nothing extra.
+        if (!reading.voiced && lowShare >= 0.5 * kRumbleShare)
+        {
+            const T* clear = clearHistory();
+            const T* clearWindow = clear + (historySize_ - windowSize_);
+            const double kept = static_cast<double>(simd::sumOfSquaresT(clearWindow, windowSize_));
+            T clearEnergy = T(0), clearFirst = T(0);
+            if (kept < (1.0 - kRumbleShare) * static_cast<double>(energy)
+                && differenceFunction(clearWindow, yinClear_.data(), rawClear_.data(), clearEnergy, clearFirst))
+            {
+                // readWindow() and the code below read yinBuffer_ and rawDiff_.
+                yinBuffer_.swap(yinClear_);
+                rawDiff_.swap(rawClear_);
+                WindowReading second = readWindow(clearWindow, clearEnergy, clearFirst, threshold);
+                // What the filter leaves of brown noise is a band just above
+                // its corner, and a band of noise dips like a low note. A
+                // tone repeats at every multiple of its period and holds it
+                // from one detection to the next; the band does neither. So
+                // a dip above the threshold must pass periodPersists() and
+                // agreesWithRecent() here, and a period that does not is
+                // remembered as this detection's candidate for the next.
+                if (second.voiced && second.dip >= static_cast<double>(threshold))
+                {
+                    historySumsReady_ = false;
+                    double contrast = 0.0;
+                    const double period = static_cast<double>(parabolicInterp(rawDiff_.data(), second.tau));
+                    secondCandidate = period;
+                    second.voiced = periodPersists(clear, period, contrast) && agreesWithRecent(period);
+                }
+                if (second.voiced || second.dip < reading.dip)
+                {
+                    reading = second;
+                    history = clear;
+                    currentWindow = clearWindow;
+                }
+                else
+                {
+                    yinBuffer_.swap(yinClear_);
+                    rawDiff_.swap(rawClear_);
+                }
+            }
+        }
+
+        const int tauEstimate = reading.tau;
+        const double dip = reading.dip;
+        const bool steady = reading.steady;
+        if (reading.voiced)
         {
             // Sub-sample precision from the raw difference function (see
             // parabolicInterp()); the CMND only selects the dip.
@@ -461,7 +539,7 @@ private:
             return;
         }
 
-        // Noise floor suppression (opt-in): a steady window that reads
+        // Noise floor suppression (on by default): a steady window that reads
         // unvoiced is read again. Its noise removed, a dip of the cleaned
         // window below the threshold locates the period, which is then taken
         // from the input's own difference function next to it (the
@@ -473,7 +551,7 @@ private:
         // confidence is the input's own dip there: a reading taken through
         // the noise stays a low-confidence one (about 0.5 at 0 dB SNR).
         double candidate = 0.0;
-        if (noiseSuppression_.load(std::memory_order_relaxed) && steady)
+        if (noiseSuppression_.load(std::memory_order_relaxed) && steady && dip < kFallbackCeiling)
         {
             historySumsReady_ = false;
             const T* clean = suppressNoise(currentWindow);
@@ -529,8 +607,129 @@ private:
                 }
             }
         }
-        rememberCandidate(candidate);
+        rememberCandidate(candidate > 0.0 ? candidate : secondCandidate);
         publishUnvoiced();
+    }
+
+    /// What one look at a window found (readWindow()).
+    struct WindowReading
+    {
+        int tau = -1;         ///< chosen lag, or -1
+        double dip = 1.0;     ///< CMND value there
+        bool steady = false;  ///< the window's halves hold comparable energy
+        bool voiced = false;  ///< the dip reads as a note
+    };
+
+    /**
+     * @brief Chooses the dip of the CMND in yinBuffer_ and decides voicing.
+     *
+     * Voicing: the chosen dip must be one the threshold prior accepts with
+     * probability at least kVoicedSurvival, a ceiling on its CMND value
+     * (0.30 at the default prior mean of 0.1). A periodic signal in white
+     * noise dips to about the noise share of the power (0.24 at 5 dB SNR);
+     * noise without a period has no dip near the ceiling (white noise
+     * bottoms out near 0.85). A dip above the threshold itself also needs a
+     * steady window, its two halves within kMinHalfEnergyRatio of each other
+     * in energy: across a note's start or end the dip is shallow for another
+     * reason, and the period read there is biased (measured 9 cents high a
+     * hop after a 220 Hz note stopped), so those windows stay unvoiced as
+     * under the single threshold. Nor may it be a period two notes of the
+     * window share (sharesItsPeriod()).
+     * @param window    The window the difference function was taken from.
+     * @param energy    Its energy.
+     * @param e1        The energy of its first half.
+     * @param threshold The sensitivity threshold in effect.
+     */
+    [[nodiscard]] WindowReading readWindow(const T* window, T energy, T e1, T threshold) noexcept
+    {
+        int partial[kMaxPartials];
+        int numPartial = 0;
+        WindowReading reading;
+        reading.tau = chooseDip(yinBuffer_.data(), partial, numPartial);
+        reading.dip = (reading.tau < 0) ? 1.0
+                    : static_cast<double>(yinBuffer_[static_cast<size_t>(reading.tau)]);
+        const double firstHalf = static_cast<double>(e1);
+        const double secondHalf = static_cast<double>(energy) - firstHalf;
+        reading.steady = std::min(firstHalf, secondHalf)
+                       >= kMinHalfEnergyRatio * std::max(firstHalf, secondHalf);
+        reading.voiced = reading.tau >= 0 && reading.dip < voicingCeiling_
+            && (reading.dip < static_cast<double>(threshold)
+                || (reading.steady && !sharesItsPeriod(window, reading.tau, partial, numPartial)));
+        return reading;
+    }
+
+    /**
+     * @brief The input history through a high-pass below the lowest note the
+     *        window can hold, oldest sample first (the layout of buffer_).
+     *
+     * A sixth-order Butterworth high-pass at kRumbleCorner of the lowest
+     * frequency the window reads, run in double (its corner sits near a
+     * thousandth of the sample rate). It runs here, over the samples that
+     * arrived since the last call, so a stream that reads voiced at once
+     * never pays for it; when more arrived than the history holds, the
+     * filter starts over at the oldest sample kept and the first window of
+     * the history carries its settling (the analysis window is the last).
+     * A sample that is not finite restarts it as well.
+     */
+    [[nodiscard]] const T* clearHistory() noexcept
+    {
+        const T* raw = &buffer_[static_cast<size_t>(writePos_)];
+        if (clearPending_ > historySize_)
+        {
+            for (RumbleSection& section : rumble_) section.s1 = section.s2 = 0.0;
+            clearPending_ = historySize_;
+        }
+        const double limit = static_cast<double>(std::numeric_limits<T>::max());
+        for (int k = historySize_ - clearPending_; k < historySize_; ++k)
+        {
+            double v = static_cast<double>(raw[k]);
+            for (RumbleSection& section : rumble_)
+            {
+                const double y = section.b0 * v + section.s1;
+                section.s1 = section.b1 * v - section.a1 * y + section.s2;
+                section.s2 = section.b2 * v - section.a2 * y;
+                v = y;
+            }
+            if (!(std::abs(v) <= limit))
+            {
+                for (RumbleSection& section : rumble_) section.s1 = section.s2 = 0.0;
+                v = 0.0;
+            }
+            int position = writePos_ + k;
+            if (position >= historySize_) position -= historySize_;
+            clearBuffer_[static_cast<size_t>(position)] = static_cast<T>(v);
+            clearBuffer_[static_cast<size_t>(position + historySize_)] = static_cast<T>(v);
+        }
+        clearPending_ = 0;
+        // A state that has decayed to nothing is zero (no subnormal tail).
+        for (RumbleSection& section : rumble_)
+            if (std::abs(section.s1) < 1.0e-30 && std::abs(section.s2) < 1.0e-30)
+                section.s1 = section.s2 = 0.0;
+        return &clearBuffer_[static_cast<size_t>(writePos_)];
+    }
+
+    /** @brief Designs the high-pass of clearHistory() for the current window. */
+    void designRumbleFilter() noexcept
+    {
+        // The lowest frequency the window reads: a period of halfWindow_ - 1.
+        const double lowest = sampleRate_ / static_cast<double>(std::max(2, halfWindow_ - 1));
+        const double corner = std::min(kRumbleCorner * lowest, 0.4 * sampleRate_);
+        const double w0 = 6.283185307179586 * corner / sampleRate_;
+        const double c = std::cos(w0), s = std::sin(w0);
+        for (int k = 0; k < kRumbleSections; ++k)
+        {
+            // Butterworth: the k-th pole pair of an order 2 * kRumbleSections.
+            const double q = 1.0 / (2.0 * std::cos(3.141592653589793 * (2.0 * k + 1.0)
+                                                   / (4.0 * kRumbleSections)));
+            const double alpha = s / (2.0 * q), a0 = 1.0 + alpha;
+            RumbleSection& section = rumble_[static_cast<size_t>(k)];
+            section.b0 = 0.5 * (1.0 + c) / a0;
+            section.b1 = -2.0 * section.b0;
+            section.b2 = section.b0;
+            section.a1 = -2.0 * c / a0;
+            section.a2 = (1.0 - alpha) / a0;
+            section.s1 = section.s2 = 0.0;
+        }
     }
 
     /**
@@ -619,6 +818,30 @@ private:
         std::copy(window, window + windowSize_, fftTime_.begin());
         fft_->forward(fftTime_.data(), specFull_.data());   // tail beyond the window is still zero
 
+        // Power of the window in its three lowest bins (detect() screens
+        // for rumble with it): bin spacing is half the lowest frequency the
+        // window reads, so they reach up to that note at any window size.
+        {
+            double low = 0.0;
+            const int lowBins = std::min(3, fftSize_ / 2 + 1);
+            for (int k = 0; k < lowBins; ++k)
+            {
+                const double re = static_cast<double>(specFull_[static_cast<size_t>(2 * k)]);
+                const double im = static_cast<double>(specFull_[static_cast<size_t>(2 * k + 1)]);
+                low += (k == 0 ? 1.0 : 2.0) * (re * re + im * im);
+            }
+            lowBandPower_ = low / static_cast<double>(fftSize_);
+            // The two lowest alone lie below every note the window reads.
+            double sub = 0.0;
+            for (int k = 0; k < std::min(2, lowBins); ++k)
+            {
+                const double re = static_cast<double>(specFull_[static_cast<size_t>(2 * k)]);
+                const double im = static_cast<double>(specFull_[static_cast<size_t>(2 * k + 1)]);
+                sub += (k == 0 ? 1.0 : 2.0) * (re * re + im * im);
+            }
+            subBandPower_ = sub / static_cast<double>(fftSize_);
+        }
+
         const int numBins = fftSize_ / 2 + 1;
         for (int k = 0; k < numBins; ++k)
         {
@@ -688,6 +911,17 @@ private:
      * kScreenSlack (far above its rounding error), rejects nearly every lag
      * before the exact test in double. The screen is branch-free on purpose:
      * on noise the minima fall at random lags.
+     *
+     * A choice above the threshold is a reading through noise, and there the
+     * dips at a period and at its multiples are equally deep but for the
+     * noise, so the deepest is as often the second or third multiple as the
+     * period: 17.5% of the windows of 70 to 1000 Hz tones at 5 dB SNR read a
+     * multiple of their period. Such a choice yields to the first earlier
+     * record within kMultipleMargin of it that is a dip of its own, with the
+     * CMND rising kMultipleBarrier above both in between (a minimum on the
+     * wall of the chosen dip is not). That leaves 0.2% of those windows
+     * wrong; a tone whose odd partials hold under a tenth of its power, which
+     * also repeats at half its period, then reads an octave up in noise.
      */
     [[nodiscard]] int chooseDip(const T* c, int* partial, int& numPartial) noexcept
     {
@@ -773,7 +1007,21 @@ private:
         if (count == 0) return -1;
         const DipRecord& last = rec[count - 1];
         const double lastMass = last.mass + kAbsoluteMinWeight * (1.0 - last.survival);
-        return (lastMass > leaderMass) ? last.lag : rec[leader].lag;
+        int chosen = (lastMass > leaderMass) ? count - 1 : leader;
+        // A choice above the threshold yields to the first separate dip
+        // about as deep (see above).
+        const double value = rec[chosen].value;
+        if (value > static_cast<double>(cachedThreshold_))
+        {
+            const double limit = value + kMultipleMargin;
+            for (int i = 0; i < chosen; ++i)
+                if (rec[i].value <= limit && rec[i].barrier >= limit + kMultipleBarrier)
+                {
+                    chosen = i;
+                    break;
+                }
+        }
+        return rec[chosen].lag;
     }
 
     /**
@@ -815,7 +1063,7 @@ private:
 
     /**
      * @brief The window with its broadband noise floor removed (spectral
-     *        subtraction), for the opt-in second reading.
+     *        subtraction), for the reading through noise.
      *
      * The window, zero-padded to twice its length, is transformed; the noise
      * floor of each band of kFloorBins bins is the median power there over
@@ -1259,6 +1507,23 @@ private:
     static constexpr int kSurvivalSteps = 1024;
     /// Margin of the settling test in chooseDip() (prior mass).
     static constexpr double kSettleMargin = 1.0e-9;
+    /// How much deeper a choice above the threshold must be than an earlier
+    /// separate dip to keep it (in noise the dips at a period and at its
+    /// multiples differ by a few hundredths), and how far the CMND must rise
+    /// above both in between for them to be separate dips.
+    static constexpr double kMultipleMargin = 0.15;
+    static constexpr double kMultipleBarrier = 0.25;
+    /// Second look without rumble (clearHistory()): sections of its
+    /// Butterworth high-pass (sixth order), the corner as a fraction of the
+    /// lowest frequency the window reads, and the share of the window's power
+    /// the filter must remove for the look to be taken.
+    static constexpr int kRumbleSections = 3;
+    static constexpr double kRumbleCorner = 0.9;
+    static constexpr double kRumbleShare = 0.02;
+    /// Share of the window's power in its two lowest bins (below every note
+    /// it reads) from which a dip above the threshold must also pass
+    /// periodPersists() at the first look.
+    static constexpr double kSubRumbleShare = 0.10;
 
     /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
     /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
@@ -1292,6 +1557,20 @@ private:
     std::vector<T> yinBuffer_;  // Size: halfWindow_
     std::vector<T> rawDiff_;    // Size: halfWindow_ (difference function d(tau))
 
+    // The history without rumble (clearHistory())
+    struct RumbleSection
+    {
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;  ///< high-pass section
+        double s1 = 0.0, s2 = 0.0;                                ///< its state
+    };
+    std::array<RumbleSection, kRumbleSections> rumble_ {};
+    std::vector<T> clearBuffer_;   // Size: 2 * historySize_, mirrored like buffer_
+    int clearPending_ = 0;         // Newest input samples not yet filtered into it
+    double lowBandPower_ = 0.0;    // Power in the three lowest bins of the last window transformed
+    double subBandPower_ = 0.0;    // Power in the two lowest of them
+    std::vector<T> yinClear_;      // Size: halfWindow_ (CMND of the rumble-free window)
+    std::vector<T> rawClear_;      // Size: halfWindow_ (its difference function)
+
     // YIN-FFT resources (cross-correlation difference function)
     int fftSize_ = 2048;
     std::unique_ptr<FFTReal<T>> fft_; // doubles as the "prepared" gate
@@ -1302,7 +1581,7 @@ private:
     std::vector<T> prefixSq_;   // Size: windowSize_ + 1
 
     // Noise floor suppression (see suppressNoise())
-    std::atomic<bool> noiseSuppression_{ false };
+    std::atomic<bool> noiseSuppression_{ true };
     std::unique_ptr<FFTReal<T>> fftClean_;   // 2 * windowSize_
     std::vector<T> cleanTime_;    // Size: 2 * windowSize_ (the cleaned window first)
     std::vector<T> cleanSpec_;    // Size: 2 * windowSize_ + 2

@@ -2041,6 +2041,220 @@ DSPARK_TEST(PitchDetector_noise_suppression_follows_vibrato)
 
 namespace {
 
+/// Notes in continuous noise, with the pitch of every sample (0 in the gaps).
+struct NoisyNotes
+{
+    std::vector<float> x;
+    std::vector<double> f0;
+};
+
+/// `count` harmonic notes of 0.9 s (40 partials, tilt 3 to 12 dB/octave,
+/// random phases, 5 ms edges) between `lo` and `hi` Hz, 0.5 s apart, in
+/// continuous noise at `snrDb` over the notes: white, or brown (a leaky
+/// running sum of white noise, nearly all of it below 100 Hz).
+NoisyNotes makeNoisyNotes(uint64_t seed, int count, double lo, double hi, bool brown, double snrDb)
+{
+    const double fs = 48000.0;
+    NoiseSource rng { seed };
+    const size_t note = static_cast<size_t>(0.9 * fs), gap = static_cast<size_t>(0.5 * fs);
+    const size_t total = gap + static_cast<size_t>(count) * (note + gap);
+    std::vector<double> x(total, 0.0);
+    NoisyNotes out;
+    out.f0.assign(total, 0.0);
+    double signalPower = 0.0;
+    size_t at = gap;
+    for (int n = 0; n < count; ++n, at += note + gap)
+    {
+        const double f = lo * std::pow(hi / lo, rng.uniform());
+        const double tilt = 3.0 + 9.0 * rng.uniform();
+        double amplitude[40], phase[40];
+        int partials = 0;
+        for (int h = 1; h <= 40 && h * f < 20000.0; ++h, ++partials)
+        {
+            amplitude[h - 1] = std::pow(10.0, -tilt * std::log2(static_cast<double>(h)) / 20.0);
+            phase[h - 1] = 2.0 * pi<double> * rng.uniform();
+        }
+        for (size_t k = 0; k < note; ++k)
+        {
+            const double t = 2.0 * pi<double> * f * static_cast<double>(k) / fs;
+            double s = 0.0;
+            for (int h = 0; h < partials; ++h) s += amplitude[h] * std::sin(t * (h + 1) + phase[h]);
+            const double edge = std::min({ 1.0, static_cast<double>(k) / 240.0, static_cast<double>(note - k) / 240.0 });
+            const double v = s * (0.5 - 0.5 * std::cos(pi<double> * edge));
+            x[at + k] = v;
+            out.f0[at + k] = f;
+            signalPower += v * v;
+        }
+    }
+    signalPower /= static_cast<double>(static_cast<size_t>(count) * note);
+
+    std::vector<double> noise(total);
+    double state = 0.0, noisePower = 0.0;
+    for (int i = 0; i < 4000; ++i) state = 0.998 * state + 0.05 * rng.gauss();
+    for (double& v : noise)
+    {
+        const double w = rng.gauss();
+        state = 0.998 * state + 0.05 * w;
+        v = brown ? state : w;
+        noisePower += v * v;
+    }
+    noisePower /= static_cast<double>(total);
+    const double gain = std::sqrt(signalPower / noisePower / std::pow(10.0, snrDb / 10.0));
+    double peak = 0.0;
+    for (size_t i = 0; i < total; ++i)
+    {
+        x[i] += gain * noise[i];
+        peak = std::max(peak, std::abs(x[i]));
+    }
+    out.x.resize(total);
+    for (size_t i = 0; i < total; ++i) out.x[i] = static_cast<float>(0.5 * x[i] / peak);
+    return out;
+}
+
+/// Frame-by-frame score of a detector: over the windows that lie whole in a
+/// note, readings within 50 cents (right) and beyond (wrong; low: below the
+/// note); over the windows that lie whole in a gap, readings at all.
+struct FrameScore
+{
+    int notes = 0, right = 0, wrong = 0, wrongLow = 0, gaps = 0, gapRead = 0;
+};
+
+/// Scores `m` with a detector at its defaults (suppression < 0) or with the
+/// noise suppression off (0) or on (1).
+FrameScore scoreFrames(const NoisyNotes& m, int suppression)
+{
+    PitchDetector<float> pd;
+    pd.prepare(48000.0);
+    if (suppression >= 0) pd.setNoiseSuppression(suppression == 1);
+    const size_t hop = 512, window = static_cast<size_t>(pd.getWindowSize());
+    FrameScore s;
+    for (size_t at = 0; at + hop <= m.x.size(); at += hop)
+    {
+        pd.pushSamples(std::span<const float>(m.x.data() + at, hop));
+        const size_t end = at + hop;
+        if (end < window) continue;
+        bool inNote = true, inGap = true;
+        for (size_t j = end - window; j < end; ++j)
+        {
+            if (m.f0[j] > 0.0) inGap = false; else inNote = false;
+        }
+        const double hz = static_cast<double>(pd.getFrequencyHz());
+        if (inNote)
+        {
+            ++s.notes;
+            if (hz > 0.0)
+            {
+                const double cents = 1200.0 * std::log2(hz / m.f0[end - window / 2]);
+                if (std::abs(cents) < 50.0) ++s.right;
+                else { ++s.wrong; if (cents < 0.0) ++s.wrongLow; }
+            }
+        }
+        else if (inGap)
+        {
+            ++s.gaps;
+            if (hz > 0.0) ++s.gapRead;
+        }
+    }
+    return s;
+}
+
+}   // namespace
+
+// In noise the dips at a period and at its multiples are equally deep but for
+// the noise, and the deepest was as often the second or third multiple as
+// the period: at 5 dB SNR a tone read a multiple of its period in one window
+// in six. A choice above the threshold now yields to the first separate dip
+// about as deep.
+DSPARK_TEST(PitchDetector_noisy_tones_do_not_read_a_multiple_of_their_period)
+{
+    const NoisyNotes m = makeNoisyNotes(2024u, 12, 70.0, 1000.0, false, 5.0);
+    const FrameScore off = scoreFrames(m, 0);
+    const FrameScore on = scoreFrames(m, 1);
+    std::cout << "  [pitch frames] 5 dB white: off " << off.right << " right, " << off.wrong << " wrong ("
+              << off.wrongLow << " low) of " << off.notes << "; on " << on.right << " right, " << on.wrong
+              << " wrong; gaps read " << on.gapRead << " of " << on.gaps << "\n";
+    // Of 966 windows: 920 right and 5 wrong without the second reading
+    // (727 and 236, of them 233 below the note, before), 961 and 5 with it.
+    EXPECT_GT(off.notes, 600);
+    EXPECT_LT(off.wrongLow * 100, off.notes * 2);
+    EXPECT_LT(on.wrong * 100, on.notes * 2);
+    EXPECT_GT(on.right * 100, on.notes * 95);
+    EXPECT_LT(on.gapRead * 100, on.gaps);
+}
+
+// What lies below the lowest note the window can hold (rumble, the bottom of
+// brown noise) fills the difference function at the long lags where low notes
+// dip. A window that reads unvoiced is looked at again without that band.
+DSPARK_TEST(PitchDetector_reads_low_notes_through_rumble)
+{
+    const NoisyNotes m = makeNoisyNotes(77u, 10, 47.0, 67.0, true, 5.0);
+    const FrameScore off = scoreFrames(m, 0);
+    const FrameScore on = scoreFrames(m, 1);
+    std::cout << "  [pitch frames] 5 dB brown, 47-67 Hz: off " << off.right << " right, " << off.wrong
+              << " wrong of " << off.notes << ", gaps read " << off.gapRead << " of " << off.gaps << "; on "
+              << on.right << " right, " << on.wrong << " wrong, gaps read " << on.gapRead << "\n";
+    // Of 805 windows: 743 right without the second reading and 753 with it
+    // (455 and 484 before).
+    EXPECT_GT(off.right * 100, off.notes * 85);
+    EXPECT_GT(on.right * 100, on.notes * 87);
+    EXPECT_LT(on.gapRead * 100, on.gaps * 3);
+
+    // A quiet 110 Hz tone under a 12 Hz rumble 24 dB above it, which fades in
+    // after three seconds of the tone alone.
+    const double fs = 48000.0;
+    const int n = static_cast<int>(fs * 7.0), start = static_cast<int>(fs * 3.0);
+    std::vector<float> x(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        double s = 0.0;
+        for (int k = 1; k <= 10; ++k) s += std::sin(2.0 * pi<double> * 110.0 * k * i / fs) / k;
+        const double fade = std::clamp((i - start) / (0.25 * fs), 0.0, 1.0);
+        x[static_cast<size_t>(i)] = static_cast<float>(0.02 * s + 0.5 * fade * std::sin(2.0 * pi<double> * 12.0 * i / fs));
+    }
+    for (const int suppression : { 0, 1 })
+    {
+        PitchDetector<float> pd;
+        pd.prepare(fs);
+        pd.setNoiseSuppression(suppression == 1);
+        int frames = 0, right = 0, wrong = 0;
+        for (int at = 0; at + 512 <= n; at += 512)
+        {
+            pd.pushSamples(std::span<const float>(x.data() + at, 512));
+            if (at < start + static_cast<int>(0.5 * fs)) continue;
+            ++frames;
+            const double hz = static_cast<double>(pd.getFrequencyHz());
+            if (hz <= 0.0) continue;
+            if (std::abs(1200.0 * std::log2(hz / 110.0)) < 50.0) ++right; else ++wrong;
+        }
+        std::cout << "  [pitch frames] tone under rumble, suppression " << suppression << ": " << right
+                  << " right, " << wrong << " wrong of " << frames << "\n";
+        EXPECT_GT(right * 100, frames * 90);
+        EXPECT_EQ(wrong, 0);
+    }
+}
+
+// The reading through noise is on by default in the detector (it costs only
+// in windows that read unvoiced with something in them); the follower, whose
+// default confidence gate would discard those readings, keeps it off.
+DSPARK_TEST(PitchDetector_noise_suppression_is_on_by_default)
+{
+    EXPECT_TRUE(PitchDetector<float>().getNoiseSuppression());
+    EXPECT_TRUE(PitchDetector<double>().getNoiseSuppression());
+    EXPECT_FALSE(PitchFollower<float>().getNoiseSuppression());
+
+    const NoisyNotes m = makeNoisyNotes(5u, 5, 150.0, 600.0, false, 0.0);
+    const FrameScore byDefault = scoreFrames(m, -1);
+    const FrameScore off = scoreFrames(m, 0);
+    std::cout << "  [pitch frames] 0 dB white: default " << byDefault.right << " right, " << byDefault.wrong
+              << " wrong of " << byDefault.notes << "; off " << off.right << " right\n";
+    // 393 of 403 windows right and none wrong by default, none read with it off.
+    EXPECT_GT(byDefault.right * 100, byDefault.notes * 85);
+    EXPECT_LT(byDefault.wrong * 100, byDefault.notes * 2);
+    EXPECT_LT(off.right * 100, off.notes * 10);
+}
+
+namespace {
+
 /// A phase-continuous harmonic tone (10 partials, 1/k) of `hz` into `x`.
 void harmonicTone(std::vector<float>& x, int from, int to, double hz, double& phase, double fs)
 {

@@ -48,21 +48,22 @@ All notable user-facing changes to DSPark are documented here.
   settings and an HMM note tracker decoded over the whole file: clean 95.2 /
   95.3 / 2.4% (follower 93.7 / 94.2 / 1.9, HMM 94.2 / 94.3 / 5.1); 100 cents
   of vibrato 95.7 / 95.7 / 4.0 (94.6 / 94.8 / 2.9, HMM 95.0 / 94.7 / 5.6);
-  5 dB SNR white noise 96.7 / 96.2 / 0.0 (93.7 / 93.8 / 0.0, HMM 95.1 / 94.8
-  / 4.7); 5 dB pink noise 96.4 / 96.0 / 0.3 (91.0 / 87.8 / 0.3, HMM 95.1 /
-  95.1 / 4.3); 0 dB white noise 92.3 / 91.5 / 1.6 (86.2 / 87.3 / 0.0, the HMM
+  5 dB SNR white noise 96.7 / 96.3 / 0.0 (93.8 / 94.1 / 0.0, HMM 95.1 / 94.8
+  / 4.7); 5 dB pink noise 96.3 / 95.9 / 0.0 (93.3 / 92.9 / 0.0, HMM 95.1 /
+  95.1 / 4.3); 0 dB white noise 92.3 / 91.6 / 1.6 (86.2 / 87.3 / 0.0, the HMM
   reads none); a fundamental 15 dB below its partials 100 / 99.5 / 0.6 (97.8
   / 98.0 / 0.6, HMM 99.8 / 98.4 / 6.9). Octave errors at most 0.2% of voiced
-  frames (follower up to 2.6%). The same holds on material generated from
+  frames (follower up to 0.9%). The same holds on material generated from
   other seeds. It allocates and is not for the audio thread.
 - `PitchFollower::isVoiced()`: whether the latest detection passed the
   confidence and range gates, a per-detection voicing flag without
   `isTracking()`'s 250 ms hold; and `PitchFollower::setNoiseSuppression()` /
-  `getNoiseSuppression()`, which reach the wrapped detector's opt-in second
-  read. Against an HMM note tracker (the second stage of Mauch & Dixon 2014,
+  `getNoiseSuppression()`, which reach the wrapped detector's read through
+  noise (off in the follower by default). Against an HMM note tracker (the
+  second stage of Mauch & Dixon 2014,
   decoded causally) on 30 s legato melodies at 48 kHz, with `setGlide(0)`,
   `setConfidence(0.5)` and `isVoiced()`: readings within 50 cents 93.7%
-  against 93.5% clean, 94.6% against 94.1% with 100 cents of vibrato, 93.6%
+  against 93.5% clean, 94.6% against 94.1% with 100 cents of vibrato, 93.8%
   against 71.0% at 5 dB SNR; voicing false alarms 1.9% against 5.1%; 22
   against 24 ms from a note change to a reading within 50 cents; with the
   noise suppression and `setConfidence(0.45)`, 86.2% at 0 dB SNR, where the
@@ -372,8 +373,9 @@ All notable user-facing changes to DSPark are documented here.
   offline conversion into caller storage, the vector form's samples bit for
   bit (truncated to the capacity). It allocates nothing once the offline
   engine is designed.
-- `PitchDetector::setNoiseSuppression()` (opt-in, default off; the output is
-  unchanged off): a steady window that reads unvoiced is read again with its
+- `PitchDetector::setNoiseSuppression()` (on by default as of the entry
+  under Changed; the figures here are from when it was added, switched off
+  by default): a steady window that reads unvoiced is read again with its
   noise floor removed by spectral subtraction (the floor estimated per band
   from the window itself). The cleaned window locates the period, the
   input's own difference function next to its dip gives it (the subtraction
@@ -412,6 +414,65 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `PitchDetector` (analysis readout) reads notes through noise at its
+  defaults. Measured at 48 kHz window by window on sustained harmonic notes
+  with gaps between them in continuous noise, 7500 windows per row; right
+  means within 50 cents of the note.
+  - A choice above the threshold yields to the first separate dip about as
+    deep. In noise the dips at a period and at its multiples are equally
+    deep, and the deepest was as often a multiple. Notes of 70 to 1000 Hz at
+    5 dB SNR, suppression off: white noise 70.3% to 80.8% right and 17.5% to
+    0.2% wrong, pink noise 77.9% to 94.4% right and 17.2% to 0.6% wrong.
+  - A window that reads unvoiced and holds power below the lowest note the
+    window can read is looked at again without that band (a sixth-order
+    high-pass, run only over the samples such windows need). Rumble and the
+    bottom of pink or brown noise fill the difference function at the lags
+    where low notes dip. Notes of 47 to 67 Hz at 5 dB SNR, suppression off:
+    brown noise 57.0% to 86.9% right (wrong 3.9% to 4.1%, gaps read as a
+    note 0.4% to 0.1% of their windows), pink noise 61.9% to 74.9%. Brown
+    noise alone reads as a note in 0.11% of windows (was 0.75%).
+  - `setNoiseSuppression()` is on by default
+    (`setNoiseSuppression(false)` restores the first looks alone) and no
+    longer runs on a window whose own dip sits at the floor noise alone
+    reaches. At the defaults, before and after: notes of 70 to 1000 Hz in
+    white noise at 5 and 0 dB SNR 70.3% and 0.3% to 99.3% and 97.5%, in pink
+    noise 77.9% and 7.6% to 98.7% and 85.3%; notes of 47 to 67 Hz in white
+    noise 87.2% and 2.6% to 99.5% and 95.7%, in pink noise 61.9% and 8.0% to
+    87.6% and 68.3%; notes at 2 dB with 50 cents of vibrato 12.0% to 96.5%.
+    Against the suppression as it was when switched on: 70 to 1000 Hz at 5
+    dB in white noise 80.4% to 99.3%, at 0 dB in pink noise 70.9% to 85.3%
+    (wrong 4.2% to 0.2%), 47 to 67 Hz at 0 dB in pink noise 44.1% to 68.3%
+    (wrong 0.8% to 1.4%). Windows read wrong: under 1% from 70 Hz up, 1.4 to
+    4.3% below it in pink and brown noise.
+  - Against the frame stage of the probabilistic-threshold method followed
+    by its HMM decoded causally (a clean-room port), same notes: ahead in
+    every row with noise (70 to 1000 Hz at 5 dB in white noise 99.3% against
+    32.7%, in pink 98.7% against 80.5%; 47 to 67 Hz at 5 dB in pink 87.6%
+    against 56.5%, in brown 87.8% against 85.7%), level on clean notes
+    (100%). Behind it: gaps in brown noise read as a note in 0.2% of their
+    windows against 0.1%, and bands of noise alone read as a note more often
+    in some bands (Q 2 at 120 Hz 4.7% of windows against 1.2%, Q 5 at 300 Hz
+    10.1% against 6.1%, at 1 kHz 4.6% against 0.2%) and less often in others
+    (Q 5 at 60 Hz 25.1% against 36.2%, Q 10 from 60 Hz to 1 kHz 33 to 47%
+    against 55 to 72%).
+  - Cost, ns per sample, suppression off / on (before): a clean tone 15.4
+    either way, unchanged; a tone in white noise at 0 dB 18 / 145 (18 /
+    150); a low note in pink noise at 5 dB 27 / 30 (18 / 34); white noise
+    alone 17 / 17 (17 / 118); pink noise alone 38 / 102 (17 / 107); brown
+    noise alone 38 / 109 (17 / 55). `prepare()`-time heap 260 to 300 KB at
+    44.1/48 kHz, 515 to 600 KB at 88.2/96 kHz, 1030 to 1190 KB at 176.4/192
+    kHz (float). Steady clean tones read exactly as before.
+  - `PitchFollower` and `PitchCorrector` keep the suppression off (the
+    follower's confidence gate would discard its readings; the corrector's
+    tracking was tuned on the first reading) and take the first two changes.
+    On the legato melodies of the `PitchFollower` entries above, clean and
+    vibrato rows read as before to the last frame. At 5 dB SNR in pink noise
+    the follower at its best settings goes from 91.0% to 93.3% of frames
+    within 50 cents (voicing and pitch right 87.8% to 92.9%, octave errors
+    2.6% to 0.7%) and `track()` from 96.4% to 96.3% (voicing and pitch right
+    96.0% to 95.9%, false alarms 0.3% to none; on a second set of seeds
+    96.6% to 96.9%); at 0 dB in pink noise `track()` goes from 91.7% to
+    93.2% (voicing and pitch right 85.2% to 89.3%).
 - `Limiter` gain computer (no audio change): the gain a frame requires is
   taken as the ratio of the ceiling to the larger of peak and ceiling instead
   of a minimum against 1. The value is the same bit for bit (compared over
@@ -438,7 +499,7 @@ All notable user-facing changes to DSPark are documented here.
   records are merged on a stack:
   CPU 16.8 to 17.0 ns per sample on a clean tone, 18.7 to 19.1 on a tone in
   noise.
-- `PitchDetector::setNoiseSuppression()` (opt-in): where the cleaned window
+- `PitchDetector::setNoiseSuppression()`: where the cleaned window
   does not dip below the threshold, the input's own dip is the candidate;
   either candidate is refined from the correlation peaks at its multiples
   over the two windows of history, and a reading is kept only when two of
@@ -574,7 +635,7 @@ All notable user-facing changes to DSPark are documented here.
   kind are unchanged on the held-out files and on two further sets of 24
   files per kind. Quiet attacks 15 to 45 ms before a louder note's end:
   10/7/8 of 56 to 53 offline and 52 causal at 44.1/48/96 kHz.
-- `PitchDetector::setNoiseSuppression()` (opt-in): the multiples of a period
+- `PitchDetector::setNoiseSuppression()`: the multiples of a period
   are tested over the last two analysis windows of input instead of the
   window alone (the input buffer keeps two windows: 32 KB more at 48 kHz).
   Notes below 67 Hz at 48 kHz, which left no multiple inside the window and

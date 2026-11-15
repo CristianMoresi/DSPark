@@ -46,7 +46,7 @@
  * (VFA) and the time from a note change to a reading within 50 cents,
  * with setGlide(0), setConfidence(0.5) and isVoiced(): clean 93.7% / 1.9%
  * / 22 ms against 93.5% / 5.1% / 24 ms; 100 cents of vibrato 94.6% against
- * 94.1%; 5 dB SNR white noise 93.6% against 71.0%; with
+ * 94.1%; 5 dB SNR white noise 93.8% against 71.0%; with
  * setNoiseSuppression() and setConfidence(0.45), 0 dB 86.2% where the HMM
  * reads nothing. The default gate (0.85) holds the last clean pitch
  * through noisy passages, and the default glide trades latency for a
@@ -102,6 +102,17 @@ class PitchFollower
 {
 public:
     // -- Lifecycle -------------------------------------------------------------
+
+    /**
+     * @brief Creates a follower with the detector's noise suppression off.
+     *
+     * The follower gates readings at a confidence of 0.85 by default, which
+     * a reading taken through noise never reaches (about 0.5 at 0 dB SNR),
+     * so the detector's second reading would be paid for and discarded. Turn
+     * it on together with a lower confidence (setNoiseSuppression(),
+     * setConfidence()) to follow a note through noise.
+     */
+    PitchFollower() noexcept { detector_.setNoiseSuppression(false); }
 
     /**
      * @brief Prepares the follower and the wrapped detector.
@@ -367,12 +378,12 @@ public:
      * alarms: clean legato 95.2 / 95.3 / 2.4% (follower 93.7 / 94.2 / 1.9,
      * HMM 94.2 / 94.3 / 5.1); 100 cents of vibrato 95.7 / 95.7 / 4.0
      * (94.6 / 94.8 / 2.9, HMM 95.0 / 94.7 / 5.6); 5 dB SNR white noise
-     * 96.7 / 96.2 / 0.0 (93.7 / 93.8 / 0.0, HMM 95.1 / 94.8 / 4.7); 5 dB
-     * pink noise 96.4 / 96.0 / 0.3 (91.0 / 87.8 / 0.3, HMM 95.1 / 95.1 /
-     * 4.3); 0 dB white noise 92.3 / 91.5 / 1.6 (86.2 / 87.3 / 0.0, HMM
+     * 96.7 / 96.3 / 0.0 (93.8 / 94.1 / 0.0, HMM 95.1 / 94.8 / 4.7); 5 dB
+     * pink noise 96.3 / 95.9 / 0.0 (93.3 / 92.9 / 0.0, HMM 95.1 / 95.1 /
+     * 4.3); 0 dB white noise 92.3 / 91.6 / 1.6 (86.2 / 87.3 / 0.0, HMM
      * none); tones with a fundamental 15 dB below their partials 100 / 99.5
      * / 0.6 (97.8 / 98.0 / 0.6, HMM 99.8 / 98.4 / 6.9). Octave errors: at
-     * most 0.2% of voiced frames (follower up to 2.6%).
+     * most 0.2% of voiced frames (follower up to 0.9%).
      *
      * Not real-time: it allocates (the result, one detector and about 200
      * bytes per detection for the decode) and runs on the calling thread.

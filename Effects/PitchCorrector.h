@@ -360,6 +360,9 @@ public:
                                       : automaticFrame(spec.sampleRate);
 
         detector_.prepare(spec.sampleRate);
+        // The tracking below was tuned on the detector's first reading alone;
+        // the second one it can take through noise stays off here.
+        detector_.setNoiseSuppression(false);
         // The corrector keeps the Standard engine: its retune dynamics and the
         // 2 * frame latency are tuned to it, and it moves the shift on every
         // control tick, where Studio's strike anchoring buys nothing.

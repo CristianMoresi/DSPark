@@ -412,6 +412,16 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Limiter` gain computer (no audio change): the gain a frame requires is
+  taken as the ratio of the ceiling to the larger of peak and ceiling instead
+  of a minimum against 1. The value is the same bit for bit (compared over
+  160 million ceiling and peak pairs in float and double, zero, infinity and
+  NaN included), and no minimum is left for a compiler to turn into a branch
+  on whether the peak crosses the ceiling, which mispredicts on every other
+  frame of a signal that is being limited. GCC did that in the float
+  instantiation: `Limiter<float>` driven 6 dB over the ceiling goes from 13.8
+  to 8.7 ns per mono frame in sample-peak mode there (stereo 13.0 to 10.3),
+  level with `Limiter<double>` (7.9 and 9.6).
 - `PitchDetector` (default path, analysis readout): each threshold of the
   vote picks the deepest minimum of the stretch of lags below it instead of
   the first minimum there, so the small minima noise leaves on a broad

@@ -1008,9 +1008,14 @@ protected:
     /** One frame of the gain computer; leaves the gain to apply in currentGain_. */
     inline void advanceGain(T peak, T ceiling, bool adaptive, T relMs) noexcept
     {
-        // min() instead of a branch on peak > ceiling (data-dependent, so it
-        // mispredicts constantly under limiting); peak == 0 gives +inf -> 1.
-        const double required = std::min(1.0, static_cast<double>(ceiling / peak));
+        // min(1, ceiling / peak) written as the ratio against the larger of
+        // the two: the same value bit for bit (the quotient when the peak is
+        // over the ceiling, exactly 1 otherwise, and 1 for a NaN peak), with
+        // no minimum left for a compiler to turn into a branch on
+        // peak > ceiling, which is data-dependent and mispredicts constantly
+        // under limiting. A zero ceiling over silence gives 0 / 0; the minima
+        // below ignore a NaN, which is what a required gain of 1 does.
+        const double required = static_cast<double>(ceiling / std::max(ceiling, peak));
 
         // Exact minimum of r over the last holdLen_ frames (see restartHoldBlock()).
         rHist_[static_cast<size_t>(frame_ & holdMask_)] = required;

@@ -1299,6 +1299,58 @@ DSPARK_TEST(Limiter_high_precision_true_peak_per_sample_path_and_live_switch)
     }
 }
 
+// The gain a frame requires is ceiling / max(ceiling, peak). A ceiling of
+// -100 dB or below is zero, and over silence that ratio is 0 / 0: the gain
+// computer ignores it, the output stays silent and finite, and the limiter
+// passes signal again once the ceiling comes back.
+DSPARK_TEST(Limiter_zero_ceiling_over_silence_stays_finite)
+{
+    const auto check = []<class T>()
+    {
+        for (const bool truePeak : { false, true })
+        {
+            Limiter<T> lim;
+            lim.setCeiling(T(-120));
+            lim.prepare(48000.0, 1);
+            lim.setTruePeak(truePeak);
+            LimiterTestNoise noise { 0x31u };
+            const auto process = [&](std::vector<T>& x) {
+                for (size_t o = 0; o < x.size(); o += 256)
+                {
+                    T* ch[1] = { x.data() + o };
+                    lim.processBlock(AudioBufferView<T>(ch, 1, static_cast<int>(std::min<size_t>(256, x.size() - o))));
+                }
+            };
+
+            // Silence, a burst of noise, silence.
+            std::vector<T> x(4096, T(0));
+            for (size_t i = 1024; i < 2048; ++i) x[i] = static_cast<T>(noise.next());
+            process(x);
+            bool silent = true;
+            for (const T v : x) silent = silent && (v == T(0));
+            EXPECT_TRUE(silent);
+            EXPECT_TRUE(std::isfinite(lim.getGainReductionDb()));
+
+            lim.setCeiling(T(-6));
+            std::vector<T> y(24000);
+            for (T& v : y) v = static_cast<T>(0.25 * noise.next());
+            process(y);
+            T late = T(0);
+            bool finite = true;
+            for (size_t i = 0; i < y.size(); ++i)
+            {
+                finite = finite && std::isfinite(y[i]);
+                if (i >= y.size() - 4800) late = std::max(late, std::abs(y[i]));
+            }
+            EXPECT_TRUE(finite);
+            EXPECT_GT(late, T(0.2));
+            EXPECT_LT(late, T(0.2501));
+        }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
 
 // ============================================================================
 // NoiseGate

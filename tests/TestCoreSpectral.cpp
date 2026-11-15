@@ -1485,7 +1485,7 @@ std::vector<double> resamplerOffline(double src, double dst, typename Resampler<
 
 // The two-stage offline engine (FFT band-limiting, then a short
 // interpolator) meets the tier specifications of the direct kernels. Double
-// Ultra, 19 kHz at 0.5: fundamental exact and residual -219.4 to -231.0 dB
+// Ultra, 19 kHz at 0.5: fundamental exact and residual -219.4 to -231.1 dB
 // over the exact, table (irrational ratio), integer (48 -> 96 kHz, stage 2
 // skipped) and downsampling paths. Float High computes in double inside, so
 // it is limited only by the float output: the 48 -> 96 kHz image residual of
@@ -1552,7 +1552,7 @@ DSPARK_TEST(Resampler_two_stage_meets_the_tier_specification)
 
 // Both engines implement the same tier: on in-band material (12 tones up to
 // 0.85 of the passband edge) they agree to within the tier's attenuation.
-// Measured: High -152.4 to -160.4 dB, Ultra -222.9 to -229.3 dB re peak.
+// Measured: High -152.4 to -164.5 dB, Ultra -223.1 to -229.8 dB re peak.
 DSPARK_TEST(Resampler_two_stage_agrees_with_direct_in_band)
 {
     constexpr double kPi = 3.14159265358979323846;
@@ -1658,6 +1658,112 @@ DSPARK_TEST(Resampler_two_stage_spans_agree_and_vanish_outside_reach)
         for (size_t k = 0; k < narrow.size(); ++k)
             rounded = rounded && narrow[k] == static_cast<float>(whole[k]);
         EXPECT_TRUE(rounded);
+    }
+}
+
+// Stage 2 of the two-stage engine computes the outputs of up to eight phase
+// cycles together, in sets that follow the span asked for. Every span still
+// returns the samples of the whole conversion bit for bit: every length from
+// one output to more than two cycles (or 26 short ones), at offsets that
+// walk the cycle and cross both ends, for cycles of 3, 25, 147 and 160
+// phases, up and down; and the float instantiation returns the double one
+// rounded.
+DSPARK_TEST(Resampler_two_stage_spans_of_every_length_agree)
+{
+    using RD = Resampler<double>;
+    using RF = Resampler<float>;
+    struct Case { double src, dst; RD::Quality q; int maxLength; };
+    const Case cases[] = {
+        { 44100.0, 96000.0, RD::Quality::Ultra, 380 },
+        { 96000.0, 44100.0, RD::Quality::High, 330 },
+        { 32000.0, 48000.0, RD::Quality::Ultra, 80 },
+        { 48000.0, 50000.0, RD::Quality::Normal, 230 },
+    };
+    uint32_t s = 4242u;
+    auto next = [&s]() { s = s * 1664525u + 1013904223u; return s >> 8; };
+    for (const auto& c : cases)
+    {
+        constexpr int n = 5000;
+        std::vector<float> xf(static_cast<size_t>(n));
+        for (auto& v : xf) v = static_cast<float>(next()) / 8388608.0f - 1.0f;
+        const std::vector<double> xd(xf.begin(), xf.end());
+
+        RD r;
+        r.prepare(c.src, c.dst, c.q);
+        r.setOfflineEngine(RD::OfflineEngine::TwoStage);
+        const int64_t reach = r.getReach();
+        const int64_t body = static_cast<int64_t>(std::ceil(n * r.getRatio()));
+        const int64_t total = body + 2 * reach;
+        const auto range = r.processRange(xd.data(), n, -reach, total);
+        EXPECT_EQ(static_cast<int64_t>(range.size()), total);
+        if (static_cast<int64_t>(range.size()) != total) continue;
+
+        bool same = true;
+        int64_t pos = 0;
+        for (int length = 1; length <= c.maxLength; ++length)
+        {
+            const int64_t count = std::min<int64_t>(length, total - pos);
+            const auto part = r.processRange(xd.data(), n, pos - reach, count);
+            same = same && static_cast<int64_t>(part.size()) == count
+                && std::equal(part.begin(), part.end(), range.begin() + static_cast<std::ptrdiff_t>(pos));
+            pos = (pos + count + static_cast<int64_t>(next() % 97)) % total;
+        }
+        EXPECT_TRUE(same);
+
+        const auto whole = r.process(xd.data(), n);
+        EXPECT_EQ(static_cast<int64_t>(whole.size()), body);
+        RF f;
+        f.prepare(c.src, c.dst, static_cast<RF::Quality>(c.q));
+        f.setOfflineEngine(RF::OfflineEngine::TwoStage);
+        const auto narrow = f.process(xf.data(), n);
+        EXPECT_EQ(narrow.size(), whole.size());
+        if (narrow.size() != whole.size() || static_cast<int64_t>(whole.size()) != body) continue;
+        bool rounded = true, inRange = true;
+        for (size_t k = 0; k < whole.size(); ++k)
+        {
+            rounded = rounded && narrow[k] == static_cast<float>(whole[k]);
+            inRange = inRange && whole[k] == range[k + static_cast<size_t>(reach)];
+        }
+        EXPECT_TRUE(rounded);
+        EXPECT_TRUE(inRange);
+    }
+}
+
+// The two-stage engine's stage-2 kernel is 24 taps at High and 32 or 36 at
+// Ultra (a multiple of four, never shorter than the tier asks). A 19 kHz
+// tone at 0.5 through both stages, double: the fundamental is exact and all
+// that is left once it is removed (images, aliases, rounding) measured
+// -167.6 / -173.4 / -167.7 / -182.7 dB re the tone at High over 44.1 -> 48,
+// 48 -> 44.1, 44.1 -> 96 and 96 -> 44.1 kHz, and -221.1 dB at Ultra,
+// 44.1 -> 96 kHz.
+DSPARK_TEST(Resampler_two_stage_tones_stay_at_the_tier_up_and_down)
+{
+    constexpr double kPi = 3.14159265358979323846;
+    using RD = Resampler<double>;
+    struct Case { double src, dst; RD::Quality q; double fundamental, residualDb; };
+    const Case cases[] = {
+        { 44100.0, 48000.0, RD::Quality::High, 5e-8, -160.0 },
+        { 48000.0, 44100.0, RD::Quality::High, 5e-8, -160.0 },
+        { 44100.0, 96000.0, RD::Quality::High, 5e-8, -160.0 },
+        { 96000.0, 44100.0, RD::Quality::High, 5e-8, -160.0 },
+        { 44100.0, 96000.0, RD::Quality::Ultra, 1e-10, -215.0 },
+    };
+    for (const auto& c : cases)
+    {
+        constexpr int n = 1 << 16;
+        std::vector<double> in(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            in[static_cast<size_t>(i)] = 0.5 * std::sin(2.0 * kPi * 19000.0 * i / c.src);
+        auto out = resamplerOffline<double>(c.src, c.dst, c.q, RD::OfflineEngine::TwoStage, in);
+        const int n0 = 4096;
+        const int len = static_cast<int>(out.size()) - 8192;
+        const double fund = resamplerFitTone(out, n0, len, 19000.0, c.dst, true);
+        double rms = 0.0;
+        for (int i = 0; i < len; ++i)
+            rms += out[static_cast<size_t>(n0 + i)] * out[static_cast<size_t>(n0 + i)];
+        rms = std::sqrt(rms / len);
+        EXPECT_NEAR(fund, 0.5, c.fundamental);
+        EXPECT_LT(20.0 * std::log10(rms / (fund / std::sqrt(2.0)) + 1e-300), c.residualDb);
     }
 }
 

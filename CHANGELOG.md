@@ -18,6 +18,12 @@ All notable user-facing changes to DSPark are documented here.
   against 24 ms from a note change to a reading within 50 cents; with the
   noise suppression and `setConfidence(0.45)`, 86.2% at 0 dB SNR, where the
   HMM reads none.
+- `simd::dotProductStrided(shared, first, stride, count, outputs, out)`:
+  `outputs` double dot products of one array with windows `stride` elements
+  apart. Every product keeps its own accumulator, so a result has the same
+  bits whether it is computed alone or in a set of any size, and the shared
+  operand is loaded once for up to eight products that run side by side. It
+  runs on the AVX2+FMA kernels with the run-time dispatch.
 - `simd::dotProduct4(shared, other, count, out)`: four double dot products of
   one array with four others, each equal to `dotProduct(shared, other[x],
   count)` bit for bit. The AVX kernels load the shared operand once for the
@@ -290,7 +296,7 @@ All notable user-facing changes to DSPark are documented here.
   stays the default, so default audio is unchanged): `process()` and
   `processRange()` band-limit the input by FFT convolution (at the input rate,
   or at twice it when the lower Nyquist is above a quarter of the input rate)
-  and change the rate with a 22-34 tap kernel. Every tier keeps Direct's
+  and change the rate with a 24-36 tap kernel. Every tier keeps Direct's
   passband edge, image and alias rejection and in-band tone residual, or
   improves them (Ultra, 96 to 44.1 kHz: alias of stopband tones -218 dB
   instead of -209). Double, ns per input sample once prepared, into caller
@@ -397,6 +403,28 @@ All notable user-facing changes to DSPark are documented here.
   0.7% now; notes whose fundamental is 15 dB below its partials 28.6% to
   0.7%. Readings within 50 cents at the defaults 68.9% to 89.4% (clean
   legato), time to a note change 104 to 48 ms.
+- `Resampler` two-stage engine (opt-in): the stage-2 kernel length is a
+  multiple of four, so no product has a scalar tail at any vector width (High
+  24 taps at every ratio, 22 before when downsampling; Ultra 36 instead of 34
+  when upsampling and 32 as before when downsampling; Normal 20 instead of
+  18), and stage 2 computes the outputs of up to eight phase cycles together
+  with `simd::dotProductStrided()`, in groups whose windows stay in the
+  first-level cache while every kernel row meets them. ns per input sample
+  (MSVC x64, AVX2 dispatch, double, into caller storage) at 96 -> 44.1 /
+  48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: Ultra 2.36 / 3.78 / 4.90 / 7.85
+  -> 2.25 / 3.61 / 3.99 / 5.98, High 2.32 / 3.94 / 3.67 / 5.44 -> 2.06 /
+  3.43 / 3.39 / 5.07; without the dispatch (SSE2) Ultra 4.31 / 7.39 / 8.22 /
+  12.83 -> 3.64 / 6.05 / 6.64 / 9.66. Against a reference resampler of the
+  same two-stage structure at its 32-bit setting, Ultra: 1.21 and 1.06 times
+  its time at 44.1 -> 96 and 44.1 -> 48 kHz before, 0.92 and 0.87 now (96 ->
+  44.1 kHz 0.99 -> 0.94). Output: where the kernel grew it moves by the
+  kernel's own residual, far below the tier (-127 dB re peak at Normal, -167
+  dB at High, -228 dB at Ultra); elsewhere the rational ratios move at
+  rounding level (-309 dB), and the 2:1 and 1:2 paths, non-rational ratios
+  whose kernel kept its length and the Direct engine are bit-identical. Tone
+  residuals are unchanged or lower (19 kHz at 96 -> 44.1 kHz, High: -182.5
+  -> -182.7 dB re the tone) and `processRange()` spans still agree bit for
+  bit.
 - FFT engine (`FFTReal`, `FFTComplex` and the split engine the two-stage
   resampler runs on), faster with the same output, bit for bit, in every
   build: the passes keep their pointers in registers and load each twiddle

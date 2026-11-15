@@ -131,6 +131,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 // --- Vec<T, W> and the kernels written on it --------------------------------
 // detail/SimdVec.inl defines Vec<T, W> (W lanes of T; W = 1 is scalar code),
@@ -151,6 +152,15 @@
 #endif
 #if defined(DSPARK_SIMD_FMA)
     #define DSPARK_VEC_FMA 1
+#endif
+// DSPARK_VEC_INLINE inlines a kernel block into its caller in the same copy:
+// a call per block would cost a large part of the block's own work.
+#if defined(_MSC_VER)
+    #define DSPARK_VEC_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_VEC_INLINE inline __attribute__((always_inline))
+#else
+    #define DSPARK_VEC_INLINE inline
 #endif
 namespace dspark {
 namespace simd {
@@ -773,6 +783,39 @@ inline void dotProduct4(const double* shared, const double* const* other, int co
   #endif
     for (int x = 0; x < 4; ++x) out[x] = dotProduct(shared, other[x], count);
 #endif
+}
+
+/**
+ * @brief Dot products of one array with `outputs` arrays `stride` elements
+ *        apart: out[x] = sum_i shared[i] * first[x * stride + i] for x in
+ *        [0, outputs).
+ *
+ * Each product keeps one accumulator of the widest vector (a multiply-add
+ * chain over its vectors), whose lanes are then summed pairwise; the last
+ * count % width terms follow one at a time. A result therefore depends only
+ * on its own operands: splitting a set of products into calls of any sizes
+ * gives the same bits. The shared operand is loaded once for up to eight
+ * products, whose chains run side by side, so a set costs well below one
+ * dotProduct() per product. Runs on the AVX2+FMA copy when
+ * isRuntimeDispatchActive().
+ * @param shared  The operand common to every product.
+ * @param first   The first product's other operand.
+ * @param stride  Distance in elements from one product's operand to the next.
+ * @param count   Length of every product.
+ * @param outputs Number of products (none when below 1).
+ * @param out     Receives the outputs results.
+ */
+inline void dotProductStrided(const double* shared, const double* first, std::ptrdiff_t stride, int count,
+                              int outputs, double* out) noexcept
+{
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive())
+    {
+        avx2::dotProductStridedKernel(shared, first, stride, count, outputs, out);
+        return;
+    }
+#endif
+    dotProductStridedKernel(shared, first, stride, count, outputs, out);
 }
 
 // ============================================================================
@@ -1456,3 +1499,5 @@ void firCorrelateBankSum(const T* m, const T* h, int taps, T* DSPARK_RESTRICT y,
 
 } // namespace simd
 } // namespace dspark
+
+#undef DSPARK_VEC_INLINE

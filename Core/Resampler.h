@@ -39,7 +39,7 @@
  * processBlock() shifted by getLatency(). TwoStage meets the same tier
  * specification at a fraction of the cost: an FFT low-pass at the input
  * rate (or at twice it) does the sharp band-limiting, after which the
- * signal is oversampled enough for a short interpolation kernel (22 to 34
+ * signal is oversampled enough for a short interpolation kernel (24 to 36
  * taps at High and Ultra) to change the rate. Its arithmetic is double for
  * both instantiations. At 96 to 44.1 kHz, Ultra, it runs 11x faster than
  * Direct (see setOfflineEngine()). process() also writes into caller
@@ -135,26 +135,29 @@ public:
      * passband edge and stopband edge, 12 dB more attenuation. The
      * band-limited signal is then oversampled at least 2:1 over its band, so
      * the rate change needs only a short kernel whose stopband starts at the
-     * band's first image: 22 or 24 taps at High, 32 or 34 at Ultra, 40 dB
-     * above the tier (the images of in-band tones fall there, and Direct's
-     * longer kernel has decayed that far at those distances). When the
-     * output rate is an integer fraction of that rate (48 <-> 96 kHz) the
-     * output is read straight from the band-limited signal. Both stages run
-     * in double, for both instantiations, so the float output is limited by
-     * its own rounding only. Outputs one cycle of phases apart share their
-     * stage-2 kernel row, so four of them are computed together
-     * (simd::dotProduct4(), each bit for bit the single product).
+     * band's first image: 24 taps at High, 32 or 36 at Ultra (the length is
+     * a multiple of four, so a product has no scalar tail at any vector
+     * width), 40 dB above the tier (the images of in-band tones fall there,
+     * and Direct's longer kernel has decayed that far at those distances).
+     * When the output rate is an integer fraction of that rate (48 <-> 96
+     * kHz) the output is read straight from the band-limited signal. Both
+     * stages run in double, for both instantiations, so the float output is
+     * limited by its own rounding only. Outputs one cycle of phases apart
+     * share their stage-2 kernel row and their windows lie a fixed step
+     * apart, so up to eight of them are computed together
+     * (simd::dotProductStrided(), whose results do not depend on how a set
+     * is split).
      *
      * Measured against Direct (MSVC x64, AVX2 dispatch, double, ns per
      * input sample once prepared, into caller storage) at 96 -> 44.1 /
-     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 2.3 / 3.9 / 3.6 / 5.3
-     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 2.3 / 3.7 / 4.9 / 7.8
+     * 48 -> 44.1 / 44.1 -> 48 / 44.1 -> 96 kHz: High 2.1 / 3.4 / 3.4 / 5.1
+     * instead of 16.4 / 16.6 / 20.4 / 42.1; Ultra 2.3 / 3.6 / 4.0 / 6.0
      * instead of 26.2 / 26.9 / 27.7 / 60.3. Stage 1 reads a double input
      * straight from the caller's buffer, and its filter product and inverse
      * are one transform. At 2:1 (96 -> 48 kHz) the inverse runs at half
      * the length on the folded spectrum: High 1.2, Ultra 1.3 instead of 14.6
      * and 23.9. The vector-returning process() adds the vector:
-     * Ultra 2.9 / 4.5 / 5.6 / 9.4. Passband edge, image
+     * Ultra 2.6 / 4.5 / 5.1 / 8.2. Passband edge, image
      * and alias rejection and the residual of in-band tones are those of
      * Direct or better; on in-band material the two engines agree to -152 dB
      * at High and -222 dB at Ultra.
@@ -863,7 +866,7 @@ private:
         // Stage 2: flat to passband * b; the mid signal holds nothing above b
         // until its first image at 1 - b, where the stopband starts.
         const double order2 = (atten2 - 7.95) / (14.36 * (1.0 - (1.0 + spec.passband) * b));
-        s.stage2.taps = std::max(4, 2 * static_cast<int>(std::ceil(0.5 * order2)));
+        s.stage2.taps = std::max(4, 4 * static_cast<int>(std::ceil(0.25 * order2)));
         s.stage2.cutoff = spec.passband * b + 1.0 - b;
         s.stage2.beta = kaiserBeta(atten2);
         const auto [l, m] = rationalRatio(sourceRate * static_cast<double>(s.up), targetRate);
@@ -1244,48 +1247,51 @@ private:
                     int64_t k = p.cycleOf2[static_cast<size_t>(phase)];
                     const double* row = rows + k * taps2;
                     // Outputs j and j + l share a kernel row, and their windows
-                    // lie step2 mid samples apart: whole sets of four cycles
-                    // run as one cycle of four-product dot products (each bit
-                    // for bit the single product, the row loaded once for the
-                    // four windows), the rest one by one. Output j from here
-                    // sits at w0 + floor((phase + j step2) / l), so those up to
-                    // `last` are the first ((last - w0 + 1) l - phase - 1) /
-                    // step2 + 1.
+                    // lie step2 mid samples apart. The batch runs in groups of
+                    // at most eight cycles, of nearly equal sizes (the group's
+                    // windows stay in the first-level cache while every row
+                    // meets them); in a group, each position of the cycle runs
+                    // its outputs as one strided set of products, the row
+                    // loaded once for all of them. A result has the same bits
+                    // however its set is split, so spans agree. Output j from
+                    // here sits at w0 + floor((phase + j step2) / l), so those
+                    // up to `last` are the first ((last - w0 + 1) l - phase -
+                    // 1) / step2 + 1.
                     const int64_t cycleStep = p.step2;
                     const int64_t batch = std::min<int64_t>(
                         count - i, ((last - w0 + 1) * l - phase - 1) / cycleStep + 1);
-                    const int64_t sets = batch / (4 * l);
-                    for (int64_t g = 0; g < sets; ++g)
+                    const int64_t cycles = batch / l, rest = batch % l;
+                    const int64_t spanned = cycles + (rest > 0 ? 1 : 0);
+                    const int64_t groups = (spanned + 7) / 8;
+                    for (int64_t g = 0, c0 = 0; g < groups; ++g)
                     {
-                        for (int64_t t = 0; t < l; ++t)
+                        const int64_t size = (spanned - c0 + (groups - g) - 1) / (groups - g);
+                        const double* s = src + c0 * cycleStep;
+                        const double* r = row;
+                        int64_t kk = k;
+                        const int64_t positions = std::min(l, batch - c0 * l);
+                        for (int64_t t = 0; t < positions; ++t)
                         {
-                            const double* const windows[4] = { src, src + cycleStep, src + 2 * cycleStep,
-                                                               src + 3 * cycleStep };
-                            double y[4];
-                            simd::dotProduct4(row, windows, taps2, y);
-                            out[i + t]         = static_cast<T>(y[0]);
-                            out[i + t + l]     = static_cast<T>(y[1]);
-                            out[i + t + 2 * l] = static_cast<T>(y[2]);
-                            out[i + t + 3 * l] = static_cast<T>(y[3]);
-                            const int64_t a = advance[k];
-                            src += a;
-                            row += taps2;
-                            if (++k == l) { k = 0; row = rows; }
+                            const int m = static_cast<int>(std::min(size, cycles + (t < rest ? 1 : 0) - c0));
+                            double y[8];
+                            simd::dotProductStrided(r, s, static_cast<std::ptrdiff_t>(cycleStep), taps2, m, y);
+                            T* const o = out + i + c0 * l + t;
+                            for (int x = 0; x < m; ++x) o[x * l] = static_cast<T>(y[x]);
+                            s += advance[kk];
+                            r += taps2;
+                            if (++kk == l) { kk = 0; r = rows; }
                         }
-                        // One cycle walked: the other three are step2 each.
-                        src += 3 * cycleStep;
-                        w0 += 4 * cycleStep;
-                        i += 4 * l;
+                        c0 += size;
                     }
-                    for (int64_t b = sets * 4 * l; b < batch; ++b)
+                    // On to output i + batch: position `rest` of cycle `cycles`.
+                    for (int64_t t = 0; t < rest; ++t)
                     {
-                        out[i++] = static_cast<T>(simd::dotProduct(row, src, taps2));
-                        const int64_t a = advance[k];
-                        src += a;
-                        w0 += a;
-                        row += taps2;
-                        if (++k == l) { k = 0; row = rows; }
+                        src += advance[k];
+                        if (++k == l) k = 0;
                     }
+                    src += cycles * cycleStep;
+                    w0 = origin + (src - mid);
+                    i += batch;
                     phase = (k * remStep) % l;
                 }
                 anchor = w0 + half2 - 1;

@@ -1439,6 +1439,68 @@ DSPARK_TEST(SimdOps_dot_product_of_four_matches_four_dot_products)
     }
 }
 
+DSPARK_TEST(SimdOps_strided_dot_products_do_not_depend_on_the_split)
+{
+    // dotProductStrided() runs up to eight products side by side on one load
+    // of the shared operand. Each result must depend on its own operands
+    // only: the same bits whether the product is computed alone or in a set
+    // of any size, at any place in it, at every length (vector body and
+    // tail) and stride (overlapping windows, a negative step, the same
+    // window, windows on the shared operand itself), on both kernel sets.
+    // It is the dot product (within the rounding of its additions), and a
+    // call writes its results only.
+    using namespace dspark;
+    DispatchScope scope;
+    std::vector<double> buf(4000);
+    uint32_t rng = 0x57D1u;
+    for (auto& v : buf)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+    }
+    constexpr int maxOutputs = 21, maxCount = 41;
+    constexpr double eps = std::numeric_limits<double>::epsilon();
+    const bool dispatch = simd::runtimeDispatchSupported();
+    for (const bool wide : { false, true })
+    {
+        simd::setRuntimeDispatch(wide && dispatch);
+        bool same = true, exact = true, untouched = true;
+        const double* const shared = buf.data() + 200;
+        for (const double* const first : { static_cast<const double*>(buf.data() + 1500), shared })
+            for (const std::ptrdiff_t stride : { std::ptrdiff_t(1), std::ptrdiff_t(7), std::ptrdiff_t(64),
+                                                 std::ptrdiff_t(-3), std::ptrdiff_t(0) })
+                for (int count = 0; count <= maxCount; ++count)
+                {
+                    double alone[maxOutputs];
+                    for (int x = 0; x < maxOutputs; ++x)
+                    {
+                        const double* const other = first + x * stride;
+                        simd::dotProductStrided(shared, other, stride, count, 1, &alone[x]);
+                        double ref = 0.0, magnitude = 0.0;
+                        for (int i = 0; i < count; ++i)
+                        {
+                            ref += shared[i] * other[i];
+                            magnitude += std::abs(shared[i] * other[i]);
+                        }
+                        exact = exact && std::abs(alone[x] - ref) <= 4.0 * count * eps * magnitude;
+                    }
+                    for (int outputs = -1; outputs <= maxOutputs; ++outputs)
+                    {
+                        double out[maxOutputs + 2];
+                        std::fill(std::begin(out), std::end(out), 123.0);
+                        simd::dotProductStrided(shared, first, stride, count, outputs, out);
+                        for (int x = 0; x < outputs; ++x)
+                            same = same && std::memcmp(&out[x], &alone[x], sizeof(double)) == 0;
+                        for (int x = std::max(outputs, 0); x < maxOutputs + 2; ++x)
+                            untouched = untouched && out[x] == 123.0;
+                    }
+                }
+        EXPECT_TRUE(same);
+        EXPECT_TRUE(exact);
+        EXPECT_TRUE(untouched);
+    }
+}
+
 namespace
 {
 template <typename T> void checkFirBanks()

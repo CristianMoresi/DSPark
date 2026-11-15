@@ -46,6 +46,13 @@ struct Vec<T, 1>
     {
         *p0 = a; *p1 = b; *p2 = c; *p3 = d;
     }
+    /// The sum of the lanes, halves added pairwise ((l0 + l2) + (l1 + l3) at
+    /// four lanes); sumLanes4() writes four of them in the same order.
+    static T sumLanes(V v) noexcept { return v; }
+    static void sumLanes4(T* out, V a, V b, V c, V d) noexcept
+    {
+        out[0] = a; out[1] = b; out[2] = c; out[3] = d;
+    }
 };
 
 #if defined(DSPARK_VEC_SSE2)
@@ -127,6 +134,12 @@ struct Vec<double, 2>
     static V set2(double lane0Value, double lane1Value) noexcept { return _mm_set_pd(lane1Value, lane0Value); }
     static double lane0(V v) noexcept { return _mm_cvtsd_f64(v); }
     static double lane1(V v) noexcept { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
+    static double sumLanes(V v) noexcept { return _mm_cvtsd_f64(_mm_add_sd(v, _mm_unpackhi_pd(v, v))); }
+    static void sumLanes4(double* out, V a, V b, V c, V d) noexcept
+    {
+        _mm_storeu_pd(out, _mm_add_pd(_mm_unpacklo_pd(a, b), _mm_unpackhi_pd(a, b)));
+        _mm_storeu_pd(out + 2, _mm_add_pd(_mm_unpacklo_pd(c, d), _mm_unpackhi_pd(c, d)));
+    }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {
         const V a = _mm_loadu_pd(p), b = _mm_loadu_pd(p + 2);
@@ -235,6 +248,12 @@ struct Vec<double, 2>
     static V set2(double lane0Value, double lane1Value) noexcept { return vsetq_lane_f64(lane1Value, vdupq_n_f64(lane0Value), 1); }
     static double lane0(V v) noexcept { return vgetq_lane_f64(v, 0); }
     static double lane1(V v) noexcept { return vgetq_lane_f64(v, 1); }
+    static double sumLanes(V v) noexcept { return vgetq_lane_f64(v, 0) + vgetq_lane_f64(v, 1); }
+    static void sumLanes4(double* out, V a, V b, V c, V d) noexcept
+    {
+        vst1q_f64(out, vpaddq_f64(a, b));
+        vst1q_f64(out + 2, vpaddq_f64(c, d));
+    }
     static void loadDeinterleave(const double* p, V& re, V& im) noexcept
     {
         const float64x2x2_t v = vld2q_f64(p);
@@ -383,6 +402,19 @@ struct Vec<double, 4>
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), c); }
 #endif
+    /// The sum of the lanes, (l0 + l2) + (l1 + l3); sumLanes4() writes four
+    /// of them in the same order.
+    static double sumLanes(V v) noexcept
+    {
+        const __m128d s = _mm_add_pd(_mm256_castpd256_pd128(v), _mm256_extractf128_pd(v, 1));
+        return _mm_cvtsd_f64(_mm_add_sd(s, _mm_unpackhi_pd(s, s)));
+    }
+    static void sumLanes4(double* out, V a, V b, V c, V d) noexcept
+    {
+        const V ac = _mm256_add_pd(_mm256_permute2f128_pd(a, c, 0x20), _mm256_permute2f128_pd(a, c, 0x31));
+        const V bd = _mm256_add_pd(_mm256_permute2f128_pd(b, d, 0x20), _mm256_permute2f128_pd(b, d, 0x31));
+        _mm256_storeu_pd(out, _mm256_hadd_pd(ac, bd));
+    }
     static V reverse(V v) noexcept
     {
 #if defined(DSPARK_VEC_AVX2)
@@ -593,6 +625,84 @@ void firCorrelateBankSumKernel(const T* m, const T* h, int taps, T* DSPARK_RESTR
     };
     for (; i + Outputs <= n; i += Outputs) block(std::integral_constant<int, Outputs>{});
     for (; i < n; ++i) block(std::integral_constant<int, 1>{});
+}
+
+/// Outputs products of dotProductStrided() (see SimdOps.h) at this copy's
+/// widest double vector: one accumulator each, so a result is the same
+/// multiply-add chain whatever the number of products in the call. The
+/// accumulators are named, not an array, so they stay in registers, and the
+/// block is inlined into dotProductStridedKernel().
+template <int Outputs>
+DSPARK_VEC_INLINE void dotProductStridedBlock(const double* shared, const double* first, std::ptrdiff_t stride,
+                                              int count, double* out) noexcept
+{
+    static_assert(Outputs >= 1 && Outputs <= 8, "SimdOps: one to eight products per block");
+    constexpr int W = kVecWidth<double>;
+    using O = Vec<double, W>;
+    using V = typename O::V;
+    V a0 = O::set1(0.0), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+    const int vectorEnd = count - count % W;
+    int i = 0;
+    for (; i < vectorEnd; i += W)
+    {
+        const V s = O::load(shared + i);
+        const double* const q = first + i;
+        a0 = O::madd(s, O::load(q), a0);
+        if constexpr (Outputs > 1) a1 = O::madd(s, O::load(q + stride), a1);
+        if constexpr (Outputs > 2) a2 = O::madd(s, O::load(q + 2 * stride), a2);
+        if constexpr (Outputs > 3) a3 = O::madd(s, O::load(q + 3 * stride), a3);
+        if constexpr (Outputs > 4) a4 = O::madd(s, O::load(q + 4 * stride), a4);
+        if constexpr (Outputs > 5) a5 = O::madd(s, O::load(q + 5 * stride), a5);
+        if constexpr (Outputs > 6) a6 = O::madd(s, O::load(q + 6 * stride), a6);
+        if constexpr (Outputs > 7) a7 = O::madd(s, O::load(q + 7 * stride), a7);
+    }
+    if constexpr (Outputs >= 4)
+        O::sumLanes4(out, a0, a1, a2, a3);
+    else
+    {
+        out[0] = O::sumLanes(a0);
+        if constexpr (Outputs > 1) out[1] = O::sumLanes(a1);
+        if constexpr (Outputs > 2) out[2] = O::sumLanes(a2);
+    }
+    if constexpr (Outputs == 8)
+        O::sumLanes4(out + 4, a4, a5, a6, a7);
+    else
+    {
+        if constexpr (Outputs > 4) out[4] = O::sumLanes(a4);
+        if constexpr (Outputs > 5) out[5] = O::sumLanes(a5);
+        if constexpr (Outputs > 6) out[6] = O::sumLanes(a6);
+    }
+    // The last count % W terms one at a time, after the lanes.
+    for (int j = i; j < count; ++j)
+        for (int x = 0; x < Outputs; ++x)
+            out[x] += shared[j] * first[x * stride + j];
+}
+
+/// dotProductStrided() on this copy (see SimdOps.h): the products in blocks
+/// of at most eight, of nearly equal sizes (a block of one or two would wait
+/// on its chain).
+inline void dotProductStridedKernel(const double* shared, const double* first, std::ptrdiff_t stride, int count,
+                                    int outputs, double* out) noexcept
+{
+    while (outputs > 0)
+    {
+        const int blocks = (outputs + 7) / 8;
+        const int n = (outputs + blocks - 1) / blocks;
+        switch (n)
+        {
+            case 8: dotProductStridedBlock<8>(shared, first, stride, count, out); break;
+            case 7: dotProductStridedBlock<7>(shared, first, stride, count, out); break;
+            case 6: dotProductStridedBlock<6>(shared, first, stride, count, out); break;
+            case 5: dotProductStridedBlock<5>(shared, first, stride, count, out); break;
+            case 4: dotProductStridedBlock<4>(shared, first, stride, count, out); break;
+            case 3: dotProductStridedBlock<3>(shared, first, stride, count, out); break;
+            case 2: dotProductStridedBlock<2>(shared, first, stride, count, out); break;
+            default: dotProductStridedBlock<1>(shared, first, stride, count, out); break;
+        }
+        outputs -= n;
+        first += n * stride;
+        out += n;
+    }
 }
 
 #if defined(DSPARK_VEC_AVX)

@@ -6,6 +6,26 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `PitchFollower::track(mono, sampleRate[, settings])` (static, offline):
+  reads a whole mono signal and returns one `TrackPoint` (time, pitch,
+  confidence, voiced) per detection, decoded over the complete sequence. The
+  real-time follower judges each detection with the past alone; with the
+  whole sequence known, every detection offers its own reading, the octaves
+  of it, its neighbours' readings and the line between them, and the track is
+  the cheapest path through those and "unvoiced" (pitch changes cost their
+  size, entering or leaving a note more than filling a short gap). Measured
+  at 48 kHz on legato melodies, frames within 50 cents / frames with voicing
+  and pitch right / voicing false alarms, against the follower at its best
+  settings and an HMM note tracker decoded over the whole file: clean 95.2 /
+  95.3 / 2.4% (follower 93.7 / 94.2 / 1.9, HMM 94.2 / 94.3 / 5.1); 100 cents
+  of vibrato 95.7 / 95.7 / 4.0 (94.6 / 94.8 / 2.9, HMM 95.0 / 94.7 / 5.6);
+  5 dB SNR white noise 96.7 / 96.2 / 0.0 (93.7 / 93.8 / 0.0, HMM 95.1 / 94.8
+  / 4.7); 5 dB pink noise 96.4 / 96.0 / 0.3 (91.0 / 87.8 / 0.3, HMM 95.1 /
+  95.1 / 4.3); 0 dB white noise 92.3 / 91.5 / 1.6 (86.2 / 87.3 / 0.0, the HMM
+  reads none); a fundamental 15 dB below its partials 100 / 99.5 / 0.6 (97.8
+  / 98.0 / 0.6, HMM 99.8 / 98.4 / 6.9). Octave errors at most 0.2% of voiced
+  frames (follower up to 2.6%). The same holds on material generated from
+  other seeds. It allocates and is not for the audio thread.
 - `PitchFollower::isVoiced()`: whether the latest detection passed the
   confidence and range gates, a per-detection voicing flag without
   `isTracking()`'s 250 ms hold; and `PitchFollower::setNoiseSuppression()` /

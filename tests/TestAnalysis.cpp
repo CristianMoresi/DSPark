@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -3363,4 +3364,273 @@ DSPARK_TEST(DelayEstimator_programme_end_is_not_a_shared_event)
     EXPECT_NEAR(r.delaySamples, static_cast<double>(delay), 0.05);
     EXPECT_GT(r.confidence, 0.9);
     EXPECT_FALSE(r.inverted);
+}
+
+namespace {
+
+/// The generator of the offline-track material (xorshift64).
+struct TrackRng
+{
+    std::uint64_t state;
+    std::uint64_t next() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; }
+    double uniform() { return static_cast<double>(next() >> 11) * 0x1.0p-53; }
+    double gauss()
+    {
+        const double a = uniform(), b = uniform();
+        return std::sqrt(-2.0 * std::log(a + 1e-300)) * std::cos(2.0 * 3.14159265358979323846 * b);
+    }
+};
+
+struct TrackMaterial
+{
+    std::vector<float> x;
+    std::vector<double> f0;   ///< Fundamental per sample; 0 = no note.
+};
+
+/// A legato melody at 48 kHz: phrases of six notes of 250 to 450 ms joined by
+/// 25 ms glides, steps of up to seven semitones (an octave leap in one of
+/// eight), 300 ms rests between phrases, 80 to 700 Hz, 40 partials falling
+/// 7 dB per octave, vibrato at 5.5 Hz and white noise at snrDb (above 90:
+/// none) re the notes.
+TrackMaterial trackMelody(std::uint64_t seed, double seconds, double vibratoCents, double snrDb)
+{
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    TrackRng r { seed };
+    const int length = static_cast<int>(fs * seconds);
+    std::vector<double> f0(static_cast<size_t>(length), 0.0), x(static_cast<size_t>(length), 0.0);
+    double st = 12.0 * std::log2(200.0 / 440.0);
+    int i = static_cast<int>(0.2 * fs);
+    while (i < length - static_cast<int>(0.5 * fs))
+    {
+        for (int n = 0; n < 6 && i < length - static_cast<int>(0.5 * fs); ++n)
+        {
+            const double prev = st;
+            const double step = (r.uniform() < 0.125) ? (r.uniform() < 0.5 ? 12.0 : -12.0)
+                                                       : std::round((r.uniform() * 2.0 - 1.0) * 7.0);
+            st = std::clamp(st + step, 12.0 * std::log2(80.0 / 440.0), 12.0 * std::log2(700.0 / 440.0));
+            const int len = static_cast<int>(fs * (0.25 + 0.2 * r.uniform()));
+            const int glide = (n == 0) ? 0 : static_cast<int>(0.025 * fs);
+            for (int k = 0; k < len && i + k < length; ++k)
+            {
+                const double s = (k < glide) ? prev + (st - prev) * k / glide : st;
+                const double v = vibratoCents * std::sin(2.0 * kPi * 5.5 * (i + k) / fs) / 100.0;
+                f0[static_cast<size_t>(i + k)] = 440.0 * std::pow(2.0, (s + v) / 12.0);
+            }
+            i += len;
+        }
+        i += static_cast<int>(0.3 * fs);
+    }
+    double phase[40];
+    for (double& p : phase) p = r.uniform() * 6.28;
+    for (size_t j = 0; j < x.size(); ++j)
+    {
+        if (f0[j] <= 0.0) continue;
+        double s = 0.0;
+        for (int h = 1; h <= 40; ++h)
+        {
+            if (h * f0[j] > 18000.0) break;
+            phase[h - 1] += 2.0 * kPi * f0[j] * h / fs;
+            s += std::pow(10.0, -7.0 * std::log2(static_cast<double>(h)) / 20.0) * std::sin(phase[h - 1]);
+        }
+        x[j] += s;
+    }
+    if (snrDb < 90.0)
+    {
+        double power = 0.0, noisePower = 0.0;
+        int voiced = 0;
+        for (size_t j = 0; j < x.size(); ++j)
+            if (f0[j] > 0.0) { power += x[j] * x[j]; ++voiced; }
+        power /= std::max(1, voiced);
+        std::vector<double> noise(x.size());
+        for (size_t j = 0; j < x.size() + 4000; ++j)
+        {
+            const double w = r.gauss();
+            if (j >= 4000) { noise[j - 4000] = w; noisePower += w * w; }
+        }
+        noisePower /= static_cast<double>(x.size());
+        const double gain = std::sqrt(power / noisePower / std::pow(10.0, snrDb / 10.0));
+        for (size_t j = 0; j < x.size(); ++j) x[j] += gain * noise[j];
+    }
+    double peak = 0.0;
+    for (double v : x) peak = std::max(peak, std::abs(v));
+    TrackMaterial m;
+    m.x.resize(x.size());
+    for (size_t j = 0; j < x.size(); ++j) m.x[j] = static_cast<float>(0.5 * x[j] / peak);
+    m.f0 = std::move(f0);
+    return m;
+}
+
+/// Frame counts of a pitch track against the truth.
+struct TrackScore
+{
+    int voicedFrames = 0, unvoicedFrames = 0, pitchRight = 0, octaveOff = 0, accurate = 0, falseAlarms = 0;
+    void add(double truth, double estimate, bool voiced)
+    {
+        if (truth > 0.0)
+        {
+            ++voicedFrames;
+            if (estimate > 0.0)
+            {
+                const double cents = 1200.0 * std::log2(estimate / truth);
+                const double folded = std::fmod(std::abs(cents) + 600.0, 1200.0) - 600.0;
+                if (std::abs(cents) < 50.0) ++pitchRight;
+                if (std::abs(cents) >= 50.0 && std::abs(folded) < 50.0) ++octaveOff;
+                if (voiced && std::abs(cents) < 50.0) ++accurate;
+            }
+        }
+        else
+        {
+            ++unvoicedFrames;
+            if (voiced) ++falseAlarms; else ++accurate;
+        }
+    }
+    /// Voiced frames within 50 cents, percent.
+    [[nodiscard]] double rpa() const { return 100.0 * pitchRight / std::max(1, voicedFrames); }
+    /// Frames with the voicing and the pitch right, percent.
+    [[nodiscard]] double accuracy() const { return 100.0 * accurate / std::max(1, voicedFrames + unvoicedFrames); }
+    [[nodiscard]] double falseAlarmRate() const { return 100.0 * falseAlarms / std::max(1, unvoicedFrames); }
+};
+
+/// Scores PitchFollower::track() and the real-time follower (confidence gate
+/// 0.45, noise suppression, no glide, isVoiced()) on one material, a frame
+/// per detection with the truth at the centre of its window.
+void scoreTrackAndFollower(const TrackMaterial& m, TrackScore& offline, TrackScore& causal, size_t& pointCount)
+{
+    constexpr double fs = 48000.0;
+    constexpr int window = 2048, hop = 512, skipped = window / hop - 1;
+    const int frames = static_cast<int>(m.x.size()) / hop;
+    PitchFollower<float>::TrackSettings settings;
+    settings.minHz = 60.0f;
+    settings.maxHz = 1200.0f;
+    const auto points = PitchFollower<float>::track(std::span<const float>(m.x.data(), m.x.size()), fs, settings);
+    pointCount = points.size();
+    PitchFollower<float> follower;
+    follower.prepare(spec(fs, hop, 1));
+    follower.setRange(60.0f, 1200.0f);
+    follower.setConfidence(0.45f);
+    follower.setGlide(0.0f);
+    follower.setNoiseSuppression(true);
+    for (int k = 0; k < frames; ++k)
+    {
+        const int centre = (k + 1) * hop - window / 2;
+        const double truth = (centre >= 0) ? m.f0[static_cast<size_t>(centre)] : 0.0;
+        const bool has = k >= skipped && static_cast<size_t>(k - skipped) < points.size();
+        const auto point = has ? points[static_cast<size_t>(k - skipped)] : PitchFollower<float>::TrackPoint{};
+        offline.add(truth, static_cast<double>(point.frequencyHz), point.voiced);
+        follower.pushSamples(std::span<const float>(m.x.data() + static_cast<size_t>(k) * hop, static_cast<size_t>(hop)));
+        causal.add(truth, static_cast<double>(follower.getSmoothedHz()), follower.isVoiced());
+    }
+}
+
+}   // namespace
+
+// The follower judges every detection with the past alone: a note change
+// costs it a detection of confirmation, an octave error can only be folded
+// towards what came before and a detection the detector declines stays
+// empty. PitchFollower::track() decodes the whole sequence. On 12 s legato
+// melodies (frames within 50 cents / frames with voicing and pitch right /
+// octave errors): clean 95.4 / 95.6 / 0.0% against the follower's 94.1 /
+// 94.7 / 0.7%; at 5 dB SNR 96.5 / 96.0 / 0.0% against 93.2 / 93.5 / 0.6%.
+// An HMM note tracker decoded over the whole file reads 94.8 / 94.8 and
+// 95.0 / 94.9 there, with 4.8 and 5.5% of voicing false alarms (track():
+// 2.4 and 0.0%).
+DSPARK_TEST(PitchFollower_offline_track_reads_more_than_the_follower)
+{
+    struct Case { std::uint64_t seed; double vibrato, snr, rpa, accuracy, rpaGain, accuracyGain, falseAlarms; };
+    const Case cases[] = {
+        { 1, 0.0, 99.0, 94.4, 94.6, 0.5, 0.3, 4.5 },
+        { 5, 30.0, 5.0, 95.5, 95.0, 2.0, 1.5, 2.0 },
+    };
+    for (const Case& c : cases)
+    {
+        const TrackMaterial m = trackMelody(c.seed, 12.0, c.vibrato, c.snr);
+        TrackScore offline, causal;
+        size_t points = 0;
+        scoreTrackAndFollower(m, offline, causal, points);
+        EXPECT_EQ(points, m.x.size() / 512 - 3);
+        EXPECT_GT(offline.rpa(), c.rpa);
+        EXPECT_GT(offline.accuracy(), c.accuracy);
+        EXPECT_GT(offline.rpa(), causal.rpa() + c.rpaGain);
+        EXPECT_GT(offline.accuracy(), causal.accuracy() + c.accuracyGain);
+        EXPECT_LT(offline.falseAlarmRate(), c.falseAlarms);
+        EXPECT_LT(offline.octaveOff, 2);
+        EXPECT_GT(causal.octaveOff, offline.octaveOff);
+    }
+}
+
+// track() returns one point per detection whose window lies inside the
+// signal, a hop apart from the window's centre on; unvoiced points carry the
+// pitch of the nearest note; signals it cannot read return nothing.
+DSPARK_TEST(PitchFollower_offline_track_points_and_degenerate_inputs)
+{
+    constexpr double fs = 48000.0, kTau = 6.283185307179586;
+    using Follower = PitchFollower<float>;
+    EXPECT_TRUE(Follower::track(std::span<const float>(), fs).empty());
+    const std::vector<float> shortSignal(2047, 0.25f);
+    EXPECT_TRUE(Follower::track(shortSignal, fs).empty());
+    const std::vector<float> silence(48000, 0.0f);
+    EXPECT_TRUE(Follower::track(silence, 0.0).empty());
+    EXPECT_TRUE(Follower::track(silence, std::numeric_limits<double>::quiet_NaN()).empty());
+    Follower::TrackSettings inverted;
+    inverted.minHz = 500.0f;
+    inverted.maxHz = 100.0f;
+    EXPECT_TRUE(Follower::track(silence, fs, inverted).empty());
+
+    const auto quiet = Follower::track(silence, fs);
+    EXPECT_EQ(quiet.size(), size_t(48000 / 512 - 3));
+    bool allUnvoiced = !quiet.empty();
+    for (const auto& p : quiet)
+        allUnvoiced = allUnvoiced && !p.voiced && p.frequencyHz == 0.0f && p.confidence == 0.0f;
+    EXPECT_TRUE(allUnvoiced);
+
+    // 0.3 s of silence, 0.5 s at 220 Hz, 0.3 s of silence, 0.5 s at 330 Hz,
+    // 0.3 s of silence.
+    const int n = static_cast<int>(1.9 * fs);
+    const auto noteAt = [&](int i) {
+        const double t = i / fs;
+        return (t >= 0.3 && t < 0.8) ? 220.0 : (t >= 1.1 && t < 1.6) ? 330.0 : 0.0;
+    };
+    std::vector<float> x(static_cast<size_t>(n), 0.0f);
+    std::vector<double> xd(static_cast<size_t>(n), 0.0);
+    for (int i = 0; i < n; ++i)
+    {
+        const double hz = noteAt(i);
+        if (hz > 0.0) xd[static_cast<size_t>(i)] = 0.5 * std::sin(kTau * hz * i / fs);
+        x[static_cast<size_t>(i)] = static_cast<float>(xd[static_cast<size_t>(i)]);
+    }
+    const auto points = Follower::track(x, fs);
+    const auto pointsDouble = PitchFollower<double>::track(xd, fs);
+    EXPECT_EQ(points.size(), size_t(n / 512 - 3));
+    EXPECT_EQ(pointsDouble.size(), points.size());
+    if (points.size() != size_t(n / 512 - 3) || pointsDouble.size() != points.size()) return;
+
+    EXPECT_NEAR(points.front().seconds, 1024.0 / fs, 1e-12);
+    bool spaced = true, insideRight = true, outsideRight = true, carried = true, sameVoicing = true;
+    for (size_t k = 0; k < points.size(); ++k)
+    {
+        const auto& p = points[k];
+        if (k > 0) spaced = spaced && std::abs(p.seconds - points[k - 1].seconds - 512.0 / fs) < 1e-12;
+        sameVoicing = sameVoicing && p.voiced == pointsDouble[k].voiced;
+        const int centre = static_cast<int>(std::lround(p.seconds * fs));
+        // The window of this detection: wholly inside a note, or far from one.
+        const double first = noteAt(std::max(centre - 1024, 0)), last = noteAt(std::min(centre + 1023, n - 1));
+        const double nearBefore = noteAt(std::max(centre - 1024 - 3 * 512, 0));
+        const double nearAfter = noteAt(std::min(centre + 1023 + 3 * 512, n - 1));
+        const double hz = static_cast<double>(p.frequencyHz);
+        if (first > 0.0 && first == last && noteAt(centre) == first)
+            insideRight = insideRight && p.voiced && std::abs(1200.0 * std::log2(hz / first)) < 5.0;
+        else if (first == 0.0 && last == 0.0 && nearBefore == 0.0 && nearAfter == 0.0 && noteAt(centre) == 0.0)
+        {
+            outsideRight = outsideRight && !p.voiced;
+            // An unvoiced point carries the nearest note: 220 Hz before the
+            // middle of the gap between the notes, 330 Hz after it.
+            const double expected = (p.seconds < 0.90) ? 220.0 : (p.seconds > 1.00) ? 330.0 : 0.0;
+            if (expected > 0.0) carried = carried && std::abs(1200.0 * std::log2(hz / expected)) < 50.0;
+        }
+    }
+    EXPECT_TRUE(spaced);
+    EXPECT_TRUE(insideRight);
+    EXPECT_TRUE(outsideRight);
+    EXPECT_TRUE(carried);
+    EXPECT_TRUE(sameVoicing);
 }

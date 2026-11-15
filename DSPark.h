@@ -409,7 +409,7 @@
  * | `AudioIntervalAnalyzer<T>` | Analysis/AudioIntervalAnalyzer.h | Exact sample intervals with scoped loudness, validity and finite true peak |
  * | `Goertzel<T>`            | Analysis/Goertzel.h       | Single-frequency O(N) magnitude detection    |
  * | `PitchDetector<T>`       | Analysis/PitchDetector.h  | YIN monophonic pitch detection with MIDI/cents output |
- * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source |
+ * | `PitchFollower<T>`       | Analysis/PitchFollower.h  | Gated, octave-safe, glide-smoothed pitch tracking source; offline track decoded over the whole signal |
  * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
  * | `DelayEstimator<T>`      | Analysis/DelayEstimator.h | Delay between two recordings: GCC-PHAT, sub-sample, confidence |
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |

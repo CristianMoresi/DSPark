@@ -35,6 +35,9 @@
  *   faster at high pitches and sluggish at low ones).
  * - **Voicing** - isVoiced() tells whether the latest detection passed the
  *   gates; isTracking() holds for 250 ms after the last one that did.
+ * - **Offline form** - track() reads a whole signal and decodes the pitch
+ *   track over the complete sequence of detections, so it also uses what
+ *   comes after each one (see its description for the measured gain).
  *
  * Measured against an HMM note tracker (the second stage of Mauch & Dixon
  * 2014, decoded causally by its forward filter) on the same material,
@@ -320,7 +323,297 @@ public:
         }
     }
 
+    // -- Offline tracking ------------------------------------------------------------
+
+    /** @brief One detection of an offline pitch track (see track()). */
+    struct TrackPoint
+    {
+        double seconds = 0.0;  ///< Centre of the detection's analysis window.
+        T frequencyHz = T(0);  ///< Pitch; on an unvoiced point, that of the nearest voiced one (0 if none).
+        T confidence = T(0);   ///< The detector's confidence in its own reading there (0: it read nothing).
+        bool voiced = false;   ///< Whether the point belongs to a note.
+    };
+
+    /** @brief Settings of track(). */
+    struct TrackSettings
+    {
+        T minHz = T(60);               ///< Lowest pitch reported.
+        T maxHz = T(1200);             ///< Highest pitch reported.
+        bool noiseSuppression = true;  ///< PitchDetector::setNoiseSuppression().
+        int windowSize = 0;            ///< Analysis window, as prepare(); 0 = automatic.
+    };
+
+    /**
+     * @brief Offline: reads a whole mono signal and decodes its pitch track
+     *        over the complete sequence of detections.
+     *
+     * The follower judges every detection with the past alone, so a note
+     * change costs it a detection of confirmation, an octave error can only
+     * be folded towards what came before, and a detection the detector
+     * declines stays empty. With the whole sequence known, every detection
+     * offers its own reading, the octaves of it, the readings of the three
+     * detections on each side and the line between them, and the track is the
+     * cheapest path through those and "unvoiced" (a Viterbi decode): a pitch
+     * change costs its size up to six semitones, another octave of a reading
+     * or a neighbour's pitch a fixed amount, and entering or leaving a note
+     * more than filling a gap of a few detections. The detection before a
+     * note's first reading joins the note: the detector does not read a
+     * window until the note fills it.
+     *
+     * Measured at 48 kHz on the material of the class description, against
+     * the follower at its best settings there and against the HMM note
+     * tracker decoded over the whole file (Viterbi). Frames within 50 cents
+     * (RPA) / overall accuracy (voicing and pitch right) / voicing false
+     * alarms: clean legato 95.2 / 95.3 / 2.4% (follower 93.7 / 94.2 / 1.9,
+     * HMM 94.2 / 94.3 / 5.1); 100 cents of vibrato 95.7 / 95.7 / 4.0
+     * (94.6 / 94.8 / 2.9, HMM 95.0 / 94.7 / 5.6); 5 dB SNR white noise
+     * 96.7 / 96.2 / 0.0 (93.7 / 93.8 / 0.0, HMM 95.1 / 94.8 / 4.7); 5 dB
+     * pink noise 96.4 / 96.0 / 0.3 (91.0 / 87.8 / 0.3, HMM 95.1 / 95.1 /
+     * 4.3); 0 dB white noise 92.3 / 91.5 / 1.6 (86.2 / 87.3 / 0.0, HMM
+     * none); tones with a fundamental 15 dB below their partials 100 / 99.5
+     * / 0.6 (97.8 / 98.0 / 0.6, HMM 99.8 / 98.4 / 6.9). Octave errors: at
+     * most 0.2% of voiced frames (follower up to 2.6%).
+     *
+     * Not real-time: it allocates (the result, one detector and about 200
+     * bytes per detection for the decode) and runs on the calling thread.
+     * Any thread; it shares no state with a follower instance.
+     *
+     * @param mono       Mono samples of the whole signal.
+     * @param sampleRate Sample rate in Hz.
+     * @param settings   Range, noise suppression and analysis window.
+     * @return One point per detection whose window lies inside the signal
+     *         (one every quarter of the window), in time order. Empty for an
+     *         invalid rate or range, or a signal shorter than the window.
+     */
+    [[nodiscard]] static std::vector<TrackPoint> track(std::span<const T> mono, double sampleRate,
+                                                       const TrackSettings& settings)
+    {
+        std::vector<TrackPoint> points;
+        if (!std::isfinite(sampleRate) || sampleRate <= 0.0) return points;
+        const double minHz = static_cast<double>(settings.minHz), maxHz = static_cast<double>(settings.maxHz);
+        if (!(std::isfinite(minHz) && std::isfinite(maxHz) && minHz > 0.0 && maxHz >= minHz)) return points;
+
+        PitchDetector<T> detector;
+        detector.prepare(sampleRate, settings.windowSize, (settings.windowSize > 0) ? settings.windowSize / 4 : 0);
+        detector.setNoiseSuppression(settings.noiseSuppression);
+        const std::size_t window = static_cast<std::size_t>(std::max(detector.getWindowSize(), 1));
+        const std::size_t hop = static_cast<std::size_t>(std::max(detector.getHopSize(), 1));
+        if (mono.size() < window) return points;
+
+        // One reading per detection: the detector fires at the end of each hop.
+        const std::size_t hops = mono.size() / hop;
+        std::vector<TrackReading> readings;
+        readings.reserve(hops);
+        points.reserve(hops);
+        for (std::size_t k = 0; k < hops; ++k)
+        {
+            detector.pushSamples(mono.subspan(k * hop, hop));
+            const std::size_t end = (k + 1) * hop;
+            if (end < window) continue;   // the window still reaches before the signal
+            const double hz = static_cast<double>(detector.getFrequencyHz());
+            TrackReading reading;
+            TrackPoint point;
+            point.seconds = (static_cast<double>(end) - 0.5 * static_cast<double>(window)) / sampleRate;
+            if (hz >= minHz && hz <= maxHz)
+            {
+                reading.voiced = true;
+                reading.semitones = 12.0 * std::log2(hz / 440.0);
+                reading.confidence = static_cast<double>(detector.getConfidence());
+                point.confidence = detector.getConfidence();
+            }
+            readings.push_back(reading);
+            points.push_back(point);
+        }
+        decodeTrack(readings, 12.0 * std::log2(minHz / 440.0), 12.0 * std::log2(maxHz / 440.0), points);
+        return points;
+    }
+
+    /** @brief track() with the default settings (60 to 1200 Hz, noise
+     *         suppression on, automatic window).
+     *  @param mono       Mono samples of the whole signal.
+     *  @param sampleRate Sample rate in Hz.
+     *  @return The decoded track (see the other overload). */
+    [[nodiscard]] static std::vector<TrackPoint> track(std::span<const T> mono, double sampleRate)
+    {
+        return track(mono, sampleRate, TrackSettings{});
+    }
+
 private:
+    // -- Offline decode (see track()) -------------------------------------------------
+
+    /// One detection as the decode reads it.
+    struct TrackReading
+    {
+        double semitones = 0.0;   ///< Pitch re 440 Hz.
+        double confidence = 0.0;
+        bool voiced = false;
+    };
+
+    static constexpr int kTrackReach = 3;                             ///< Detections a pitch is borrowed from, each side.
+    static constexpr int kTrackCandidates = 4 + 2 * kTrackReach;      ///< Reading, two octaves, neighbours, the line between.
+    static constexpr double kTrackOwn = 4.0;            ///< A reading, times one minus its confidence.
+    static constexpr double kTrackOctave = 1.0;         ///< Another octave of the reading.
+    static constexpr double kTrackBorrowVoiced = 3.0;   ///< A neighbour's pitch where the detector read another.
+    static constexpr double kTrackBorrowSilent = 0.5;   ///< A neighbour's pitch where it read nothing.
+    static constexpr double kTrackBorrowStep = 0.5;     ///< ... per detection of distance beyond the first.
+    static constexpr double kTrackUnvoicedBase = 1.0;   ///< Calling a detection with a reading unvoiced,
+    static constexpr double kTrackUnvoicedConf = 4.0;   ///< ... plus this times its confidence.
+    static constexpr double kTrackEdge = 0.5;           ///< Leaving the detection before a first reading unvoiced.
+    static constexpr double kTrackSwitch = 4.0;         ///< Entering or leaving a note.
+    static constexpr double kTrackPerSemitone = 1.0;    ///< A pitch change, per semitone,
+    static constexpr double kTrackJumpCap = 6.0;        ///< ... up to this many.
+    static constexpr double kTrackSame = 0.25;          ///< Candidates this close (semitones) are one.
+    static constexpr double kTrackLine = 2.0;           ///< Neighbours this close are joined by a line.
+
+    /// The candidates of one detection and where each one's best path came from.
+    struct TrackFrame
+    {
+        double semitones[kTrackCandidates] = {};
+        double cost[kTrackCandidates] = {};
+        std::uint8_t back[kTrackCandidates + 1] = {};   ///< State 0 is unvoiced, i + 1 candidate i.
+        std::uint8_t count = 0;
+        double unvoicedCost = 0.0;
+
+        void add(double st, double c) noexcept
+        {
+            for (int i = 0; i < count; ++i)
+                if (std::abs(semitones[i] - st) < kTrackSame)
+                {
+                    cost[i] = std::min(cost[i], c);
+                    return;
+                }
+            if (count < kTrackCandidates)
+            {
+                semitones[count] = st;
+                cost[count] = c;
+                ++count;
+            }
+        }
+    };
+
+    /** Decodes the readings over the whole sequence and writes the pitch and
+     *  the voicing of every point (see track()). */
+    static void decodeTrack(const std::vector<TrackReading>& readings, double minSemitones, double maxSemitones,
+                            std::vector<TrackPoint>& points)
+    {
+        const std::ptrdiff_t total = static_cast<std::ptrdiff_t>(readings.size());
+        if (total == 0) return;
+        const auto at = [&](std::ptrdiff_t k) -> const TrackReading& { return readings[static_cast<std::size_t>(k)]; };
+
+        std::vector<TrackFrame> frames(readings.size());
+        for (std::ptrdiff_t k = 0; k < total; ++k)
+        {
+            TrackFrame& frame = frames[static_cast<std::size_t>(k)];
+            const TrackReading& own = at(k);
+            if (own.voiced)
+            {
+                const double cost = kTrackOwn * (1.0 - own.confidence);
+                frame.add(own.semitones, cost);
+                if (own.semitones - 12.0 >= minSemitones) frame.add(own.semitones - 12.0, cost + kTrackOctave);
+                if (own.semitones + 12.0 <= maxSemitones) frame.add(own.semitones + 12.0, cost + kTrackOctave);
+                frame.unvoicedCost = kTrackUnvoicedBase + kTrackUnvoicedConf * own.confidence;
+            }
+            else if (k + 1 < total && at(k + 1).voiced)
+            {
+                frame.unvoicedCost = kTrackEdge;
+            }
+            const double borrow = own.voiced ? kTrackBorrowVoiced : kTrackBorrowSilent;
+            std::ptrdiff_t left = -1, right = -1;
+            for (std::ptrdiff_t d = 1; d <= kTrackReach; ++d)
+            {
+                const double distant = borrow + kTrackBorrowStep * static_cast<double>(d - 1);
+                if (k - d >= 0 && at(k - d).voiced)
+                {
+                    if (left < 0) left = k - d;
+                    frame.add(at(k - d).semitones, distant);
+                }
+                if (k + d < total && at(k + d).voiced)
+                {
+                    if (right < 0) right = k + d;
+                    // The detection before a first reading takes it at no cost.
+                    frame.add(at(k + d).semitones, (!own.voiced && d == 1) ? 0.0 : distant);
+                }
+            }
+            if (left >= 0 && right >= 0 && std::abs(at(left).semitones - at(right).semitones) < kTrackLine)
+            {
+                const double w = static_cast<double>(k - left) / static_cast<double>(right - left);
+                frame.add(at(left).semitones + (at(right).semitones - at(left).semitones) * w,
+                          borrow + kTrackBorrowStep * static_cast<double>(std::min(k - left, right - k) - 1));
+            }
+        }
+
+        // Viterbi over "unvoiced" and each detection's candidates.
+        double best[kTrackCandidates + 1] = {}, next[kTrackCandidates + 1] = {};
+        best[0] = frames[0].unvoicedCost;
+        for (int i = 0; i < frames[0].count; ++i) best[i + 1] = frames[0].cost[i];
+        for (std::size_t k = 1; k < frames.size(); ++k)
+        {
+            const TrackFrame& before = frames[k - 1];
+            TrackFrame& frame = frames[k];
+            {
+                double low = best[0];
+                int from = 0;
+                for (int i = 0; i < before.count; ++i)
+                {
+                    const double v = best[i + 1] + kTrackSwitch;
+                    if (v < low) { low = v; from = i + 1; }
+                }
+                next[0] = low + frame.unvoicedCost;
+                frame.back[0] = static_cast<std::uint8_t>(from);
+            }
+            for (int j = 0; j < frame.count; ++j)
+            {
+                double low = best[0] + kTrackSwitch;
+                int from = 0;
+                for (int i = 0; i < before.count; ++i)
+                {
+                    const double v = best[i + 1]
+                        + kTrackPerSemitone * std::min(std::abs(frame.semitones[j] - before.semitones[i]), kTrackJumpCap);
+                    if (v < low) { low = v; from = i + 1; }
+                }
+                next[j + 1] = low + frame.cost[j];
+                frame.back[j + 1] = static_cast<std::uint8_t>(from);
+            }
+            std::copy(next, next + frame.count + 1, best);
+        }
+
+        // Walk the cheapest path back; unvoiced points keep the pitch of the
+        // nearest voiced one (the earlier one when two are as near).
+        int state = 0;
+        for (int i = 1; i <= frames.back().count; ++i)
+            if (best[i] < best[state]) state = i;
+        for (std::size_t k = frames.size(); k-- > 0;)
+        {
+            TrackPoint& point = points[k];
+            point.voiced = state > 0;
+            point.frequencyHz = state > 0
+                ? static_cast<T>(440.0 * std::pow(2.0, frames[k].semitones[state - 1] / 12.0)) : T(0);
+            state = frames[k].back[state];
+        }
+        constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
+        std::size_t voicedAt = kNone;
+        for (std::size_t k = 0; k < points.size(); ++k)
+        {
+            if (points[k].voiced) voicedAt = k;
+            else if (voicedAt != kNone) points[k].frequencyHz = points[voicedAt].frequencyHz;
+        }
+        voicedAt = kNone;
+        std::size_t earlier = kNone;   // the voiced point before the current unvoiced run
+        for (std::size_t k = points.size(); k-- > 0;)
+        {
+            if (points[k].voiced) { voicedAt = k; earlier = kNone; continue; }
+            if (voicedAt == kNone) continue;
+            if (earlier == kNone)
+            {
+                std::size_t j = k;
+                while (j > 0 && !points[j - 1].voiced) --j;
+                earlier = (j > 0) ? j - 1 : kNone - 1;   // kNone - 1: no voiced point before the run
+            }
+            const bool none = earlier == kNone - 1;
+            if (none || voicedAt - k < k - earlier) points[k].frequencyHz = points[voicedAt].frequencyHz;
+        }
+    }
+
     /** @brief Gating, octave correction and jump confirmation on a fresh
      *  detection; the glide and the tracking state on every call. */
     void update(int numSamples, bool freshReading) noexcept

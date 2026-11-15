@@ -335,6 +335,7 @@ inline EffectSlot makeLimiter()
     s.addSlider("Hold", 0, 50, 10, "ms");
     s.addToggle("True Peak", false);
     s.addToggle("Hold Every Peak", false);
+    s.addToggle("True Peak High Precision", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p, inputGainDb](auto b) {
         // Input Gain MUST be applied BEFORE the limiter - otherwise
@@ -362,6 +363,8 @@ inline EffectSlot makeLimiter()
             case 7: p->setTruePeak(v > 0.5f); break;
             case 8: p->setHoldMode(v > 0.5f ? dspark::Limiter<float>::HoldMode::EveryPeak
                                             : dspark::Limiter<float>::HoldMode::Deepest); break;
+            case 9: p->setTruePeakPrecision(v > 0.5f ? dspark::Limiter<float>::TruePeakPrecision::High
+                                                     : dspark::Limiter<float>::TruePeakPrecision::Standard); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

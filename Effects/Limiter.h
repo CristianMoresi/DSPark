@@ -34,8 +34,16 @@
  * white noise +0.77 dB and differentiated white noise +1.10 dB (sample-peak
  * mode: +0.66, +2.56, +5.92 and +4.24 dB). What is left is content above
  * 0.45 of the sample rate, whose crests are built by samples further away
- * than a reading that answers within 33 samples can see. A final clamp at
- * the ceiling remains as a rounding backstop (and covers live ceiling or
+ * than a reading that answers within 33 samples can see.
+ * setTruePeakPrecision(TruePeakPrecision::High) feeds the sidechain with
+ * that analyzer's readings instead and adds the 262 samples they reach back
+ * to the latency. Read with a referee four times as long (a 2048-tap first
+ * stage), the same four programmes come out +0.001, +0.01, +0.21 and
+ * +0.32 dB over the ceiling against +0.004, +0.20, +0.86 and +1.40 dB;
+ * noise with all its energy above 0.42 of the sample rate +0.40 against
+ * +1.51 dB, bursts of a tone at 0.47 of the sample rate +0.01 against
+ * +0.59 dB, a low thump under noise +0.08 against +0.23 dB. A final clamp
+ * at the ceiling remains as a rounding backstop (and covers live ceiling or
  * lookahead changes); true-peak levels are reduced but not mathematically
  * bounded.
  *
@@ -46,7 +54,8 @@
  * Features:
  * - Brickwall limiting (sample peaks never exceed the ceiling)
  * - ISP true-peak detection (4x reconstruction with vertex refinement, plus
- *   the BS.1770 Annex 2 estimate)
+ *   the BS.1770 Annex 2 estimate), and a high-precision reading that
+ *   follows content up to Nyquist for 262 samples of latency
  * - Sliding-minimum gain hold + S-curve attack (artifact-free transients)
  * - CPU-optimized adaptive release (avoids std::exp in hot paths)
  * - Real-time safe parameter updates (lock-free atomics)
@@ -57,7 +66,8 @@
  * safe from any thread; changes are consumed at the next block (or the next
  * channel-0 sample). Non-finite setter arguments are ignored. getLatency()
  * derives from the published lookahead and true-peak parameters, so a host
- * reads the correct value immediately after setLookahead() or setTruePeak().
+ * reads the correct value immediately after setLookahead(), setTruePeak() or
+ * setTruePeakPrecision().
  * getGainReductionDb() is metering:
  * a cross-thread read of a published atomic word (up to one block behind).
  *
@@ -81,6 +91,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 // Keeps the gain computer's rare paths (once per hold block, once per 2^16
@@ -145,9 +156,11 @@ public:
         // later. The sample count is capped in double before the cast (a cast
         // of an out-of-int-range double is undefined behaviour).
         const double maxLaExact = sampleRate_ * kMaxLookaheadMs / 1000.0;
-        // True-peak mode raises the lookahead to at least kTpMinLookahead.
-        const int maxLookaheadSamples = std::max(static_cast<int>(std::min(maxLaExact, 1.0e7)) + 1,
-                                                 kTpMinLookahead + 1);
+        // True-peak mode raises the lookahead to at least kTpMinLookahead; its
+        // high-precision reading adds kTpHighDelay samples to the lookahead
+        // instead (always more than that minimum).
+        const int maxLookaheadSamples = static_cast<int>(std::min(maxLaExact, 1.0e7)) + 1 + kTpHighDelay;
+        static_assert(kTpHighDelay > kTpMinLookahead, "the high-precision lookahead covers the standard minimum");
 
         // Use the clamped count: a degenerate numChannels (<= 0, or negative cast
         // to size_t, or > kMaxChannels) must neither under-allocate (which would
@@ -176,6 +189,11 @@ public:
         // Long-kernel true-peak estimator: per-channel histories (the kernel
         // is designed by the estimator itself).
         tpChannels_.assign(static_cast<size_t>(numChannels_), typename TpEstimator::Channel {});
+        // High-precision reading: the analyzer (kernels and scratch) and its
+        // per-channel histories, allocated whether or not the mode is on so
+        // setTruePeakPrecision() can switch it during playback.
+        if (!tpAnalyzer_) tpAnalyzer_ = std::make_unique<TpAnalyzer>();
+        tpHighChannels_.assign(static_cast<size_t>(numChannels_), typename TpAnalyzer::Channel {});
 
         if (std::isfinite(initialLookaheadMs) && initialLookaheadMs > 0.0)
             lookaheadMs_.store(std::clamp(static_cast<T>(initialLookaheadMs),
@@ -262,15 +280,24 @@ public:
             const int n = std::min(kChunk, nS - start);
 
             // Pass 1: linked peak detection (loudest channel per frame).
+            const bool aligned = isp && tpHighApplied_;
             std::fill(chunkPeak_, chunkPeak_ + n, T(0));
+            if (aligned)
+            {
+                std::fill(chunkAnnex_, chunkAnnex_ + n, T(0));
+                std::fill(chunkSlow_, chunkSlow_ + n, T(0));
+            }
             for (int ch = 0; ch < nCh; ++ch)
             {
                 const T* x = chData[ch] + start;
                 for (int i = 0; i < n; ++i)
                     chunkPeak_[i] = std::max(chunkPeak_[i], std::abs(x[i])); // NaN is ignored
                 if (isp)
-                    detectTruePeak(x, n, ch, chunkPeak_);
+                    detectTruePeak(x, n, ch, chunkPeak_, chunkAnnex_, chunkSlow_);
             }
+            if (aligned)
+                for (int i = 0; i < n; ++i)
+                    chunkPeak_[i] = alignHighReadings(chunkPeak_[i], chunkAnnex_[i], chunkSlow_[i]);
 
             // Pass 2: ceiling smoother, lookahead glide and gain computer.
             for (int i = 0; i < n; ++i)
@@ -361,8 +388,9 @@ public:
 
         delayLines_[channel].push(input);
         T chPeak = std::abs(input);
+        T chAnnex = T(0), chSlow = T(0);
         if (isp)
-            detectTruePeak(&input, 1, channel, &chPeak);
+            detectTruePeak(&input, 1, channel, &chPeak, &chAnnex, &chSlow);
 
         // The gain computer advances on channel 0. Peaks of the other channels
         // reach it on the next frame (they are processed after channel 0), so
@@ -371,13 +399,20 @@ public:
         if (channel == 0)
         {
             const T relMs = std::max(releaseMs_.load(std::memory_order_relaxed), T(1));
-            advanceGain(std::max(chPeak, pendingPeak_), ceiling, adaptive, relMs);
+            T peak = std::max(chPeak, pendingPeak_);
+            if (isp && tpHighApplied_)
+                peak = alignHighReadings(peak, std::max(chAnnex, pendingAnnex_), std::max(chSlow, pendingSlow_));
+            advanceGain(peak, ceiling, adaptive, relMs);
             pendingPeak_ = T(0);
+            pendingAnnex_ = T(0);
+            pendingSlow_ = T(0);
             publishedGain_.store(currentGain_, std::memory_order_relaxed);
         }
-        else if (chPeak > pendingPeak_)
+        else
         {
-            pendingPeak_ = chPeak;
+            if (chPeak > pendingPeak_) pendingPeak_ = chPeak;
+            if (chAnnex > pendingAnnex_) pendingAnnex_ = chAnnex;
+            if (chSlow > pendingSlow_) pendingSlow_ = chSlow;
         }
 
         T out = delayLines_[channel].read(sampleLookNow_) * currentGain_;
@@ -397,10 +432,14 @@ public:
     {
         for (auto& dl : delayLines_) dl.reset();
         for (auto& state : tpChannels_) state = {};
+        for (auto& state : tpHighChannels_) state = {};
+        resetHighAlignment();
         currentGain_ = T(1);
         publishedGain_.store(T(1), std::memory_order_relaxed);
         limitingDuration_ = 0;
         pendingPeak_ = T(0);
+        pendingAnnex_ = T(0);
+        pendingSlow_ = T(0);
         resetGainComputer();
         lookaheadCurrent_ = static_cast<T>(lookaheadSamples_);
         ceilingSmooth_.skip();
@@ -441,7 +480,8 @@ public:
      *       pointers up to the max memory allocated during prepare(); the read
      *       offset glides to the new value at one sample per sample. Non-finite
      *       values are ignored. getLatency() reflects the new value immediately.
-     *       In true-peak mode the lookahead is at least 49 samples.
+     *       In true-peak mode the lookahead is at least 49 samples (standard
+     *       precision) or 262 samples longer than set (high precision).
      *
      * @param ms Lookahead in milliseconds (clamped to 0.5 to 10.0 ms).
      */
@@ -478,6 +518,58 @@ public:
     {
         truePeakEnabled_.store(enabled, std::memory_order_relaxed);
         lookaheadDirty_.store(true, std::memory_order_release);
+    }
+
+    /** Which reading true-peak mode feeds the sidechain with. */
+    enum class TruePeakPrecision
+    {
+        /// The 64-tap reading that answers within 33 samples, taken out of
+        /// the lookahead: accurate up to 0.45 of the sample rate. The
+        /// default.
+        Standard,
+        /// The reading of TruePeakAnalyzer (an 8x grid from a 512-tap first
+        /// stage), which also follows content between 0.45 of the sample
+        /// rate and Nyquist. It reaches 262 samples back and they are added
+        /// to the latency, so the lookahead is all attack ramp as in
+        /// sample-peak mode.
+        High
+    };
+
+    /**
+     * @brief Selects the true-peak reading (see TruePeakPrecision). RT-Safe.
+     *
+     * Only acts while setTruePeak() is on. With High, getLatency() is the
+     * lookahead plus 262 samples (5.5 ms more at 48 kHz) and the 49-sample
+     * floor of Standard does not apply. Every reading is held back until
+     * the slowest one of its sample has arrived, so none turns the gain
+     * down early: where both precisions read the same the output is as loud
+     * as in Standard or louder (a dense mix driven 12 dB over the ceiling,
+     * 0.05 dB), and where Standard reads low High is quieter by what
+     * Standard let through (white noise 0.25 dB); the file description
+     * gives the overshoot of both. The intermodulation is that of
+     * sample-peak mode at the same lookahead (60 Hz + 7 kHz at the default:
+     * -63.0 dBc, double -58.9, against -61.9 and -61.5). Detection costs
+     * about 1.8 times Standard's per frame (2.1 in double), and prepare()
+     * allocates its kernels (5 KB in float, 10 KB in double) and 6 KB (11 KB)
+     * of history per channel whether or not it is used. Switching it during
+     * playback moves the latency like a lookahead change; the reading's
+     * histories are rebuilt from the delay lines, so the output afterwards
+     * is that of a limiter that had it on all along.
+     *
+     * @param precision Reading to use; out-of-range values fall back to
+     *                  Standard.
+     */
+    void setTruePeakPrecision(TruePeakPrecision precision) noexcept
+    {
+        truePeakPrecision_.store(precision == TruePeakPrecision::High ? 1 : 0, std::memory_order_relaxed);
+        lookaheadDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return The selected true-peak reading. */
+    [[nodiscard]] TruePeakPrecision getTruePeakPrecision() const noexcept
+    {
+        return truePeakPrecision_.load(std::memory_order_relaxed) == 1 ? TruePeakPrecision::High
+                                                                       : TruePeakPrecision::Standard;
     }
 
     /** @brief Enables program-dependent adaptive release. RT-Safe.
@@ -568,12 +660,14 @@ public:
      * is correct immediately after setLookahead() or setTruePeak() from any
      * thread (the audio thread may consume the change one block later; the
      * glide covers the transition). In true-peak mode the lookahead is at
-     * least 49 samples (about 1 ms at 48 kHz).
+     * least 49 samples (about 1 ms at 48 kHz); with its high-precision
+     * reading it is the set lookahead plus 262 samples.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed),
-                                   truePeakEnabled_.load(std::memory_order_relaxed));
+        const bool truePeak = truePeakEnabled_.load(std::memory_order_relaxed);
+        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), truePeak,
+                                   truePeak && truePeakPrecision_.load(std::memory_order_relaxed) == 1);
     }
 
     /** @brief Current gain reduction in dB (metering).
@@ -601,6 +695,7 @@ public:
         w.write("safetyClip", safetyClipEnabled_.load(std::memory_order_relaxed));
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
         w.write("holdMode", static_cast<int32_t>(holdMode_.load(std::memory_order_relaxed)));
+        w.write("truePeakPrecision", static_cast<int32_t>(truePeakPrecision_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -618,6 +713,8 @@ public:
         // A blob written before the hold existed was rendered without one.
         setHold(static_cast<T>(r.read("hold", 0.0f)));
         setHoldMode(r.read("holdMode", int32_t(0)) == 1 ? HoldMode::EveryPeak : HoldMode::Deepest);
+        setTruePeakPrecision(r.read("truePeakPrecision", int32_t(0)) == 1 ? TruePeakPrecision::High
+                                                                         : TruePeakPrecision::Standard);
         return true;
     }
 
@@ -647,13 +744,112 @@ protected:
     static constexpr int kTpMinLookahead = kTpDelay + 16;     ///< Leaves at least a 16-sample ramp.
     static_assert(kChunk <= TpEstimator::kChunk, "one processBlock() chunk per estimator call");
 
-    /** Raises peak[i] to the true-peak reading of each of n (<= kChunk)
-     *  samples of channel ch: the long-kernel estimate and the ITU-R BS.1770
-     *  Annex 2 one. The per-sample path calls it with n == 1; every output
-     *  runs the same arithmetic either way. */
-    void detectTruePeak(const T* x, int n, int ch, T* peak) noexcept
+    // ---- High-precision true-peak reading ------------------------------------
+    //
+    // TruePeakAnalyzer's per-sample readings: a 512-tap first stage follows
+    // the content between 0.45 fs and Nyquist that the 64-tap estimate cannot.
+    // The reading at frame n covers the reconstruction around
+    // x[n - 261] .. x[n - 260] and the crest centred an eighth of a sample
+    // before it, so it concerns the samples n - 262 .. n - 260. That reach
+    // goes to the latency (the lookahead parameter stays all ramp, as in
+    // sample-peak mode), and the readings that arrive sooner (the sample
+    // peak, the BS.1770 Annex 2 estimate) wait for it in alignHighReadings():
+    // the gain computer receives, kTpHighDelay frames late, one peak per
+    // sample that holds everything known about that sample, so no reading
+    // turns the gain down before its own sample.
+    using TpAnalyzer = TruePeakAnalyzer<T>;
+    static constexpr int kTpHighDelay = TpAnalyzer::getDelay() + 1;  ///< Samples a high-precision reading reaches back.
+    static constexpr int kAnnexWindow = TruePeakDetector<T, 1>::getTaps(); ///< Samples one Annex 2 reading is formed from.
+    static constexpr int kAlignFast = kTpHighDelay - (kAnnexWindow - 1);   ///< Delay of the fast readings.
+    static constexpr int kAlignRing = 256;                                 ///< Power of two above kAlignFast.
+    static constexpr int kAlignRecent = 16;                                ///< Power of two holding kAnnexWindow frames.
+    static_assert(kChunk <= TpAnalyzer::kChunk, "one processBlock() chunk per analyzer call");
+    static_assert(kAlignFast > 0 && kAlignFast < kAlignRing && kAnnexWindow <= kAlignRecent
+                  && kAlignRing % kAlignRecent == 0,
+                  "alignment rings hold the fast readings");
+
+    /** True-peak readings of n (<= kChunk) samples of channel ch. Standard
+     *  precision raises peak[i] to the 64-tap estimate and the ITU-R BS.1770
+     *  Annex 2 one. High precision raises slow[i] to the analyzer's reading
+     *  and annex[i] to the Annex 2 one, for alignHighReadings(). The
+     *  per-sample path calls it with n == 1; every output runs the same
+     *  arithmetic either way. */
+    void detectTruePeak(const T* x, int n, int ch, T* peak, T* annex, T* slow) noexcept
     {
-        tpEstimator_.process(tpChannels_[static_cast<size_t>(ch)], x, n, peak, true);
+        if (tpHighApplied_)
+            tpAnalyzer_->process(tpHighChannels_[static_cast<size_t>(ch)], x, n, slow, annex);
+        else
+            tpEstimator_.process(tpChannels_[static_cast<size_t>(ch)], x, n, peak, true);
+    }
+
+    /** One frame of the high-precision alignment: takes this frame's sample
+     *  peak, Annex 2 reading and analyzer reading (loudest channel) and
+     *  returns the peak that concerns the sample kTpHighDelay frames back:
+     *  its own magnitude, every Annex 2 reading formed from it (the twelve
+     *  that follow it) and the three analyzer readings around it. */
+    [[nodiscard]] inline T alignHighReadings(T samplePeak, T annex, T slow) noexcept
+    {
+        // w counts frames modulo the larger ring (a multiple of the smaller).
+        const int w = alignFrame_;
+        alignFrame_ = (alignFrame_ + 1) & (kAlignRing - 1);
+        alignSample_[w & (kAlignRecent - 1)] = samplePeak;
+        alignAnnex_[w & (kAlignRecent - 1)] = annex;
+        // Everything the fast readings know about the sample kAnnexWindow - 1
+        // frames back.
+        T fast = alignSample_[(w + kAlignRecent - (kAnnexWindow - 1)) & (kAlignRecent - 1)];
+        for (int j = 0; j < kAnnexWindow; ++j)
+            fast = std::max(fast, alignAnnex_[(w + kAlignRecent - j) & (kAlignRecent - 1)]); // NaN is ignored
+        alignFast_[w] = fast;
+        T peak = alignFast_[(w + kAlignRing - kAlignFast) & (kAlignRing - 1)];
+        peak = std::max(peak, std::max(slow, std::max(alignSlow_[0], alignSlow_[1])));
+        alignSlow_[1] = alignSlow_[0];
+        alignSlow_[0] = slow;
+        return peak;
+    }
+
+    /** Clears the alignment histories. */
+    void resetHighAlignment() noexcept
+    {
+        std::fill(std::begin(alignSample_), std::end(alignSample_), T(0));
+        std::fill(std::begin(alignAnnex_), std::end(alignAnnex_), T(0));
+        std::fill(std::begin(alignFast_), std::end(alignFast_), T(0));
+        alignSlow_[0] = alignSlow_[1] = T(0);
+        alignFrame_ = 0;
+    }
+
+    /** Rebuilds the high-precision histories when that reading is switched on
+     *  mid-stream: the last samples the delay lines hold run through the
+     *  analyzer and the alignment (the peaks are discarded), so the first
+     *  readings are not formed from stale history and the samples still
+     *  waiting in the delay lines keep their sample peaks. */
+    void seedHighTruePeakHistory() noexcept
+    {
+        const int nCh = std::min(numChannels_, static_cast<int>(delayLines_.size()));
+        if (!tpAnalyzer_ || tpHighChannels_.size() < static_cast<size_t>(nCh)) return;
+        for (int ch = 0; ch < nCh; ++ch)
+            tpHighChannels_[static_cast<size_t>(ch)] = {};
+        resetHighAlignment();
+        // Covers the first-stage kernel and the two short stages behind it.
+        constexpr int kChunks = (TpAnalyzer::kTaps + 2 * kChunk - 1) / kChunk;
+        T block[kChunk];
+        for (int c = kChunks; c > 0; --c)
+        {
+            std::fill(chunkPeak_, chunkPeak_ + kChunk, T(0));
+            std::fill(chunkAnnex_, chunkAnnex_ + kChunk, T(0));
+            std::fill(chunkSlow_, chunkSlow_ + kChunk, T(0));
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const auto& line = delayLines_[static_cast<size_t>(ch)];
+                for (int i = 0; i < kChunk; ++i)
+                {
+                    block[i] = line.read(c * kChunk - 1 - i); // oldest first
+                    chunkPeak_[i] = std::max(chunkPeak_[i], std::abs(block[i])); // NaN is ignored
+                }
+                tpAnalyzer_->process(tpHighChannels_[static_cast<size_t>(ch)], block, kChunk, chunkSlow_, chunkAnnex_);
+            }
+            for (int i = 0; i < kChunk; ++i)
+                (void)alignHighReadings(chunkPeak_[i], chunkAnnex_[i], chunkSlow_[i]);
+        }
     }
 
     /** Refills the estimator histories from the delay lines when true-peak
@@ -676,18 +872,23 @@ protected:
 
     TpEstimator tpEstimator_;                                  ///< Kernel and phase scratch.
     std::vector<typename TpEstimator::Channel> tpChannels_;    ///< Per channel history.
+    std::unique_ptr<TpAnalyzer> tpAnalyzer_;                   ///< High-precision kernels and scratch (prepare()).
+    std::vector<typename TpAnalyzer::Channel> tpHighChannels_; ///< Per channel history of the high-precision reading.
 
     /** Lookahead in samples for a given ms parameter and detection mode
      *  (shared by the audio-side recompute and getLatency() so both always
      *  agree exactly). The product is capped in double before the int cast
      *  (out-of-range casts are UB). True-peak mode needs the estimator's
-     *  kTpDelay samples plus a ramp of at least 16 samples. */
-    [[nodiscard]] int lookaheadSamplesFor(T ms, bool truePeak) const noexcept
+     *  kTpDelay samples plus a ramp of at least 16 samples; its
+     *  high-precision reading adds its whole reach on top, so the lookahead
+     *  parameter is all ramp, as in sample-peak mode. */
+    [[nodiscard]] int lookaheadSamplesFor(T ms, bool truePeak, bool highPrecision) const noexcept
     {
         const double clampedMs = std::clamp(static_cast<double>(ms), 0.5, kMaxLookaheadMs);
         const double exact = sampleRate_ * clampedMs / 1000.0;
         const int samples = std::max(1, static_cast<int>(std::min(exact, 1.0e7)));
-        return truePeak ? std::max(samples, kTpMinLookahead) : samples;
+        if (!truePeak) return samples;
+        return highPrecision ? samples + kTpHighDelay : std::max(samples, kTpMinLookahead);
     }
 
     /** Consumes the published lookahead and true-peak parameters (audio/setup
@@ -696,10 +897,16 @@ protected:
     inline void applyLookaheadTarget() noexcept
     {
         const bool isp = truePeakEnabled_.load(std::memory_order_relaxed);
-        if (isp && !ispApplied_)
+        const bool high = isp && truePeakPrecision_.load(std::memory_order_relaxed) == 1;
+        // A reading that was not running holds stale history: refill it from
+        // the delay lines before it is used.
+        if (isp && high && !(ispApplied_ && tpHighApplied_))
+            seedHighTruePeakHistory();
+        else if (isp && !high && !(ispApplied_ && !tpHighApplied_))
             seedTruePeakHistory();
         ispApplied_ = isp;
-        lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), ispApplied_);
+        tpHighApplied_ = high;
+        lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), isp, high);
         configureGainComputer();
     }
 
@@ -715,7 +922,11 @@ protected:
     // the hold time after it has passed. In ISP mode a reading at n covers
     // x[n - kTpDelay .. n] (the long estimator's interval sits kTpDelay - 1
     // samples back, the BS.1770 estimate inside that range), so the span
-    // shrinks by kTpDelay to cover the earliest of them.
+    // shrinks by kTpDelay to cover the earliest of them. With the
+    // high-precision reading the peak of frame n concerns x[n - kTpHighDelay]
+    // alone (alignHighReadings()), so the span shrinks by kTpHighDelay, the
+    // lookahead is longer by as much and W spans the ramp only: e in
+    // [p + kTpHighDelay, p + L] is at or below what x[p] requires.
 
     /** Sizes the hold window and the two moving averages for the current
      *  lookahead / ISP mode and rebuilds their running sums from history. */
@@ -723,12 +934,15 @@ protected:
     {
         if (histSize_ == 0) return;
         const int L = std::clamp(lookaheadSamples_, 1, histSize_ - 3);
-        const int isp = ispApplied_ ? kTpDelay : 0;
+        const int isp = ispApplied_ ? (tpHighApplied_ ? kTpHighDelay : kTpDelay) : 0;
         const int span = std::max(0, L - isp);          // (a - 1) + (b - 1)
         // EveryPeak: the hold is part of the sliding minimum. Deepest: the
         // minimum spans the lookahead and the hold counter does the rest.
+        // The high-precision peaks arrive aligned, kTpHighDelay frames after
+        // the sample each concerns, so their minimum only spans the ramp.
         const bool everyPeak = lastHoldMode_ == 1;
-        holdLen_ = std::min(L + 1 + (everyPeak ? holdSamples_ : 0), holdHistSize_ - 1);
+        const int window = tpHighApplied_ ? span : L;
+        holdLen_ = std::min(window + 1 + (everyPeak ? holdSamples_ : 0), holdHistSize_ - 1);
         counterHold_ = everyPeak ? 0 : holdSamples_;
         boxA_ = span / 2 + 1;
         boxB_ = span - (boxA_ - 1) + 1;
@@ -943,7 +1157,9 @@ protected:
     int holdLeft_ = 0;               ///< Hold samples left before the release may act.
     int lastHoldMode_ = 0;           ///< Applied HoldMode (0 Deepest, 1 EveryPeak).
     std::atomic<int> holdMode_ { 0 };
+    std::atomic<int> truePeakPrecision_ { 0 };  ///< Published TruePeakPrecision (0 Standard, 1 High).
     bool ispApplied_ = false;        ///< Detection mode the gain computer is sized for.
+    bool tpHighApplied_ = false;     ///< High-precision reading applied (implies ispApplied_).
 
     T currentGain_ = T(1);
     /// Cross-thread metering readout of currentGain_: published once per
@@ -978,8 +1194,19 @@ protected:
     int holdLen_ = 97;
     int sinceResum_ = 0;
     T pendingPeak_ = T(0);           ///< Other channels' peaks for the next processSample() frame.
+    T pendingAnnex_ = T(0);          ///< The same for their Annex 2 readings (high precision).
+    T pendingSlow_ = T(0);           ///< The same for their analyzer readings (high precision).
+
+    // High-precision alignment (see alignHighReadings()).
+    T alignSample_[kAlignRecent] = {};   ///< Recent sample peaks.
+    T alignAnnex_[kAlignRecent] = {};    ///< Recent Annex 2 readings.
+    T alignFast_[kAlignRing] = {};       ///< Fast readings per sample, waiting for the analyzer.
+    T alignSlow_[2] = {};                ///< Last two analyzer readings.
+    int alignFrame_ = 0;                 ///< Frame counter modulo kAlignRing.
 
     // processBlock() chunk scratch (see its three passes).
+    T chunkAnnex_[kChunk] = {};
+    T chunkSlow_[kChunk] = {};
     T chunkPeak_[kChunk] = {};
     T chunkCeiling_[kChunk] = {};
     T chunkGain_[kChunk] = {};

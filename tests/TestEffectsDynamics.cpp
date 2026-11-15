@@ -840,7 +840,7 @@ namespace {
 /// Worst sideband of the 7 kHz tone of a 60 Hz + 7 kHz pair driven 6 dB over
 /// a -6 dB ceiling, in dB re that tone, over the last of two seconds.
 template <class T>
-double limiterSidebandDbc(bool truePeak, double lookaheadMs)
+double limiterSidebandDbc(bool truePeak, double lookaheadMs, bool highPrecision = false)
 {
     constexpr double kTau = 6.283185307179586;
     Limiter<T> lim;
@@ -848,6 +848,7 @@ double limiterSidebandDbc(bool truePeak, double lookaheadMs)
     lim.prepare(48000.0, 1);
     if (lookaheadMs > 0.0) lim.setLookahead(static_cast<T>(lookaheadMs));
     lim.setTruePeak(truePeak);
+    if (highPrecision) lim.setTruePeakPrecision(Limiter<T>::TruePeakPrecision::High);
     const size_t n = 96000;
     std::vector<T> y(n);
     for (size_t i = 0; i < n; ++i)
@@ -976,6 +977,326 @@ DSPARK_TEST(Limiter_true_peak_output_read_on_an_independent_grid)
     // Sample-peak mode leaves the peaks between samples alone.
     EXPECT_GT(overDb(clipped, 6.0, false), 2.0);
     EXPECT_GT(overDb(white, 6.0, false), 4.0);
+}
+
+namespace {
+
+struct LimiterPrecisionRun
+{
+    double overDb;      ///< Output true peak over the ceiling (TruePeakAnalyzer).
+    double annexOverDb; ///< The same as a BS.1770 Annex 2 meter reads it.
+    double rmsDb;       ///< Output level.
+    int latency;
+};
+
+/// A mono double Limiter at the defaults and a -1 dB ceiling over x, scaled
+/// to peak driveDb over the ceiling and followed by silence so the limiter
+/// sees the programme's real end.
+LimiterPrecisionRun limitAndRead(std::vector<double> x, double driveDb, bool truePeak, bool highPrecision)
+{
+    const double ceiling = std::pow(10.0, -1.0 / 20.0);
+    double m = 0.0;
+    for (double v : x) m = std::max(m, std::abs(v));
+    const double scale = ceiling * std::pow(10.0, driveDb / 20.0) / m;
+    for (double& v : x) v *= scale;
+    x.resize(x.size() + 4096, 0.0);
+
+    Limiter<double> lim;
+    lim.setCeiling(-1.0);
+    lim.prepare(48000.0, 1);
+    lim.setTruePeak(truePeak);
+    if (highPrecision) lim.setTruePeakPrecision(Limiter<double>::TruePeakPrecision::High);
+    for (size_t o = 0; o < x.size(); o += 512)
+    {
+        double* ch[1] = { x.data() + o };
+        lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, x.size() - o))));
+    }
+
+    TruePeakAnalyzer<double> analyzer;
+    const auto state = std::make_unique<TruePeakAnalyzer<double>::Channel>();
+    TruePeakDetector<double, 1> annex;
+    double peak = 0.0, annexPeak = 0.0, sum = 0.0;
+    for (size_t o = 0; o < x.size(); o += 128)
+        peak = std::max(peak, analyzer.processMax(*state, x.data() + o,
+                                                  static_cast<int>(std::min<size_t>(128, x.size() - o)), peak));
+    peak = std::max(peak, analyzer.getTailPeak(*state));
+    for (double v : x)
+    {
+        annexPeak = std::max(annexPeak, annex.processSample(v, 0));
+        sum += v * v;
+    }
+    return { 20.0 * std::log10(peak / ceiling), 20.0 * std::log10(annexPeak / ceiling),
+             10.0 * std::log10(sum / static_cast<double>(x.size())), lim.getLatency() };
+}
+
+}   // namespace
+
+// The standard true-peak reading answers within 33 samples and cannot follow
+// content between 0.45 fs and Nyquist, whose crests are built by samples
+// hundreds of positions away. TruePeakPrecision::High reads with
+// TruePeakAnalyzer (a 512-tap first stage) and pays its 262 samples of reach
+// in latency.
+DSPARK_TEST(Limiter_high_precision_true_peak_follows_content_near_nyquist)
+{
+    constexpr double kTau = 6.283185307179586;
+    const size_t n = 96000;
+    std::vector<double> dense(n, 0.0), white(n), bright(n), bursts(n);
+    LimiterTestNoise phases { 0x1234u };
+    for (int k = 0; k < 48; ++k)
+    {
+        const double hz = 40.0 * std::pow(18000.0 / 40.0, k / 47.0);
+        const double phase = 0.5 * kTau * phases.next();
+        const double level = 1.0 / std::sqrt(1.0 + k);
+        for (size_t i = 0; i < n; ++i)
+            dense[i] += level * std::sin(kTau * hz * static_cast<double>(i) / 48000.0 + phase);
+    }
+    LimiterTestNoise noise { 0x9876u };
+    double previous = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        white[i] = noise.next();
+        bright[i] = white[i] - previous;
+        previous = white[i];
+        // Bursts of a 0.47 fs tone: 20 ms on, 20 ms off, abrupt edges.
+        bursts[i] = ((i / 960) % 2 == 0) ? std::sin(kTau * 0.47 * static_cast<double>(i) + 0.3) : 0.0;
+    }
+
+    // Output true peak over the ceiling, Standard and High: white noise
+    // +0.77 and +0.01 dB, its first difference +0.80 and +0.02, the bursts
+    // +0.59 and +0.001, the dense mix (nothing above 0.45 fs) +0.004 and
+    // 0.000 with High 0.05 dB louder: its readings wait for each other, so
+    // none turns the gain down before its own sample.
+    const struct { const std::vector<double>* x; double driveDb; double highBelow; double standardAbove; } cases[] = {
+        { &white, 6.0, 0.10, 0.5 }, { &bright, 6.0, 0.10, 0.5 }, { &bursts, 6.0, 0.05, 0.35 }, { &dense, 12.0, 0.03, -1.0 },
+    };
+    for (const auto& c : cases)
+    {
+        const LimiterPrecisionRun standard = limitAndRead(*c.x, c.driveDb, true, false);
+        const LimiterPrecisionRun high = limitAndRead(*c.x, c.driveDb, true, true);
+        EXPECT_LT(high.overDb, c.highBelow);
+        EXPECT_GT(standard.overDb, c.standardAbove);
+        EXPECT_LT(high.annexOverDb, 0.02);          // an Annex 2 meter agrees
+        EXPECT_EQ(high.latency, standard.latency + 262);
+        if (c.standardAbove < 0.0)
+            EXPECT_GT(high.rmsDb, standard.rmsDb - 0.02);
+    }
+}
+
+// High precision adds the 262 samples its reading reaches back to the
+// latency, so the lookahead stays all attack ramp as in sample-peak mode;
+// below the ceiling the output is the input that many samples late; and the
+// choice travels in the state.
+DSPARK_TEST(Limiter_high_precision_true_peak_latency_ramp_and_state)
+{
+    using Lim = Limiter<double>;
+    const auto high = Lim::TruePeakPrecision::High;
+    {
+        Lim lim;
+        lim.prepare(48000.0, 2);
+        EXPECT_TRUE(lim.getTruePeakPrecision() == Lim::TruePeakPrecision::Standard);
+        EXPECT_EQ(lim.getLatency(), 96);
+        lim.setTruePeakPrecision(high);                // acts with true peak on only
+        EXPECT_EQ(lim.getLatency(), 96);
+        lim.setTruePeak(true);
+        EXPECT_EQ(lim.getLatency(), 96 + 262);
+        lim.setLookahead(0.5);
+        EXPECT_EQ(lim.getLatency(), 24 + 262);          // no 49-sample floor: the ramp is the lookahead
+        lim.setTruePeakPrecision(Lim::TruePeakPrecision::Standard);
+        EXPECT_EQ(lim.getLatency(), 49);
+        lim.setTruePeakPrecision(high);
+        lim.prepare(44100.0, 2);                        // survives a re-preparation
+        EXPECT_TRUE(lim.getTruePeakPrecision() == high);
+        EXPECT_EQ(lim.getLatency(), 22 + 262);
+    }
+
+    // Below the ceiling: the input, getLatency() samples late.
+    {
+        Lim lim;
+        lim.setCeiling(-1.0);
+        lim.prepare(48000.0, 1);
+        lim.setTruePeak(true);
+        lim.setTruePeakPrecision(high);
+        const size_t latency = static_cast<size_t>(lim.getLatency());
+        std::vector<double> x(8000);
+        LimiterTestNoise noise { 0x77u };
+        for (double& v : x) v = 0.25 * noise.next();
+        std::vector<double> y = x;
+        for (size_t o = 0; o < y.size(); o += 300)
+        {
+            double* ch[1] = { y.data() + o };
+            lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(300, y.size() - o))));
+        }
+        double worst = 0.0;
+        for (size_t i = 0; i < y.size(); ++i)
+            worst = std::max(worst, std::abs(y[i] - (i >= latency ? x[i - latency] : 0.0)));
+        EXPECT_LT(worst, 1e-15);
+    }
+
+    // The sample-domain contract at the shortest lookahead: the gain applied
+    // to every sample keeps it at or below the ceiling.
+    {
+        std::vector<double> x(6000);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = 0.5 * std::sin(2.0 * 3.14159265358979 * 1000.0 * static_cast<double>(i) / 48000.0);
+        x[1000] = 2.0;
+        x[1090] = 1.6;
+        x[1400] = -1.9;
+        Lim lim;
+        lim.setCeiling(-1.0);
+        lim.prepare(48000.0, 1);
+        lim.setLookahead(0.5);
+        lim.setTruePeak(true);
+        lim.setTruePeakPrecision(high);
+        const double ceil = decibelsToGain(-1.0);
+        const size_t latency = static_cast<size_t>(lim.getLatency());
+        int hits = 0;
+        for (size_t i = 0; i < x.size(); ++i)
+        {
+            double s = x[i];
+            double* p[1] = { &s };
+            lim.processBlock(AudioBufferView<double>(p, 1, 1));
+            const double gain = decibelsToGain(lim.getGainReductionDb());
+            if (i >= latency && std::abs(x[i - latency]) * gain > ceil * (1.0 + 1e-9)) ++hits;
+        }
+        EXPECT_EQ(hits, 0);
+    }
+
+    // The ramp is the whole lookahead, so the intermodulation is that of
+    // sample-peak mode at the same setting: -63.0 dBc (double -58.9) at the
+    // default against -61.9 (-61.5), -68.1 (-63.9) at 2.7 ms against -66.7
+    // (-66.3). Which crest restarts the hold depends on the last bit of a
+    // reading, hence the spread between float and double.
+    for (const bool wide : { false, true })
+    {
+        const double atDefault = wide ? limiterSidebandDbc<double>(true, 0.0, true) : limiterSidebandDbc<float>(true, 0.0, true);
+        const double longer = wide ? limiterSidebandDbc<double>(true, 2.7, true) : limiterSidebandDbc<float>(true, 2.7, true);
+        EXPECT_LT(atDefault, -54.5);
+        EXPECT_LT(longer, -59.5);
+    }
+
+    // The state carries the choice; a blob without it restores Standard.
+    {
+        Limiter<float> a;
+        a.setTruePeak(true);
+        a.setTruePeakPrecision(Limiter<float>::TruePeakPrecision::High);
+        const auto blob = a.getState();
+        StateReader r(blob.data(), blob.size());
+        EXPECT_EQ(r.read("truePeakPrecision", int32_t(-1)), int32_t(1));
+        Limiter<float> b;
+        EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(b.isTruePeakEnabled());
+        EXPECT_TRUE(b.getTruePeakPrecision() == Limiter<float>::TruePeakPrecision::High);
+
+        Limiter<float> plain;
+        const auto old = plain.getState();
+        EXPECT_TRUE(b.setState(old.data(), old.size()));
+        EXPECT_TRUE(b.getTruePeakPrecision() == Limiter<float>::TruePeakPrecision::Standard);
+    }
+}
+
+// In high precision the per-sample path is bit-identical to the block path
+// for mono (the analyzer runs the same block filters one sample at a time),
+// and the reading can be switched during playback: the histories are rebuilt
+// from the delay lines, so the output after a switch is that of a limiter
+// that had it on all along.
+DSPARK_TEST(Limiter_high_precision_true_peak_per_sample_path_and_live_switch)
+{
+    for (const bool everyPeak : { false, true })
+    {
+        Limiter<float> lb, ls;
+        for (Limiter<float>* l : { &lb, &ls })
+        {
+            l->setCeiling(-6.0f);
+            if (everyPeak) l->setHoldMode(Limiter<float>::HoldMode::EveryPeak);
+            l->prepare(48000.0, 1);
+            l->setTruePeak(true);
+            l->setTruePeakPrecision(Limiter<float>::TruePeakPrecision::High);
+            l->setAdaptiveRelease(true);
+            l->setSafetyClip(true);
+        }
+        const int n = 6000;
+        std::vector<float> in(static_cast<size_t>(n));
+        LimiterTestNoise noise { 0x99u };
+        for (int i = 0; i < n; ++i)
+            in[static_cast<size_t>(i)] = static_cast<float>(0.05 * std::sin(6.283185307179586 * 330.0 * i / 48000.0)
+                                                            + (i % 997 == 500 ? 1.0 : 0.0) + 0.4 * noise.next());
+        std::vector<float> blockOut = in;
+        const int sizes[] = { 512, 37, 300, 1, 129, 700 };
+        for (int off = 0, k = 0; off < n; ++k)
+        {
+            const int len = std::min(sizes[k % 6], n - off);
+            float* p[1] = { blockOut.data() + off };
+            lb.processBlock(AudioBufferView<float>(p, 1, len));
+            off += len;
+        }
+        float maxDiff = 0.0f;
+        for (int i = 0; i < n; ++i)
+            maxDiff = std::max(maxDiff, std::abs(ls.processSample(in[static_cast<size_t>(i)], 0) - blockOut[static_cast<size_t>(i)]));
+        EXPECT_TRUE(maxDiff == 0.0f);
+        const float ceiling = decibelsToGain(-6.0f);
+        for (int i = 0; i < n; ++i)
+            EXPECT_TRUE(std::abs(blockOut[static_cast<size_t>(i)]) <= ceiling + 1e-6f);
+    }
+
+    // Switching during playback.
+    {
+        const size_t n = 96000, from = 140 * 512;
+        const double ceiling = std::pow(10.0, -1.0 / 20.0);
+        std::vector<double> x(n);
+        LimiterTestNoise noise { 0x9876u };
+        for (double& v : x) v = 2.0 * ceiling * noise.next();
+        using Lim = Limiter<double>;
+        const auto run = [&](bool switching) {
+            Lim lim;
+            lim.setCeiling(-1.0);
+            lim.prepare(48000.0, 1);
+            if (!switching)
+            {
+                lim.setTruePeak(true);
+                lim.setTruePeakPrecision(Lim::TruePeakPrecision::High);
+            }
+            std::vector<double> y = x;
+            int block = 0;
+            for (size_t o = 0; o < n; o += 512, ++block)
+            {
+                if (switching)
+                {
+                    if (block == 20) lim.setTruePeak(true);
+                    if (block == 50) lim.setTruePeakPrecision(Lim::TruePeakPrecision::High);
+                    if (block == 90) lim.setTruePeakPrecision(Lim::TruePeakPrecision::Standard);
+                    if (block == 110) { lim.setTruePeak(false); lim.setTruePeakPrecision(Lim::TruePeakPrecision::High); }
+                    if (block == 130) lim.setTruePeak(true);
+                }
+                double* ch[1] = { y.data() + o };
+                lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, n - o))));
+            }
+            return y;
+        };
+        const auto peakFrom = [&](const std::vector<double>& y) {
+            TruePeakAnalyzer<double> analyzer;
+            const auto state = std::make_unique<TruePeakAnalyzer<double>::Channel>();
+            double peak = 0.0;
+            for (size_t o = from; o < n; o += 128)
+                peak = std::max(peak, analyzer.processMax(*state, y.data() + o,
+                                                          static_cast<int>(std::min<size_t>(128, n - o)), peak));
+            return 20.0 * std::log10(peak / ceiling);
+        };
+        const std::vector<double> switched = run(true);
+        const std::vector<double> always = run(false);
+        bool finite = true;
+        double worstSample = 0.0;
+        for (double v : switched)
+        {
+            finite = finite && std::isfinite(v);
+            worstSample = std::max(worstSample, std::abs(v));
+        }
+        EXPECT_TRUE(finite);
+        EXPECT_LT(worstSample, ceiling * (1.0 + 1e-9));
+        // +0.013 dB over the ceiling after the last switch, as with the
+        // reading on from the start.
+        EXPECT_LT(peakFrom(switched), 0.08);
+        EXPECT_NEAR(peakFrom(switched), peakFrom(always), 0.03);
+    }
 }
 
 

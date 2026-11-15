@@ -6,6 +6,35 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Limiter::setTruePeakPrecision(TruePeakPrecision::High)` (opt-in; the
+  default `Standard` is unchanged): true-peak mode reads with
+  `TruePeakAnalyzer` (an 8x grid from a 512-tap first stage) instead of the
+  64-tap reading that answers within 33 samples, and follows the content
+  between 0.45 of the sample rate and Nyquist that the short reading cannot.
+  The 262 samples the reading reaches back are added to `getLatency()`
+  (5.5 ms more at 48 kHz) and the lookahead stays all attack ramp, as in
+  sample-peak mode. Output true peak over a -1 dB ceiling at the defaults,
+  read with a referee four times as long (a 2048-tap first stage), `High`
+  against `Standard`: white noise +0.21 against +0.86 dB, its first
+  difference +0.32 against +1.40, noise above 0.42 of the sample rate +0.40
+  against +1.51, bursts of a tone at 0.47 of the sample rate +0.01 against
+  +0.59, a hard-clipped 5 kHz tone +0.01 against +0.20, a low thump under
+  noise +0.08 against +0.23, a 48-partial mix +0.001 against +0.004. Every
+  reading waits for the slowest one of its sample, so none turns the gain
+  down early: the dense mix comes out 0.05 dB louder than in `Standard`, and
+  material `Standard` reads low comes out quieter by what it let through
+  (white noise 0.25 dB). Intermodulation as in sample-peak mode at the same
+  lookahead (60 Hz + 7 kHz at the default: -63.0 dBc, double -58.9, against
+  -61.9 and -61.5). Detection costs about 1.8 times `Standard`'s per frame
+  (2.1 in double). `prepare()` now allocates the reading's kernels and
+  histories and the gain histories of the longer lookahead whether or not
+  the mode is used: 25 KB more for float stereo at 48 kHz, 41 KB in double.
+  The state carries the choice (`truePeakPrecision`; older blobs restore
+  `Standard`), and the reading can be switched during playback.
+- `TruePeakAnalyzer::process()`: the analyzer's readings one per input
+  sample (the largest of them is what `processMax()` keeps), with the BS.1770
+  Annex 2 reading as a separate output, for a detector that can wait 262
+  samples for them.
 - `PitchFollower::track(mono, sampleRate[, settings])` (static, offline):
   reads a whole mono signal and returns one `TrackPoint` (time, pitch,
   confidence, voiced) per detection, decoded over the complete sequence. The

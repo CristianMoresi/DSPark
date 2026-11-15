@@ -32,7 +32,8 @@
  *   stage and two short ones, each crest refined, kept as a running maximum.
  *   Tones that start abruptly read within 0.01 dB up to 0.45 fs and within
  *   -0.09 / +0.05 dB up to 0.485 fs. LoudnessMeter's true-peak readout uses
- *   it.
+ *   it, and so does the Limiter's high-precision true-peak mode, which pays
+ *   for its 262-sample reach in latency.
  *
  * The EBU Tech 3341 true-peak tolerances (+0.2/-0.4 dB, cases 15-23) hold for
  * all three.
@@ -587,13 +588,14 @@ private:
  * Readings are taken in chunks and only the largest is kept (processMax()),
  * so a meter's max-hold is exact while chunks that cannot raise it skip the
  * crest refinement. A reading reaches getDelay() samples back; a finite
- * programme is completed with getTailPeak(). The detectors of real-time
- * dynamics, which must answer within a few dozen samples, use
- * TruePeakEstimator instead.
+ * programme is completed with getTailPeak(). process() gives the same
+ * readings one per input sample to a detector that can wait that long for
+ * them (the Limiter's high-precision true-peak mode); the detectors that
+ * must answer within a few dozen samples use TruePeakEstimator instead.
  *
  * Threading: a channel's state and the analyzer's scratch belong to the
- * stream owner; processMax() and getTailPeak() are not re-entrant. No
- * allocation; the kernels are designed by the constructor.
+ * stream owner; processMax(), process() and getTailPeak() are not
+ * re-entrant. No allocation; the kernels are designed by the constructor.
  *
  * @tparam T Sample type (float or double).
  */
@@ -695,6 +697,68 @@ public:
     }
 
     /**
+     * @brief Appends samples to a channel and raises each peak[i] to the
+     *        reading of the 8x grid points x[i] completes.
+     *
+     * The per-sample form, for a detector that can wait for it: the reading
+     * for input sample n covers the reconstruction from x[n - getDelay()] to
+     * the last eighth point before x[n - getDelay() + 1], plus the crest
+     * centred on the eighth point before x[n - getDelay()], so it concerns
+     * the samples n - getDelay() - 1 .. n - getDelay() + 1. Every reading is
+     * the same arithmetic however the stream is cut into calls, and for
+     * finite input the largest of them is what processMax() returns. NaN
+     * readings are ignored (peak[i] keeps its value).
+     *
+     * @param channel     The channel's history (owned by the caller).
+     * @param x           Input samples.
+     * @param n           Sample count, 1 .. kChunk.
+     * @param peak        Readings to raise, n values.
+     * @param annex2      When not null, n values raised to the BS.1770 Annex 2
+     *                    table's phases over x[i - 11] .. x[i]: what a meter
+     *                    built on that table reads at x[i] between samples.
+     *                    Kept apart because that reading sits 6 samples
+     *                    back, not getDelay().
+     */
+    void process(Channel& channel, const T* x, int n, T* peak, T* annex2 = nullptr) noexcept
+    {
+        assert(n >= 1 && n <= kChunk);
+        n = std::clamp(n, 0, kChunk);
+        if (n == 0) return;
+        const T* grid = advance(channel, x, n); // 4n points of the 4x stream
+
+        if (annex2 != nullptr)
+        {
+            // BS.1770 Annex 2 phases over the newest kAnnexTaps input samples.
+            const T* annexBase = channel.input + (channel.fill - n) + (kTaps - kAnnexTaps);
+            for (int p = 0; p < kAnnexPhases; ++p)
+            {
+                simd::firCorrelate(annexBase, Annex::getReversedPhase(p), kAnnexTaps, scratch_, n, T(1));
+                for (int i = 0; i < n; ++i)
+                    annex2[i] = std::max(annex2[i], std::abs(scratch_[i])); // NaN is ignored
+            }
+        }
+        T p0 = channel.previous[0], p1 = channel.previous[1];
+        for (int i = 0; i < n; ++i)
+        {
+            T m = T(0);
+            for (int k = 0; k < 4; ++k)
+            {
+                const T a = grid[4 * i + k + kTaps3 / 2 - 1];
+                const T b = eighth_[4 * i + k];
+                m = std::max(m, std::abs(a)); // NaN is ignored
+                m = std::max(m, std::abs(b));
+                m = detail::refineVertex(p0, p1, a, m);
+                m = detail::refineVertex(p1, a, b, m);
+                p0 = a;
+                p1 = b;
+            }
+            peak[i] = std::max(peak[i], m); // NaN is ignored
+        }
+        channel.previous[0] = p0;
+        channel.previous[1] = p1;
+    }
+
+    /**
      * @brief Peak of the zero-extended tail of a finite programme.
      *
      * Reads enough zero samples on a copy of the channel that every grid
@@ -718,6 +782,11 @@ public:
     }
 
 private:
+    using Annex = TruePeakDetector<T, 1>;
+    static constexpr int kAnnexTaps = Annex::getTaps();
+    static constexpr int kAnnexPhases = Annex::getPhases();
+    static_assert(kAnnexTaps <= kTaps, "the BS.1770 window must fit the first stage history");
+
     /// Half of each stage's kernel, in input samples.
     static constexpr int kDelay = kTaps / 2 + kTaps2 / 4 + kTaps3 / 8;
     /// Zero samples after which the last input sample no longer reaches any

@@ -954,6 +954,113 @@ DSPARK_TEST(TruePeakAnalyzer_running_maximum_is_exact_for_any_chunking)
     check.template operator()<double>();
 }
 
+namespace {
+
+/// Per-sample readings of TruePeakAnalyzer::process() over a signal.
+template <class T>
+struct AnalyzerReadings
+{
+    std::vector<T> peak, annex;
+};
+
+template <class T>
+AnalyzerReadings<T> analyzerReadings(TruePeakAnalyzer<T>& analyzer, const std::vector<T>& x, int chunk)
+{
+    const auto state = std::make_unique<typename TruePeakAnalyzer<T>::Channel>();
+    AnalyzerReadings<T> r { std::vector<T>(x.size(), T(0)), std::vector<T>(x.size(), T(0)) };
+    for (size_t start = 0; start < x.size(); start += static_cast<size_t>(chunk))
+        analyzer.process(*state, x.data() + start,
+                         static_cast<int>(std::min<size_t>(static_cast<size_t>(chunk), x.size() - start)),
+                         r.peak.data() + start, r.annex.data() + start);
+    return r;
+}
+
+}   // namespace
+
+// process() gives one reading per input sample: the same values however the
+// stream is cut into calls, the largest of them what processMax() keeps, a
+// unit impulse read getDelay() samples later, the Annex 2 output what that
+// table's phases read over the newest twelve samples, and a sample that is
+// not finite never a reading.
+DSPARK_TEST(TruePeakAnalyzer_per_sample_readings_match_the_running_maximum)
+{
+    const auto check = []<class T>()
+    {
+        using A = TruePeakAnalyzer<T>;
+        constexpr int whole[] = { A::kChunk };
+        for (const AbruptCase& c : kAbruptCases)
+        {
+            const std::vector<T> x = abruptTone<T>(c);
+            A analyzer;
+            const AnalyzerReadings<T> blocks = analyzerReadings(analyzer, x, A::kChunk);
+            const AnalyzerReadings<T> singles = analyzerReadings(analyzer, x, 1);
+            const AnalyzerReadings<T> odd = analyzerReadings(analyzer, x, 37);
+            EXPECT_TRUE(blocks.peak == singles.peak);
+            EXPECT_TRUE(blocks.peak == odd.peak);
+            EXPECT_TRUE(blocks.annex == singles.annex);
+            EXPECT_TRUE(blocks.annex == odd.annex);
+
+            typename A::Channel state;
+            EXPECT_EQ(*std::max_element(blocks.peak.begin(), blocks.peak.end()), analyzerMax(analyzer, state, x, whole));
+
+            // The Annex 2 output against that table's phases, summed here.
+            using Table = TruePeakDetector<T, 1>;
+            double worst = 0.0;
+            for (size_t i = static_cast<size_t>(Table::getTaps()); i < x.size(); ++i)
+            {
+                double expected = 0.0;
+                for (int p = 0; p < Table::getPhases(); ++p)
+                {
+                    const T* h = Table::getReversedPhase(p);
+                    double sum = 0.0;
+                    for (int j = 0; j < Table::getTaps(); ++j)
+                        sum += static_cast<double>(h[j])
+                             * static_cast<double>(x[i - static_cast<size_t>(Table::getTaps() - 1 - j)]);
+                    expected = std::max(expected, std::abs(sum));
+                }
+                worst = std::max(worst, std::abs(static_cast<double>(blocks.annex[i]) - expected));
+            }
+            EXPECT_LT(worst, 1e-5);
+        }
+
+        // A unit impulse is read getDelay() samples later, not before.
+        {
+            A analyzer;
+            std::vector<T> x(static_cast<size_t>(A::getDelay() + 40), T(0));
+            x[0] = T(1);
+            const AnalyzerReadings<T> r = analyzerReadings(analyzer, x, 29);
+            int arrival = -1;
+            for (size_t i = 0; i < x.size() && arrival < 0; ++i)
+                if (r.peak[i] > T(0.9999)) arrival = static_cast<int>(i);
+            EXPECT_EQ(arrival, A::getDelay());
+            EXPECT_NEAR(static_cast<double>(r.peak[static_cast<size_t>(A::getDelay())]), 1.0, 1e-5);
+        }
+
+        // A sample that is not finite is never a reading; a caller's own
+        // values are kept.
+        {
+            A analyzer;
+            const auto state = std::make_unique<typename A::Channel>();
+            const T poison[] = { T(0.25), std::numeric_limits<T>::quiet_NaN(), T(-0.5), T(0.125) };
+            T peak[] = { T(0.5), T(0.5), T(0.5), T(0.5) };
+            T annex[] = { T(0.5), T(0.5), T(0.5), T(0.5) };
+            analyzer.process(*state, poison, 4, peak, annex);
+            std::vector<T> zeros(static_cast<size_t>(A::getDelay() + 8), T(0));
+            std::vector<T> later(zeros.size(), T(0));
+            for (size_t start = 0; start < zeros.size(); start += 64)
+                analyzer.process(*state, zeros.data() + start, static_cast<int>(std::min<size_t>(64, zeros.size() - start)),
+                                 later.data() + start);
+            bool finite = true;
+            for (const T v : peak) finite = finite && std::isfinite(v) && v >= T(0.5);
+            for (const T v : annex) finite = finite && std::isfinite(v) && v >= T(0.5);
+            for (const T v : later) finite = finite && std::isfinite(v);
+            EXPECT_TRUE(finite);
+        }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
 // A double meter reads the reconstruction in single precision: magnitudes
 // beyond float's range count as samples (their own peak, finite and valid)
 // and the reconstruction between them is not read.

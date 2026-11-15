@@ -81,6 +81,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);
         l.setAdaptiveRelease(true); l.setLookahead(7.5f);
         l.setHold(25.0f); l.setHoldMode(Limiter<float>::HoldMode::EveryPeak);
+        l.setTruePeakPrecision(Limiter<float>::TruePeakPrecision::High);
     })));
     EXPECT_TRUE((roundTrip<NoiseGate<float>>([](auto& g) {
         g.setThreshold(-52.0f); g.setHold(80.0f); g.setDuckMode(true);
@@ -466,6 +467,7 @@ DSPARK_TEST(State_roundtrip_dynamics_double)
     EXPECT_TRUE((roundTripHeap<Limiter<double>>([](auto& l) {
         l.setCeiling(-1.2); l.setRelease(60.0); l.setTruePeak(true);
         l.setAdaptiveRelease(true); l.setLookahead(7.5);
+        l.setTruePeakPrecision(Limiter<double>::TruePeakPrecision::High);
     })));
     EXPECT_TRUE((roundTripHeap<NoiseGate<double>>([](auto& g) {
         g.setThreshold(-52.0); g.setHold(80.0); g.setDuckMode(true);

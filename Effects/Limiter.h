@@ -24,16 +24,20 @@
  * instead of being clipped. Optional ISP (Inter-Sample Peak) detection feeds
  * the sidechain with the larger of two true-peak estimates of every sample
  * interval: a 64-tap-per-phase 4x reconstruction refined to its local
- * maxima (accurate up to the top of the band), and the ITU-R BS.1770 Annex 2
- * estimate (so a BS.1770 meter also reads the output at or below the
- * ceiling). The ramp shortens by the 33 samples a reading reaches back. On
- * an independent 8x, 128-tap reconstruction the output reaches at most
- * +0.14 dB over the ceiling on dense mixes driven 6 to 12 dB over it,
- * +0.13 dB on a hard-clipped 5 kHz tone and +0.27 dB on differentiated
- * white noise (the BS.1770 estimate alone: +0.93, +0.77 and +1.26 dB). A
- * final clamp at the ceiling remains as a rounding backstop (and covers live
- * ceiling or lookahead changes); true-peak levels are reduced but not
- * mathematically bounded.
+ * maxima (accurate up to 0.45 of the sample rate), and the ITU-R BS.1770
+ * Annex 2 estimate (so a BS.1770 meter also reads the output at or below the
+ * ceiling). The ramp shortens by the 33 samples a reading reaches back. Read
+ * with TruePeakAnalyzer (an 8x grid from a 512-tap first stage, which also
+ * resolves content between 0.45 of the sample rate and Nyquist), at the
+ * defaults and a -1 dB ceiling: a 48-partial mix driven 6 or 12 dB over the
+ * ceiling comes out +0.004 dB over it, a hard-clipped 5 kHz tone +0.19 dB,
+ * white noise +0.77 dB and differentiated white noise +1.10 dB (sample-peak
+ * mode: +0.66, +2.56, +5.92 and +4.24 dB). What is left is content above
+ * 0.45 of the sample rate, whose crests are built by samples further away
+ * than a reading that answers within 33 samples can see. A final clamp at
+ * the ceiling remains as a rounding backstop (and covers live ceiling or
+ * lookahead changes); true-peak levels are reduced but not mathematically
+ * bounded.
  *
  * @note This class is strictly real-time safe. It performs zero allocations
  *       in the audio thread. The maximum lookahead time dictates the memory
@@ -459,9 +463,12 @@ public:
      * file description for the measured overshoot). A reading reaches 33
      * samples back, so the attack ramp shortens by 33 samples and the
      * lookahead is raised to at least 49 samples (about 1 ms at 48 kHz);
-     * getLatency() reports it. At the 2 ms default the shorter ramp moves the
-     * 60 Hz + 7 kHz intermodulation from -61.6 to -58.9 dBc (HoldMode
-     * EveryPeak: -99.7 dBc). Detection costs about 12 ns per sample per
+     * getLatency() reports it. The intermodulation of a limiter follows the
+     * length of that ramp: at the 2 ms default (96 samples, 63 of ramp) a
+     * 60 Hz + 7 kHz pair reads -59.1 dBc against -61.9 in sample-peak mode
+     * (double: -60.5 and -61.5), and setLookahead(2.7), which gives the ramp
+     * its 96 samples back for 129 of latency, -64.1 dBc (HoldMode EveryPeak
+     * at the default: -99.7 dBc). Detection costs about 12 ns per sample per
      * channel more than sample-peak mode; processSample() runs it one sample
      * at a time and is several times slower per sample than processBlock().
      *

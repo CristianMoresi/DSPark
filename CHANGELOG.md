@@ -748,6 +748,17 @@ All notable user-facing changes to DSPark are documented here.
   shorter (60 Hz + 7 kHz intermodulation at the 2 ms default: -58.9 against
   -61.6 dBc) and the lookahead is at least 49 samples in true-peak mode
   (`getLatency()` reports it). Cost: 35 against 18 ns per stereo frame.
+- `Limiter` figures measured again (no audio change). The true-peak overshoot
+  is read with `TruePeakAnalyzer`, which also resolves content above 0.45 of
+  the sample rate: at the defaults and a -1 dB ceiling a 48-partial mix
+  driven 6 or 12 dB over the ceiling comes out +0.004 dB over it, a
+  hard-clipped 5 kHz tone +0.19 dB, white noise +0.77 dB and differentiated
+  white noise +1.10 dB, where the 128-tap reading above gave +0.27
+  (sample-peak mode: +0.66, +2.56, +5.92 and +4.24 dB). The intermodulation
+  figures now state what sets them, the length of the attack ramp: 60 Hz +
+  7 kHz at the 2 ms default reads -59.1 dBc in true-peak mode and -61.9 in
+  sample-peak mode, and -64.1 dBc in true-peak mode with `setLookahead(2.7)`,
+  which gives the ramp its 96 samples back for 129 of latency.
 - `CrossoverFilter` linear phase (default audio moves within rounding: at most
   2.7e-7, -128.6 dB, on noise): the 4096-tap FIR runs in eight partitions of
   512 instead of four of 1024, and the engine delays its output by two

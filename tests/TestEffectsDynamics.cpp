@@ -835,6 +835,149 @@ DSPARK_TEST(Limiter_every_peak_hold_removes_intermodulation)
     EXPECT_GT(worstSidebandDbc(false), -70.0);   // control: Deepest
 }
 
+namespace {
+
+/// Worst sideband of the 7 kHz tone of a 60 Hz + 7 kHz pair driven 6 dB over
+/// a -6 dB ceiling, in dB re that tone, over the last of two seconds.
+template <class T>
+double limiterSidebandDbc(bool truePeak, double lookaheadMs)
+{
+    constexpr double kTau = 6.283185307179586;
+    Limiter<T> lim;
+    lim.setCeiling(T(-6));
+    lim.prepare(48000.0, 1);
+    if (lookaheadMs > 0.0) lim.setLookahead(static_cast<T>(lookaheadMs));
+    lim.setTruePeak(truePeak);
+    const size_t n = 96000;
+    std::vector<T> y(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        y[i] = static_cast<T>(0.8 * std::sin(kTau * 60.0 * t) + 0.2 * std::sin(kTau * 7000.0 * t));
+    }
+    for (size_t o = 0; o < n; o += 512)
+    {
+        T* ch[1] = { y.data() + o };
+        lim.processBlock(AudioBufferView<T>(ch, 1, static_cast<int>(std::min<size_t>(512, n - o))));
+    }
+    const auto amplitude = [&](double hz) {
+        double c = 0.0, s = 0.0;
+        for (size_t i = n - 48000; i < n; ++i)
+        {
+            const double ph = kTau * hz * static_cast<double>(i) / 48000.0;
+            c += static_cast<double>(y[i]) * std::cos(ph);
+            s += static_cast<double>(y[i]) * std::sin(ph);
+        }
+        return std::sqrt(c * c + s * s);
+    };
+    const double carrier = amplitude(7000.0);
+    double worst = 0.0;
+    for (int k = 1; k <= 6; ++k)
+        worst = std::max({ worst, amplitude(7000.0 - 60.0 * k), amplitude(7000.0 + 60.0 * k) });
+    return 20.0 * std::log10(worst / carrier);
+}
+
+/// Deterministic noise in [-1, 1).
+struct LimiterTestNoise
+{
+    uint32_t state;
+    double next()
+    {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<double>(state >> 8) / 8388608.0 - 1.0;
+    }
+};
+
+}   // namespace
+
+// The sidebands a limiter leaves around a tone that rides a larger slow wave
+// follow the length of its attack ramp. True-peak mode gives 33 samples of
+// the lookahead to its reading, so at the 2 ms default the 60 Hz + 7 kHz pair
+// reads -59.1 dBc (double -60.5) against -61.9 (-61.5) in sample-peak mode;
+// 2.7 ms of lookahead gives the ramp its 96 samples back and reads -64.1 dBc
+// (-65.2). Two gain envelopes multiplied (sample peaks on the long ramp, the
+// true-peak excess on the short one) were measured instead: -60.1 dBc, with
+// the output 1.9 to 10 dB quieter than the ceiling asks, because the second
+// envelope cannot know how far the first one already is below the peak.
+DSPARK_TEST(Limiter_intermodulation_follows_the_attack_ramp)
+{
+    for (const bool wide : { false, true })
+    {
+        const double sample = wide ? limiterSidebandDbc<double>(false, 0.0) : limiterSidebandDbc<float>(false, 0.0);
+        const double truePeak = wide ? limiterSidebandDbc<double>(true, 0.0) : limiterSidebandDbc<float>(true, 0.0);
+        const double longer = wide ? limiterSidebandDbc<double>(true, 2.7) : limiterSidebandDbc<float>(true, 2.7);
+        EXPECT_LT(sample, -59.0);
+        EXPECT_LT(truePeak, -56.5);
+        EXPECT_LT(longer, -61.5);
+        EXPECT_LT(longer, truePeak - 2.0);
+    }
+}
+
+// The limited output read with TruePeakAnalyzer (an 8x grid from a 512-tap
+// first stage, which also resolves content between 0.45 fs and Nyquist), in
+// dB over a -1 dB ceiling at the defaults: a 48-partial mix driven 12 dB over
+// the ceiling +0.004 (sample-peak mode +0.66), a hard-clipped 5 kHz tone
+// +0.19 (+2.56), white noise +0.77 (+5.92) and its first difference +1.10
+// (+4.24). What true-peak mode leaves is content above 0.45 fs, which a
+// reading that answers within 33 samples cannot follow.
+DSPARK_TEST(Limiter_true_peak_output_read_on_an_independent_grid)
+{
+    constexpr double kTau = 6.283185307179586;
+    const size_t n = 192000;
+    const double ceiling = std::pow(10.0, -1.0 / 20.0);
+    const auto overDb = [&](std::vector<double> x, double driveDb, bool truePeak) {
+        double m = 0.0;
+        for (double v : x) m = std::max(m, std::abs(v));
+        const double scale = ceiling * std::pow(10.0, driveDb / 20.0) / m;
+        for (double& v : x) v *= scale;
+        Limiter<double> lim;
+        lim.setCeiling(-1.0);
+        lim.prepare(48000.0, 1);
+        lim.setTruePeak(truePeak);
+        for (size_t o = 0; o < n; o += 512)
+        {
+            double* ch[1] = { x.data() + o };
+            lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(512, n - o))));
+        }
+        TruePeakAnalyzer<double> analyzer;
+        const auto state = std::make_unique<TruePeakAnalyzer<double>::Channel>();
+        double peak = 0.0;
+        for (size_t o = 0; o < n; o += 128)
+            peak = std::max(peak, analyzer.processMax(*state, x.data() + o,
+                                                      static_cast<int>(std::min<size_t>(128, n - o)), peak));
+        peak = std::max(peak, analyzer.getTailPeak(*state));
+        return 20.0 * std::log10(peak / ceiling);
+    };
+
+    std::vector<double> dense(n, 0.0), clipped(n), white(n), bright(n);
+    LimiterTestNoise phases { 0x1234u };
+    for (int k = 0; k < 48; ++k)
+    {
+        const double hz = 40.0 * std::pow(18000.0 / 40.0, k / 47.0);
+        const double phase = 0.5 * kTau * phases.next();
+        const double level = 1.0 / std::sqrt(1.0 + k);
+        for (size_t i = 0; i < n; ++i)
+            dense[i] += level * std::sin(kTau * hz * static_cast<double>(i) / 48000.0 + phase);
+    }
+    LimiterTestNoise noise { 0x9876u };
+    double previous = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        clipped[i] = std::clamp(4.0 * std::sin(kTau * 5000.0 * static_cast<double>(i) / 48000.0), -1.0, 1.0);
+        white[i] = noise.next();
+        bright[i] = white[i] - previous;
+        previous = white[i];
+    }
+
+    EXPECT_LT(overDb(dense, 12.0, true), 0.05);
+    EXPECT_LT(overDb(clipped, 6.0, true), 0.35);
+    EXPECT_LT(overDb(white, 6.0, true), 1.0);
+    EXPECT_LT(overDb(bright, 6.0, true), 1.35);
+    // Sample-peak mode leaves the peaks between samples alone.
+    EXPECT_GT(overDb(clipped, 6.0, false), 2.0);
+    EXPECT_GT(overDb(white, 6.0, false), 4.0);
+}
+
 
 // ============================================================================
 // NoiseGate

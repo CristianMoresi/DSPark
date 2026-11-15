@@ -1659,7 +1659,7 @@ public:
         dryWetMixer_.prepare(spec);
         
         if (oversamplingFactor_ > 1 && !oversampler_)
-            oversampler_ = std::make_unique<Oversampling<SampleType>>(oversamplingFactor_);
+            oversampler_ = makeOversampler(oversamplingFactor_);
         if (oversampler_) oversampler_->prepare(spec);
 
         tempBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
@@ -1781,6 +1781,19 @@ public:
     }
 
 private:
+    /// The oversampler of a factor. From 8x the curves leave harmonics across
+    /// the whole oversampled band at close to their full level (the
+    /// wavefolder above the tone's own), and the High preset's later stages
+    /// are only as deep as its first (80 dB): every stage is then made at
+    /// least 100 dB deep. At 2x and 4x the folding of the curve itself is
+    /// what is left, so the preset stays.
+    [[nodiscard]] static std::unique_ptr<Oversampling<SampleType>> makeOversampler(int factor)
+    {
+        using Os = Oversampling<SampleType>;
+        return std::make_unique<Os>(factor, Os::Quality::High, Os::Mode::LinearPhaseFir,
+                                    factor >= 8 ? Os::Depth::Deep : Os::Depth::Preset);
+    }
+
     void processChunk(AudioBufferView<SampleType> buffer) noexcept
     {
         // Second-order antialiasing delays the wet path by whole base
@@ -2122,6 +2135,11 @@ public:
      *        left an alias at 17.7 kHz only 34 dB down (46 dB with ADAA);
      *        at 2x it measures 124 dB down, for the oversampler's latency
      *        (64 samples at 48 kHz, reported by getLatency()).
+     *        From 8x every decimation stage is at least 100 dB deep
+     *        (Oversampling::Depth::Deep), for 93 samples of latency at 8x
+     *        and 95 at 16x (70 at 4x): the wavefolder at +24 dB aliases at
+     *        -104 dBc at 8x (-75 with the preset's stages) and SoftClip
+     *        with second-order antialiasing at -119 dBc at 16x (-95).
      */
     void setOversampling(int factor)
     {
@@ -2129,7 +2147,7 @@ public:
         oversamplingFactor_ = factor;
         if (factor > 1)
         {
-            oversampler_ = std::make_unique<Oversampling<SampleType>>(factor);
+            oversampler_ = makeOversampler(factor);
             if (spec_.sampleRate > 0) oversampler_->prepare(spec_);
         }
         else

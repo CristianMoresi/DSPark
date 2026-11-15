@@ -1430,3 +1430,77 @@ DSPARK_TEST(AnalogAudit_tube_decimation_is_deep_from_4x)
     amp.prepare(spec(fs, 512, 1));
     EXPECT_EQ(amp.getLatency(), 93);
 }
+
+// Saturation and Clipper decimated through the High preset at every factor,
+// whose later stages are only as deep as its first. At 8x the wavefolder at
+// +24 dB, which leaves harmonics above the tone's own level across the whole
+// oversampled band, aliased at -75.2 dBc; at 16x the curves with second-order
+// antialiasing stopped at the last stage's 93 dB (SoftClip -95.1 dBc, hard
+// clip -94.9 dBc). Saturation from 8x and Clipper at 16x now decimate with
+// every stage at least 100 dB deep: -104.3, -119.3 and -114.7 dBc, for 20
+// more base samples of latency at 8x and 21 at 16x. The lower factors keep
+// the preset: there the folding of the curve itself is what is left.
+DSPARK_TEST(AnalogAudit_saturation_and_clipper_decimate_deep_at_high_factors)
+{
+    const double fs = 48000.0;
+    const int n = 16384;
+    // Worst non-harmonic component from 20 Hz to 20 kHz relative to a
+    // coherent tone of amplitude 0.5, after one second.
+    const auto worst = [&](auto& p, double hz) {
+        int b = static_cast<int>(std::lround(hz / fs * n));
+        if ((b & 1) == 0) ++b;
+        const size_t settle = 48000 + static_cast<size_t>(p.getLatency());
+        const size_t total = (settle + static_cast<size_t>(n) + 511) / 512 * 512;
+        std::vector<double> y(total);
+        for (size_t i = 0; i < total; ++i)
+            y[i] = 0.5 * std::sin(kTwoPi * (b * fs / n) * static_cast<double>(i) / fs);
+        for (size_t pos = 0; pos < total; pos += 512)
+        {
+            double* ch[] = { y.data() + pos };
+            p.processBlock(AudioBufferView<double>(ch, 1, 512));
+        }
+        FFTReal<double> fft(static_cast<size_t>(n));
+        std::vector<double> spectrum(static_cast<size_t>(n) + 2);
+        fft.forward(y.data() + settle, spectrum.data());
+        const auto mag = [&](size_t k) { return std::hypot(spectrum[2 * k], spectrum[2 * k + 1]); };
+        double w = 0.0;
+        for (size_t k = static_cast<size_t>(std::ceil(20.0 / fs * n)); k <= static_cast<size_t>(20000.0 / fs * n); ++k)
+            if (k % static_cast<size_t>(b) != 0) w = std::max(w, mag(k));
+        return toDb(w / mag(static_cast<size_t>(b)));
+    };
+    using Sat = Saturation<double>;
+    const auto saturation = [&](Sat::Algorithm algorithm, int factor, Sat::Antialiasing order) {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(algorithm);
+        s->setDrive(24.0);
+        s->setMix(1.0);
+        s->setDcBlocking(false);
+        s->setAntialiasing(order);
+        s->setOversampling(factor);
+        s->prepare(spec(fs, 512, 1));
+        return s;
+    };
+    using Clip = Clipper<double>;
+    const auto clipper = [&](int factor, bool antialias) {
+        auto c = std::make_unique<Clip>();
+        c->setMode(Clip::Mode::Hard);
+        c->setOversampling(factor);
+        c->setInputGain(24.0);
+        c->setMix(1.0);
+        c->setAntialiasing(antialias);
+        c->prepare(spec(fs, 512, 1));
+        return c;
+    };
+
+    for (double hz : { 15250.0, 19250.0 })
+        EXPECT_LT(worst(*saturation(Sat::Algorithm::Wavefolder, 8, Sat::Antialiasing::Off), hz), -95.0);
+    EXPECT_LT(worst(*saturation(Sat::Algorithm::SoftClip, 16, Sat::Antialiasing::SecondOrder), 19250.0), -110.0);
+    EXPECT_LT(worst(*clipper(16, true), 19250.0), -105.0);
+
+    // 20 more base samples at 8x and 21 at 16x; the lower factors are unchanged.
+    EXPECT_EQ(saturation(Sat::Algorithm::SoftClip, 4, Sat::Antialiasing::Off)->getLatency(), 70);
+    EXPECT_EQ(saturation(Sat::Algorithm::SoftClip, 8, Sat::Antialiasing::Off)->getLatency(), 93);
+    EXPECT_EQ(saturation(Sat::Algorithm::SoftClip, 16, Sat::Antialiasing::Off)->getLatency(), 95);
+    EXPECT_EQ(clipper(8, false)->getLatency(), 73);
+    EXPECT_EQ(clipper(16, false)->getLatency(), 95);
+}

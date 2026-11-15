@@ -630,6 +630,20 @@ All notable user-facing changes to DSPark are documented here.
   -94.4/-89.3/-84.9 -> -115.2/-103.1/-102.6. Cost at 4x within 1 % (Clamp)
   and 6 % lower (Conduction, with the changes below). 1x and 2x, and so the
   default, are bit-identical.
+- `Saturation` from 8x and `Clipper` at 16x decimate through
+  `Oversampling::Depth::Deep` (every stage at least 100 dB deep; the lower
+  factors keep the High preset, where the folding of the curve itself is what
+  is left): latency of `Saturation` at 8x/16x 73/74 -> 93/95 base samples and
+  of `Clipper` at 16x 74 -> 95, the dry path follows. Worst alias over tones
+  of 1 to 19.25 kHz at -6 dBFS with +24 dB of drive: the wavefolder at 8x
+  -75.2 -> -104.3 dBc and at 16x -74.7 -> -105.3; with second-order
+  antialiasing at 16x SoftClip -95.1 -> -119.3, Tape -86.4 -> -114.1,
+  HardClip -94.9 -> -114.7 and the `Clipper` modes -94.9..-95.4 ->
+  -114.7..-119.4; at +6 dB the floor goes from -111 to -128 dBc. Cost:
+  `Saturation` within 1 %, `Clipper` at 16x 7 to 13 % more. `DynamicEQ`
+  keeps the preset: the deeper stages change nothing there (-122.8 dBc
+  either way). `Saturation` up to 4x and `Clipper` up to 8x, and so the
+  defaults, are bit-identical.
 - `TubePreamp` cost: the tone circuit's phi functions of a whole internal
   sample are kept per mode instead of recomputed (bit-identical, both grid
   models), the conduction model's grid table stores each cell's cubic

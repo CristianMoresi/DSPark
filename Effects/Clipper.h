@@ -126,8 +126,13 @@ public:
         const int osFactor = osFactor_.load(std::memory_order_relaxed);
 
         if (osFactor > 1) {
+            // At 16x the antialiased curves leave less than the High
+            // preset's last stage lets through (93 dB): every stage is then
+            // made at least 100 dB deep. Below that the folding of the curve
+            // itself is what is left, so the preset stays.
             oversampler_ = std::make_unique<Oversampling<T>>(
-                osFactor, Oversampling<T>::Quality::High);
+                osFactor, Oversampling<T>::Quality::High, Oversampling<T>::Mode::LinearPhaseFir,
+                osFactor >= 16 ? Oversampling<T>::Depth::Deep : Oversampling<T>::Depth::Preset);
             oversampler_->prepare(spec);
         } else {
             oversampler_.reset();
@@ -306,6 +311,10 @@ public:
      * @brief Sets the oversampling multiplier to mitigate aliasing.
      *
      * Values are rounded UP to the next power of two and capped at 16.
+     * At 16x every decimation stage is at least 100 dB deep
+     * (Oversampling::Depth::Deep; 95 samples of latency, 73 at 8x): a hard
+     * clip at +24 dB with antialiasing aliases at -115 dBc there (-95 with
+     * the preset's stages).
      * @note Changing this requires a subsequent call to `prepare()` to allocate filters.
      *
      * @param factor Oversampling ratio (1 = off, 2, 4, 8, 16).

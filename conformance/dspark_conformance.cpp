@@ -14,8 +14,9 @@
 //             level, oscillator levels, filter DC rejection, ...)
 //   [r128]    EBU R128 tone programmes generated here from the levels and
 //             durations of Tech 3341 and Tech 3342 table 1, plus a stepped
-//             programme for the Tech 3342 short-term rate, so gating, windows
-//             and true peak are measured on every target
+//             programme for the Tech 3342 short-term rate and tones that start
+//             abruptly above 0.45 fs, so gating, windows and true peak are
+//             measured on every target
 //   [ebu]     EBU R128 conformance against the official EBU loudness test
 //             set: integrated loudness (Tech 3341-2023 table 1), loudness
 //             range (Tech 3342-2023 table 1) and true peak (Tech 3341 cases
@@ -1581,6 +1582,40 @@ void runR128ToneTests()
                                       c.truePeakDb);
         std::snprintf(d, sizeof(d), "(got %.2f dBTP, expected %.1f)", got, c.truePeakDb);
         check(got >= c.truePeakDb - 0.4 && got <= c.truePeakDb + 0.2, "r128", c.name, d);
+    }
+
+    // A tone that starts and stops abruptly between 0.45 fs and Nyquist builds
+    // its crest from samples hundreds of positions away. Expected values are
+    // the peak of the exact band-limited reconstruction of the zero-extended
+    // tone (amplitude 0.5).
+    struct AbruptCase
+    {
+        const char* name;
+        double cyclesPerSample;
+        double phaseRadians;
+        int count;
+        double truePeakDb;
+    };
+    const AbruptCase abruptCases[] = {
+        { "true peak of an abrupt tone at 0.47 fs", 0.47, 0.0, 300, -5.21293 },
+        { "true peak of an abrupt tone at 0.48 fs", 0.48, 1.9, 300, -3.42984 },
+    };
+    for (const AbruptCase& c : abruptCases)
+    {
+        std::vector<float> tone(static_cast<size_t>(c.count + 128), 0.0f);
+        for (int i = 0; i < c.count; ++i)
+        {
+            const double cycles = c.cyclesPerSample * static_cast<double>(i);
+            tone[static_cast<size_t>(i + 64)] = static_cast<float>(
+                0.5 * std::sin(dspark::twoPi<double> * (cycles - std::floor(cycles)) + c.phaseRadians));
+        }
+        dspark::LoudnessMeter<float> meter;
+        meter.prepare(48000.0, 2);
+        meter.process(tone.data(), tone.data(), static_cast<int>(tone.size()));
+        meter.finalizeTruePeak();
+        const double got = static_cast<double>(meter.getTruePeakDb());
+        std::snprintf(d, sizeof(d), "(got %.3f dBTP, expected %.3f)", got, c.truePeakDb);
+        check(std::abs(got - c.truePeakDb) <= 0.1, "r128", c.name, d);
     }
 }
 

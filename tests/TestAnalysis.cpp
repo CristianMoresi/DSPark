@@ -601,11 +601,11 @@ void checkFiniteTruePeak()
         const T range = meter.getLoudnessRange();
         meter.finalizeTruePeak();
         // The finite hard ending reconstructs to 0.990809 (-0.0802 dB, the
-        // exact band-limited sum of the zero-extended programme). The
-        // long-kernel reading is 0.987980; the BS.1770 Annex 2 table alone
-        // read 0.972223 (-0.2447 dB).
-        EXPECT_NEAR(meter.getTruePeakDb(), -0.1050385, 0.000002);
-        EXPECT_NEAR(meter.getTruePeakDb(), -0.0802, 0.03);
+        // exact band-limited sum of the zero-extended programme). The meter
+        // reads 0.990337; a 64-tap reading gave 0.987980 (-0.1050 dB) and
+        // the BS.1770 Annex 2 table alone 0.972223 (-0.2447 dB).
+        EXPECT_NEAR(meter.getTruePeakDb(), -0.0843382, 0.00002);
+        EXPECT_NEAR(meter.getTruePeakDb(), -0.0802, 0.006);
         const T finalPeak = meter.getTruePeakDb();
         meter.finalizeTruePeak();
         EXPECT_EQ(meter.getTruePeakDb(), finalPeak);
@@ -792,7 +792,7 @@ DSPARK_TEST(TruePeakEstimator_reads_the_reconstruction_peak)
     check.template operator()<double>();
 }
 
-// The meter's true-peak readout is the long-kernel reading: steady tones read
+// The meter's true-peak readout follows the reconstruction: steady tones read
 // their true peak where the Annex 2 table read up to 0.22 dB high.
 DSPARK_TEST(LoudnessMeter_true_peak_reads_steady_sines_at_their_peak)
 {
@@ -811,6 +811,162 @@ DSPARK_TEST(LoudnessMeter_true_peak_reads_steady_sines_at_their_peak)
     };
     check.template operator()<float>();
     check.template operator()<double>();
+}
+
+namespace {
+
+/// Tone of amplitude 0.5 that starts and stops abruptly: `count` samples
+/// between 64 zeros. `exactDb` is the peak of its exact band-limited
+/// reconstruction (the zero-extended sum, measured with a +-2048-tap kernel).
+struct AbruptCase { double cyclesPerSample, phase; int count; double exactDb; };
+
+// A 64-tap reading misses these by -0.82 to +0.28 dB (every one by more than
+// 0.2 dB): the crest sits where the tone starts or stops and is built by
+// samples a short kernel does not reach.
+constexpr AbruptCase kAbruptCases[] = {
+    { 0.46,  0.0, 300, -5.22393 }, { 0.465, 0.0, 601, -5.24609 }, { 0.47,  0.0, 300, -5.21293 },
+    { 0.47,  1.9, 300, -4.07621 }, { 0.475, 0.0, 601, -5.23735 }, { 0.48,  0.0, 300, -5.19068 },
+    { 0.48,  1.9, 300, -3.42984 }, { 0.485, 0.0, 601, -5.22680 },
+};
+
+template <class T>
+std::vector<T> abruptTone(const AbruptCase& c)
+{
+    std::vector<T> x(static_cast<size_t>(c.count + 128), T(0));
+    for (int i = 0; i < c.count; ++i)
+    {
+        const double cycles = c.cyclesPerSample * i;
+        x[static_cast<size_t>(i + 64)] = static_cast<T>(static_cast<float>(
+            0.5 * std::sin(twoPi<double> * (cycles - std::floor(cycles)) + c.phase)));
+    }
+    return x;
+}
+
+/// Running maximum of an analyzer over x, taken in the chunk sizes of
+/// `pattern` (cycled), without the tail.
+template <class T, size_t N>
+T analyzerMax(TruePeakAnalyzer<T>& analyzer, typename TruePeakAnalyzer<T>::Channel& state,
+              const std::vector<T>& x, const int (&pattern)[N])
+{
+    T running = T(0);
+    size_t turn = 0;
+    for (size_t start = 0; start < x.size();)
+    {
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(pattern[turn++ % N]), x.size() - start));
+        const T peak = analyzer.processMax(state, x.data() + start, n, running);
+        if (peak > running) running = peak;
+        start += static_cast<size_t>(n);
+    }
+    return running;
+}
+
+}   // namespace
+
+// The meter reads a tone that starts and stops abruptly above 0.45 fs at its
+// reconstruction peak; with a 64-tap reading every case was off by 0.24 to
+// 0.82 dB.
+DSPARK_TEST(LoudnessMeter_true_peak_reads_abrupt_tones_above_0_45_fs)
+{
+    const auto check = []<class T>()
+    {
+        for (const AbruptCase& c : kAbruptCases)
+        {
+            const std::vector<T> x = abruptTone<T>(c);
+            LoudnessMeter<T> meter;
+            meter.prepare(48000.0, 1);
+            for (size_t start = 0; start < x.size(); start += 100)
+                meter.process(x.data() + start, static_cast<int>(std::min<size_t>(100, x.size() - start)));
+            meter.finalizeTruePeak();
+            EXPECT_NEAR(static_cast<double>(meter.getTruePeakDb()), c.exactDb, c.cyclesPerSample < 0.478 ? 0.065 : 0.1);
+        }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
+// The analyzer's running maximum is the same value however the stream is cut
+// into calls, its tail query leaves the live history alone and equals feeding
+// zeros, a reading arrives getDelay() samples after its sample, and a sample
+// that is not finite neither reaches a reading nor outlives the kernel.
+DSPARK_TEST(TruePeakAnalyzer_running_maximum_is_exact_for_any_chunking)
+{
+    const auto check = []<class T>()
+    {
+        using A = TruePeakAnalyzer<T>;
+        constexpr int whole[] = { A::kChunk };
+        constexpr int single[] = { 1 };
+        constexpr int mixed[] = { 1, 7, 64, 128, 33, 2, 127, 5 };
+        for (const AbruptCase& c : kAbruptCases)
+        {
+            const std::vector<T> x = abruptTone<T>(c);
+            A analyzer;
+            typename A::Channel a, b, m;
+            const T peakWhole = analyzerMax(analyzer, a, x, whole);
+            const T peakSingle = analyzerMax(analyzer, b, x, single);
+            const T peakMixed = analyzerMax(analyzer, m, x, mixed);
+            EXPECT_EQ(peakSingle, peakWhole);
+            EXPECT_EQ(peakMixed, peakWhole);
+
+            // The tail: the same value as feeding zeros, the history untouched.
+            const typename A::Channel before = a;
+            const T tail = analyzer.getTailPeak(a);
+            EXPECT_TRUE(std::equal(std::begin(before.input), std::end(before.input), std::begin(a.input)));
+            EXPECT_EQ(before.fill, a.fill);
+            EXPECT_EQ(analyzer.getTailPeak(a), tail);
+            const std::vector<T> zeros(static_cast<size_t>(A::kTaps + A::getDelay()), T(0));
+            EXPECT_EQ(analyzerMax(analyzer, b, zeros, single), tail);
+            const double peakDb = 20.0 * std::log10(static_cast<double>(std::max(peakWhole, tail)));
+            EXPECT_NEAR(peakDb, c.exactDb, c.cyclesPerSample < 0.478 ? 0.065 : 0.1);
+        }
+
+        // A unit impulse is read getDelay() samples later, not before.
+        {
+            A analyzer;
+            typename A::Channel state;
+            T running = T(0);
+            int arrival = -1;
+            for (int i = 0; i <= A::getDelay() + 4 && arrival < 0; ++i)
+            {
+                const T sample = i == 0 ? T(1) : T(0);
+                running = std::max(running, analyzer.processMax(state, &sample, 1, running));
+                if (running > T(0.9999)) arrival = i;
+            }
+            EXPECT_EQ(arrival, A::getDelay());
+            EXPECT_NEAR(static_cast<double>(running), 1.0, 1e-5);
+        }
+
+        // Samples that are not finite give no reading, and once they have
+        // left the kernel the readings are those of a clean stream.
+        {
+            const std::vector<T> x = abruptTone<T>(kAbruptCases[0]);
+            A analyzer;
+            typename A::Channel dirty, clean;
+            const T poison[] = { T(0.25), std::numeric_limits<T>::quiet_NaN(), std::numeric_limits<T>::infinity(), T(-0.5) };
+            const T first = analyzerMax(analyzer, dirty, std::vector<T>(std::begin(poison), std::end(poison)), single);
+            EXPECT_TRUE(std::isfinite(first));
+            const std::vector<T> flush(static_cast<size_t>(A::kTaps + A::getDelay()), T(0));
+            EXPECT_TRUE(std::isfinite(analyzerMax(analyzer, dirty, flush, mixed)));
+            EXPECT_EQ(analyzerMax(analyzer, dirty, x, mixed), analyzerMax(analyzer, clean, x, whole));
+        }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
+// A double meter reads the reconstruction in single precision: magnitudes
+// beyond float's range count as samples (their own peak, finite and valid)
+// and the reconstruction between them is not read.
+DSPARK_TEST(LoudnessMeter_true_peak_of_double_samples_beyond_float_range)
+{
+    LoudnessMeter<double> meter;
+    meter.prepare(48000.0, 1);
+    std::vector<double> x(2000, 0.0);
+    x[700] = 1.0e100;
+    x[701] = -2.0e100;
+    meter.process(x.data(), static_cast<int>(x.size()));
+    meter.finalizeTruePeak();
+    EXPECT_TRUE(meter.isMeasurementValid());
+    EXPECT_NEAR(meter.getTruePeakDb(), 20.0 * std::log10(2.0e100), 1e-9);
 }
 
 DSPARK_TEST(LoudnessMeter_louder_signal_higher_LUFS)

@@ -35,6 +35,13 @@ All notable user-facing changes to DSPark are documented here.
   refined), with a tail query for finite programmes and a running-maximum
   form. It is the long-kernel estimator the Limiter's true-peak mode already
   ran, moved to Core; the Limiter's output is bit-identical.
+- `TruePeakAnalyzer` (Core/TruePeakDetector.h): the meter's reading of the
+  band-limited reconstruction peak. The BS.1770 Annex 2 procedure carried to
+  8x in three stages (a 512-tap Kaiser-windowed sinc for the midpoint of
+  every sample interval, then 16 and 8 taps for the 4x and 8x points), the
+  crest of every grid maximum refined, kept as a running maximum that is the
+  same value however the stream is cut into calls, with a tail query for
+  finite programmes. A reading reaches 261 samples back; no allocation.
 - `Oversampling` stopband depth: a fourth constructor argument,
   `Depth::Deep`, keeps a quality preset's band (passband and stop edge) and
   makes every half-band stage at least 100 dB deep over the band it
@@ -459,19 +466,22 @@ All notable user-facing changes to DSPark are documented here.
   1.30; High 2.47 -> 2.30, 4.19 -> 3.87, 4.25 -> 3.58, 6.33 -> 5.33, 1.27 ->
   1.18.
 - `LoudnessMeter` true peak (and `AudioIntervalAnalyzer`'s, which reads it):
-  read with `TruePeakEstimator` instead of the BS.1770 Annex 2 example table.
+  read with `TruePeakAnalyzer` instead of the BS.1770 Annex 2 example table.
   Against the exact band-limited reconstruction (the table in brackets):
-  steady sines within 0.003 dB up to 0.49 fs (up to +0.22 dB near 0.09 and
-  0.25 fs); tones up to 0.45 fs that start abruptly -0.24 / +0.07 dB
-  (-0.78 / +0.19); noise band-limited to 0.45 fs -0.03 / +0.01 dB
-  (-0.37 / +0.04). Default readings move by up to -0.22 dB on steady tones.
-  Content between 0.45 fs and Nyquist, which the table attenuates, now
-  reads -1.1 / +0.75 dB for tones that start abruptly there (-2.8 / +0.23)
-  and -0.55 / +0.47 dB for white noise (-1.08 / +0.40). A sample's own
-  magnitude still counts at once; the reconstruction around it is read 33
-  samples later and at the end by `finalizeTruePeak()`. CPU 0.49 to 0.78 ms
-  per second of 48 kHz stereo with all measures (0.89 while the level keeps
-  rising; 1.03 and 1.14 on SSE2) and 4 KB more per meter.
+  steady sines within 0.004 dB up to 0.49 fs (up to +0.22 dB near 0.09 and
+  0.25 fs); tones that start abruptly within 0.01 dB up to 0.45 fs
+  (-0.78 / +0.19), -0.09 / +0.05 dB up to 0.485 fs and -0.21 / +0.08 dB at
+  0.49 fs (-2.8 / +0.23 above 0.45 fs); noise band-limited to 0.45 fs within
+  0.003 dB (-0.37 / +0.04); white noise -0.19 / +0.13 dB (-1.08 / +0.40).
+  Default readings move by up to -0.22 dB on steady tones and by up to
+  +2.8 dB on content between 0.45 fs and Nyquist, which the table
+  attenuates. A sample's own magnitude still counts at once; the
+  reconstruction around it is read 261 samples later and at the end by
+  `finalizeTruePeak()`, in single precision for every sample type. CPU 0.49
+  to 1.85 ms per second of 48 kHz stereo with all measures (2.1 while the
+  level keeps rising; 2.5 and 2.7 on SSE2) and 16 KB more per meter. The
+  conformance program reads two abrupt tones (0.47 and 0.48 fs) against
+  their exact reconstruction peak on every target.
 - `LoudnessMeter` loudness range: every short-term value is held to 0.005 LU
   (was 0.1 LU) and the relative gate is set from the exact mean energy, so
   LRA matches the EBU Tech 3342 reference code run on the meter's own 10 Hz

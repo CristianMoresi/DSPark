@@ -37,9 +37,9 @@ that sentence.
 Publish a copy of its finished `Result` to readers. `LoudnessMeter` scalar
 readouts remain concurrent; `finalizeTruePeak()` runs on its stream owner and
 `getMeasurementInfo()` requires that owner or a stopped measurement. The Core
-`TruePeakDetector::getTailPeak()` and `TruePeakEstimator::getTailPeak()` copy
-writer-owned history and must not run concurrently with processing/reset on
-that detector.
+`TruePeakDetector::getTailPeak()`, `TruePeakEstimator::getTailPeak()` and
+`TruePeakAnalyzer::getTailPeak()` copy writer-owned history and must not run
+concurrently with processing/reset on that detector.
 
 Any word that both threads can reach concurrently is `std::atomic`, or it
 travels through `Core/SpscQueue.h`. No plain scalar, struct or array is read on

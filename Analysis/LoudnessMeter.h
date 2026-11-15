@@ -9,7 +9,7 @@
  *
  * Momentary (400 ms), short-term (3 s), integrated (two-pass gated),
  * loudness range (EBU Tech 3342) and true peak (the BS.1770 Annex 2
- * procedure, read by the long-kernel TruePeakEstimator).
+ * procedure carried to 8x by Core's TruePeakAnalyzer).
  * Integrated loudness and LRA use constant-memory histograms: no allocation
  * and O(bins) readout, real-time safe. Integrated loudness keeps the exact
  * energy of every bin, so it reads the block energies themselves rather than
@@ -43,6 +43,7 @@
 #include <limits>
 #include <numbers>
 #include <array>
+#include <type_traits>
 
 namespace dspark {
 
@@ -282,13 +283,16 @@ public:
     /**
      * @brief Returns the maximum true peak observed since the last reset.
      *
-     * The BS.1770 Annex 2 procedure read with Core's TruePeakEstimator (the
-     * reconstruction at the quarter points of every sample interval with
-     * 64-tap phases, each crest refined): steady sines read within 0.003 dB
-     * of their true peak up to 0.49 fs (transients and content above 0.45 fs:
-     * see TruePeakEstimator). A sample's own magnitude counts at once; the
-     * reconstruction around it is read TruePeakEstimator::getDelay() samples
-     * later, and the end of a finite programme by finalizeTruePeak().
+     * The BS.1770 Annex 2 procedure read with Core's TruePeakAnalyzer (the
+     * reconstruction on an 8x grid, from a 512-tap first stage, each crest
+     * refined): steady sines read within 0.004 dB of their true peak up to
+     * 0.49 fs, and tones that start abruptly within 0.01 dB up to 0.45 fs
+     * and -0.09 / +0.05 dB up to 0.485 fs (see TruePeakAnalyzer). A sample's
+     * own magnitude counts at once; the reconstruction around it is read
+     * TruePeakAnalyzer::getDelay() samples later, and the end of a finite
+     * programme by finalizeTruePeak(). The reconstruction is read in single
+     * precision whatever T is (the sample magnitudes in T; magnitudes beyond
+     * float's range count as samples only).
      *
      * @return True peak in dBTP.
      */
@@ -312,7 +316,7 @@ public:
         T peak = truePeakMax_.load(std::memory_order_relaxed);
         for (int channel = 0; channel < kMaxChannels; ++channel)
         {
-            const T tail = truePeak_.getTailPeak(tpChannels_[static_cast<size_t>(channel)]);
+            const T tail = static_cast<T>(truePeak_.getTailPeak(tpChannels_[static_cast<size_t>(channel)]));
             if (std::isfinite(tail))
                 peak = std::max(peak, tail);
             else
@@ -489,8 +493,12 @@ private:
     static constexpr int kNumRangeCells = kNumBins * kRangeCells;
     static constexpr uint16_t kRangeCellMax = std::numeric_limits<uint16_t>::max();
 
-    // True-peak estimator chunk (the most samples one estimator call takes).
-    static constexpr int kTruePeakChunk = TruePeakEstimator<T>::kChunk;
+    // True-peak analysis runs in single precision whatever T is: the reading's
+    // own error (0.004 dB on steady tones) is three orders above float
+    // rounding, and a double kernel costs twice as much.
+    using TruePeakReader = TruePeakAnalyzer<float>;
+    // The most samples one reader call takes.
+    static constexpr int kTruePeakChunk = TruePeakReader::kChunk;
 
     // Filters state (Forced to double to prevent DF2T precision issues)
     struct BiquadState { double z1 = 0.0, z2 = 0.0; };
@@ -680,9 +688,9 @@ private:
         return kMinHistogramLUFS - 0.5 * kBinWidth + (static_cast<double>(cell) + 0.5) * kRangeCellWidth;
     }
 
-    /// Feeds one channel's samples to the true-peak estimator and returns
-    /// `peak` raised to its finite readings. A sample's own magnitude counts
-    /// at once.
+    /// Feeds one channel's samples to the true-peak reader and returns `peak`
+    /// raised to its finite readings. A sample's own magnitude counts at
+    /// once, in T.
     [[nodiscard]] T measureTruePeak(const T* x, int channel, int numSamples, T peak) noexcept
     {
         auto& state = tpChannels_[static_cast<size_t>(channel)];
@@ -700,11 +708,52 @@ private:
                 else if (a > peak)
                     peak = a;
             }
-            const T chunkPeak = truePeak_.processMax(state, x + start, n, peak);
+            const T chunkPeak = static_cast<T>(truePeak_.processMax(state, narrow(x + start, n), n, readerFloor(peak)));
             if (chunkPeak > peak)
                 peak = chunkPeak;
         }
         return peak;
+    }
+
+    /// The running maximum as the reader's floor: never above `peak`, so the
+    /// reader does not skip a chunk that could raise it.
+    [[nodiscard]] static float readerFloor(T peak) noexcept
+    {
+        if constexpr (std::is_same_v<T, float>)
+        {
+            return peak;
+        }
+        else
+        {
+            constexpr T kFloatMax = static_cast<T>(std::numeric_limits<float>::max());
+            // Two float steps down: one for the conversion, one for the product.
+            constexpr float kDown = 1.0f - 2.0f * std::numeric_limits<float>::epsilon();
+            return static_cast<float>(std::min(peak, kFloatMax)) * kDown;
+        }
+    }
+
+    /// The reader's view of n (<= kTruePeakChunk) samples: the samples
+    /// themselves for float, a single-precision copy otherwise (magnitudes
+    /// beyond float's range saturate at its limit: the sample's own
+    /// magnitude, counted in T, is above anything the reader can return).
+    [[nodiscard]] const float* narrow(const T* x, int n) noexcept
+    {
+        if constexpr (std::is_same_v<T, float>)
+        {
+            static_cast<void>(n);
+            return x;
+        }
+        else
+        {
+            constexpr T kFloatMax = static_cast<T>(std::numeric_limits<float>::max());
+            for (int i = 0; i < n; ++i)
+            {
+                const T v = x[i];
+                // NaN stays NaN; everything else lands inside float's range.
+                tpNarrow_[i] = static_cast<float>(v > kFloatMax ? kFloatMax : (v < -kFloatMax ? -kFloatMax : v));
+            }
+            return tpNarrow_;
+        }
     }
 
     void invalidateMeasurement() noexcept
@@ -781,8 +830,10 @@ private:
     std::atomic<bool> measurementValid_ { true };
 
     // BS.1770 true-peak (dBTP) tracking
-    TruePeakEstimator<T> truePeak_;
-    std::array<typename TruePeakEstimator<T>::Channel, kMaxChannels> tpChannels_ {};
+    TruePeakReader truePeak_;
+    std::array<TruePeakReader::Channel, kMaxChannels> tpChannels_ {};
+    /// Single-precision copy of a chunk (T other than float).
+    float tpNarrow_[std::is_same_v<T, float> ? 1 : kTruePeakChunk] = {};
     std::atomic<T> truePeakMax_ { T(0) };
 };
 

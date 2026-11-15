@@ -7,9 +7,9 @@
  * @file TruePeakDetector.h
  * @brief Shared ITU-R BS.1770 true-peak (inter-sample peak) detectors.
  *
- * Two readings of the analog reconstruction peak of a digital signal, both
- * following the BS.1770 Annex 2 procedure (4x over-sampling, low-pass
- * interpolation, absolute value):
+ * Three readings of the analog reconstruction peak of a digital signal, all
+ * following the BS.1770 Annex 2 procedure (over-sampling by at least 4,
+ * low-pass interpolation, absolute value):
  *
  * - TruePeakDetector runs the example interpolator printed in BS.1770-5
  *   Annex 2: the 48-tap, 4-phase polyphase FIR (12 taps per phase). It reads
@@ -18,16 +18,24 @@
  *   0.25 fs, and the pass band ends near 0.41 fs. Use it to stay at or below
  *   a ceiling as such a meter judges it (Compressor, Limiter guard, the
  *   offline gain stages).
- * - TruePeakEstimator reads the reconstruction itself: 64-tap Kaiser-windowed
- *   sinc phases at the quarter points of every sample interval, and the
- *   vertex of the parabola through each local maximum of that 4x grid.
- *   Against the exact band-limited reconstruction it reads steady sines up to
- *   0.49 fs within 0.003 dB, and tones up to 0.45 fs that start abruptly
- *   within -0.24 / +0.07 dB (the 12-tap table: -0.78 / +0.19). LoudnessMeter's
- *   true-peak readout and the Limiter's true-peak mode use it.
+ * - TruePeakEstimator reads the reconstruction itself within 33 samples:
+ *   64-tap Kaiser-windowed sinc phases at the quarter points of every sample
+ *   interval, and the vertex of the parabola through each local maximum of
+ *   that 4x grid. Against the exact band-limited reconstruction it reads
+ *   steady sines up to 0.49 fs within 0.003 dB, and tones up to 0.45 fs that
+ *   start abruptly within -0.24 / +0.07 dB (the 12-tap table: -0.78 / +0.19).
+ *   It is the detector's reading (the Limiter's true-peak mode): above
+ *   0.45 fs a tone that starts abruptly reads up to 0.75 dB high or 1.1 dB
+ *   low, because the crest there is built by samples further away than a
+ *   detector can wait for.
+ * - TruePeakAnalyzer is the meter's reading: an 8x grid from a 512-tap first
+ *   stage and two short ones, each crest refined, kept as a running maximum.
+ *   Tones that start abruptly read within 0.01 dB up to 0.45 fs and within
+ *   -0.09 / +0.05 dB up to 0.485 fs. LoudnessMeter's true-peak readout uses
+ *   it.
  *
  * The EBU Tech 3341 true-peak tolerances (+0.2/-0.4 dB, cases 15-23) hold for
- * both.
+ * all three.
  *
  * Dependencies: DspMath.h, SimdOps.h.
  */
@@ -262,6 +270,65 @@ private:
     std::array<State, MaxChannels> states_ {};
 };
 
+namespace detail {
+
+// Kaiser-windowed sinc interpolation phase (beta `beta`, cut at Nyquist),
+// normalised to unity at DC: `out[j]` multiplies window sample j of a
+// `Count`-sample window and the phase reads the point `frac` (0 < frac < 1)
+// past window sample Count / 2 - 1. Designed in double.
+template <int Count, typename T>
+inline void designSincPhase(T* out, double beta, double frac) noexcept
+{
+    constexpr double kPi = std::numbers::pi_v<double>;
+    const auto besselI0 = [](double x) noexcept {
+        double sum = 1.0, term = 1.0;
+        for (int k = 1; k < 64; ++k)
+        {
+            const double h = x / (2.0 * k);
+            term *= h * h;
+            sum += term;
+            if (term < 1e-17 * sum) break;
+        }
+        return sum;
+    };
+    const double norm = besselI0(beta);
+    constexpr double halfTaps = Count / 2;
+    double taps[Count];
+    double sum = 0.0;
+    for (int j = 0; j < Count; ++j)
+    {
+        // Distance from tap j to the interpolation point.
+        const double d = static_cast<double>(j) - (halfTaps - 1.0) - frac;
+        const double sinc = std::sin(kPi * d) / (kPi * d);
+        const double u = d / halfTaps;
+        const double w = besselI0(beta * std::sqrt(std::max(0.0, 1.0 - u * u))) / norm;
+        taps[j] = sinc * w;
+        sum += taps[j];
+    }
+    for (int j = 0; j < Count; ++j)
+        out[j] = static_cast<T>(taps[j] / sum);
+}
+
+// Raises m to the vertex of the parabola through (a, b, c) when b is a
+// local maximum of the magnitude there (never by more than a quarter of
+// |b|). No multiply feeds an add, so the result does not depend on
+// floating-point contraction.
+template <typename T>
+[[nodiscard]] inline T refineVertex(T a, T b, T c, T m) noexcept
+{
+    const T ab = std::abs(b);
+    const T d = (a + c) - (b + b);
+    if (ab >= std::abs(a) && ab >= std::abs(c) && b * d < T(0))
+    {
+        const T q = c - a;
+        const T v = std::abs(b - (q * q) / (T(8) * d));
+        if (v > m) m = v;
+    }
+    return m;
+}
+
+} // namespace detail
+
 /**
  * @class TruePeakEstimator
  * @brief Block-based reading of the band-limited reconstruction peak.
@@ -283,6 +350,9 @@ private:
  * beyond any short kernel: tones there that start abruptly read
  * -1.1 / +0.75 dB (-2.8 / +0.23) and white noise -0.55 / +0.47 dB
  * (-1.08 / +0.40); the table reads that band low because it attenuates it.
+ * A crest there is built by samples hundreds of positions away, so a reading
+ * that must answer within getDelay() samples cannot follow it: meters, which
+ * can wait, read with TruePeakAnalyzer.
  *
  * Each reading at input sample n describes the interval x[n - 32] .. x[n - 31]
  * and the half grid step before it, so it reaches back getDelay() samples; a
@@ -313,40 +383,8 @@ public:
     /** @brief Designs the interpolation phases. */
     TruePeakEstimator() noexcept
     {
-        constexpr double kBeta = 8.0;
-        constexpr double kPi = std::numbers::pi_v<double>;
-        const auto besselI0 = [](double x) noexcept {
-            double sum = 1.0, term = 1.0;
-            for (int k = 1; k < 64; ++k)
-            {
-                const double h = x / (2.0 * k);
-                term *= h * h;
-                sum += term;
-                if (term < 1e-17 * sum) break;
-            }
-            return sum;
-        };
-        const double norm = besselI0(kBeta);
-        constexpr double halfTaps = kTaps / 2;
         for (int p = 0; p < kPhases; ++p)
-        {
-            const double frac = static_cast<double>(p + 1) / 4.0;
-            double taps[kTaps];
-            double sum = 0.0;
-            for (int j = 0; j < kTaps; ++j)
-            {
-                // Distance from tap j to the interpolation point, which sits
-                // frac past the window's sample halfTaps - 1.
-                const double d = static_cast<double>(j) - (halfTaps - 1.0) - frac;
-                const double sinc = std::sin(kPi * d) / (kPi * d);
-                const double u = d / halfTaps;
-                const double w = besselI0(kBeta * std::sqrt(std::max(0.0, 1.0 - u * u))) / norm;
-                taps[j] = sinc * w;
-                sum += taps[j];
-            }
-            for (int j = 0; j < kTaps; ++j)
-                coeffs_[p][j] = static_cast<T>(taps[j] / sum);
-        }
+            detail::designSincPhase<kTaps>(coeffs_[p], 8.0, static_cast<double>(p + 1) / 4.0);
     }
 
     /** @brief Input samples one reading reaches back. */
@@ -392,10 +430,10 @@ public:
             const T y1 = phase_[0][i], y2 = phase_[1][i], y3 = phase_[2][i];
             T m = std::max(std::max(std::abs(a0), std::abs(a4)),
                            std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
-            m = refineVertex(last, a0, y1, m);
-            m = refineVertex(a0, y1, y2, m);
-            m = refineVertex(y1, y2, y3, m);
-            m = refineVertex(y2, y3, a4, m);
+            m = detail::refineVertex(last, a0, y1, m);
+            m = detail::refineVertex(a0, y1, y2, m);
+            m = detail::refineVertex(y1, y2, y3, m);
+            m = detail::refineVertex(y2, y3, a4, m);
             last = y3;
             peak[i] = std::max(peak[i], m); // NaN is ignored
         }
@@ -455,10 +493,10 @@ public:
             const T y1 = phase_[0][i], y2 = phase_[1][i], y3 = phase_[2][i];
             T m = std::max(std::max(std::abs(a0), std::abs(a4)),
                            std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
-            m = refineVertex(last, a0, y1, m);
-            m = refineVertex(a0, y1, y2, m);
-            m = refineVertex(y1, y2, y3, m);
-            m = refineVertex(y2, y3, a4, m);
+            m = detail::refineVertex(last, a0, y1, m);
+            m = detail::refineVertex(a0, y1, y2, m);
+            m = detail::refineVertex(y1, y2, y3, m);
+            m = detail::refineVertex(y2, y3, a4, m);
             last = y3;
             if (m > result && m <= kFinite) result = m;
         }
@@ -513,24 +551,229 @@ private:
         return base;
     }
 
-    /** Raises m to the vertex of the parabola through (a, b, c) when b is a
-     *  local maximum of the magnitude there. No multiply feeds an add, so the
-     *  result does not depend on floating-point contraction. */
-    [[nodiscard]] static inline T refineVertex(T a, T b, T c, T m) noexcept
-    {
-        const T ab = std::abs(b);
-        const T d = (a + c) - (b + b);
-        if (ab >= std::abs(a) && ab >= std::abs(c) && b * d < T(0))
-        {
-            const T q = c - a;
-            const T v = std::abs(b - (q * q) / (T(8) * d));
-            if (v > m) m = v;
-        }
-        return m;
-    }
-
     T coeffs_[kPhases][kTaps] = {};
     T phase_[kPhases + 1][kChunk] = {}; ///< Phase outputs (+ one Annex 2 phase).
+};
+
+/**
+ * @class TruePeakAnalyzer
+ * @brief Running-maximum reading of the band-limited reconstruction peak, for
+ *        meters.
+ *
+ * The BS.1770 Annex 2 procedure (over-sampling, low-pass interpolation,
+ * absolute value) carried to 8x in three stages: a 512-tap Kaiser-windowed
+ * sinc (beta 7) reads the midpoint of every sample interval, a 16-tap one
+ * (beta 9) the midpoints of that 2x stream and an 8-tap one (beta 9) the
+ * midpoints of the 4x stream (the 2x stream fills only the lower half of
+ * its band and the 4x stream the lower quarter, so short kernels are exact
+ * there). The vertex of the parabola through every local maximum of the 8x
+ * grid refines the crest. The long first stage is what reads content near
+ * Nyquist: the transition band of an interpolator is as wide as its kernel
+ * is short, and a tone inside it is reconstructed with the wrong phase
+ * between samples, so a kernel that reaches 32 samples (TruePeakEstimator)
+ * misplaces every crest a tone above 0.45 fs builds where it starts or
+ * stops.
+ *
+ * Measured against the exact reconstruction sum of the zero-extended signal
+ * (TruePeakEstimator in brackets): steady sines up to 0.49 fs read within
+ * 0.004 dB (0.002); tones that start abruptly within 0.01 dB up to 0.45 fs
+ * (-0.22 / +0.06), -0.09 / +0.05 dB up to 0.485 fs (-0.82 / +0.75) and
+ * -0.21 / +0.08 dB at 0.49 fs (-1.2 / +0.11); noise band-limited to 0.45 fs
+ * within 0.003 dB (0.02); white noise -0.19 / +0.13 dB (-0.55 / +0.47);
+ * noise with all its energy above 0.40 fs -0.27 / +0.20 dB (-0.98 / +0.63).
+ * What is left belongs to the last 0.01 fs below Nyquist, where halving the
+ * error again doubles the kernel.
+ *
+ * Readings are taken in chunks and only the largest is kept (processMax()),
+ * so a meter's max-hold is exact while chunks that cannot raise it skip the
+ * crest refinement. A reading reaches getDelay() samples back; a finite
+ * programme is completed with getTailPeak(). The detectors of real-time
+ * dynamics, which must answer within a few dozen samples, use
+ * TruePeakEstimator instead.
+ *
+ * Threading: a channel's state and the analyzer's scratch belong to the
+ * stream owner; processMax() and getTailPeak() are not re-entrant. No
+ * allocation; the kernels are designed by the constructor.
+ *
+ * @tparam T Sample type (float or double).
+ */
+template <FloatType T>
+class TruePeakAnalyzer
+{
+    static constexpr int kTaps2 = 16;  ///< Taps of the 2x-to-4x stage.
+    static constexpr int kTaps3 = 8;   ///< Taps of the 4x-to-8x stage.
+
+public:
+    static constexpr int kTaps = 512;  ///< Taps of the first (interval midpoint) stage.
+    static constexpr int kChunk = 128; ///< Most samples one processMax() call takes.
+
+    /** @brief History of one channel (each stage's kernel span plus one chunk). */
+    struct Channel
+    {
+        T input[kTaps - 1 + kChunk] = {};             ///< Input samples, oldest first.
+        T twice[kTaps2 - 1 + 2 * kChunk] = {};        ///< 2x stream, oldest first.
+        T fourTimes[kTaps3 - 1 + 4 * kChunk] = {};    ///< 4x stream, oldest first.
+        int fill = 0;                                 ///< Input samples past the history prefix.
+        T previous[2] = {};                           ///< Last two points of the 8x grid.
+    };
+
+    /** @brief Designs the three interpolation stages. */
+    TruePeakAnalyzer() noexcept
+    {
+        detail::designSincPhase<kTaps>(coeffs1_, 7.0, 0.5);
+        detail::designSincPhase<kTaps2>(coeffs2_, 9.0, 0.5);
+        detail::designSincPhase<kTaps3>(coeffs3_, 9.0, 0.5);
+    }
+
+    /** @brief Input samples one reading reaches back: the newest 8x grid
+     *         point a call reads lies this many samples before the newest
+     *         input sample, at most. */
+    [[nodiscard]] static constexpr int getDelay() noexcept
+    {
+        return kDelay;
+    }
+
+    /**
+     * @brief Appends samples to a channel and returns the largest finite
+     *        reading among the 8x grid points they complete (0 if none).
+     *
+     * Every crest refined by a call is centred on one of its grid points or
+     * on the last point before them, and a refinement raises its centre by at
+     * most a quarter. When none of those points exceeds atLeast / 1.25 the
+     * refinement is therefore skipped and the grid maximum is returned;
+     * otherwise every crest is refined. Either way the history advances the
+     * same way, so the running maximum of a stream does not depend on how it
+     * is cut into calls.
+     *
+     * @param channel The channel's history (owned by the caller).
+     * @param x       Input samples.
+     * @param n       Sample count, 1 .. kChunk.
+     * @param atLeast The running maximum the caller already holds.
+     * @return The chunk's largest finite reading, exact whenever it can
+     *         exceed atLeast.
+     */
+    [[nodiscard]] T processMax(Channel& channel, const T* x, int n, T atLeast) noexcept
+    {
+        assert(n >= 1 && n <= kChunk);
+        n = std::clamp(n, 0, kChunk);
+        if (n == 0) return T(0);
+        const T* grid = advance(channel, x, n); // 4n points of the 4x stream
+        const int points = 4 * n;
+        constexpr T kFinite = std::numeric_limits<T>::max();
+        T gridMax = T(0);
+        for (int u = 0; u < points; ++u)
+        {
+            const T a = std::abs(grid[u + kTaps3 / 2 - 1]);
+            const T b = std::abs(eighth_[u]);
+            if (a > gridMax && a <= kFinite) gridMax = a;
+            if (b > gridMax && b <= kFinite) gridMax = b;
+        }
+        // The first crest of the call is centred on the point carried over.
+        const T carried = std::abs(channel.previous[1]);
+        const T centres = carried <= kFinite ? std::max(gridMax, carried) : gridMax;
+        if (!(centres * T(1.25) > atLeast))
+        {
+            channel.previous[0] = grid[points - 1 + kTaps3 / 2 - 1];
+            channel.previous[1] = eighth_[points - 1];
+            return gridMax;
+        }
+        T result = gridMax;
+        T p0 = channel.previous[0], p1 = channel.previous[1];
+        for (int u = 0; u < points; ++u)
+        {
+            const T a = grid[u + kTaps3 / 2 - 1];
+            const T b = eighth_[u];
+            T m = detail::refineVertex(p0, p1, a, T(0));
+            m = detail::refineVertex(p1, a, b, m);
+            p0 = a;
+            p1 = b;
+            if (m > result && m <= kFinite) result = m;
+        }
+        channel.previous[0] = p0;
+        channel.previous[1] = p1;
+        return result;
+    }
+
+    /**
+     * @brief Peak of the zero-extended tail of a finite programme.
+     *
+     * Reads enough zero samples on a copy of the channel that every grid
+     * point the last samples still reach is measured; the live history is
+     * not changed. Returns only the tail; combine it with the readings
+     * already taken. Same threading as processMax().
+     *
+     * @param channel The channel's history.
+     */
+    [[nodiscard]] T getTailPeak(const Channel& channel) noexcept
+    {
+        Channel copy = channel;
+        constexpr T zeros[kChunk] = {};
+        T result = T(0);
+        for (int left = kTailSamples; left > 0; left -= kChunk)
+        {
+            const T peak = processMax(copy, zeros, std::min(left, kChunk), result);
+            if (peak > result) result = peak;
+        }
+        return result;
+    }
+
+private:
+    /// Half of each stage's kernel, in input samples.
+    static constexpr int kDelay = kTaps / 2 + kTaps2 / 4 + kTaps3 / 8;
+    /// Zero samples after which the last input sample no longer reaches any
+    /// grid point: its first-stage reach plus the reading delay.
+    static constexpr int kTailSamples = kTaps / 2 + kDelay + 1;
+    static_assert(kTaps % 2 == 0 && kTaps2 % 2 == 0 && kTaps3 % 2 == 0, "midpoint kernels are even");
+
+    /** Appends n (<= kChunk) samples and runs the three stages: leaves the
+     *  4n eighth points in eighth_ and returns the base of the 4x stream
+     *  window (4x point u of this call is base[u + kTaps3 / 2 - 1]). */
+    const T* advance(Channel& channel, const T* x, int n) noexcept
+    {
+        if (channel.fill + n > kChunk)
+        {
+            // Keep the last kernel span of each stage.
+            const int f = channel.fill;
+            std::copy(channel.input + f, channel.input + f + (kTaps - 1), channel.input);
+            std::copy(channel.twice + 2 * f, channel.twice + 2 * f + (kTaps2 - 1), channel.twice);
+            std::copy(channel.fourTimes + 4 * f, channel.fourTimes + 4 * f + (kTaps3 - 1), channel.fourTimes);
+            channel.fill = 0;
+        }
+        const int f = channel.fill;
+
+        // Stage 1: the midpoint of every interval, from the input.
+        std::copy(x, x + n, channel.input + (kTaps - 1) + f);
+        const T* in = channel.input + f;
+        simd::firCorrelate(in, coeffs1_, kTaps, scratch_, n, T(1));
+        T* twice = channel.twice + (kTaps2 - 1) + 2 * f;
+        for (int i = 0; i < n; ++i)
+        {
+            twice[2 * i] = in[i + kTaps / 2 - 1];
+            twice[2 * i + 1] = scratch_[i];
+        }
+
+        // Stage 2: the midpoints of the 2x stream.
+        const T* two = channel.twice + 2 * f;
+        simd::firCorrelate(two, coeffs2_, kTaps2, scratch_, 2 * n, T(1));
+        T* four = channel.fourTimes + (kTaps3 - 1) + 4 * f;
+        for (int t = 0; t < 2 * n; ++t)
+        {
+            four[2 * t] = two[t + kTaps2 / 2 - 1];
+            four[2 * t + 1] = scratch_[t];
+        }
+
+        // Stage 3: the midpoints of the 4x stream.
+        const T* base = channel.fourTimes + 4 * f;
+        simd::firCorrelate(base, coeffs3_, kTaps3, eighth_, 4 * n, T(1));
+        channel.fill += n;
+        return base;
+    }
+
+    T coeffs1_[kTaps] = {};
+    T coeffs2_[kTaps2] = {};
+    T coeffs3_[kTaps3] = {};
+    T scratch_[2 * kChunk] = {};  ///< Stage 1 and stage 2 outputs.
+    T eighth_[4 * kChunk] = {};   ///< Stage 3 outputs.
 };
 
 } // namespace dspark

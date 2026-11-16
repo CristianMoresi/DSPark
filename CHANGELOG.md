@@ -445,6 +445,34 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `wdf::DiodePairRoot` at medium drive, and at every drive for c > 0.02
+  (silicon diodes behind more than about 0.36 M ohm, germanium behind a few
+  k ohm): the root comes from local expansions built for the constants of
+  the instance (`detail::DiodeLocal`). Between the low-drive series and the
+  drive from which the table's reverse-diode correction is short, up to 56
+  cells of sixteen terms about points of the curve, found from the bits of
+  the drive; beyond c = 0.02 also a low-drive series to y^35 for the
+  constant, and the table root at high drive. No transcendental function
+  and no division per sample is left on those paths, where the root took
+  the table with its full correction (c up to 0.02) or repeated Halley
+  steps with an exponential and a division each (beyond). Measured at 48
+  kHz on an RC clipper next to the single-omega approximation that ignores
+  the reverse diode, before and after in the same job on four machines
+  (GCC, Clang and MSVC on x64, GCC on arm64), 0.05 to 8 V peak: behind 1 M
+  to 10 M ohm with the default constants (c from 0.05 to 0.5) the root went
+  from 1.3 to 3.1 times the approximation's cost to 0.55 to 0.81 (57 to
+  124 ns per sample -> 18 to 39), where the approximation is off by -12 to
+  -49 dB; behind 94 k to 330 k ohm at 0.3 to 0.5 V peak, its closest rows,
+  from 0.78 to 0.96 to 0.61 to 0.86, and over every row from 2.2 k ohm up
+  it now costs 0.54 to 0.88 times the approximation. Worst relative error
+  against a long double reference over drives from 1e-6 to 1e6 times
+  (1 + 2c): 3.2e-16 for c from 1e-9 to 1e5 (1.1e-15 before for c > 0.02);
+  `c <= 1e-4` gives the same output bit for bit. `prepare()` builds the
+  expansions for the circuit as it stands (10 to 45 microseconds); after a
+  change of constants while running they are built again once the new
+  constants have held for 256 samples, one cell per sample, and the
+  previous paths answer until then, so a circuit whose values move every
+  sample pays no more than before. An instance grows to 9.8 KB.
 - `wdf::DiodePairRoot` for 1e-4 < c <= 0.02 (silicon diodes behind about
   1.8 k to 0.36 M ohm with the default constants) at low and medium drive.
   The exact reversion series is carried to y^35 and takes the drives above

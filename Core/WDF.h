@@ -806,13 +806,17 @@ private:
  * kappa = 0.04 the series is not used. For the default 1N4148 constants
  * behind 707 ohm Y is 1.17 (pair) and 1.09 (single), incident waves up to
  * 53 and 49 mV: the low-level region where the omega estimate and its
- * correction step cost the most relative to the signal.
+ * correction step cost the most relative to the signal. For the pair,
+ * pairLong() carries the same reversion through y^35 under the same rule
+ * (first omitted terms y^37 and y^39), which reaches 1.2 to 2.5 units of nVt
+ * further for kappa from 2e-4 to 0.04 (see DiodePairRoot).
  */
 struct DiodeSeries
 {
-    /// Coefficients of y^3, y^5, ..., y^19 (pair), each a polynomial
-    /// c1 kappa + c2 kappa^2 + ... of degree (k - 1) / 2, lowest power first.
-    static constexpr double kPairCoefficients[45] = {
+    /// Coefficients of y^3, y^5, ..., y^39 (pair), each a polynomial
+    /// c1 kappa + c2 kappa^2 + ... of degree (k - 1) / 2, lowest power first:
+    /// pair() reads them through y^19, pairLong() all of them.
+    static constexpr double kPairCoefficients[190] = {
         -0.16666666666666666, -0.008333333333333333, 0.08333333333333333,
         -0.0001984126984126984, 0.011111111111111112, -0.05555555555555555,
         -2.7557319223985893e-06, 0.000677910052910053, -0.01273148148148148,
@@ -827,9 +831,58 @@ struct DiodeSeries
         0.004199620627572016, -0.01803037122770919, 0.025757673182441702,
         -8.22063524662433e-18, 2.154825793386156e-12, -3.537694774007972e-09,
         6.748958893377618e-07, -3.461694730904479e-05, 0.0006657831313824112,
-    /// Coefficients of y^2, y^3, ..., y^17 (single), degree k - 1 in kappa.
-        -0.005497982872275568, 0.019581856805365037, -0.024477321006706295
+        -0.005497982872275568, 0.019581856805365037, -0.024477321006706295,
+        -1.9572941063391263e-20, 2.052328564378316e-14, -7.63054132550079e-11,
+        2.6857233826151793e-08, -2.3437074499064687e-06, 7.502594069606581e-05,
+        -0.0010560215634321858, 0.007007507328205631, -0.021295269275834475,
+        0.023661410306482753, -3.868170170630684e-23, 1.6224188783272867e-16,
+        -1.3615508265959045e-12, 8.718744862893881e-10, -1.2608500024975103e-07,
+        6.444848572066936e-06, -0.00014466849341383163, 0.0015856217815772857,
+        -0.008759798795847214, 0.02319379350200681, -0.02319379350200681,
+        -6.446950284384474e-26, 1.0816170984167235e-18, -2.0454899596721922e-14,
+        2.3622256014636148e-11, -5.560999346458007e-09, 4.4139111094536364e-07,
+        -1.5151959626692243e-05, 0.0002566754712713968, -0.0022861625245067354,
+        0.010791464659987286, -0.025300563078439094, 0.023000511889490084,
+        -9.183689863795546e-29, 6.163067369443176e-21, -2.624379797399636e-16,
+        5.435863409317769e-13, -2.0576040831492097e-10, 2.486734120772481e-08,
+        -1.2686390623297178e-06, 3.18473810836589e-05, -0.0004280069091063092,
+        0.0031952644376229754, -0.013144553833792228, 0.02763993138172911,
+        -0.023033276151440924, -1.1309962886447716e-31, 3.0359947054677823e-23,
+        -2.90983516988768e-18, 1.0773119729318394e-14, -6.500516401322334e-12,
+        1.1793526431273427e-09, -8.760273119582742e-08, 3.166099301127302e-06,
+        -6.155872734178536e-05, 0.0006803442075780342, -0.004357681886385206,
+        0.01586718791319178, -0.03023826647467491, 0.023260204980519162,
+        -1.216125041553518e-34, 1.305804281413749e-25, -2.8164494022894016e-20,
+        1.8598856226380004e-16, -1.7781683941160714e-13, 4.792391011366623e-11,
+        -5.105092927875956e-09, 2.6013585118536054e-07, -7.1081371288621065e-06,
+        0.00011151636823255261, -0.0010411731217924711, 0.005826556292754563,
+        -0.019014342187516006, 0.033124532770107074, -0.02366038055007648,
+        -1.151633562077195e-37, 4.946228446941997e-28, -2.400577152778124e-22,
+        2.823876221983734e-18, -4.259542492017361e-15, 1.692153810932095e-12,
+        -2.555530089128816e-10, 1.8074100859420624e-08, -6.795666888993754e-07,
+        1.4701125115609984e-05, -0.0001918618460532977, 0.0015450912017424953,
+        -0.0076648654207181945, 0.022648764847580313, -0.03633078320260323,
+        0.024220522135068822, -9.67759295863189e-41, 1.6625978069690206e-30,
+        -1.815631965979403e-24, 3.80152886681811e-20, -9.020063567411856e-17,
+        5.251035194309445e-14, -1.1143997834640651e-11, 1.0808330297892926e-09,
+        -5.503300371729764e-08, 1.6071863715423982e-06, -2.848117077960185e-05,
+        0.0003165434147228053, -0.002235380660678097, 0.009947103846933474,
+        -0.026842037472040975, 0.039892624693054525, -0.02493289043315908,
+        -7.265460179153071e-44, 4.992786214815564e-33, -1.2268004484704633e-26,
+        4.569781510266617e-22, -1.7020604798406413e-18, 1.4456351083934227e-15,
+        -4.281836851327378e-13, 5.641424476816121e-11, -3.842042611039085e-09,
+        1.490510231519924e-07, -3.511190846188237e-06, 5.231861394876127e-05,
+        -0.0005044424531680884, 0.0031658955995590354, -0.012761233058852326,
+        0.03167578795742484, -0.04384969153807692, 0.02579393619886878,
+        -4.902469756513544e-47, 1.3475806253306053e-35, -7.45026815204885e-29,
+        4.9358060995432006e-24, -2.88161452928429e-20, 3.5590142851266987e-17,
+        -1.463339766188361e-14, 2.599510558910379e-12, -2.3448394274072986e-10,
+        1.1933073304746268e-08, -3.6768172678110105e-07, 7.190746000583771e-06,
+        -9.19608815095438e-05, 0.0007807836711677919, -0.004403321514323129,
+        0.016210944378911955, -0.03724307230981259, 0.04824614786994889,
+        -0.02680341548330494
     };
+    /// Coefficients of y^2, y^3, ..., y^17 (single), degree k - 1 in kappa.
     static constexpr double kSingleCoefficients[136] = {
         -0.5, -0.16666666666666666, 0.5, -0.041666666666666664, 0.4166666666666667, -0.625,
         -0.008333333333333333, 0.20833333333333334, -0.875, 0.875, -0.001388888888888889,
@@ -889,6 +942,26 @@ struct DiodeSeries
         return limit(tail, 17);
     }
 
+    /** Fills b[0..16] (y^3 .. y^35) and returns its series limit Y (0 = unused):
+     *  the same reversion carried further, for the drives just above pair()'s
+     *  limit at larger kappa. */
+    static double pairLong(double kappa, double* b) noexcept
+    {
+        if (!(kappa > 0.0 && kappa <= kMaxKappa)) return 0.0;
+        double tail[2] {};
+        int offset = 0;
+        for (int i = 0; i < 19; ++i)
+        {
+            const int degree = i + 1;
+            double v = 0.0;
+            for (int j = degree - 1; j >= 0; --j) v = v * kappa + kPairCoefficients[offset + j];
+            offset += degree;
+            if (i < 17) b[i] = v * kappa;
+            else tail[i - 17] = v * kappa;
+        }
+        return limit(tail, 37);
+    }
+
     /** Fills d[0..13] (y^2 .. y^15) and returns the series limit Y (0 = unused). */
     static double single(double kappa, double* d) noexcept
     {
@@ -912,7 +985,7 @@ private:
      *  below kTolerance relative to y. */
     static double limit(const double* tail, int firstPower) noexcept
     {
-        const int step = firstPower == 17 ? 2 : 1;
+        const int step = (firstPower & 1) != 0 ? 2 : 1;   // the pair has odd powers only
         double y = kMaxY;
         for (int i = 0; i < 2; ++i)
         {
@@ -948,25 +1021,31 @@ private:
  * to 0.02) the exact reversion series of
  * detail::DiodeSeries replaces the estimate and its correction step: no
  * transcendental function and no division, 2.2e-16 worst relative error
- * against 50-digit roots. Above it, up to c = 0.02 and ln c + x < 2^20, the
- * root comes from detail::DiodeOmegaTable instead: the forward diode's root
- * s1 = x - omega(ln c + x) to double precision, plus the reverse diode's
- * correction from the same table point, with no exponential and no division
- * per sample; for c > 1e-4 this starts where the correction is small enough
- * (c^2 / (omega (1 + omega)) <= 3.5e-3, which reaches down to the series
- * limit up to c of about 6e-3, 94 k ohm with the default constants), and
- * the estimate with its correction step covers the drives between; where
- * the correction has become small (from z = 0 on at 94 k ohm) it keeps
- * three orders instead of seven. Against 50-digit roots for c from 1e-15
- * to 0.02 and drives up to 1e6 nVt the table root is within one unit in
- * the last place. Cost for an RC clipper on the development machine (MSVC
- * x64), default constants: 13.4-13.7 ns per sample at low drive
- * (0.01-0.05 V peak) and 19-20 ns above (0.5-8 V peak) behind 707 ohm,
- * and behind 94 k ohm (the port of a 1 pF capacitor in parallel) 23.8 ns
- * at 0.5 V, 23.3 ns at 2 V and 23.7 ns at 8 V peak (with the full
- * correction everywhere: 24.7, 25.0 and 24.1 ns); against 20-29 ns for the
- * single-omega approximation that ignores the reverse diode (-46 to -82 dB
- * error; 23.8, 28.2 and 29.1 ns behind 94 k ohm).
+ * against 50-digit roots. For 1e-4 < c <= 0.02 the same series carried to
+ * y^35 takes the drives above it, 1.2 to 2.5 units of nVt further (incident
+ * waves up to 159 mV behind 2.2 k ohm and 80 mV behind 0.33 M ohm with the
+ * default constants). Above the series, up to c = 0.02 and
+ * ln c + x < 2^20, the root comes from detail::DiodeOmegaTable instead: the
+ * forward diode's root s1 = x - omega(ln c + x) to double precision, plus
+ * the reverse diode's correction from the same table point, with no
+ * exponential and no division per sample; for c > 1e-4 this starts where
+ * the correction is small enough (c^2 / (omega (1 + omega)) <= 3.5e-3), a
+ * drive the longer series reaches for every c up to 0.02, so the estimate
+ * and its correction step are left to c > 0.02 and to drives beyond
+ * ln c + x = 2^20; where the correction has become small (from z = 0 on at
+ * 94 k ohm) it keeps three orders instead of seven. Against 50-digit roots
+ * for c from 1e-15 to 0.02 and drives up to 1e6 nVt the series and table
+ * roots are within one unit in the last place. Cost for an RC clipper at
+ * 48 kHz with the default constants, measured on four machines (GCC, Clang
+ * and MSVC on x64, GCC on arm64) next to the single-omega approximation
+ * that ignores the reverse diode: behind 2.2 k to 330 k ohm (c up to 0.018)
+ * and from 0.05 to 8 V peak the root takes 15 to 33 ns per sample, 0.48 to
+ * 0.97 times the approximation's cost (24 to 44 ns, with -39 to -88 dB of
+ * error); the closest rows are 0.3 to 0.5 V peak behind 150 k to 330 k ohm,
+ * where most samples take the table root with its full correction. For
+ * c > 0.02 (silicon diodes behind more than about 0.36 M ohm, germanium
+ * behind a few k ohm) the repeated Halley steps cost 1.7 to 3.1 times the
+ * approximation, whose error there is -12 to -49 dB.
  */
 template <FloatType T, typename Tree>
 class DiodePairRoot
@@ -1005,7 +1084,8 @@ public:
         if (k != kCached_ || nvt != nvtCached_) [[unlikely]]
             updateConstants(k, nvt);
 
-        const double x = std::abs(a) * invNvt_;
+        const double magnitude = std::abs(a);
+        const double x = magnitude * invNvt_;
         if (x < seriesLimit_)
         {
             // Low drive: the exact reversion series (detail::DiodeSeries).
@@ -1017,9 +1097,24 @@ public:
             v_ = std::copysign(s * nvt, a);
             return;
         }
+        if (x < series2Limit_)
+        {
+            // Just above it, for 1e-4 < c <= 0.02 (where the omega table's
+            // correction takes many terms or does not reach): the same
+            // series to y^35.
+            const double y = x * invBeta_, u = y * y, u2 = u * u, u4 = u2 * u2, u8 = u4 * u4;
+            const double* b = series2_;
+            const double p = ((((b[0] + b[1] * u) + u2 * (b[2] + b[3] * u)) + u4 * ((b[4] + b[5] * u) + u2 * (b[6] + b[7] * u)))
+                              + u8 * (((b[8] + b[9] * u) + u2 * (b[10] + b[11] * u)) + u4 * ((b[12] + b[13] * u) + u2 * (b[14] + b[15] * u))))
+                           + (u8 * u8) * b[16];
+            const double s = y + (y * u) * p;
+            tree_.incident(static_cast<T>(std::copysign(s * (2.0 * nvt), a) - a));
+            v_ = std::copysign(s * nvt, a);
+            return;
+        }
         if (x < kClosedFormLimit) [[likely]]
         {
-            const double s = solveNormalised(x);
+            const double s = solveNormalised(x, magnitude);
             tree_.incident(static_cast<T>(std::copysign(s * (2.0 * nvt), a) - a));
             v_ = std::copysign(s * nvt, a);
             return;
@@ -1043,6 +1138,7 @@ private:
         kCached_ = k;
         nvtCached_ = nvt;
         invNvt_ = 1.0 / nvt;
+        invNvt4_ = 4.0 * invNvt_;
         c_ = 0.5 * k * invNvt_;
         logC_ = std::log(c_);
         logC4_ = 4.0 * logC_;
@@ -1073,12 +1169,21 @@ private:
         // The table root holds where q = c^2 / (omega (1 + omega)) <= kTableQ:
         // above the series limit for c <= 1e-4; from omega(1 + omega) =
         // c^2 / kWideTableQ up to c = 0.02, with the correction series of
-        // solveTableWide() scaled by powers of c^2.
+        // solveTableWide() scaled by powers of c^2. In that range the longer
+        // series takes every drive it reaches above the short one: it costs
+        // less than the table root with its full correction, and for
+        // c > 0.0062, where the table starts above the short series, it
+        // covers the drives between (at c = 0.02 it reaches 1.764 against
+        // 1.748 nVt). The omega estimate with its correction step would
+        // cover any remaining gap.
+        series2Limit_ = seriesLimit_;
         tableFrom_ = seriesLimit_;
         if (mode_ == Mode::Halley)
         {
             const double w = 0.5 * (std::sqrt(1.0 + 4.0 * c2_ / kWideTableQ) - 1.0);
-            tableFrom_ = std::max(seriesLimit_, w + std::log(w) - logC_);
+            const double wideStart = w + std::log(w) - logC_;
+            series2Limit_ = std::max(seriesLimit_, cPlus_ * detail::DiodeSeries::pairLong(2.0 * c_ * bound_, series2_));
+            tableFrom_ = std::max(series2Limit_, wideStart);
             int o = 0;
             for (int j = 0; j < 5; ++j)
             {
@@ -1092,12 +1197,28 @@ private:
             tableFrom_ = std::numeric_limits<double>::infinity();
     }
 
-    /** Root s >= 0 of s + c (e^s - e^-s) = x for x >= 0. */
-    [[nodiscard]] double solveNormalised(double x) const noexcept
+    /** logValue on the nodes of the ln(omega) form (index >= kFirstLogNode),
+     *  else linearValue, selected by a bit mask: a mid-level signal crosses
+     *  that boundary (z = 0) twice per half cycle, and a branch there
+     *  mispredicted (behind 0.33 M ohm at 0.5 V peak: 24.3 against 22.9 ns per
+     *  sample with the longer series as well). */
+    [[nodiscard]] static double byForm(int index, double logValue, double linearValue) noexcept
+    {
+        const std::uint64_t mask = std::uint64_t(0)
+            - static_cast<std::uint64_t>(index >= detail::DiodeOmegaTable::kFirstLogNode);
+        return std::bit_cast<double>((std::bit_cast<std::uint64_t>(logValue) & mask)
+                                     | (std::bit_cast<std::uint64_t>(linearValue) & ~mask));
+    }
+
+    /** Root s >= 0 of s + c (e^s - e^-s) = x for x = magnitude / nVt >= 0. */
+    [[nodiscard]] double solveNormalised(double x, double magnitude) const noexcept
     {
         if (x >= tableFrom_) [[likely]]
         {
-            const double z4 = x * 4.0 + logC4_;   // 4 (ln c + x), one rounding
+            // 4 (ln c + x) with one rounding. The product is 4 x exactly (the
+            // factor 4 only moves the exponent), formed from the wave so that
+            // the table index does not wait for x.
+            const double z4 = magnitude * invNvt4_ + logC4_;
             if (z4 < 4.0 * detail::DiodeOmegaTable::kOctaveMax) [[likely]]
                 return mode_ == Mode::Newton ? solveTable(x, z4) : solveTableWide(x, z4);
         }
@@ -1149,11 +1270,10 @@ private:
             const double d = (q * (1.0 - h) - q2) + (1.5 * q) * q2;
             // Root = base + p0 + rest + d, with the large base + p0 summed
             // exactly (|base| > |p0|) so that only the final add rounds.
-            const bool logForm = index >= Table::kFirstLogNode;
-            const double base = logForm ? -logC_ : x;
+            const double base = byForm(index, -logC_, x);
             const double s0 = base + n.p[0];
             const double e0 = n.p[0] - (s0 - base);
-            return s0 + (((rest + e0) - (logForm ? logCLow_ : 0.0)) + d);
+            return s0 + (((rest + e0) - byForm(index, logCLow_, 0.0)) + d);
         }
         // Above z = 32, q < c^2 / 818: q^2 is below 1e-24 of the root.
         double t = 0.0;
@@ -1194,11 +1314,10 @@ private:
             const double t2 = t * t, t4 = t2 * t2;
             const double H = ((n.h[0] + n.h[1] * t) + t2 * (n.h[2] + n.h[3] * t))
                            + t4 * ((n.h[4] + n.h[5] * t) + t2 * n.h[6]);
-            const bool logForm = index >= Table::kFirstLogNode;
-            const double base = logForm ? -logC_ : x;
+            const double base = byForm(index, -logC_, x);
             const double s0 = base + n.p[0];
             const double e0 = n.p[0] - (s0 - base);
-            const double tail = (rest + e0) - (logForm ? logCLow_ : 0.0);
+            const double tail = (rest + e0) - byForm(index, logCLow_, 0.0);
             if (index >= shortFrom_)
             {
                 // q <= kShortQ and r <= kShortR on this node (see
@@ -1290,8 +1409,11 @@ private:
     int shortFrom_ = std::numeric_limits<int>::max();   ///< First node with the short correction.
     enum class Mode { Newton, Halley, Iterate };
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0, bound_ = 1.0, cPlus_ = 3.0;
+    double invNvt4_ = 4.0;                        ///< 4 / nVt (table index).
     double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.
     double series_[7] {};                         ///< y^3 .. y^15 coefficients.
+    double series2Limit_ = -1.0;                  ///< Longer series from seriesLimit_ to here.
+    double series2_[17] {};                       ///< y^3 .. y^35 coefficients (Halley mode).
     Mode mode_ = Mode::Iterate;
 };
 

@@ -445,6 +445,30 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `wdf::DiodePairRoot` for 1e-4 < c <= 0.02 (silicon diodes behind about
+  1.8 k to 0.36 M ohm with the default constants) at low and medium drive.
+  The exact reversion series is carried to y^35 and takes the drives above
+  the short series, 1.2 to 2.5 units of nVt further (incident waves up to
+  80 to 159 mV), where the root came from the table with its full
+  correction or, where the table starts higher (c above 0.0062), from an
+  omega estimate and a correction step with an exponential and a division.
+  The longer series reaches the table start for every c up to 0.02, so that
+  step is no longer used in the range. The table index is formed from the
+  wave, one multiply less on the way to the table. Measured at 48 kHz on an
+  RC clipper next to the single-omega approximation that ignores the
+  reverse diode (-39 to -88 dB of error), before and after in the same job
+  on four machines (GCC, Clang and MSVC on x64, GCC on arm64), behind 2.2 k
+  to 330 k ohm at 0.05 to 8 V peak: the root cost up to 1.42 times the
+  approximation (1.28, 1.19 and 1.09 on the other three machines; more than
+  the approximation on 14 to 21 of the 41 rows with GCC and MSVC and on 2
+  with Clang, all behind 10 k ohm or more at 0.5 V peak or less) and now
+  costs 0.48 to 0.97 times it on every row, 15 to 33 ns per sample; behind
+  330 k ohm at 0.1 V peak 33 to 44 ns -> 20 to 23. The roots stay within
+  one unit in the last place of 50-digit references on the new path, and
+  the output for c <= 1e-4 and for c > 0.02 is the same bit for bit. For
+  c > 0.02 (silicon behind more than about 0.36 M ohm, germanium behind a
+  few k ohm) nothing changes: the repeated Halley steps cost 1.7 to 3.1
+  times the approximation, whose error there is -12 to -49 dB.
 - `PitchDetector` (analysis readout) reads notes through noise at its
   defaults. Measured at 48 kHz window by window on sustained harmonic notes
   with gaps between them in continuous noise, 7500 windows per row; right

@@ -68,10 +68,10 @@
  * reactive states; the next finite input continues from rest.
  *
  * Memory: the omega tables (detail::WrightOmega, 22 KB, and
- * detail::DiodeOmegaTable, 99 KB) are built once per process when the first
+ * detail::DiodeOmegaTable, 103 KB) are built once per process when the first
  * diode root is constructed; nothing is allocated afterwards. A
  * DiodePairRoot holds 9.8 KB of its own for the local expansions of its
- * constants (detail::DiodeLocal).
+ * constants (detail::DiodeLocal), a DiodeRoot 6.2 KB.
  *
  * Dependencies: DspMath.h.
  */
@@ -100,6 +100,21 @@
     #define DSPARK_NOINLINE __attribute__((noinline))
   #else
     #define DSPARK_NOINLINE
+  #endif
+#endif
+
+// Forces the kernel of the local expansions into the root that reads a
+// cell: it has several callers, and with them a compiler may leave it out
+// of line (MSVC did for the pair once the single diode read cells too, 1 ns
+// per sample there). Forcing the table and series paths as well was
+// measured and is not done: no gain with GCC, a loss with Clang and MSVC.
+#ifndef DSPARK_WDF_INLINE
+  #if defined(_MSC_VER) && !defined(__clang__)
+    #define DSPARK_WDF_INLINE __forceinline
+  #elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_WDF_INLINE inline __attribute__((always_inline))
+  #else
+    #define DSPARK_WDF_INLINE inline
   #endif
 #endif
 
@@ -603,6 +618,42 @@ private:
 };
 
 /**
+ * e^a to twice the working precision, as hi + lo (|a| below 700): a = k ln 2
+ * + r with the product by ln 2 and the difference kept with their rounding
+ * errors, the series of e^r summed in double-double arithmetic, and the
+ * scaling by 2^k. Setup code: about 300 operations.
+ */
+inline void expTwice(double a, double& hi, double& lo) noexcept
+{
+    constexpr double kLn2Hi = 0.6931471805599453, kLn2Lo = 2.3190468138462996e-17;
+    const double k = std::nearbyint(a * 1.4426950408889634);
+    const double product = k * kLn2Hi;
+    const double productLow = std::fma(k, kLn2Hi, -product) + k * kLn2Lo;
+    const double first = a - product;
+    const double firstPart = first - a;
+    const double tail = ((a - (first - firstPart)) - (product + firstPart)) - productLow;
+    const double rh = first + tail;
+    const double rPart = rh - first;
+    const double rl = (first - (rh - rPart)) + (tail - rPart);
+    // 1 + r (1 + r / 2 (1 + r / 3 (...))): |r| < 0.35, so 22 terms pass 1e-31.
+    double sh = 1.0, sl = 0.0;
+    for (int n = 22; n >= 1; --n)
+    {
+        const double p = sh * rh;
+        const double pl = std::fma(sh, rh, -p) + (sh * rl + sl * rh);
+        const double q = p / n;
+        const double ql = (std::fma(-q, static_cast<double>(n), p) + pl) / n;
+        const double t = 1.0 + q;
+        const double tl = (q - (t - 1.0)) + ql;
+        sh = t + tl;
+        sl = tl - (sh - t);
+    }
+    const int e = static_cast<int>(k);
+    hi = std::ldexp(sh, e);
+    lo = std::ldexp(sl, e);
+}
+
+/**
  * @brief Full-precision Wright omega tables for the diode roots (no
  *        correction step needed).
  *
@@ -614,19 +665,29 @@ private:
  * - z in [-40, 32): 289 nodes 0.25 apart. Below z = 0 a node expands
  *   -omega (the root is A plus the expansion), above it ln(omega) = z - omega
  *   (the root is the expansion minus ln c, free of the cancellation between
- *   A and a large omega). Every
- *   node also expands R = 1 / (omega (1 + omega)) to degree 9 and
+ *   A and a large omega). Both are the series about the node through the
+ *   power 13 with the powers 10 to 13 folded into the nine kept, each
+ *   replaced by the polynomial of lower degree closest to it over the node
+ *   (Chebyshev economisation): cut at degree 9 the series would leave up
+ *   to 4e-16 at the edges of the nodes nearest the branch points of omega,
+ *   z = -1 +- i pi, and the fold leaves 1/512 of the first omitted power.
+ *   Every node also expands R = 1 / (omega (1 + omega)) to degree 9 and
  *   H = 1 / (1 + omega)^2 to degree 6, which give the antiparallel pair's
  *   reverse-diode correction (see DiodePairRoot; the lower degrees serve the
  *   small corrections, the full ones the larger corrections of c > 1e-4).
  * - z in [32, 2^20): ln(omega) to degree 9 and R to degree 7 about the
  *   midpoint of each of 16 cells per octave, indexed by the exponent and
  *   leading mantissa bits of z.
- * Truncation (largest omitted Taylor terms at the cell edges) stays below
- * 6e-17 of the root, and below 1e-16 for the pair's correction terms up to
- * c = 0.02. The coefficients follow from the Taylor recurrences of
- * P = 1 / (1 + omega) and R at each node, computed once per process on first
- * use (instance(), 99 KB); thread-safe and allocation free afterwards.
+ * What the constant term of a node or cell leaves out of -omega or
+ * ln(omega) there is kept apart, to twice the working precision
+ * (nodeLow(), from a double-double exponential and one Newton step): the
+ * single diode with a constant that is not small reads its root as the
+ * difference of two terms of similar size and needs both whole.
+ * Truncation of R and H (largest omitted Taylor terms at the cell edges)
+ * stays below 1e-16 for the pair's correction terms up to c = 0.02. The
+ * coefficients follow from the Taylor recurrences of P = 1 / (1 + omega)
+ * and R at each node, computed once per process on first use (instance(),
+ * 103 KB); thread-safe and allocation free afterwards.
  */
 class DiodeOmegaTable
 {
@@ -686,6 +747,22 @@ private:
         return c;
     }
 
+    /** The same, with the factor between z and the scaled offset and what
+     *  the p[0] of the cell leaves out of ln(omega) at its midpoint. */
+    [[nodiscard]] const Cell& cell(double z, double& t, double& scale, double& low) const noexcept
+    {
+        const auto bits = std::bit_cast<std::uint64_t>(z);
+        const auto index = static_cast<size_t>((bits >> 48) - kFirstCellBits);
+        const Cell& c = cells_[index];
+        scale = std::bit_cast<double>(kInverseSixteenth - (bits & kExponentMask));
+        t = (z - c.mid) * scale;
+        low = cellLow_[index];
+        return c;
+    }
+
+    /** What the p[0] of the node leaves out of -omega or ln(omega) there. */
+    [[nodiscard]] double nodeLow(int index) const noexcept { return nodeLow_[static_cast<size_t>(index)]; }
+
 public:
     /** Degree-7 polynomial (Estrin scheme). */
     [[nodiscard]] static double poly7(const double* c, double t) noexcept
@@ -700,7 +777,38 @@ private:
     static constexpr std::uint64_t kFirstCellBits = 0x4040u;      // bits(32.0) >> 48
     static constexpr std::uint64_t kExponentMask = 0x7FF0000000000000ull;
     static constexpr std::uint64_t kInverseSixteenth = std::uint64_t(2050) << 52; // 2^(4 - e)
-    static constexpr int kOrder = 10;
+    static constexpr int kOrder = 14;
+    static constexpr int kFolded = 13;        ///< Highest power folded into the nine kept.
+
+    /**
+     * Lowers the polynomial sum q[k] t^k (k up to @p from) to degree @p to
+     * over |t| <= 1/2: each power above it, from the highest down, is
+     * replaced by the lower-degree polynomial closest to it there (the power
+     * minus its multiple of the Chebyshev polynomial of that degree), which
+     * leaves 2^(1 - 2n) of its coefficient instead of 2^-n. The change of
+     * the constant term is added to @p constant instead of q[0].
+     */
+    static void economise(double* q, int from, int to, double& constant) noexcept
+    {
+        double cheb[kOrder + 1][kOrder + 1] {};            // T_n in powers of u = 2 t
+        cheb[0][0] = 1.0;
+        cheb[1][1] = 1.0;
+        for (int n = 1; n < from; ++n)
+            for (int j = 0; j <= n + 1; ++j)
+                cheb[n + 1][j] = (j > 0 ? 2.0 * cheb[n][j - 1] : 0.0) - cheb[n - 1][j];
+        for (int n = from; n > to; --n)
+        {
+            // t^n = u^n / 2^n, and u^n = (T_n(u) - its lower powers) / 2^(n - 1).
+            const double factor = -q[n] * std::ldexp(1.0, 1 - 2 * n);
+            for (int j = n - 2; j >= 0; j -= 2)
+            {
+                const double change = factor * cheb[n][j] * std::ldexp(1.0, j);
+                if (j == 0) constant += change;
+                else q[j] += change;
+            }
+            q[n] = 0.0;
+        }
+    }
 
     static double solve(double z) noexcept
     {
@@ -723,9 +831,26 @@ private:
      * relative accuracy where omega is large (the recurrence of omega itself,
      * omega' (1 + omega) = omega, cancels there).
      */
-    static void series(double z, double* w, double* l, double* r, double* h = nullptr) noexcept
+    static void series(double z, double* w, double* l, double* r, double* h = nullptr,
+                       double* low = nullptr) noexcept
     {
         const double y = solve(z);
+        if (low)
+        {
+            // What the doubles y and ln y leave out of omega and ln(omega)
+            // (low[0], low[1]): ln y to twice the precision from e^(ln y),
+            // then one Newton step of y + ln y = z with that residual.
+            const double lh = std::log(y);
+            double eh = 0.0, el = 0.0;
+            expTwice(lh, eh, el);
+            const double ll = ((y - eh) - el) / eh;
+            const double sum = y + lh;
+            const double part = sum - y;
+            const double sumLow = (y - (sum - part)) + (lh - part);
+            const double dy = -(((sum - z) + sumLow) + ll) * y / (1.0 + y);
+            low[0] = dy;
+            low[1] = ll + dy / y;
+        }
         double p[kOrder + 1], q[kOrder + 1], pp[kOrder + 1], rp[kOrder + 1];
         p[0] = 1.0 / (1.0 + y);
         q[0] = y * p[0];                                   // 1 - P
@@ -759,14 +884,22 @@ private:
 
     DiodeOmegaTable() noexcept
     {
-        double w[kOrder + 1], l[kOrder + 1], r[kOrder + 1], hh[kOrder + 1];
+        double w[kOrder + 1], l[kOrder + 1], r[kOrder + 1], hh[kOrder + 1], low[2], q[kOrder + 1];
         for (int i = 0; i < kNodes; ++i)
         {
-            series(kLo + 0.25 * i, w, l, r, hh);
+            series(kLo + 0.25 * i, w, l, r, hh, low);
             Node& n = nodes_[static_cast<size_t>(i)];
+            // -omega or ln(omega) in t = 4 (z - z_k), with the powers 10 to
+            // 13 folded into the nine kept: cut at degree 9, the series
+            // would leave up to 4e-16 at the edges of the nodes nearest the
+            // branch points of omega (z = -1 +- i pi).
             double scale = 1.0;
-            for (int k = 0; k < 10; ++k, scale *= 0.25)
-                n.p[k] = (i < kFirstLogNode ? -w[k] : l[k]) * scale;
+            for (int k = 0; k <= kFolded; ++k, scale *= 0.25)
+                q[k] = (i < kFirstLogNode ? -w[k] : l[k]) * scale;
+            double shift = 0.0;
+            economise(q, kFolded, 9, shift);
+            for (int k = 0; k < 10; ++k) n.p[k] = q[k];
+            nodeLow_[static_cast<size_t>(i)] = (i < kFirstLogNode ? -low[0] : low[1]) + shift;
             scale = 1.0;
             for (int k = 0; k < 10; ++k, scale *= 0.25) n.r[k] = r[k] * scale;
             const double u = 1.0 / (1.0 + w[0]);
@@ -779,7 +912,8 @@ private:
         {
             const double width = std::ldexp(1.0, 1 + c / 16);     // 2^e / 16, e = 5 + c/16
             const double mid = std::ldexp(1.0 + (c % 16) / 16.0, 5 + c / 16) + 0.5 * width;
-            series(mid, w, l, r);
+            series(mid, w, l, r, nullptr, low);
+            cellLow_[static_cast<size_t>(c)] = low[1];
             Cell& cl = cells_[static_cast<size_t>(c)];
             cl.mid = mid;
             double scale = 1.0;
@@ -791,6 +925,8 @@ private:
 
     std::array<Node, kNodes> nodes_ {};
     std::array<Cell, kCells> cells_ {};
+    std::array<double, kNodes> nodeLow_ {};     ///< Remainders of the p[0] (single diode).
+    std::array<double, kCells> cellLow_ {};
 };
 
 /**
@@ -1028,6 +1164,15 @@ private:
  * omitted terms are checked the same way. The same recurrence about the
  * origin, in the variable of DiodeSeries, gives the low-drive series for the
  * constants its tabulated polynomials do not cover.
+ *
+ * The single diode, s + c (e^s - 1) = x, is served the same way on both
+ * sides of the origin for the constants beyond those of DiodeSeries: its
+ * curve has one branch point above the real axis, at -(ln c + 1 + c) + i pi,
+ * the anchors are expansions about s_m = k / 4 with e^(s_m) tabulated to
+ * twice the working precision (g' (1 + c e^g) = 1 with E = e^g carried
+ * along, E' = E g'), and the cells run from the end of the series about the
+ * origin to the drives of two fixed roots, -1 and 1.5, beyond which the
+ * omega table answers (singleTableDrives()).
  */
 struct DiodeLocal
 {
@@ -1071,6 +1216,35 @@ struct DiodeLocal
         { 6.0, 201.71315737027922, 8.575934656268528e-15, 201.7156361224559 },
     };
 
+    static constexpr int kSingleCentreCount = 18;
+    /// Cells an instance of the single diode has room for: its cells run
+    /// between two roots that do not depend on the constant, and 3000
+    /// constants up to 1e5 need at most 24.
+    static constexpr int kSingleMaxCells = 32;
+    /// s and e^s as a double and its remainder: the centres of the single
+    /// diode's anchors, on both sides of the origin, as far as its cells go.
+    struct ExpCentre { double s, expHi, expLo; };
+    static constexpr ExpCentre kSingleCentres[kSingleCentreCount] = {
+        { -2.0, 0.1353352832366127, -1.042381423288669e-17 },
+        { -1.75, 0.17377394345044514, -1.2999409968044821e-17 },
+        { -1.5, 0.22313016014842982, 1.0887723699042263e-17 },
+        { -1.25, 0.2865047968601901, 8.479830077607644e-18 },
+        { -1.0, 0.36787944117144233, -1.2428753672788363e-17 },
+        { -0.75, 0.4723665527410147, 1.7984004434373214e-17 },
+        { -0.5, 0.6065306597126334, -6.593178415491414e-19 },
+        { -0.25, 0.7788007830714049, -1.0231869534531498e-17 },
+        { 0.25, 1.2840254166877414, 8.968972781793724e-17 },
+        { 0.5, 1.6487212707001282, -4.731568479435833e-17 },
+        { 0.75, 2.117000016612675, -1.1571006249440234e-16 },
+        { 1.0, 2.718281828459045, 1.4456468917292502e-16 },
+        { 1.25, 3.4903429574618414, -4.604261945372796e-17 },
+        { 1.5, 4.4816890703380645, 3.0481759556536343e-16 },
+        { 1.75, 5.754602676005731, -2.8457593299092424e-16 },
+        { 2.0, 7.38905609893065, -1.7971139497839148e-16 },
+        { 2.25, 9.487735836358526, -5.218563277933494e-16 },
+        { 2.5, 12.182493960703473, 2.0334002173348147e-16 },
+    };
+
     struct Cell
     {
         double centre = 0.0;                   ///< x the cell's series is about.
@@ -1090,13 +1264,13 @@ private:
 
 public:
     /** Cell of the sum of x and the grid's offset. */
-    [[nodiscard]] static std::uint64_t key(double shifted) noexcept
+    [[nodiscard]] static DSPARK_WDF_INLINE std::uint64_t key(double shifted) noexcept
     {
         return std::bit_cast<std::uint64_t>(shifted) >> kKeyShift;
     }
 
     /** Root at x from the cell that holds it. */
-    [[nodiscard]] static double evaluate(const Cell& cell, double x) noexcept
+    [[nodiscard]] static DSPARK_WDF_INLINE double evaluate(const Cell& cell, double x) noexcept
     {
         const double d = x - cell.centre;
         const double* a = cell.a;
@@ -1141,6 +1315,10 @@ public:
         int count = 0;                         ///< Cells built so far.
         bool done = true;                      ///< Nothing left to build.
         double twoC = 0.0, from = 0.0, to = 0.0;
+        double c = 0.0;                        ///< Constant of the single diode.
+        bool single = false;                   ///< Single diode instead of the pair.
+        bool clipTop = false;                  ///< The last cell ends at `to`.
+        int capacity = kMaxCells;              ///< Cells the caller has room for.
         int nearest = 0;                       ///< Anchor nearest the last cell.
         int anchorCentre[2] = { -1, -1 };      ///< Centres of the two anchors held.
         double anchorWidth[2] = { 0.0, 0.0 };
@@ -1154,6 +1332,10 @@ public:
         b.nearest = 0;
         b.anchorCentre[0] = b.anchorCentre[1] = -1;
         b.twoC = 2.0 * c;
+        b.c = c;
+        b.single = false;
+        b.clipTop = false;
+        b.capacity = kMaxCells;
         b.from = from;
         b.to = to;
         // Branch point nearest the positive real axis: the image of
@@ -1193,16 +1375,18 @@ public:
         // The part of the cell the root uses: the first one starts at
         // `from`, and its series is about the middle of that part.
         const double lowX = std::max(low - b.offset, b.from);
-        const double half = 0.5 * ((high - b.offset) - lowX);
+        const double highX = b.clipTop ? std::min(high - b.offset, b.to) : high - b.offset;
+        const double half = 0.5 * (highX - lowX);
         const double centre = lowX + half;
+        const int centres = b.single ? kSingleCentreCount : kCentreCount;
         // Nearest anchor in x (their x grows with s), then the one of it
         // and its upper neighbour that leaves more room around the cell.
-        while (b.nearest + 1 < kCentreCount
-               && std::abs(centreX(b.twoC, b.nearest + 1) - centre) < std::abs(centreX(b.twoC, b.nearest) - centre))
+        while (b.nearest + 1 < centres
+               && std::abs(centreX(b, b.nearest + 1) - centre) < std::abs(centreX(b, b.nearest) - centre))
             ++b.nearest;
         int slot = anchorOf(b, b.nearest);
         double room = b.anchorWidth[slot] - std::abs(centre - b.anchor[slot].xHi);
-        if (room < 2.0 * half && b.nearest + 1 < kCentreCount)
+        if (room < 2.0 * half && b.nearest + 1 < centres)
         {
             const int upper = anchorOf(b, b.nearest + 1);
             const double upperRoom = b.anchorWidth[upper] - std::abs(centre - b.anchor[upper].xHi);
@@ -1214,8 +1398,8 @@ public:
         ++b.count;
         // Just below the cell's upper edge, so that the rounded sum of a
         // drive under it and the offset stays inside the cell.
-        end = high * (1.0 - 0x1p-40) - b.offset;
-        b.done = b.count >= kMaxCells;
+        end = b.clipTop && !(high - b.offset < b.to) ? b.to : high * (1.0 - 0x1p-40) - b.offset;
+        b.done = b.count >= b.capacity;
         return true;
     }
 
@@ -1237,6 +1421,77 @@ public:
         return b.count;
     }
 
+    // ---- Single diode: s + c (e^s - 1) = x, either sign --------------------
+
+    /**
+     * Low-drive series of the single diode for any constant: fills q[0..31]
+     * with the coefficients of y^2 .. y^33 of the root in y = x / (1 + c)
+     * (kappa = c / (1 + c)) and returns the limit in |y|, set by the terms
+     * y^34 and y^35.
+     */
+    static double originSingle(double kappa, double* q) noexcept
+    {
+        double g[kMaxOrder] {};
+        seriesSingle(1.0, -kappa, 1.0, 35, g);
+        for (int i = 0; i < 32; ++i) q[i] = g[i + 1];
+        double y = 6.0;
+        for (int k = 34; k <= 35; ++k)
+        {
+            const double tail = std::abs(g[k - 1]);
+            if (tail > 0.0) y = std::min(y, std::pow(kTolerance / tail, 1.0 / (k - 1)));
+        }
+        return y;
+    }
+
+    /// Roots between which the single diode's table root is not used (see
+    /// singleTableDrives()).
+    static constexpr double kSingleTableReverse = -1.0, kSingleTableForward = 1.5;
+
+    /**
+     * Drives from which the single diode reads its root from the omega table
+     * for a constant beyond those of DiodeSeries: the images of the roots
+     * kSingleTableReverse and kSingleTableForward. Outside them the closed
+     * form, whose two terms are both known to twice the working precision,
+     * no longer cancels.
+     */
+    static void singleTableDrives(double c, double& reverse, double& forward) noexcept
+    {
+        reverse = kSingleTableReverse + c * std::expm1(kSingleTableReverse);
+        forward = kSingleTableForward + c * std::expm1(kSingleTableForward);
+    }
+
+    /** Offset of the single diode's cell grid: its branch point lies at
+     *  -(ln c + 1 + c) + i pi, and the cells run on both sides of it. */
+    [[nodiscard]] static double singleOffset(double c) noexcept
+    {
+        return kOffset * std::numbers::pi + (std::log(c) + 1.0 + c);
+    }
+
+    /**
+     * Lays the grid out for the drives [from, to) of the single diode of
+     * constant c, of one sign, on the grid of @p offset. With @p clipTop the
+     * last cell ends at @p to (the range below the origin, which must not
+     * reach into the series). @p capacity is the room left for cells.
+     */
+    static void startSingle(Builder& b, double c, double from, double to, double offset,
+                            bool clipTop, int capacity) noexcept
+    {
+        b.count = 0;
+        b.nearest = 0;
+        b.anchorCentre[0] = b.anchorCentre[1] = -1;
+        b.twoC = 2.0 * c;
+        b.c = c;
+        b.single = true;
+        b.clipTop = clipTop;
+        b.capacity = capacity;
+        b.from = from;
+        b.to = to;
+        b.offset = offset;
+        b.firstKey = 0;
+        b.done = !(to > from) || !(from + offset > 0.0) || capacity <= 0;
+        if (!b.done) b.firstKey = key(from + offset);
+    }
+
 private:
     static constexpr int kMaxOrder = 40;
 
@@ -1247,14 +1502,16 @@ private:
         for (int i = 0; i < 2; ++i)
             if (b.anchorCentre[i] == m) return i;
         const int slot = b.anchorCentre[0] <= b.anchorCentre[1] ? 0 : 1;
-        b.anchorWidth[slot] = build(b.twoC, kCentres[m], b.anchor[slot]);
+        b.anchorWidth[slot] = b.single ? buildSingle(b.c, kSingleCentres[m], b.anchor[slot])
+                                       : build(b.twoC, kCentres[m], b.anchor[slot]);
         b.anchorCentre[slot] = m;
         return slot;
     }
 
-    [[nodiscard]] static double centreX(double twoC, int m) noexcept
+    [[nodiscard]] static double centreX(const Builder& b, int m) noexcept
     {
-        return kCentres[m].s + twoC * kCentres[m].sinhHi;
+        return b.single ? kSingleCentres[m].s + b.c * (kSingleCentres[m].expHi - 1.0)
+                        : kCentres[m].s + b.twoC * kCentres[m].sinhHi;
     }
 
     /**
@@ -1319,6 +1576,64 @@ private:
     }
 
     /**
+     * g_1 .. g_order of the inverse of the single diode's curve, as series()
+     * does for the pair: g' (1 + c e^g) = 1 with the series of E = e^g
+     * carried along (E' = E g'). About a point in x, invD = 1 / (1 + c e^s)
+     * and feedback = -c invD; about the origin in y, 1 and -kappa.
+     */
+    static void seriesSingle(double invD, double feedback, double exp0, int order, double* g) noexcept
+    {
+        double p[kMaxOrder] {}, E[kMaxOrder] {};
+        E[0] = exp0;
+        p[0] = invD;
+        for (int n = 0; n + 1 < order; ++n)
+        {
+            double fromE = 0.0;
+            for (int j = 0; j <= n; ++j) fromE += E[j] * p[n - j];
+            E[n + 1] = fromE / (n + 1);
+            double sum = 0.0;
+            for (int j = 1; j <= n + 1; ++j) sum += E[j] * p[n + 1 - j];
+            p[n + 1] = feedback * sum;
+        }
+        for (int k = 1; k <= order; ++k) g[k - 1] = p[k - 1] / k;
+    }
+
+    /** Anchor of the single diode about the centre m; returns its
+     *  half-width in x. */
+    static double buildSingle(double c, const ExpCentre& m, Expansion& e) noexcept
+    {
+        double g[kMaxOrder] {};
+        const double invD = 1.0 / (1.0 + c * m.expHi);
+        seriesSingle(invD, -c * invD, m.expHi, kTerms + 2, g);
+        // x_m = s_m + c (e^s - 1): the product, the difference and the sum
+        // with their rounding errors.
+        const double product = c * m.expHi;
+        const double productLow = std::fma(c, m.expHi, -product) + c * m.expLo;
+        const double excess = product - c;
+        const double excessPart = excess - product;
+        const double excessLow = (product - (excess - excessPart)) + (-c - excessPart);
+        const double sum = m.s + excess;
+        const double part = sum - m.s;
+        const double sumLow = (m.s - (sum - part)) + (excess - part);
+        e.xHi = sum;
+        e.xLo = (sumLow + excessLow) + productLow;
+        e.s = m.s;
+        // No further than |x_m| / 2 and than the root s_m / 2 (to first order).
+        double width = 0.5 * std::min(std::abs(sum), std::abs(m.s) / g[0]);
+        const double reference = kTolerance * 0.5 * std::abs(m.s);
+        for (int k = kTerms + 1; k <= kTerms + 2; ++k)
+        {
+            const double tail = std::abs(g[k - 1]);
+            if (tail > 0.0) width = std::min(width, std::pow(reference / tail, 1.0 / k));
+        }
+        e.width = width;
+        e.a[0] = 0.0;
+        double power = width;
+        for (int k = 1; k <= kTerms; ++k, power *= width) e.a[k] = g[k - 1] * power;
+        return width;
+    }
+
+    /**
      * Taylor shift of the anchor to @p centre: the cell's root there and its
      * coefficients. False when the first two omitted terms of the cell, at
      * its half-width, pass kTolerance of half that root.
@@ -1347,7 +1662,7 @@ private:
         cell.rootLo = low - (cell.rootHi - sum);
         double power = invWidth;
         for (int j = 1; j <= kCellTerms; ++j, power *= invWidth) cell.a[j - 1] = work[j] * power;
-        const double reach = half * invWidth, reference = kTolerance * 0.5 * cell.rootHi;
+        const double reach = half * invWidth, reference = kTolerance * 0.5 * std::abs(cell.rootHi);
         double term = 1.0;
         for (int j = 0; j <= kCellTerms; ++j) term *= reach;   // reach to the 17
         return std::abs(work[kCellTerms + 1]) * term <= reference
@@ -1905,23 +2220,51 @@ private:
  * Conducts for positive v, blocks (down to -Is) for negative v.
  *
  * Solver: s + c (e^s - 1) = a / nVt (s = v/nVt, c = R Is / nVt) has the
- * exact root s = A + c - omega(ln c + A + c) (Werner et al. 2015). For c up
- * to 0.04 (where the reversion series below covers the small drives at which
- * A + c and omega would cancel) and ln c + A + c < 2^20, that closed form is
- * evaluated with detail::DiodeOmegaTable to double precision, within one
- * unit in the last place of 50-digit roots: no exponential and no division
- * per sample. Otherwise one correction step with one expm1() turns a
- * tabulated omega estimate into the root to full double precision: Newton
- * while c <= 1e-4, Halley up to c = 10, repeated Halley steps beyond.
- * Measured worst relative error over drives of +-1e-9 to 1e4 nVt: 9e-16 for
- * c from 1e-15 to 10, 1.1e-14 up to 1e5. For incident waves below about
- * 42-49 mV of either sign (default constants behind 0.7-2.2 k ohm; any c up
- * to 0.04) the exact reversion series of detail::DiodeSeries is used
- * instead (4e-16 worst relative error against 50-digit roots). Cost per
- * sample for an RC circuit on the development machine (MSVC x64): 12.2 ns
- * at low drive and 13-16 ns above (0.5-8 V peak), against 26-27 ns with the
- * estimate and its correction step and 19-23 ns for the closed form with a
- * cubic omega estimate.
+ * exact root s = A + c - omega(ln c + A + c) (Werner et al. 2015). It is
+ * read from series and tables, with no transcendental function and no
+ * division per sample, by constant and drive:
+ * - c up to 0.04 (the default constants behind up to about 0.7 M ohm): the
+ *   exact reversion series of detail::DiodeSeries for incident waves below
+ *   about 42-49 mV of either sign (default constants behind 0.7-2.2 k ohm),
+ *   where A + c and omega would cancel, and the closed form from
+ *   detail::DiodeOmegaTable beyond, up to ln c + A + c = 2^20.
+ * - c from 0.04 to 1e5 (germanium diodes, very large resistances): at low
+ *   drive a series to y^33 from a recurrence for the constant
+ *   (detail::DiodeLocal::originSingle()); outside the drives of the roots
+ *   -1 and 1.5 the closed form from the table, with x + c, ln c and the
+ *   constant term of the table each carried to twice the working precision
+ *   so that their difference keeps it; and between the series and those
+ *   two drives, on either side, local expansions of the root
+ *   (detail::DiodeLocal): cells of sixteen terms found from the bits of the
+ *   drive, at most 24 of them for 3000 constants over that range, in room
+ *   for 32.
+ *
+ * The series and the cells of a constant beyond 0.04 belong to it.
+ * prepare() builds them for the circuit as it stands (2 to 24 microseconds);
+ * when a value of the circuit or of the diode changes while running they
+ * are dropped, and once the new constants have held for 256 samples they
+ * are built again, the series in one sample and then one cell per sample.
+ * Until then between the two table drives, there as well for c beyond 1e5,
+ * at every drive for c beyond 1e7 and beyond ln c + A + c = 2^20, a
+ * tabulated omega estimate takes correction steps on the exact equation,
+ * with one exponential and one division each: one Newton step while
+ * c <= 1e-4, one Halley step up to c = 10, repeated Halley steps beyond.
+ *
+ * Accuracy: against a long double reference over drives of either sign from
+ * 1e-6 to 1e6 times (1 + c), the worst relative error is 3.6e-16 for c from
+ * 1e-9 to 1e5 (3.3e-16 beyond c = 0.04), and under reverse drive it stays
+ * within 3.5e-16 up to c = 1e9. The result does not depend on the
+ * previous sample.
+ *
+ * Cost for an RC circuit at 48 kHz, measured on four machines (GCC, Clang
+ * and MSVC on x64, GCC on arm64) next to the closed form with a fast omega
+ * estimate (D'Angelo et al., DAFx-19), from 0.05 to 8 V peak: behind 2.2 k
+ * to 330 k ohm with the default constants (c up to 0.018) 15 to 26 ns per
+ * sample, 0.48 to 0.81 times the estimate's cost (whose error is -53 to
+ * -153 dB); behind 1 M to 10 M ohm (c from 0.05 to 0.5) 17 to 27 ns, 0.49
+ * to 0.87 times the estimate (-43 to -80 dB).
+ *
+ * Memory: 6.2 KB per instance, most of it the cells.
  */
 template <FloatType T, typename Tree>
 class DiodeRoot
@@ -1941,6 +2284,12 @@ public:
         tree_.updatePorts();
         tree_.reset();
         v_ = 0.0;
+        // The constants of the circuit as it stands, with their local
+        // expansions, so that the first sample already finds them.
+        const double k = tree_.portResistance() * static_cast<double>(is_);
+        const double nvt = static_cast<double>(nvt_);
+        if (k != kCached_ || nvt != nvtCached_) updateConstants(k, nvt);
+        while (localPending_) stepLocal();
     }
     void reset() noexcept { tree_.reset(); v_ = 0.0; }
 
@@ -1956,17 +2305,15 @@ public:
         const double k = tree_.portResistance() * static_cast<double>(is_);
         const double nvt = static_cast<double>(nvt_);
         if (k != kCached_ || nvt != nvtCached_) [[unlikely]]
+            updateConstants(k, nvt);
+        else if (localPending_) [[unlikely]]
         {
-            kCached_ = k;
-            nvtCached_ = nvt;
-            invNvt_ = 1.0 / nvt;
-            c_ = k * invNvt_;
-            logC_ = std::log(c_);
-            steps_ = c_ <= 1e-4 ? 0 : (c_ <= 10.0 ? 1 : 32);
-            logCc4_ = 4.0 * (logC_ + c_);
-            logCLow_ = std::fma(c_, std::exp(-logC_), -1.0);
-            invBeta_ = 1.0 / (1.0 + c_);
-            seriesLimit_ = (1.0 + c_) * detail::DiodeSeries::single(c_ * invBeta_, series_);
+            // Constants changed while running: the local expansions wait
+            // until they have held for kSettle samples, so that a circuit
+            // whose values move every sample never pays for them, and are
+            // then built one cell per sample.
+            if (settle_ < kSettle) ++settle_;
+            else stepLocal();
         }
 
         const double x = a * invNvt_;
@@ -1987,35 +2334,13 @@ public:
         }
         else if (std::abs(x) < 1e12)
         {
-            double s = x + c_ - (*omega_)(logC_ + x + c_);
-            for (int it = 0; it <= steps_; ++it)
-            {
-                const double m = std::expm1(s);
-                const double e = c_ * (1.0 + m);        // c e^s = g' - 1 = g''
-                const double g = (s - x) + c_ * m;
-                const double g1 = 1.0 + e;
-                if (steps_ == 0)
-                {
-                    s -= g / g1;
-                    break;
-                }
-                const double step = (2.0 * g) * g1 / ((2.0 * g1) * g1 - g * e);
-                s -= step;
-                if (steps_ == 1 || !(std::abs(step) > 1e-6 * std::abs(s))) break;
-            }
-            v_ = s * nvt;
+            // 4 (ln c + c + x) with one rounding, formed from the wave so
+            // that the table index does not wait for x.
+            v_ = (large_ ? solveLarge(x, a * invNvt4_ + logCc4_) : solveIterate(x)) * nvt;
         }
         else
         {
-            // Far-field analytic seed: forward drive lands near
-            // nVt ln(1 + a/k); reverse drive blocks, so the root sits near a.
-            const double seed = (a > 0.0) ? nvt * std::log1p(a / k) : a;
-            v_ = detail::solveMonotonic(a, seed, [k, nvt, a](double v, double& f, double& fp)
-            {
-                const double xx = std::clamp(v / nvt, -700.0, 700.0);
-                f  = v + k * std::expm1(xx) - a;
-                fp = 1.0 + (k / nvt) * std::exp(xx);
-            });
+            v_ = solveFarField(a, k, nvt);
         }
 
         tree_.incident(static_cast<T>(2.0 * v_ - a));
@@ -2025,6 +2350,244 @@ public:
     [[nodiscard]] T getVoltage() const noexcept { return static_cast<T>(v_); }
 
 private:
+    DSPARK_NOINLINE void updateConstants(double k, double nvt) noexcept
+    {
+        kCached_ = k;
+        nvtCached_ = nvt;
+        invNvt_ = 1.0 / nvt;
+        c_ = k * invNvt_;
+        logC_ = std::log(c_);
+        steps_ = c_ <= 1e-4 ? 0 : (c_ <= 10.0 ? 1 : 32);
+        logCc4_ = 4.0 * (logC_ + c_);
+        logCLow_ = std::fma(c_, std::exp(-logC_), -1.0);
+        invNvt4_ = 4.0 * invNvt_;
+        invBeta_ = 1.0 / (1.0 + c_);
+        seriesLimit_ = (1.0 + c_) * detail::DiodeSeries::single(c_ * invBeta_, series_);
+
+        // Beyond the constants the tabulated series cover (c above 0.0417)
+        // the table root answers outside two drives that depend on the
+        // constant (detail::DiodeLocal::singleTableDrives()), and up to
+        // kLocalMaxC a low-drive series and cells built for the constant
+        // (detail::DiodeLocal) answer between them: in prepare(), or once
+        // these constants have held for kSettle samples.
+        large_ = !(seriesLimit_ > 0.0) && c_ <= kTableMaxC;
+        longLimit_ = 0.0;
+        forwardTo_ = -1.0;
+        reverseFrom_ = std::numeric_limits<double>::infinity();
+        reverseTo_ = -std::numeric_limits<double>::infinity();
+        reverseCount_ = 0;
+        settle_ = 0;
+        localPhase_ = 0;
+        localPending_ = large_ && c_ <= kLocalMaxC;
+        if (large_)
+        {
+            // ln c to twice the precision, and what logCc4_ leaves out of
+            // 4 (ln c + c).
+            double eh = 0.0, el = 0.0;
+            detail::expTwice(logC_, eh, el);
+            logCLow_ = ((c_ - eh) - el) / eh;
+            const double sum = logC_ + c_;
+            const double part = sum - logC_;
+            logCcLow4_ = 4.0 * (((logC_ - (sum - part)) + (c_ - part)) + logCLow_);
+            detail::DiodeLocal::singleTableDrives(c_, tableReverse_, tableForward_);
+        }
+    }
+
+    /**
+     * One step of the local expansions of the current constants: the first
+     * builds the low-drive series and lays the grid out, the next ones add
+     * one cell each, below the origin first and then above it. A step costs
+     * at most two anchors and one cell, about 3000 multiply-adds.
+     */
+    DSPARK_NOINLINE void stepLocal() noexcept
+    {
+        using Local = detail::DiodeLocal;
+        if (localPhase_ == 0)
+        {
+            const double limit = (1.0 + c_) * Local::originSingle(c_ * invBeta_, long_);
+            localOffset_ = Local::singleOffset(c_);
+            Local::startSingle(localBuild_, c_, tableReverse_, -limit, localOffset_, true, Local::kSingleMaxCells);
+            reverseFirstKey_ = localBuild_.firstKey;
+            longLimit_ = limit;
+            localPhase_ = 1;
+            return;
+        }
+        if (localPhase_ == 1)
+        {
+            double end = reverseTo_;
+            if (Local::step(localBuild_, local_, end))
+            {
+                reverseFrom_ = tableReverse_;
+                reverseTo_ = end;
+                reverseCount_ = localBuild_.count;
+                if (!localBuild_.done) return;
+            }
+            // Below the origin is done: above it, in the room that is left.
+            Local::startSingle(localBuild_, c_, longLimit_, tableForward_, localOffset_, false,
+                               Local::kSingleMaxCells - reverseCount_);
+            forwardFirstKey_ = localBuild_.firstKey;
+            localPhase_ = 2;
+            localPending_ = !localBuild_.done;
+            return;
+        }
+        double end = forwardTo_;
+        const bool added = Local::step(localBuild_, local_ + reverseCount_, end);
+        forwardTo_ = end;
+        localPending_ = added && !localBuild_.done;
+    }
+
+    /** Root for 0.0417 < c <= kLocalMaxC: the series and the cells of the
+     *  constant where they are built, the table root where it is accurate,
+     *  and the estimate with its correction steps for whatever is left. */
+    [[nodiscard]] double solveLarge(double x, double z4) const noexcept
+    {
+        using Local = detail::DiodeLocal;
+        if (std::abs(x) < longLimit_)
+        {
+            // s = y + y^2 (q_0 + q_1 y + ... + q_31 y^31).
+            const double y = x * invBeta_;
+            const double* q = long_;
+            const double y2 = y * y, y4 = y2 * y2, y8 = y4 * y4;
+            const double q0 = (q[0] + q[1] * y) + y2 * (q[2] + q[3] * y);
+            const double q1 = (q[4] + q[5] * y) + y2 * (q[6] + q[7] * y);
+            const double q2 = (q[8] + q[9] * y) + y2 * (q[10] + q[11] * y);
+            const double q3 = (q[12] + q[13] * y) + y2 * (q[14] + q[15] * y);
+            const double q4 = (q[16] + q[17] * y) + y2 * (q[18] + q[19] * y);
+            const double q5 = (q[20] + q[21] * y) + y2 * (q[22] + q[23] * y);
+            const double q6 = (q[24] + q[25] * y) + y2 * (q[26] + q[27] * y);
+            const double q7 = (q[28] + q[29] * y) + y2 * (q[30] + q[31] * y);
+            const double low = (q0 + y4 * q1) + y8 * (q2 + y4 * q3);
+            const double high = (q4 + y4 * q5) + y8 * (q6 + y4 * q7);
+            return y + y2 * (low + (y8 * y8) * high);
+        }
+        if (x > 0.0)
+        {
+            if (x < forwardTo_)
+            {
+                const auto cell = static_cast<std::size_t>(Local::key(x + localOffset_) - forwardFirstKey_);
+                return Local::evaluate(local_[static_cast<std::size_t>(reverseCount_) + cell], x);
+            }
+            if (x >= tableForward_) return solveTableLarge(x, z4);
+        }
+        else
+        {
+            if (x >= reverseFrom_ && x < reverseTo_)
+            {
+                const auto cell = static_cast<std::size_t>(Local::key(x + localOffset_) - reverseFirstKey_);
+                return Local::evaluate(local_[cell], x);
+            }
+            if (x <= tableReverse_) return solveTableLarge(x, z4);
+        }
+        return solveIterate(x);
+    }
+
+    /** Bracketed Newton in volts, for drives beyond 1e12 nVt. Far-field
+     *  analytic seed: forward drive lands near nVt ln(1 + a/k); reverse
+     *  drive blocks, so the root sits near a. */
+    [[nodiscard]] DSPARK_NOINLINE static double solveFarField(double a, double k, double nvt) noexcept
+    {
+        const double seed = (a > 0.0) ? nvt * std::log1p(a / k) : a;
+        return detail::solveMonotonic(a, seed, [k, nvt, a](double v, double& f, double& fp)
+        {
+            const double xx = std::clamp(v / nvt, -700.0, 700.0);
+            f  = v + k * std::expm1(xx) - a;
+            fp = 1.0 + (k / nvt) * std::exp(xx);
+        });
+    }
+
+    /** Tabulated omega estimate and correction steps on the exact equation
+     *  (one exponential and one division each). Out of line: the series and
+     *  the tables answer every drive of a prepared root up to c = 1e5. */
+    [[nodiscard]] DSPARK_NOINLINE double solveIterate(double x) const noexcept
+    {
+        double s = x + c_ - (*omega_)(logC_ + x + c_);
+        // x + c with its rounding error, for the residual below s = -0.7.
+        const double sum = x + c_;
+        const double part = sum - x;
+        const double sumLow = (x - (sum - part)) + (c_ - part);
+        for (int it = 0; it <= steps_; ++it)
+        {
+            double e = 0.0, g = 0.0;                // c e^s = g' - 1 = g'', residual
+            if (s < -0.7)
+            {
+                // s + c e^s - (x + c): c (e^s - 1) would lose what c e^s
+                // holds below the last place of c.
+                e = c_ * std::exp(s);
+                g = ((s - sum) - sumLow) + e;
+            }
+            else
+            {
+                const double m = std::expm1(s);
+                e = c_ * (1.0 + m);
+                g = (s - x) + c_ * m;
+            }
+            const double g1 = 1.0 + e;
+            if (steps_ == 0)
+            {
+                s -= g / g1;
+                break;
+            }
+            const double step = (2.0 * g) * g1 / ((2.0 * g1) * g1 - g * e);
+            s -= step;
+            if (steps_ == 1 || !(std::abs(step) > 1e-6 * std::abs(s))) break;
+        }
+        return s;
+    }
+
+    /**
+     * The closed form from the table for a constant that is not small, at
+     * the drives where it is accurate (see updateConstants()). The node comes
+     * from z4, the rounded 4 (ln c + c + x), so that its coefficients do not
+     * wait for anything else; what the rounding and the stored constant leave
+     * out of z is known exactly (dz) and enters through the first two
+     * derivatives of the polynomial of the node. Every leading term is
+     * carried to twice the working precision: x + c, which cancels under
+     * reverse drive, is summed with its error, the table holds what its
+     * constant terms leave out of -omega and ln(omega), and ln c has its
+     * remainder. Below z = kLo, omega < e^-40 and the root is x + c.
+     */
+    [[nodiscard]] double solveTableLarge(double x, double z4) const noexcept
+    {
+        using Table = detail::DiodeOmegaTable;
+        if (!(z4 < 4.0 * Table::kOctaveMax)) return solveIterate(x);
+        const double x4 = 4.0 * x;
+        const double part = z4 - x4;
+        const double dz = ((x4 - (z4 - part)) + (logCc4_ - part)) + logCcLow4_;
+        if (z4 < 4.0 * Table::kHi)
+        {
+            if (!(z4 >= 4.0 * Table::kLo)) return x + c_;
+            double t = 0.0;
+            int index = 0;
+            const auto& n = exact_->node(z4, t, index);
+            // The small terms are gathered apart, so that only the
+            // polynomial and two sums follow the node.
+            const double extra = dz * (n.p[1] + n.p[2] * (2.0 * t + dz)) + exact_->nodeLow(index);
+            const double rest = Table::poly9Rest(n.p, t);
+            if (index < Table::kFirstLogNode)
+            {
+                const double sum = x + c_;                  // |x| > c wherever z < 0
+                const double low = c_ - (sum - x);
+                const double s0 = sum + n.p[0];
+                const double v = s0 - sum;
+                const double e0 = (sum - (s0 - v)) + (n.p[0] - v);
+                return s0 + (rest + ((e0 + low) + extra));
+            }
+            const double s0 = n.p[0] - logC_;
+            const double v = s0 - n.p[0];
+            const double e0 = (n.p[0] - (s0 - v)) - (logC_ + v);
+            return s0 + (rest + ((e0 - logCLow_) + extra));
+        }
+        double t = 0.0, scale = 0.0, p0Low = 0.0;
+        const auto& cl = exact_->cell(0.25 * z4, t, scale, p0Low);
+        const double dt = (0.25 * dz) * scale;
+        const double extra = dt * (cl.p[1] + cl.p[2] * (2.0 * t + dt)) + p0Low;
+        const double rest = Table::poly9Rest(cl.p, t);
+        const double s0 = cl.p[0] - logC_;
+        const double v = s0 - cl.p[0];
+        const double e0 = (cl.p[0] - (s0 - v)) - (logC_ + v);
+        return s0 + (rest + ((e0 - logCLow_) + extra));
+    }
+
     /**
      * Exact root s = x + c - omega(z) (z = ln c + x + c, 4 z = z4) for
      * c <= 0.04 (the series covers the small drives, where x + c and omega
@@ -2069,9 +2632,33 @@ private:
     double kCached_ = -1.0, nvtCached_ = -1.0;
     double invNvt_ = 1.0, c_ = 1.0, logC_ = 0.0;
     double logCc4_ = 0.0, logCLow_ = 0.0;   ///< 4 (logC_ + c), ln c - logC_ (table path).
+    double invNvt4_ = 4.0, logCcLow4_ = 0.0; ///< 4 / nVt, 4 (ln c + c) - logCc4_.
     double invBeta_ = 1.0, seriesLimit_ = -1.0;   ///< Series path below |a| / nVt = seriesLimit_.
     double series_[14] {};                        ///< y^2 .. y^15 coefficients.
     int steps_ = 1;   ///< 0: one Newton step, 1: one Halley step, else Halley until converged.
+    /// The table root is not used beyond this c (the rounding of z, which
+    /// grows with c, would pass what its compensation holds), nor the local
+    /// expansions beyond kLocalMaxC (from there on the forward table drive
+    /// passes the end of the table): the correction steps keep those
+    /// constants.
+    static constexpr double kTableMaxC = 1e7;
+    static constexpr double kLocalMaxC = 1e5;
+    static constexpr int kSettle = 256;           ///< Samples the constants hold before a build.
+    bool large_ = false;                          ///< 0.0417 < c <= kTableMaxC.
+    bool localPending_ = false;                   ///< Local expansions still to build.
+    int localPhase_ = 0;                          ///< 0: series and grid, 1: below the origin, 2: above.
+    int settle_ = 0;
+    int reverseCount_ = 0;                        ///< Cells below the origin (the first ones).
+    double longLimit_ = 0.0;                      ///< Series of the constant below this |x|.
+    double tableForward_ = 0.0, tableReverse_ = 0.0;   ///< Table root from these drives outwards.
+    double forwardTo_ = -1.0;                     ///< Cells above the origin answer below this x.
+    double reverseFrom_ = std::numeric_limits<double>::infinity();
+    double reverseTo_ = -std::numeric_limits<double>::infinity();   ///< Cells below the origin: [from, to).
+    double localOffset_ = 0.0;                    ///< Offset of the cell grid.
+    std::uint64_t forwardFirstKey_ = 0, reverseFirstKey_ = 0;
+    double long_[32] {};                          ///< y^2 .. y^33 coefficients of the constant.
+    detail::DiodeLocal::Builder localBuild_;
+    detail::DiodeLocal::Cell local_[detail::DiodeLocal::kSingleMaxCells];
 };
 
 // ============================================================================

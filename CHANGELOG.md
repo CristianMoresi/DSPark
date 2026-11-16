@@ -445,6 +445,45 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `wdf::DiodeRoot` for c > 0.04 (silicon diodes behind more than about
+  0.7 M ohm with the default constants, germanium behind a few k ohm): the
+  root is read from a series and tables for the constant of the instance,
+  with no transcendental function and no division per sample, where it took
+  an omega estimate and Halley steps with an exponential and a division
+  each. At low drive a series to y^33 from a recurrence for the constant;
+  outside the drives of the roots -1 and 1.5 the closed form from the omega
+  table, with x + c, ln c and the constant term of the table each carried
+  to twice the working precision and the table index formed from the wave;
+  between them, on either side of the origin, local expansions of the root
+  (`detail::DiodeLocal`), at most 24 cells of sixteen terms for 3000
+  constants up to 1e5 in room for 32. Measured at 48 kHz on an RC circuit
+  next to the closed form with a fast omega estimate (-43 to -80 dB of
+  error), before and after in the same job on four machines (GCC, Clang and
+  MSVC on x64, GCC on arm64), behind 1 M to 10 M ohm at 0.05 to 8 V peak (c
+  from 0.05 to 0.5): the root went from 1.12 to 1.98 times the estimate's
+  cost to 0.49 to 0.87 (39 to 58 ns per sample -> 17 to 27). Behind 2.2 k
+  to 330 k ohm (c up to 0.018, the tabulated series and the table as
+  before) it costs 0.48 to 0.81 times the estimate, within 1 % of before.
+  Worst relative error against a long double reference over drives of
+  either sign from 1e-6 to 1e6 times (1 + c): 3.6e-16 for c from 1e-9 to
+  1e5 (3.3e-16 beyond c = 0.04) and, under reverse drive, 3.5e-16 up to
+  c = 1e9, where the knee of the blocked diode (x near -c) was off by up to
+  7e-14 from c = 300 on. `prepare()` builds the series and the cells
+  for the circuit as it stands (2 to 24 microseconds); after a change of
+  constants while running they are built again once the new constants have
+  held for 256 samples, one cell per sample, and the table and the
+  correction steps answer until then. An instance grows to 6.2 KB.
+- `detail::DiodeOmegaTable` (both diode roots): the polynomials of -omega
+  and ln(omega) fold the powers 10 to 13 of their series into the nine
+  kept, each replaced by the polynomial of lower degree closest to it over
+  the node, instead of being cut at degree 9. The cut left up to 4e-16 at
+  the edges of the nodes nearest the branch points of omega; the fold
+  leaves 1/512 of the first omitted power. For the single diode at c = 0.04
+  the worst relative error where the table answers went from 3.4e-16 to no
+  more than 3.0e-16; the pair's worst error over c from 1e-9 to 1e5 is
+  unchanged (3.2e-16, set by its series) and its cost is the same on the
+  four machines. The table also keeps what its constant terms leave out, to
+  twice the working precision, and grows from 99 to 103 KB.
 - `wdf::DiodePairRoot` at medium drive, and at every drive for c > 0.02
   (silicon diodes behind more than about 0.36 M ohm, germanium behind a few
   k ohm): the root comes from local expansions built for the constants of

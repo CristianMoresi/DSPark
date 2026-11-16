@@ -304,6 +304,138 @@ DSPARK_TEST(FFT_matches_the_direct_dft_at_every_size)
     checkFftAgainstDft<double>(1e-14);
 }
 
+// The real transforms split and pack their half-size spectrum with one
+// difference and one complex product per pair of bins k and N/2 - k
+// (FFTReal's split factors). At every size from 4 to 65536, in float and
+// double, on both kernel sets: the forward transform matches the complex
+// transform of the same samples (a route that shares neither the split nor
+// its table), the imaginary parts of DC and Nyquist are exactly zero, the
+// inverse returns the input, and a unit impulse and a flat spectrum map to
+// each other exactly (the split of equal mirror bins adds nothing).
+template <typename T>
+static void checkRealSplitAgainstComplex(double tolerance)
+{
+    unsigned int rng = 2468u;
+    auto uniform = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+    };
+    for (size_t n = 4; n <= 65536; n *= 2)
+    {
+        std::vector<T> x(n), spec(n + 2), back(n);
+        std::vector<double> z(2 * n, 0.0);
+        for (size_t i = 0; i < n; ++i)
+        {
+            x[i] = static_cast<T>(uniform());
+            z[2 * i] = static_cast<double>(x[i]);
+        }
+        FFTComplex<double> reference(n);
+        reference.forward(z.data());
+        FFTReal<T> fft(n);
+        fft.forward(x.data(), spec.data());
+        double err = 0.0, ref = 0.0;
+        for (size_t k = 0; k <= n / 2; ++k)
+        {
+            const double dr = static_cast<double>(spec[2 * k]) - z[2 * k];
+            const double di = static_cast<double>(spec[2 * k + 1]) - z[2 * k + 1];
+            err += dr * dr + di * di;
+            ref += z[2 * k] * z[2 * k] + z[2 * k + 1] * z[2 * k + 1];
+        }
+        EXPECT_LT(std::sqrt(err / ref), tolerance);
+        EXPECT_EQ(spec[1], T(0));
+        EXPECT_EQ(spec[n + 1], T(0));
+        fft.inverse(spec.data(), back.data());
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(back[i]) - static_cast<double>(x[i])));
+        EXPECT_LT(worst, 10.0 * tolerance);
+
+        std::fill(x.begin(), x.end(), T(0));
+        x[0] = T(1);
+        fft.forward(x.data(), spec.data());
+        bool flat = true;
+        for (size_t k = 0; k <= n / 2; ++k)
+            flat = flat && spec[2 * k] == T(1) && spec[2 * k + 1] == T(0);
+        EXPECT_TRUE(flat);
+        fft.inverse(spec.data(), back.data());
+        bool impulse = back[0] == T(1);
+        for (size_t i = 1; i < n; ++i) impulse = impulse && back[i] == T(0);
+        EXPECT_TRUE(impulse);
+    }
+}
+
+DSPARK_TEST(FFTReal_split_matches_the_complex_transform_on_both_kernel_sets)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool wide : { false, true })
+    {
+        simd::setRuntimeDispatch(wide && dispatch);
+        checkRealSplitAgainstComplex<float>(2e-6);
+        checkRealSplitAgainstComplex<double>(4e-15);
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
+// A radix-4 pass reads its twiddles as one stream (TwiddleSpan). A strided
+// pass, which broadcasts a group's factors, finds the six of a group side by
+// side. The first pass, which loads vectors across groups, finds the six rows
+// of a block of groups in one run, each row contiguous over the block. Kept
+// as six arrays a quarter of the pass apart, the rows of a first pass met the
+// four quarters of its input in the same cache sets from 4096 double points
+// on. Either layout is a permutation of the pass's table, for every count of
+// groups and both block sizes.
+DSPARK_TEST(FFT_twiddles_of_a_pass_form_one_stream)
+{
+    using Span = detail::fft::TwiddleSpan<double>;
+    EXPECT_EQ(detail::fft::kBlock<double>, size_t(4));
+    EXPECT_EQ(detail::fft::kBlock<float>, size_t(8));
+    for (const size_t block : { size_t(4), size_t(8) })
+    {
+        for (size_t n1 = 1; n1 <= 4096; n1 *= 2)
+        {
+            const size_t bf = Span::firstBlock(n1, block);
+            EXPECT_EQ(bf, std::min(n1, block));
+            std::vector<int> first(6 * n1, 0), strided(6 * n1, 0);
+            bool inRange = true, groupTogether = true, blockTogether = true, rowsContiguous = true;
+            for (size_t p = 0; p < n1; ++p)
+            {
+                size_t lo = 6 * n1, hi = 0;
+                for (size_t row = 0; row < 6; ++row)
+                {
+                    const size_t s = Span::index(4, bf, row, p);
+                    const size_t f = Span::index(1, bf, row, p);
+                    lo = std::min(lo, s);
+                    hi = std::max(hi, s);
+                    if (s < strided.size()) ++strided[s]; else inRange = false;
+                    if (f < first.size()) ++first[f]; else inRange = false;
+                    // Within a block, a row advances with the group.
+                    if (p % bf != 0)
+                        rowsContiguous = rowsContiguous && f == Span::index(1, bf, row, p - 1) + 1;
+                }
+                groupTogether = groupTogether && lo == 6 * p && hi == 6 * p + 5;
+            }
+            for (size_t start = 0; start < n1; start += bf)
+            {
+                size_t lo = 6 * n1, hi = 0;
+                for (size_t l = 0; l < bf; ++l)
+                    for (size_t row = 0; row < 6; ++row)
+                    {
+                        const size_t f = Span::index(1, bf, row, start + l);
+                        lo = std::min(lo, f);
+                        hi = std::max(hi, f);
+                    }
+                blockTogether = blockTogether && lo == 6 * start && hi == 6 * (start + bf) - 1;
+            }
+            EXPECT_TRUE(inRange);
+            EXPECT_TRUE(groupTogether);
+            EXPECT_TRUE(blockTogether);
+            EXPECT_TRUE(rowsContiguous);
+            EXPECT_TRUE(std::all_of(first.begin(), first.end(), [](int c) { return c == 1; }));
+            EXPECT_TRUE(std::all_of(strided.begin(), strided.end(), [](int c) { return c == 1; }));
+        }
+    }
+}
+
 // FFTReal::inverseStep() splits inverse() into its passes for callers that
 // spread a long transform over several callbacks: the steps in order must
 // write exactly what inverse() writes, at every size (both pass parities),

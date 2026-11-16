@@ -39,22 +39,32 @@
  *   within halves. The lane-wise passes in between do not see the order.
  * - **Twiddles in double**: every factor is computed directly with cos/sin in
  *   double precision (no recurrences), so the error stays at the level of the
- *   arithmetic itself.
+ *   arithmetic itself. A pass reads its factors as one stream: the six of a
+ *   butterfly group side by side, or, for the first pass, the six rows of a
+ *   block of groups.
  * - **Inverse by conjugation**: ifft(x) = conj(fft(conj(x))) / N, folded into
  *   the conversion passes, so both directions share one set of kernels.
  * - **Real transforms** run a half-size complex FFT on the (even, odd) sample
  *   pairs and split its spectrum with a vectorised post-pass that takes bins
- *   k and N/2 - k together (their twiddles are exact mirrors, so they share
- *   one product); the inverse packs its input the same way.
+ *   k and N/2 - k together: with Z the half-size spectrum, d = Z[k] -
+ *   conj(Z[N/2-k]) and the split factor c_k = (1 - j w^k) / 2, X[k] =
+ *   conj(Z[N/2-k]) + c_k d and X[N/2-k] = conj(Z[k] - c_k d), one difference
+ *   and one complex product for the two bins (the factors of k and N/2 - k
+ *   are exact conjugates in the table). The inverse packs its input the same
+ *   way.
  * - **Zero allocations** after construction; forward()/inverse() are
  *   noexcept and accept pointers of any alignment.
  *
- * Measured on one desktop x86-64 core, double, forward plus inverse, ns
- * per real point, 64 / 1024 / 4096 / 65536 points: 1.4 / 1.8 / 2.1 / 2.9 on
- * SSE2 and 1.1 / 0.87 / 1.1 / 1.9 with the AVX2 dispatch (before the
- * register-resident passes and the in-lane layout: 1.5 / 1.9 / 2.2 / 3.0 and
- * 1.1 / 1.0 / 1.3 / 2.0). Float: 1.1 / 0.97 / 1.1 / 1.5 and 0.97 / 0.59 /
- * 0.63 / 0.93.
+ * Measured on hosted CI runners, real transforms, forward plus inverse, ns
+ * per real point at 64 / 1024 / 4096 / 65536 points, double and then float,
+ * each row on one machine (the machines differ between rows). SSE2 (GCC):
+ * 2.0 / 2.6 / 3.2 / 5.4 and 1.5 / 1.4 / 1.6 / 2.4. Built for AVX2 and FMA
+ * (GCC): 1.9 / 1.5 / 2.8 / 3.5 and 1.5 / 0.91 / 1.1 / 1.7. NEON on an arm64
+ * server core (GCC): 3.1 / 4.2 / 5.0 / 7.6 and 2.0 / 2.3 / 2.7 / 3.9. With
+ * the split as two products per pair of bins and the twiddles of a pass as
+ * six arrays, the same runs gave 2.1 / 2.7 / 3.3 / 5.3 and 1.6 / 1.5 / 1.6 /
+ * 2.4, 1.9 / 1.6 / 2.8 / 3.7 and 1.5 / 0.94 / 1.2 / 1.8, and 3.3 / 4.4 / 5.2
+ * / 8.1 and 2.1 / 2.4 / 2.8 / 4.0.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
  * thread at a time; give each thread its own instance.
@@ -107,14 +117,33 @@ namespace fft {
 // lookup on them cannot reach the baseline passes from the AVX2 copy.
 namespace plan {
 
-/// Twiddles of one radix-4 pass, split by factor: w1, w2, w3 (re, im) for
-/// p = 0 .. n/4 - 1.
+/// Twiddles of one radix-4 pass: the factors w1, w2, w3 (re, im; rows 0 .. 5)
+/// of the groups p = 0 .. n/4 - 1, laid out so that a pass reads them as one
+/// stream. Kept as six arrays, the rows of a first pass sat n/4 values apart:
+/// a multiple of 4 KiB from 4096 double points on, where they met the four
+/// quarters of the input in the same sets of an 8-way level-1 cache.
 template <typename T>
 struct TwiddleSpan
 {
-    const T* w1r; const T* w1i;
-    const T* w2r; const T* w2i;
-    const T* w3r; const T* w3i;
+    const T* w;
+
+    /// Groups per block of the first pass's layout, for n/4 = n1 groups and
+    /// the work layout's block.
+    [[nodiscard]] static constexpr size_t firstBlock(size_t n1, size_t block) noexcept
+    {
+        return n1 < block ? n1 : block;
+    }
+
+    /// Where row `row` of group p sits. The first pass (stride 1), which
+    /// loads vectors across p, keeps blocks of `block` groups, six rows of
+    /// `block` values each; a strided pass, which broadcasts a group's
+    /// factors, keeps the six of each group together.
+    [[nodiscard]] static constexpr size_t index(size_t stride, size_t block, size_t row, size_t p) noexcept
+    {
+        if (stride != 1) return 6 * p + row;
+        const size_t l = p & (block - 1);
+        return 6 * (p - l) + row * block + l;
+    }
 };
 
 /// One pass of the plan: its length, stride and twiddle offset. radix2 and
@@ -211,17 +240,16 @@ public:
         {
             if (pass.radix2 || pass.radix8) continue;
             const size_t n1 = pass.len / 4;
+            const size_t block = TwiddleSpan<T>::firstBlock(n1, kBlock<T>);
             T* w = twiddles_.data() + pass.twOffset;
             for (size_t p = 0; p < n1; ++p)
             {
                 const double a = -2.0 * std::numbers::pi_v<double> * static_cast<double>(p)
                                / static_cast<double>(pass.len);
-                w[p]          = static_cast<T>(std::cos(a));
-                w[n1 + p]     = static_cast<T>(std::sin(a));
-                w[2 * n1 + p] = static_cast<T>(std::cos(2.0 * a));
-                w[3 * n1 + p] = static_cast<T>(std::sin(2.0 * a));
-                w[4 * n1 + p] = static_cast<T>(std::cos(3.0 * a));
-                w[5 * n1 + p] = static_cast<T>(std::sin(3.0 * a));
+                const double factors[6] = { std::cos(a), std::sin(a), std::cos(2.0 * a), std::sin(2.0 * a),
+                                            std::cos(3.0 * a), std::sin(3.0 * a) };
+                for (size_t row = 0; row < 6; ++row)
+                    w[TwiddleSpan<T>::index(pass.stride, block, row, p)] = static_cast<T>(factors[row]);
             }
         }
 
@@ -241,7 +269,7 @@ public:
                 {
                     const size_t l = p % B, j = l / q;
                     const size_t from = p - l + q * ((j & 1) * 2 + (j >> 1)) + l % q;
-                    inLaneTwiddles_[row * n1 + p] = w[row * n1 + from];
+                    inLaneTwiddles_[TwiddleSpan<T>::index(1, B, row, p)] = w[TwiddleSpan<T>::index(1, B, row, from)];
                 }
         }
     }
@@ -738,7 +766,7 @@ public:
         , halfSize_(realSize_ / 2)        // derived from the VALIDATED size, so the
         , engine_(realSize_ / 2, true)    // trio stays coherent when size degrades
     {
-        computePostTwiddles();
+        computeSplitFactors();
     }
 
     /** @brief Returns the number of real input samples (N). */
@@ -765,7 +793,7 @@ public:
         if (size < 4 || (size & (size - 1)) != 0)
             return 0;
         return detail::fft::SplitFFT<T>::allocationBytes(size / 2, true)
-             + 2 * (postTwiddleCount(size / 2) * sizeof(T)
+             + 2 * (splitFactorCount(size / 2) * sizeof(T)
                     + detail::fft::SplitFFT<T>::kAllocationOverhead);
     }
 
@@ -791,8 +819,7 @@ public:
     void inverse(const T* freqData, T* timeData) noexcept
     {
         // Pack into the conjugated half-size spectrum, run the forward engine,
-        // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M,
-        // and by the pack's factor 2 (see inverseScale()).
+        // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M.
         packInverseConj(freqData, engine_.inRe(), engine_.inIm());
         const T scale = inverseScale();
         engine_.runTo(timeData, scale, -scale);
@@ -917,35 +944,40 @@ private:
         return size;
     }
 
-    /// Post-pass twiddles kept for a half size m (see computePostTwiddles()).
-    [[nodiscard]] static size_t postTwiddleCount(size_t m) noexcept
+    /// Split factors kept for a half size m (see computeSplitFactors()).
+    [[nodiscard]] static size_t splitFactorCount(size_t m) noexcept
     {
         return std::min(m, m / 2 + detail::fft::kBlock<T>);
     }
 
-    void computePostTwiddles()
+    void computeSplitFactors()
     {
-        // The pre and post passes pair bin k <= M/2 with M - k and take
-        // w^(M-k) = -conj(w^k) from w^k, so the table is built to satisfy it
-        // exactly: computed up to M/2 (where the real part is exactly 0) and
-        // mirrored past it, as far as a vector starting at or below M/2 reads.
+        // The pre and post passes pair bin k <= M/2 with M - k through the
+        // split factor c_k = (1 - j w^k) / 2, w = exp(-2 pi i / N): with t =
+        // 2 pi k / N, c_k = ((1 - sin t) / 2, -cos(t) / 2), its real part
+        // taken as sin^2(pi / 4 - t / 2), which keeps its relative accuracy
+        // where 1 - sin t cancels. c_(M-k) = conj(c_k), so the table is built
+        // to satisfy it exactly: computed up to M/2 (where c is exactly 0)
+        // and mirrored past it, as far as a vector starting at or below M/2
+        // reads.
         const size_t m = halfSize_;
-        const size_t used = postTwiddleCount(m);
-        twRe_.resize(used);
-        twIm_.resize(used);
+        const size_t used = splitFactorCount(m);
+        splitRe_.resize(used);
+        splitIm_.resize(used);
         for (size_t k = 0; k <= m / 2; ++k)
         {
-            const double angle = -2.0 * std::numbers::pi_v<double> * static_cast<double>(k)
-                               / static_cast<double>(realSize_);
-            twRe_[k] = static_cast<T>(std::cos(angle));
-            twIm_[k] = static_cast<T>(std::sin(angle));
+            const double half = std::numbers::pi_v<double> * static_cast<double>(k)
+                              / static_cast<double>(realSize_);
+            const double s = std::sin(0.25 * std::numbers::pi_v<double> - half);
+            splitRe_[k] = static_cast<T>(s * s);
+            splitIm_[k] = static_cast<T>(-0.5 * std::cos(2.0 * half));
         }
-        twRe_[m / 2] = T(0);
-        twIm_[m / 2] = T(-1);
+        splitRe_[m / 2] = T(0);
+        splitIm_[m / 2] = T(0);
         for (size_t k = m / 2 + 1; k < used; ++k)
         {
-            twRe_[k] = -twRe_[m - k];
-            twIm_[k] = twIm_[m - k];
+            splitRe_[k] = splitRe_[m - k];
+            splitIm_[k] = -splitIm_[m - k];
         }
     }
 
@@ -955,35 +987,34 @@ private:
 #if defined(DSPARK_SIMD_DISPATCH_AVX2)
         if (simd::isRuntimeDispatchActive())
         {
-            detail::fft::avx2::unpackRealForward(zr, zi, out, halfSize_, twRe_.data(), twIm_.data());
+            detail::fft::avx2::unpackRealForward(zr, zi, out, halfSize_, splitRe_.data(), splitIm_.data());
             return;
         }
 #endif
-        detail::fft::unpackRealForward(zr, zi, out, halfSize_, twRe_.data(), twIm_.data());
+        detail::fft::unpackRealForward(zr, zi, out, halfSize_, splitRe_.data(), splitIm_.data());
     }
 
-    /// Packs the real spectrum into the conjugated half-size one, at twice its
-    /// value (FftKernels.inl).
+    /// Packs the real spectrum into the conjugated half-size one
+    /// (FftKernels.inl).
     void packInverseConj(const T* in, T* zr, T* zi) const noexcept
     {
 #if defined(DSPARK_SIMD_DISPATCH_AVX2)
         if (simd::isRuntimeDispatchActive())
         {
-            detail::fft::avx2::packRealSpectrum(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
+            detail::fft::avx2::packRealSpectrum(in, zr, zi, halfSize_, splitRe_.data(), splitIm_.data());
             return;
         }
 #endif
-        detail::fft::packRealSpectrum(in, zr, zi, halfSize_, twRe_.data(), twIm_.data());
+        detail::fft::packRealSpectrum(in, zr, zi, halfSize_, splitRe_.data(), splitIm_.data());
     }
 
-    /// The inverse's 1/M, halved for the half-size spectrum packed at twice
-    /// its value (a power of two: the result is exact either way).
-    [[nodiscard]] T inverseScale() const noexcept { return T(0.5) / static_cast<T>(halfSize_); }
+    /// The inverse's 1/M for the half-size spectrum.
+    [[nodiscard]] T inverseScale() const noexcept { return T(1) / static_cast<T>(halfSize_); }
 
     size_t realSize_;
     size_t halfSize_;
     detail::fft::SplitFFT<T> engine_;
-    std::vector<T> twRe_, twIm_;   ///< Post-pass twiddles w^k = exp(-2 pi i k / N).
+    std::vector<T> splitRe_, splitIm_;   ///< Split factors c_k = (1 - j exp(-2 pi i k / N)) / 2.
 };
 
 } // namespace dspark

@@ -445,6 +445,34 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `FFTReal`, faster, with output that changes at rounding level;
+  `FFTComplex` and the split engine read the same twiddles in another order
+  and write the same output, bit for bit. A pass reads its twiddles as one
+  stream: the six factors of a butterfly group side by side, or, for the
+  first pass, the six rows of a block of groups. They were six arrays a
+  quarter of the pass apart, which from 4096 double points on sat a multiple
+  of 4 KiB from each other and met the four quarters of the pass's input in
+  the same sets of an 8-way level-1 cache. The real transforms split the
+  half-size spectrum, and pack it for the inverse, with one difference and
+  one complex product per pair of bins k and N/2 - k, and no sum or halving:
+  with d = Z[k] - conj(Z[N/2-k]) and the factor c_k = (1 - j w^k) / 2 in the
+  table (its real part taken as sin^2(pi/4 - pi k / N), exact conjugates for
+  k and N/2 - k), X[k] = conj(Z[N/2-k]) + c_k d and X[N/2-k] = conj(Z[k] -
+  c_k d). Memory and `allocationBytes()` are unchanged. Measured before and
+  after in one job per machine, forward plus inverse of the real transform
+  at 64 to 65536 points, as the time after over the time before: GCC and
+  Clang on x64 (SSE2) 0.93 to 1.03 in double (mean 0.96 to 0.97) and 0.93 to
+  0.99 in float; built for AVX2 and FMA 0.94 to 1.03 (mean 0.96 to 0.99) and
+  0.85 to 1.02; GCC and Clang on arm64 0.92 to 0.96 and 0.94 to 0.97; MSVC
+  x64 0.96 to 1.11 in double (mean 1.00: its small sizes moved either way
+  between runs) and 0.83 to 1.01 in float. Against a reference FFT's ordered
+  real transform in the same jobs (it leaves its inverse unscaled), worst
+  size, before -> after: on x64 with SSE2, double 1.12 -> 1.07 and float
+  1.08 -> 1.03 (GCC), 1.09 -> 1.05 and 1.01 -> 0.98 (Clang), 1.08 -> 1.07
+  and 1.07 -> 1.05 (MSVC); built for AVX2, double 1.16 -> 1.11 (GCC) and
+  1.12 -> 1.10 (Clang), float below 1.0 but for 1.04 at 64 points (Clang);
+  on arm64, double 1.30 -> 1.22 and float 1.21 -> 1.17 (GCC), 1.28 -> 1.22
+  and 1.16 -> 1.11 (Clang).
 - `wdf::DiodeRoot` for c > 0.04 (silicon diodes behind more than about
   0.7 M ohm with the default constants, germanium behind a few k ohm): the
   root is read from a series and tables for the constant of the instance,

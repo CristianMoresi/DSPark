@@ -212,9 +212,7 @@ void radix4Blocked(const T* x, T* y, size_t n, size_t s, const TwiddleSpan<T>& t
     // s is a multiple of B, so every row starts a block: a row of s elements
     // spans 2 s values, and one index walks all eight rows of a group.
     const size_t rowIn = 2 * s * n1, rowOut = 2 * s;
-    const T* const w1rp = tw.w1r; const T* const w1ip = tw.w1i;
-    const T* const w2rp = tw.w2r; const T* const w2ip = tw.w2i;
-    const T* const w3rp = tw.w3r; const T* const w3ip = tw.w3i;
+    const T* const wp = tw.w;   // six factors per group, together
     if (s == B)
     {
         // One block per row: a group's twiddles serve one block, so they are
@@ -227,6 +225,7 @@ void radix4Blocked(const T* x, T* y, size_t n, size_t s, const TwiddleSpan<T>& t
             const T* const c = b + rowIn;
             const T* const d = c + rowIn;
             T* const y0 = y + 8 * B * p;
+            const T* const t = wp + 6 * p;
             for (size_t h = 0; h < B; h += W)
             {
                 const V a_r = O::load(a + h), a_i = O::load(a + B + h);
@@ -242,13 +241,13 @@ void radix4Blocked(const T* x, T* y, size_t n, size_t s, const TwiddleSpan<T>& t
                 const V t3R = O::sub(amcR, bmdI), t3I = O::add(amcI, bmdR);
                 O::store(y0 + h,         O::add(apcR, bpdR));
                 O::store(y0 + B + h,     O::add(apcI, bpdI));
-                V w = O::set1(w1rp[p]), u = O::set1(w1ip[p]);
+                V w = O::set1(t[0]), u = O::set1(t[1]);
                 O::store(y0 + 2 * B + h, O::mulSub(t1R, w, t1I, u));
                 O::store(y0 + 3 * B + h, O::mulAdd(t1R, u, t1I, w));
-                w = O::set1(w2rp[p]); u = O::set1(w2ip[p]);
+                w = O::set1(t[2]); u = O::set1(t[3]);
                 O::store(y0 + 4 * B + h, O::mulSub(t2R, w, t2I, u));
                 O::store(y0 + 5 * B + h, O::mulAdd(t2R, u, t2I, w));
-                w = O::set1(w3rp[p]); u = O::set1(w3ip[p]);
+                w = O::set1(t[4]); u = O::set1(t[5]);
                 O::store(y0 + 6 * B + h, O::mulSub(t3R, w, t3I, u));
                 O::store(y0 + 7 * B + h, O::mulAdd(t3R, u, t3I, w));
             }
@@ -257,9 +256,10 @@ void radix4Blocked(const T* x, T* y, size_t n, size_t s, const TwiddleSpan<T>& t
     }
     for (size_t p = 0; p < n1; ++p)
     {
-        const V w1r = O::set1(w1rp[p]), w1i = O::set1(w1ip[p]);
-        const V w2r = O::set1(w2rp[p]), w2i = O::set1(w2ip[p]);
-        const V w3r = O::set1(w3rp[p]), w3i = O::set1(w3ip[p]);
+        const T* const t = wp + 6 * p;
+        const V w1r = O::set1(t[0]), w1i = O::set1(t[1]);
+        const V w2r = O::set1(t[2]), w2i = O::set1(t[3]);
+        const V w3r = O::set1(t[4]), w3i = O::set1(t[5]);
         const T* const a = x + 2 * s * p;
         const T* const b = a + rowIn;
         const T* const c = b + rowIn;
@@ -314,14 +314,13 @@ void radix4HalfBlock(const T* x, T* y, size_t n, const TwiddleSpan<T>& tw) noexc
     // Output k of group p is element s (4p + k), at offsets 8 s p plus
     // 0, s, 4 s and 5 s.
     constexpr size_t o1 = s, o2 = 4 * s, o3 = 5 * s;
-    const T* const w1rp = tw.w1r; const T* const w1ip = tw.w1i;
-    const T* const w2rp = tw.w2r; const T* const w2ip = tw.w2i;
-    const T* const w3rp = tw.w3r; const T* const w3ip = tw.w3i;
+    const T* const wp = tw.w;   // six factors per group, together
     for (size_t p = 0; p < n1; ++p)
     {
-        const V w1r = O::set1(w1rp[p]), w1i = O::set1(w1ip[p]);
-        const V w2r = O::set1(w2rp[p]), w2i = O::set1(w2ip[p]);
-        const V w3r = O::set1(w3rp[p]), w3i = O::set1(w3ip[p]);
+        const T* const t = wp + 6 * p;
+        const V w1r = O::set1(t[0]), w1i = O::set1(t[1]);
+        const V w2r = O::set1(t[2]), w2i = O::set1(t[3]);
+        const V w3r = O::set1(t[4]), w3i = O::set1(t[5]);
         const T* const xp = x + 2 * s * p - s * (p & 1);
         T* const yp = y + 8 * s * p;
         for (size_t h = 0; h < s; h += W)
@@ -365,11 +364,13 @@ void radix4First(const Source& input, T* y, size_t n, const TwiddleSpan<T>& tw) 
     // Locals, not the structs: a store through y may not alias them, so the
     // pointers stay in registers, and each twiddle is loaded where it is used.
     const Source in = input;
-    const T* const w1rp = tw.w1r; const T* const w1ip = tw.w1i;
-    const T* const w2rp = tw.w2r; const T* const w2ip = tw.w2i;
-    const T* const w3rp = tw.w3r; const T* const w3ip = tw.w3i;
+    // The twiddles sit in blocks of bf groups, six rows of bf each.
+    const T* const wp = tw.w;
+    const size_t bf = TwiddleSpan<T>::firstBlock(n1, B);
     for (size_t p = 0; p < n1; p += W)
     {
+        const size_t l = p & (bf - 1);
+        const T* const t = wp + 6 * (p - l) + l;
         V a_r, a_i, b_r, b_i, c_r, c_i, d_r, d_i;
         in.read(p, a_r, a_i);
         in.read(p + n1, b_r, b_i);
@@ -388,11 +389,11 @@ void radix4First(const Source& input, T* y, size_t n, const TwiddleSpan<T>& tw) 
         T* const r2 = y + blockedOffset<T>(4 * p + 2 * W);
         T* const r3 = y + blockedOffset<T>(4 * p + 3 * W);
         const V y0r = O::add(apcR, bpdR), y0i = O::add(apcI, bpdI);
-        V w = O::load(w1rp + p), u = O::load(w1ip + p);
+        V w = O::load(t), u = O::load(t + bf);
         const V y1r = O::mulSub(t1R, w, t1I, u), y1i = O::mulAdd(t1R, u, t1I, w);
-        w = O::load(w2rp + p); u = O::load(w2ip + p);
+        w = O::load(t + 2 * bf); u = O::load(t + 3 * bf);
         const V y2r = O::mulSub(t2R, w, t2I, u), y2i = O::mulAdd(t2R, u, t2I, w);
-        w = O::load(w3rp + p); u = O::load(w3ip + p);
+        w = O::load(t + 4 * bf); u = O::load(t + 5 * bf);
         const V y3r = O::mulSub(t3R, w, t3I, u), y3i = O::mulAdd(t3R, u, t3I, w);
         // In-lane input holds the butterflies' runs in the order (0, 2, 1, 3).
         T* const s1 = Source::inLane ? r2 : r1;
@@ -625,9 +626,7 @@ void radix8LastBlocked(const T* x, const Sink& output, size_t s) noexcept
 template <typename T>
 TwiddleSpan<T> twiddleSpanOf(const Pass& pass, const T* twiddles) noexcept
 {
-    const size_t n1 = pass.len / 4;
-    const T* w = twiddles + pass.twOffset;
-    return { w, w + n1, w + 2 * n1, w + 3 * n1, w + 4 * n1, w + 5 * n1 };
+    return { twiddles + pass.twOffset };
 }
 
 /// Runs the first pass at the widest vector its length allows, into the
@@ -888,53 +887,52 @@ size_t readScaledSwapFolded(const Pass* passes, size_t passCount, size_t n, cons
  *        Z[k] = Xe[k] + j conj(w^k) Xd[k], with Xe and Xd the even and odd
  *        parts (X[k] +- conj(X[M-k])) / 2.
  *
- * The 1/2 of Xe and Xd is left out (the inverse's scale takes it: a power
- * of two, so the result is the same to the bit). Bins k and M - k share their
- * sums, differences and twiddle product (w^(M-k) = -conj(w^k) exactly, see
- * FFTReal), so one pass over k <= M/2 writes both. The imaginary parts of
- * bins 0 and M are ignored, as a real signal has none.
+ * Taken as Z[k] = conj(X[M-k]) + conj(c_k) d and Z[M-k] = conj(X[k] -
+ * conj(c_k) d), with d = X[k] - conj(X[M-k]) and c_k = (1 - j w^k) / 2 (the
+ * split factors, see FFTReal): one difference and one complex product serve
+ * both bins, and nothing is halved. c_(M-k) = conj(c_k) exactly in the table
+ * and c_(M/2) = 0, so one pass over k <= M/2 writes both bins and every value
+ * is what the formula gives for that bin alone. The imaginary parts of bins 0
+ * and M are ignored, as a real signal has none.
  */
 template <typename T, int W>
-void packRealSpectrumAt(const T* in, T* zr, T* zi, size_t m, const T* twRe, const T* twIm) noexcept
+void packRealSpectrumAt(const T* in, T* zr, T* zi, size_t m, const T* cRe, const T* cIm) noexcept
 {
     using O = Vec<T, W>;
     using V = typename O::V;
     const T dc = in[0];
     const T ny = in[2 * m];
-    zr[0] = dc + ny;
-    zi[0] = -(dc - ny);
-    const V zero = O::set1(T(0));
+    zr[0] = T(0.5) * (dc + ny);
+    zi[0] = T(0.5) * (ny - dc);   // conjugated
     for (size_t k = 1; k <= m / 2; k += W)   // k .. k+W-1 against M-k .. M-k-W+1
     {
         const size_t c = m - k - (W - 1);
-        V xkR, xkI, xcR, xcI;
-        O::loadDeinterleave(in + 2 * k, xkR, xkI);
-        O::loadDeinterleaveReversed(in + 2 * c, xcR, xcI);
-        const V eR = O::add(xkR, xcR), eI = O::sub(xkI, xcI);
-        const V dR = O::sub(xkR, xcR), dI = O::add(xkI, xcI);
-        // conj(w) * d, then j * that: (-(tI), tR)
-        const V wr = O::load(twRe + k), wi = O::load(twIm + k);
-        const V tR = O::mulAdd(wr, dR, wi, dI);    // wr*dR - (-wi)*dI
-        const V tI = O::mulSub(wr, dI, wi, dR);    // wr*dI + (-wi)*dR
-        O::store(zr + k, O::sub(eR, tI));
-        O::store(zi + k, O::sub(zero, O::add(eI, tR)));   // conjugated
-        // Bin M - k: its e and d are (eR, -eI) and (-dR, dI), its twiddle
-        // product (tR, -tI).
-        O::store(zr + c, O::reverse(O::add(eR, tI)));
-        O::store(zi + c, O::reverse(O::sub(eI, tR)));
+        V pR, pI, rR, rI;
+        O::loadDeinterleave(in + 2 * k, pR, pI);
+        O::loadDeinterleaveReversed(in + 2 * c, rR, rI);
+        const V dR = O::sub(pR, rR), dI = O::add(pI, rI);
+        // u = conj(c) * d
+        const V cr = O::load(cRe + k), ci = O::load(cIm + k);
+        const V uR = O::mulAdd(cr, dR, ci, dI);
+        const V uI = O::mulSub(cr, dI, ci, dR);
+        // conj(Z[k]) = X[M-k] + conj(u), conj(Z[M-k]) = X[k] - u.
+        O::store(zr + k, O::add(rR, uR));
+        O::store(zi + k, O::sub(rI, uI));
+        O::store(zr + c, O::reverse(O::sub(pR, uR)));
+        O::store(zi + c, O::reverse(O::sub(pI, uI)));
     }
 }
 
 /// packRealSpectrumAt() at the widest vector whose bin pairs fit in M.
 template <typename T>
-void packRealSpectrum(const T* in, T* zr, T* zi, size_t m, const T* twRe, const T* twIm) noexcept
+void packRealSpectrum(const T* in, T* zr, T* zi, size_t m, const T* cRe, const T* cIm) noexcept
 {
     if (m >= 2 * static_cast<size_t>(kWide<T>))
-        packRealSpectrumAt<T, kWide<T>>(in, zr, zi, m, twRe, twIm);
+        packRealSpectrumAt<T, kWide<T>>(in, zr, zi, m, cRe, cIm);
     else if (m >= 2 * static_cast<size_t>(kNarrow<T>))
-        packRealSpectrumAt<T, kNarrow<T>>(in, zr, zi, m, twRe, twIm);
+        packRealSpectrumAt<T, kNarrow<T>>(in, zr, zi, m, cRe, cIm);
     else
-        packRealSpectrumAt<T, 1>(in, zr, zi, m, twRe, twIm);
+        packRealSpectrumAt<T, 1>(in, zr, zi, m, cRe, cIm);
 }
 
 /// Runs the closing pass with scaled interleaved output.
@@ -959,36 +957,34 @@ void closeInterleaved(const Pass& pass, const T* xr, const T* xi, bool blocked, 
  *        time with their mirror images: X[k] = (Z[k] + conj(Z[M-k])) / 2 -
  *        j w^k (Z[k] - conj(Z[M-k])) / 2.
  *
- * Bins k and M - k share their sums and differences (the second's are the
- * first's with signs flipped, exactly) and their twiddle product (w^(M-k) =
- * -conj(w^k) exactly, see FFTReal), so one pass over k <= M/2 writes both and
- * every value is what the formula gives for that bin alone. The halving is
- * done once, at the end (a power of two, so the result is unchanged).
+ * Taken as X[k] = conj(Z[M-k]) + c_k d and X[M-k] = conj(Z[k] - c_k d), with
+ * d = Z[k] - conj(Z[M-k]) and c_k = (1 - j w^k) / 2 (the split factors, see
+ * FFTReal): one difference and one complex product serve both bins, and
+ * nothing is halved. c_(M-k) = conj(c_k) exactly in the table and c_(M/2) =
+ * 0, so one pass over k <= M/2 writes both bins and every value is what the
+ * formula gives for that bin alone.
  */
 template <typename T, int W>
-void unpackRealForwardAt(const T* zr, const T* zi, T* out, size_t m, const T* twRe,
-                         const T* twIm) noexcept
+void unpackRealForwardAt(const T* zr, const T* zi, T* out, size_t m, const T* cRe,
+                         const T* cIm) noexcept
 {
     using O = Vec<T, W>;
     using V = typename O::V;
     const T dc = zr[0] + zi[0];
     const T ny = zr[0] - zi[0];
-    const V half = O::set1(T(0.5));
     for (size_t k = 1; k <= m / 2; k += W)   // k .. k+W-1 against M-k .. M-k-W+1
     {
         const size_t c = m - k - (W - 1);
-        const V hkR = O::load(zr + k), hkI = O::load(zi + k);
-        const V hcR = O::reverse(O::load(zr + c)), hcI = O::reverse(O::load(zi + c));
-        const V eR = O::add(hkR, hcR), eI = O::sub(hkI, hcI);
-        const V oR = O::sub(hkR, hcR), oI = O::add(hkI, hcI);
-        // Bin k: -j * o = (oI, -oR), times w = (wr, wi).
-        const V wr = O::load(twRe + k), wi = O::load(twIm + k);
-        const V tR = O::mulAdd(wr, oI, wi, oR);   // wr*oI - wi*(-oR)
-        const V tI = O::mulSub(wi, oI, wr, oR);   // wr*(-oR) + wi*oI
-        O::storeInterleave2(out + 2 * k, O::mul(half, O::add(eR, tR)), O::mul(half, O::add(eI, tI)));
-        // Bin M - k: its e and o are (eR, -eI) and (-oR, oI), its twiddle
-        // product (-tR, tI).
-        O::storeInterleave2Reversed(out + 2 * c, O::mul(half, O::sub(eR, tR)), O::mul(half, O::sub(tI, eI)));
+        const V aR = O::load(zr + k), aI = O::load(zi + k);
+        const V hR = O::reverse(O::load(zr + c)), hI = O::reverse(O::load(zi + c));
+        const V dR = O::sub(aR, hR), dI = O::add(aI, hI);
+        // u = c * d
+        const V cr = O::load(cRe + k), ci = O::load(cIm + k);
+        const V uR = O::mulSub(cr, dR, ci, dI);
+        const V uI = O::mulAdd(cr, dI, ci, dR);
+        // X[k] = conj(Z[M-k]) + u, X[M-k] = conj(Z[k] - u).
+        O::storeInterleave2(out + 2 * k, O::add(hR, uR), O::sub(uI, hI));
+        O::storeInterleave2Reversed(out + 2 * c, O::sub(aR, uR), O::sub(uI, aI));
     }
     // Written last: in-place use shares the buffer with the input pairs,
     // which the engine has already consumed.
@@ -1000,15 +996,15 @@ void unpackRealForwardAt(const T* zr, const T* zi, T* out, size_t m, const T* tw
 
 /// unpackRealForwardAt() at the widest vector whose bin pairs fit in M.
 template <typename T>
-void unpackRealForward(const T* zr, const T* zi, T* out, size_t m, const T* twRe,
-                       const T* twIm) noexcept
+void unpackRealForward(const T* zr, const T* zi, T* out, size_t m, const T* cRe,
+                       const T* cIm) noexcept
 {
     if (m >= 2 * static_cast<size_t>(kWide<T>))
-        unpackRealForwardAt<T, kWide<T>>(zr, zi, out, m, twRe, twIm);
+        unpackRealForwardAt<T, kWide<T>>(zr, zi, out, m, cRe, cIm);
     else if (m >= 2 * static_cast<size_t>(kNarrow<T>))
-        unpackRealForwardAt<T, kNarrow<T>>(zr, zi, out, m, twRe, twIm);
+        unpackRealForwardAt<T, kNarrow<T>>(zr, zi, out, m, cRe, cIm);
     else
-        unpackRealForwardAt<T, 1>(zr, zi, out, m, twRe, twIm);
+        unpackRealForwardAt<T, 1>(zr, zi, out, m, cRe, cIm);
 }
 
 // ---------------------------------------------------------------------------

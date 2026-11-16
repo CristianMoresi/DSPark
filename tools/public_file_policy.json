@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 305,
+    "first_party_ascii_text": 306,
     "third_party_utf8_exact": 84,
-    "total": 573
+    "total": 574
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -430,6 +430,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Core/detail/WavetableKernels.inl"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/detail/TruePeakKernels.inl"
     },
     {
       "kind": "first_party_ascii_text",

@@ -38,7 +38,15 @@
  * The EBU Tech 3341 true-peak tolerances (+0.2/-0.4 dB, cases 15-23) hold for
  * all three.
  *
- * Dependencies: DspMath.h, SimdOps.h.
+ * The reading loops of the estimator and of the analyzer (the largest grid
+ * point of every interval and the crests refined around the grid points) run
+ * on vectors, on the AVX2 kernels when the run-time dispatch is active, and
+ * give the values of their scalar form on every path. A compiler vectorises
+ * the scalar loop only when it may run the vertex's division and comparisons
+ * for positions the source skips, which those that honour floating-point
+ * traps do not: with those the readings cost two to three times as much.
+ *
+ * Dependencies: DspMath.h, SimdOps.h, detail/TruePeakKernels.inl.
  */
 
 #include "DspMath.h"
@@ -328,6 +336,178 @@ template <typename T>
     return m;
 }
 
+// The reading of position i of a 4x grid: the largest magnitude among the
+// five grid points of the interval from sample s[i] to s[i + 1] (its quarter,
+// half and three-quarter points at q[i], h[i] and t[i + 1]) and among the
+// crests refined around the four inner ones, the first with the
+// three-quarter point before the interval, t[i].
+template <typename T>
+[[nodiscard]] inline T gridReading(const T* s, const T* q, const T* h, const T* t, int i) noexcept
+{
+    const T a0 = s[i], a4 = s[i + 1];
+    const T y0 = t[i], y1 = q[i], y2 = h[i], y3 = t[i + 1];
+    T m = std::max(std::max(std::abs(a0), std::abs(a4)),
+                   std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
+    m = refineVertex(y0, a0, y1, m);
+    m = refineVertex(a0, y1, y2, m);
+    m = refineVertex(y1, y2, y3, m);
+    m = refineVertex(y2, y3, a4, m);
+    return m;
+}
+
+// Raises m to the two crests that point u of an 8x grid completes. The grid
+// alternates the points a[u] and e[u + 1] (e[0] is the point before a[0], and
+// a[-1] the one before that): the crests are refined around e[u], between
+// a[u - 1] and a[u], and around a[u], between e[u] and e[u + 1].
+template <typename T>
+[[nodiscard]] inline T eighthCrests(const T* a, const T* e, int u, T m) noexcept
+{
+    m = refineVertex(a[u - 1], e[u], a[u], m);
+    return refineVertex(e[u], a[u], e[u + 1], m);
+}
+
+// Raises peak[i] to the reading of sample i of an 8x grid, for i in
+// [first, n): the largest magnitude among the sample's four pairs of points
+// (4 i .. 4 i + 3) and the crests they complete (eighthCrests()), the two
+// points before each pair carried from one to the next. Magnitudes that are
+// not numbers are ignored.
+template <typename T>
+inline void raiseToEighthSamples(const T* a, const T* e, T* peak, int first, int n) noexcept
+{
+    if (first >= n) return;
+    T p0 = a[4 * first - 1], p1 = e[4 * first];
+    for (int i = first; i < n; ++i)
+    {
+        T m = T(0);
+        for (int k = 0; k < 4; ++k)
+        {
+            const T x = a[4 * i + k];
+            const T y = e[4 * i + k + 1];
+            m = std::max(m, std::abs(x));
+            m = std::max(m, std::abs(y));
+            m = refineVertex(p0, p1, x, m);
+            m = refineVertex(p1, x, y, m);
+            p0 = x;
+            p1 = y;
+        }
+        peak[i] = std::max(peak[i], m);
+    }
+}
+
+// The reading loops on vectors, compiled for the build's baseline
+// (detail/TruePeakKernels.inl). A compiler vectorises the scalar loop only
+// when it may run the vertex's division and comparisons for positions the
+// source skips, which those that honour floating-point traps do not.
+namespace truepeak {
+template <typename T, int W> using Vec = simd::Vec<T, W>;
+template <typename T> inline constexpr int kWide = simd::kVecWidth<T>;
+template <typename T> inline constexpr int kNarrow = simd::kVecNarrowWidth<T>;
+#include "detail/TruePeakKernels.inl"
+} // namespace truepeak
+
+} // namespace detail
+} // namespace dspark
+
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+// The same loops compiled for AVX2+FMA, run when isRuntimeDispatchActive().
+DSPARK_SIMD_AVX2_BEGIN
+namespace dspark {
+namespace detail {
+namespace truepeak {
+namespace avx2 {
+template <typename T, int W> using Vec = simd::avx2::Vec<T, W>;
+template <typename T> inline constexpr int kWide = simd::avx2::kVecWidth<T>;
+template <typename T> inline constexpr int kNarrow = simd::avx2::kVecNarrowWidth<T>;
+#include "detail/TruePeakKernels.inl"
+} // namespace avx2
+} // namespace truepeak
+} // namespace detail
+} // namespace dspark
+DSPARK_SIMD_AVX2_END
+#endif
+
+namespace dspark {
+namespace detail {
+
+// The reading loops (detail/TruePeakKernels.inl) on the kernel copy in use:
+// the AVX2+FMA one when the run-time dispatch is active. Every copy returns
+// the same values, bit for bit, so a stream may change copy between calls.
+template <typename T>
+struct TruePeakLoops
+{
+    /// Raises peak[i] to gridReading(s, q, h, t, i) for i in [0, n).
+    static void raiseToReadings(const T* s, const T* q, const T* h, const T* t, T* peak, int n) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+        {
+            truepeak::avx2::raiseToReadings(s, q, h, t, peak, n);
+            return;
+        }
+#endif
+        truepeak::raiseToReadings(s, q, h, t, peak, n);
+    }
+
+    /// The largest finite gridReading() of the positions [0, n) and start.
+    [[nodiscard]] static T largestFiniteReading(const T* s, const T* q, const T* h, const T* t, int n,
+                                                T start) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            return truepeak::avx2::largestFiniteReading(s, q, h, t, n, start);
+#endif
+        return truepeak::largestFiniteReading(s, q, h, t, n, start);
+    }
+
+    /// Raises dst[i] to |src[i]| for i in [0, n).
+    static void raiseToMagnitudes(T* dst, const T* src, int n) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+        {
+            truepeak::avx2::raiseToMagnitudes(dst, src, n);
+            return;
+        }
+#endif
+        truepeak::raiseToMagnitudes(dst, src, n);
+    }
+
+    /// The largest finite magnitude among count values and start.
+    [[nodiscard]] static T largestFiniteMagnitude(const T* v, int count, T start) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            return truepeak::avx2::largestFiniteMagnitude(v, count, start);
+#endif
+        return truepeak::largestFiniteMagnitude(v, count, start);
+    }
+
+    /// Raises peak[i] to the reading of sample i of an 8x grid (see
+    /// raiseToEighthSamples()) for i in [0, n).
+    static void raiseToEighthReadings(const T* a, const T* e, T* peak, int n) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+        {
+            truepeak::avx2::raiseToEighthReadings(a, e, peak, n);
+            return;
+        }
+#endif
+        truepeak::raiseToEighthReadings(a, e, peak, n);
+    }
+
+    /// The largest finite crest of the points [0, points) of an 8x grid and
+    /// start.
+    [[nodiscard]] static T largestFiniteEighthCrest(const T* a, const T* e, int points, T start) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        if (simd::isRuntimeDispatchActive())
+            return truepeak::avx2::largestFiniteEighthCrest(a, e, points, start);
+#endif
+        return truepeak::largestFiniteEighthCrest(a, e, points, start);
+    }
+};
+
 } // namespace detail
 
 /**
@@ -358,6 +538,15 @@ template <typename T>
  * Each reading at input sample n describes the interval x[n - 32] .. x[n - 31]
  * and the half grid step before it, so it reaches back getDelay() samples; a
  * finite programme is completed with getTailPeak().
+ *
+ * Cost per sample of one channel in 128-sample chunks of white noise, with
+ * the Annex 2 guard, measured on hosted CI runners (before the reading loops
+ * ran on vectors in brackets): 7 to 10 ns in float and 14 to 20 in double on
+ * x86-64 with the run-time dispatch (GCC, Clang and MSVC; 10 to 26 and 24 to
+ * 34), 13 to 16 and 25 to 33 on SSE2 (16 to 26 and 33 to 40), and 16 to 20
+ * and 33 to 40 on an arm64 server core (17 to 31 and 33 to 46). processMax()
+ * also skips every vector whose grid points cannot reach the maximum it
+ * already holds, and costs 0.37 to 0.83 of what it did.
  *
  * Threading: a channel's state and the estimator's scratch belong to the
  * stream owner; process() and getTailPeak() are not re-entrant. No
@@ -417,28 +606,11 @@ public:
             const T* annexBase = base + (kTaps - kAnnexTaps);
             for (int p = 0; p < kAnnexPhases; ++p)
             {
-                simd::firCorrelate(annexBase, Annex::getReversedPhase(p), kAnnexTaps,
-                                   phase_[kPhases], n, T(1));
-                for (int i = 0; i < n; ++i)
-                    peak[i] = std::max(peak[i], std::abs(phase_[kPhases][i])); // NaN is ignored
+                simd::firCorrelate(annexBase, Annex::getReversedPhase(p), kAnnexTaps, annex_, n, T(1));
+                Loops::raiseToMagnitudes(peak, annex_, n); // NaN is ignored
             }
         }
-        T last = channel.last;
-        for (int i = 0; i < n; ++i)
-        {
-            const T a0 = base[i + kTaps / 2 - 1];
-            const T a4 = base[i + kTaps / 2];
-            const T y1 = phase_[0][i], y2 = phase_[1][i], y3 = phase_[2][i];
-            T m = std::max(std::max(std::abs(a0), std::abs(a4)),
-                           std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
-            m = detail::refineVertex(last, a0, y1, m);
-            m = detail::refineVertex(a0, y1, y2, m);
-            m = detail::refineVertex(y1, y2, y3, m);
-            m = detail::refineVertex(y2, y3, a4, m);
-            last = y3;
-            peak[i] = std::max(peak[i], m); // NaN is ignored
-        }
-        channel.last = last;
+        Loops::raiseToReadings(base + (kTaps / 2 - 1), quarter_, half_, threeQuarter(), peak, n); // NaN is ignored
         channel.fill += n;
     }
 
@@ -464,46 +636,17 @@ public:
         assert(n >= 1 && n <= kChunk);
         n = std::clamp(n, 0, kChunk);
         const T* base = appendAndInterpolate(channel, x, n);
-        constexpr T kFinite = std::numeric_limits<T>::max();
+        channel.fill += n;
         // Grid points of the chunk: the samples x[i - 32] .. x[i - 31] and the
         // three interpolated points between them.
-        T gridMax = T(0);
-        for (int i = 0; i <= n; ++i)
-        {
-            const T a = std::abs(base[i + kTaps / 2 - 1]);
-            if (a > gridMax && a <= kFinite) gridMax = a;
-        }
-        for (int p = 0; p < kPhases; ++p)
-            for (int i = 0; i < n; ++i)
-            {
-                const T a = std::abs(phase_[p][i]);
-                if (a > gridMax && a <= kFinite) gridMax = a;
-            }
+        const T* const samples = base + (kTaps / 2 - 1);
+        T gridMax = Loops::largestFiniteMagnitude(samples, n + 1, T(0));
+        gridMax = Loops::largestFiniteMagnitude(quarter_, n, gridMax);
+        gridMax = Loops::largestFiniteMagnitude(half_, n, gridMax);
+        gridMax = Loops::largestFiniteMagnitude(threeQuarter() + 1, n, gridMax);
         if (!(gridMax * T(1.25) > atLeast))
-        {
-            channel.last = n > 0 ? phase_[2][n - 1] : channel.last;
-            channel.fill += n;
             return gridMax;
-        }
-        T result = gridMax;
-        T last = channel.last;
-        for (int i = 0; i < n; ++i)
-        {
-            const T a0 = base[i + kTaps / 2 - 1];
-            const T a4 = base[i + kTaps / 2];
-            const T y1 = phase_[0][i], y2 = phase_[1][i], y3 = phase_[2][i];
-            T m = std::max(std::max(std::abs(a0), std::abs(a4)),
-                           std::max(std::abs(y2), std::max(std::abs(y1), std::abs(y3))));
-            m = detail::refineVertex(last, a0, y1, m);
-            m = detail::refineVertex(a0, y1, y2, m);
-            m = detail::refineVertex(y1, y2, y3, m);
-            m = detail::refineVertex(y2, y3, a4, m);
-            last = y3;
-            if (m > result && m <= kFinite) result = m;
-        }
-        channel.last = last;
-        channel.fill += n;
-        return result;
+        return Loops::largestFiniteReading(samples, quarter_, half_, threeQuarter(), n, gridMax);
     }
 
     /**
@@ -529,6 +672,7 @@ public:
 
 private:
     using Annex = TruePeakDetector<T, 1>;
+    using Loops = detail::TruePeakLoops<T>;
     static constexpr int kAnnexTaps = Annex::getTaps();
     static constexpr int kAnnexPhases = Annex::getPhases();
     static_assert(kAnnexTaps <= kTaps, "the BS.1770 window must fit the estimator history");
@@ -547,13 +691,29 @@ private:
         }
         std::copy(x, x + n, h + (kTaps - 1) + channel.fill);
         const T* base = h + channel.fill;
-        for (int p = 0; p < kPhases; ++p)
-            simd::firCorrelate(base, coeffs_[p], kTaps, phase_[p], n, T(1));
+        simd::firCorrelate(base, coeffs_[0], kTaps, quarter_, n, T(1));
+        simd::firCorrelate(base, coeffs_[1], kTaps, half_, n, T(1));
+        // The three-quarter point before the chunk sits ahead of the chunk's,
+        // so every interval reads the one before it from the same array.
+        T* const t = threeQuarter();
+        t[0] = channel.last;
+        simd::firCorrelate(base, coeffs_[2], kTaps, t + 1, n, T(1));
+        channel.last = t[n];
         return base;
     }
 
+    /// The chunk's three-quarter points start 32 bytes into their array, as
+    /// aligned as the arrays beside it, and the point before the chunk takes
+    /// the slot before them: threeQuarter()[0] is that point and
+    /// threeQuarter()[1 + i] the chunk's.
+    static constexpr int kLead = 32 / static_cast<int>(sizeof(T));
+    [[nodiscard]] T* threeQuarter() noexcept { return threeQuarter_ + (kLead - 1); }
+
     T coeffs_[kPhases][kTaps] = {};
-    T phase_[kPhases + 1][kChunk] = {}; ///< Phase outputs (+ one Annex 2 phase).
+    T quarter_[kChunk] = {};          ///< The chunk's quarter points.
+    T half_[kChunk] = {};             ///< The chunk's half points.
+    T threeQuarter_[kLead + kChunk] = {}; ///< The chunk's three-quarter points, from [kLead] on.
+    T annex_[kChunk] = {};            ///< One Annex 2 phase.
 };
 
 /**
@@ -587,7 +747,8 @@ private:
  *
  * Readings are taken in chunks and only the largest is kept (processMax()),
  * so a meter's max-hold is exact while chunks that cannot raise it skip the
- * crest refinement. A reading reaches getDelay() samples back; a finite
+ * crest refinement, and within a chunk that can, so does every vector of
+ * points that cannot. A reading reaches getDelay() samples back; a finite
  * programme is completed with getTailPeak(). process() gives the same
  * readings one per input sample to a detector that can wait that long for
  * them (the Limiter's high-precision true-peak mode); the detectors that
@@ -659,41 +820,17 @@ public:
         assert(n >= 1 && n <= kChunk);
         n = std::clamp(n, 0, kChunk);
         if (n == 0) return T(0);
-        const T* grid = advance(channel, x, n); // 4n points of the 4x stream
+        const T* fourth = advance(channel, x, n); // 4n points of the 4x stream
         const int points = 4 * n;
         constexpr T kFinite = std::numeric_limits<T>::max();
-        T gridMax = T(0);
-        for (int u = 0; u < points; ++u)
-        {
-            const T a = std::abs(grid[u + kTaps3 / 2 - 1]);
-            const T b = std::abs(eighth_[u]);
-            if (a > gridMax && a <= kFinite) gridMax = a;
-            if (b > gridMax && b <= kFinite) gridMax = b;
-        }
+        T gridMax = Loops::largestFiniteMagnitude(fourth, points, T(0));
+        gridMax = Loops::largestFiniteMagnitude(eighth() + 1, points, gridMax);
         // The first crest of the call is centred on the point carried over.
-        const T carried = std::abs(channel.previous[1]);
+        const T carried = std::abs(eighth()[0]);
         const T centres = carried <= kFinite ? std::max(gridMax, carried) : gridMax;
         if (!(centres * T(1.25) > atLeast))
-        {
-            channel.previous[0] = grid[points - 1 + kTaps3 / 2 - 1];
-            channel.previous[1] = eighth_[points - 1];
             return gridMax;
-        }
-        T result = gridMax;
-        T p0 = channel.previous[0], p1 = channel.previous[1];
-        for (int u = 0; u < points; ++u)
-        {
-            const T a = grid[u + kTaps3 / 2 - 1];
-            const T b = eighth_[u];
-            T m = detail::refineVertex(p0, p1, a, T(0));
-            m = detail::refineVertex(p1, a, b, m);
-            p0 = a;
-            p1 = b;
-            if (m > result && m <= kFinite) result = m;
-        }
-        channel.previous[0] = p0;
-        channel.previous[1] = p1;
-        return result;
+        return Loops::largestFiniteEighthCrest(fourth, eighth(), points, gridMax);
     }
 
     /**
@@ -724,7 +861,7 @@ public:
         assert(n >= 1 && n <= kChunk);
         n = std::clamp(n, 0, kChunk);
         if (n == 0) return;
-        const T* grid = advance(channel, x, n); // 4n points of the 4x stream
+        const T* fourth = advance(channel, x, n); // 4n points of the 4x stream
 
         if (annex2 != nullptr)
         {
@@ -733,29 +870,10 @@ public:
             for (int p = 0; p < kAnnexPhases; ++p)
             {
                 simd::firCorrelate(annexBase, Annex::getReversedPhase(p), kAnnexTaps, scratch_, n, T(1));
-                for (int i = 0; i < n; ++i)
-                    annex2[i] = std::max(annex2[i], std::abs(scratch_[i])); // NaN is ignored
+                Loops::raiseToMagnitudes(annex2, scratch_, n); // NaN is ignored
             }
         }
-        T p0 = channel.previous[0], p1 = channel.previous[1];
-        for (int i = 0; i < n; ++i)
-        {
-            T m = T(0);
-            for (int k = 0; k < 4; ++k)
-            {
-                const T a = grid[4 * i + k + kTaps3 / 2 - 1];
-                const T b = eighth_[4 * i + k];
-                m = std::max(m, std::abs(a)); // NaN is ignored
-                m = std::max(m, std::abs(b));
-                m = detail::refineVertex(p0, p1, a, m);
-                m = detail::refineVertex(p1, a, b, m);
-                p0 = a;
-                p1 = b;
-            }
-            peak[i] = std::max(peak[i], m); // NaN is ignored
-        }
-        channel.previous[0] = p0;
-        channel.previous[1] = p1;
+        Loops::raiseToEighthReadings(fourth, eighth(), peak, n); // NaN is ignored
     }
 
     /**
@@ -783,6 +901,7 @@ public:
 
 private:
     using Annex = TruePeakDetector<T, 1>;
+    using Loops = detail::TruePeakLoops<T>;
     static constexpr int kAnnexTaps = Annex::getTaps();
     static constexpr int kAnnexPhases = Annex::getPhases();
     static_assert(kAnnexTaps <= kTaps, "the BS.1770 window must fit the first stage history");
@@ -795,8 +914,9 @@ private:
     static_assert(kTaps % 2 == 0 && kTaps2 % 2 == 0 && kTaps3 % 2 == 0, "midpoint kernels are even");
 
     /** Appends n (<= kChunk) samples and runs the three stages: leaves the
-     *  4n eighth points in eighth_ and returns the base of the 4x stream
-     *  window (4x point u of this call is base[u + kTaps3 / 2 - 1]). */
+     *  4n eighth points in eighth() from [1] on, after the last one of the
+     *  call before, and returns the 4n points of the 4x stream they follow
+     *  (4x point u of this call at [u], the last one before them at [-1]). */
     const T* advance(Channel& channel, const T* x, int n) noexcept
     {
         if (channel.fill + n > kChunk)
@@ -831,18 +951,33 @@ private:
             four[2 * t + 1] = scratch_[t];
         }
 
-        // Stage 3: the midpoints of the 4x stream.
+        // Stage 3: the midpoints of the 4x stream. The eighth point before
+        // the chunk sits ahead of the chunk's, so every crest reads the
+        // points before it from the same arrays (the 4x point before the
+        // chunk is in the history).
         const T* base = channel.fourTimes + 4 * f;
-        simd::firCorrelate(base, coeffs3_, kTaps3, eighth_, 4 * n, T(1));
+        T* const e = eighth();
+        e[0] = channel.previous[1];
+        simd::firCorrelate(base, coeffs3_, kTaps3, e + 1, 4 * n, T(1));
+        const T* fourth = base + (kTaps3 / 2 - 1);
+        channel.previous[0] = fourth[4 * n - 1];
+        channel.previous[1] = e[4 * n];
         channel.fill += n;
-        return base;
+        return fourth;
     }
+
+    /// Stage 3's outputs start 32 bytes into their array, as aligned as the
+    /// arrays beside it, and the eighth point before the chunk takes the slot
+    /// before them: eighth()[0] is that point and eighth()[1 + u] the
+    /// chunk's.
+    static constexpr int kLead = 32 / static_cast<int>(sizeof(T));
+    [[nodiscard]] T* eighth() noexcept { return eighth_ + (kLead - 1); }
 
     T coeffs1_[kTaps] = {};
     T coeffs2_[kTaps2] = {};
     T coeffs3_[kTaps3] = {};
     T scratch_[2 * kChunk] = {};  ///< Stage 1 and stage 2 outputs.
-    T eighth_[4 * kChunk] = {};   ///< Stage 3 outputs.
+    T eighth_[kLead + 4 * kChunk] = {}; ///< Stage 3's outputs, from [kLead] on.
 };
 
 } // namespace dspark

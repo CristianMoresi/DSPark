@@ -14,8 +14,9 @@
 // ============================================================================
 // Vec<T, W>: W lanes of T for kernels written once for every target. W = 1 is
 // plain scalar code and exists everywhere; 4/2 lanes (float/double) exist on
-// SSE2 and NEON, 8/4 lanes with AVX. Used by FFT.h, Oversampling.h and
-// firCorrelateKernel() below.
+// SSE2 and NEON, 8/4 lanes with AVX. Used by FFT.h, Oversampling.h,
+// TruePeakDetector.h and firCorrelateKernel() below. The vector widths also
+// compare, select and take magnitudes and quotients (see Vec<float, 4>).
 // ============================================================================
 
 template <typename T, int W> struct Vec;
@@ -78,6 +79,24 @@ struct Vec<float, 4>
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), c); }
 #endif
+    /// Comparisons give a mask M (all bits of a lane set where it holds; false
+    /// where an operand is not a number); both() and either() combine two,
+    /// any() tells whether a lane is set and select() takes a where the mask
+    /// is set, b elsewhere. maxOf(a, b) is std::max(a, b): a unless a < b, so
+    /// a value that is not a number is ignored in b and kept in a.
+    /// maxNum(a, b) is the larger of two numbers in one instruction; with a
+    /// value that is not a number its result depends on the target.
+    using M = __m128;
+    static V abs(V v) noexcept { return _mm_andnot_ps(_mm_set1_ps(-0.0f), v); }
+    static V div(V a, V b) noexcept { return _mm_div_ps(a, b); }
+    static V maxOf(V a, V b) noexcept { return _mm_max_ps(b, a); }
+    static V maxNum(V a, V b) noexcept { return _mm_max_ps(a, b); }
+    static M lt(V a, V b) noexcept { return _mm_cmplt_ps(a, b); }
+    static M le(V a, V b) noexcept { return _mm_cmple_ps(a, b); }
+    static M both(M a, M b) noexcept { return _mm_and_ps(a, b); }
+    static M either(M a, M b) noexcept { return _mm_or_ps(a, b); }
+    static bool any(M m) noexcept { return _mm_movemask_ps(m) != 0; }
+    static V select(M m, V a, V b) noexcept { return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b)); }
     static V reverse(V v) noexcept { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 1, 2, 3)); }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
@@ -130,6 +149,18 @@ struct Vec<double, 2>
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), c); }
 #endif
+    /// Masks, select() and maxOf() as in Vec<float, 4>.
+    using M = __m128d;
+    static V abs(V v) noexcept { return _mm_andnot_pd(_mm_set1_pd(-0.0), v); }
+    static V div(V a, V b) noexcept { return _mm_div_pd(a, b); }
+    static V maxOf(V a, V b) noexcept { return _mm_max_pd(b, a); }
+    static V maxNum(V a, V b) noexcept { return _mm_max_pd(a, b); }
+    static M lt(V a, V b) noexcept { return _mm_cmplt_pd(a, b); }
+    static M le(V a, V b) noexcept { return _mm_cmple_pd(a, b); }
+    static M both(M a, M b) noexcept { return _mm_and_pd(a, b); }
+    static M either(M a, M b) noexcept { return _mm_or_pd(a, b); }
+    static bool any(M m) noexcept { return _mm_movemask_pd(m) != 0; }
+    static V select(M m, V a, V b) noexcept { return _mm_or_pd(_mm_and_pd(m, a), _mm_andnot_pd(m, b)); }
     static V reverse(V v) noexcept { return _mm_shuffle_pd(v, v, 1); }
     static V set2(double lane0Value, double lane1Value) noexcept { return _mm_set_pd(lane1Value, lane0Value); }
     static double lane0(V v) noexcept { return _mm_cvtsd_f64(v); }
@@ -198,6 +229,24 @@ struct Vec<float, 4>
     // Explicit fusion keeps vector and broadcast tails identical even when
     // GCC otherwise contracts their multiply/add expressions differently.
     static V madd(V a, V b, V c) noexcept { return vfmaq_f32(c, a, b); }
+    /// Comparisons give a mask M (all bits of a lane set where it holds; false
+    /// where an operand is not a number); both() and either() combine two,
+    /// any() tells whether a lane is set and select() takes a where the mask
+    /// is set, b elsewhere. maxOf(a, b) is std::max(a, b): a unless a < b, so
+    /// a value that is not a number is ignored in b and kept in a.
+    /// maxNum(a, b) is the larger of two numbers in one instruction; with a
+    /// value that is not a number its result depends on the target.
+    using M = uint32x4_t;
+    static V abs(V v) noexcept { return vabsq_f32(v); }
+    static V div(V a, V b) noexcept { return vdivq_f32(a, b); }
+    static V maxOf(V a, V b) noexcept { return vbslq_f32(vcltq_f32(a, b), b, a); }
+    static V maxNum(V a, V b) noexcept { return vmaxnmq_f32(a, b); }
+    static M lt(V a, V b) noexcept { return vcltq_f32(a, b); }
+    static M le(V a, V b) noexcept { return vcleq_f32(a, b); }
+    static M both(M a, M b) noexcept { return vandq_u32(a, b); }
+    static M either(M a, M b) noexcept { return vorrq_u32(a, b); }
+    static bool any(M m) noexcept { return vmaxvq_u32(m) != 0; }
+    static V select(M m, V a, V b) noexcept { return vbslq_f32(m, a, b); }
     static V reverse(V v) noexcept { const V r = vrev64q_f32(v); return vextq_f32(r, r, 2); }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
@@ -244,6 +293,18 @@ struct Vec<double, 2>
     static V mulSub(V a, V b, V c, V d) noexcept { return vfmsq_f64(vmulq_f64(a, b), c, d); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return vfmaq_f64(vmulq_f64(a, b), c, d); }
     static V madd(V a, V b, V c) noexcept { return vfmaq_f64(c, a, b); }
+    /// Masks, select() and maxOf() as in Vec<float, 4>.
+    using M = uint64x2_t;
+    static V abs(V v) noexcept { return vabsq_f64(v); }
+    static V div(V a, V b) noexcept { return vdivq_f64(a, b); }
+    static V maxOf(V a, V b) noexcept { return vbslq_f64(vcltq_f64(a, b), b, a); }
+    static V maxNum(V a, V b) noexcept { return vmaxnmq_f64(a, b); }
+    static M lt(V a, V b) noexcept { return vcltq_f64(a, b); }
+    static M le(V a, V b) noexcept { return vcleq_f64(a, b); }
+    static M both(M a, M b) noexcept { return vandq_u64(a, b); }
+    static M either(M a, M b) noexcept { return vorrq_u64(a, b); }
+    static bool any(M m) noexcept { return (vgetq_lane_u64(m, 0) | vgetq_lane_u64(m, 1)) != 0; }
+    static V select(M m, V a, V b) noexcept { return vbslq_f64(m, a, b); }
     static V reverse(V v) noexcept { return vextq_f64(v, v, 1); }
     static V set2(double lane0Value, double lane1Value) noexcept { return vsetq_lane_f64(lane1Value, vdupq_n_f64(lane0Value), 1); }
     static double lane0(V v) noexcept { return vgetq_lane_f64(v, 0); }
@@ -316,6 +377,18 @@ struct Vec<float, 8>
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), c); }
 #endif
+    /// Masks, select() and maxOf() as in Vec<float, 4>.
+    using M = __m256;
+    static V abs(V v) noexcept { return _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v); }
+    static V div(V a, V b) noexcept { return _mm256_div_ps(a, b); }
+    static V maxOf(V a, V b) noexcept { return _mm256_max_ps(b, a); }
+    static V maxNum(V a, V b) noexcept { return _mm256_max_ps(a, b); }
+    static M lt(V a, V b) noexcept { return _mm256_cmp_ps(a, b, _CMP_LT_OQ); }
+    static M le(V a, V b) noexcept { return _mm256_cmp_ps(a, b, _CMP_LE_OQ); }
+    static M both(M a, M b) noexcept { return _mm256_and_ps(a, b); }
+    static M either(M a, M b) noexcept { return _mm256_or_ps(a, b); }
+    static bool any(M m) noexcept { return _mm256_movemask_ps(m) != 0; }
+    static V select(M m, V a, V b) noexcept { return _mm256_blendv_ps(b, a, m); }
     static V reverse(V v) noexcept
     {
 #if defined(DSPARK_VEC_AVX2)
@@ -415,6 +488,18 @@ struct Vec<double, 4>
         const V bd = _mm256_add_pd(_mm256_permute2f128_pd(b, d, 0x20), _mm256_permute2f128_pd(b, d, 0x31));
         _mm256_storeu_pd(out, _mm256_hadd_pd(ac, bd));
     }
+    /// Masks, select() and maxOf() as in Vec<float, 4>.
+    using M = __m256d;
+    static V abs(V v) noexcept { return _mm256_andnot_pd(_mm256_set1_pd(-0.0), v); }
+    static V div(V a, V b) noexcept { return _mm256_div_pd(a, b); }
+    static V maxOf(V a, V b) noexcept { return _mm256_max_pd(b, a); }
+    static V maxNum(V a, V b) noexcept { return _mm256_max_pd(a, b); }
+    static M lt(V a, V b) noexcept { return _mm256_cmp_pd(a, b, _CMP_LT_OQ); }
+    static M le(V a, V b) noexcept { return _mm256_cmp_pd(a, b, _CMP_LE_OQ); }
+    static M both(M a, M b) noexcept { return _mm256_and_pd(a, b); }
+    static M either(M a, M b) noexcept { return _mm256_or_pd(a, b); }
+    static bool any(M m) noexcept { return _mm256_movemask_pd(m) != 0; }
+    static V select(M m, V a, V b) noexcept { return _mm256_blendv_pd(b, a, m); }
     static V reverse(V v) noexcept
     {
 #if defined(DSPARK_VEC_AVX2)

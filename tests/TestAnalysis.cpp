@@ -21,6 +21,7 @@
 #include <iostream>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -1056,6 +1057,319 @@ DSPARK_TEST(TruePeakAnalyzer_per_sample_readings_match_the_running_maximum)
             for (const T v : later) finite = finite && std::isfinite(v);
             EXPECT_TRUE(finite);
         }
+    };
+    check.template operator()<float>();
+    check.template operator()<double>();
+}
+
+namespace {
+
+/// Noise over a slow tone, so that crests are frequent, with three samples
+/// that are not finite, far enough apart to leave clean stretches between
+/// what each of them reaches. The programme is 26 dB lower around each of
+/// them, as far as the longest kernel reaches: there a reading can be
+/// infinite while the grid points beside it are not, and those must not be
+/// the largest of the stream.
+template <class T>
+std::vector<T> crestProgramme(int count)
+{
+    std::vector<T> x(static_cast<size_t>(count));
+    const int bad[] = { count / 5, count / 2, 4 * count / 5 };
+    unsigned int rng = 20261117u;
+    for (int i = 0; i < count; ++i)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        const double noise = static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+        double level = 1.0;
+        for (const int at : bad)
+            if (std::abs(i - at) <= 320) level = 0.05;
+        x[static_cast<size_t>(i)] = static_cast<T>(level * (0.45 * noise + 0.4 * std::sin(0.031 * i)));
+    }
+    x[static_cast<size_t>(bad[0])] = std::numeric_limits<T>::quiet_NaN();
+    x[static_cast<size_t>(bad[1])] = std::numeric_limits<T>::infinity();
+    x[static_cast<size_t>(bad[2])] = -std::numeric_limits<T>::infinity();
+    return x;
+}
+
+/// Per-sample readings of TruePeakEstimator::process() over x, taken in the
+/// chunk sizes of `pattern` (cycled).
+template <class T, size_t N>
+std::vector<T> estimatorReadings(const std::vector<T>& x, const int (&pattern)[N], bool guard)
+{
+    TruePeakEstimator<T> estimator;
+    typename TruePeakEstimator<T>::Channel state;
+    std::vector<T> peak(x.size(), T(0));
+    size_t turn = 0;
+    for (size_t start = 0; start < x.size();)
+    {
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(pattern[turn++ % N]), x.size() - start));
+        estimator.process(state, x.data() + start, n, peak.data() + start, guard);
+        start += static_cast<size_t>(n);
+    }
+    return peak;
+}
+
+/// Running maximum of TruePeakEstimator::processMax() over x, taken in the
+/// chunk sizes of `pattern` (cycled).
+template <class T, size_t N>
+T estimatorMax(const std::vector<T>& x, const int (&pattern)[N])
+{
+    TruePeakEstimator<T> estimator;
+    typename TruePeakEstimator<T>::Channel state;
+    T running = T(0);
+    size_t turn = 0;
+    for (size_t start = 0; start < x.size();)
+    {
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(pattern[turn++ % N]), x.size() - start));
+        const T peak = estimator.processMax(state, x.data() + start, n, running);
+        if (peak > running) running = peak;
+        start += static_cast<size_t>(n);
+    }
+    return running;
+}
+
+/// The largest finite value of v (0 if none).
+template <class T>
+T largestFiniteOf(const std::vector<T>& v)
+{
+    T largest = T(0);
+    for (const T r : v)
+        if (r > largest && r <= std::numeric_limits<T>::max()) largest = r;
+    return largest;
+}
+
+/// Whether two vectors hold the same bytes.
+template <class T>
+bool sameBytes(const std::vector<T>& a, const std::vector<T>& b)
+{
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+
+/// A grid for the reading kernels: values in [-1, 1] with runs of equal
+/// neighbours (a vertex with no curvature), zeros and values that are not
+/// finite sprinkled in.
+template <class T>
+std::vector<T> kernelGrid(size_t count, unsigned int seed)
+{
+    std::vector<T> v(count);
+    unsigned int rng = seed;
+    for (size_t i = 0; i < count; ++i)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v[i] = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+        const unsigned int kind = (rng >> 3) % 97u;
+        if (kind == 0 && i > 0) v[i] = v[i - 1];
+        else if (kind == 1) v[i] = T(0);
+        else if (kind == 2) v[i] = std::numeric_limits<T>::quiet_NaN();
+        else if (kind == 3) v[i] = std::numeric_limits<T>::infinity();
+        else if (kind == 4) v[i] = -std::numeric_limits<T>::infinity();
+    }
+    return v;
+}
+
+/// The reading kernels of one copy (the baseline one or the AVX2 one) against
+/// their scalar forms on the same grids: the same bytes and the same maxima.
+template <class T, class Kernels>
+void checkReadingKernels(const Kernels& kernels)
+{
+    constexpr T kFinite = std::numeric_limits<T>::max();
+    // 203 positions: whole vectors at every width and a remainder of each
+    // length; 4 * 203 + 1 points for the 8x grid.
+    constexpr int n = 203;
+    const std::vector<T> s = kernelGrid<T>(n + 1, 11u), q = kernelGrid<T>(n, 12u), h = kernelGrid<T>(n, 13u),
+                         t = kernelGrid<T>(n + 1, 14u);
+    const std::vector<T> fourth = kernelGrid<T>(4 * n + 1, 15u), eighth = kernelGrid<T>(4 * n + 1, 16u);
+    const T* const a = fourth.data() + 1; // a[-1] is the point before the grid
+    const T* const e = eighth.data();
+    std::vector<T> start(n);
+    for (int i = 0; i < n; ++i) start[static_cast<size_t>(i)] = T(0.01) * static_cast<T>(i % 37);
+
+    for (int count = 0; count <= n; count += (count < 40 ? 1 : 23))
+    {
+        // Per-position readings of the 4x grid.
+        std::vector<T> expected = start, got = start;
+        for (int i = 0; i < count; ++i)
+            expected[static_cast<size_t>(i)] = std::max(expected[static_cast<size_t>(i)],
+                                                        detail::gridReading(s.data(), q.data(), h.data(), t.data(), i));
+        kernels.raiseToReadings(s.data(), q.data(), h.data(), t.data(), got.data(), count);
+        EXPECT_TRUE(sameBytes(got, expected));
+
+        // Magnitudes.
+        expected = start;
+        got = start;
+        for (int i = 0; i < count; ++i)
+            expected[static_cast<size_t>(i)] = std::max(expected[static_cast<size_t>(i)], std::abs(q[static_cast<size_t>(i)]));
+        kernels.raiseToMagnitudes(got.data(), q.data(), count);
+        EXPECT_TRUE(sameBytes(got, expected));
+
+        // Per-sample readings of the 8x grid (count / 4 samples).
+        const int samples = count / 4;
+        expected = start;
+        got = start;
+        detail::raiseToEighthSamples(a, e, expected.data(), 0, samples);
+        kernels.raiseToEighthReadings(a, e, got.data(), samples);
+        EXPECT_TRUE(sameBytes(got, expected));
+
+        // Running maxima, from a start below, among and above the readings
+        // (a start above lets the kernels skip every vector).
+        for (const T from : { T(0), T(0.4), T(0.9), T(1.2), T(3) })
+        {
+            T reading = from, magnitude = from, crest = from;
+            for (int i = 0; i < count; ++i)
+            {
+                const T r = detail::gridReading(s.data(), q.data(), h.data(), t.data(), i);
+                if (r > reading && r <= kFinite) reading = r;
+                const T m = std::abs(h[static_cast<size_t>(i)]);
+                if (m > magnitude && m <= kFinite) magnitude = m;
+                const T c = detail::eighthCrests(a, e, i, T(0));
+                if (c > crest && c <= kFinite) crest = c;
+            }
+            EXPECT_EQ(kernels.largestFiniteReading(s.data(), q.data(), h.data(), t.data(), count, from), reading);
+            EXPECT_EQ(kernels.largestFiniteMagnitude(h.data(), count, from), magnitude);
+            EXPECT_EQ(kernels.largestFiniteEighthCrest(a, e, count, from), crest);
+        }
+    }
+}
+
+/// The baseline copy of the reading kernels.
+template <class T>
+struct BaselineReadingKernels
+{
+    void raiseToReadings(const T* s, const T* q, const T* h, const T* t, T* peak, int n) const
+    {
+        detail::truepeak::raiseToReadings(s, q, h, t, peak, n);
+    }
+    T largestFiniteReading(const T* s, const T* q, const T* h, const T* t, int n, T start) const
+    {
+        return detail::truepeak::largestFiniteReading(s, q, h, t, n, start);
+    }
+    void raiseToMagnitudes(T* dst, const T* src, int n) const { detail::truepeak::raiseToMagnitudes(dst, src, n); }
+    T largestFiniteMagnitude(const T* v, int n, T start) const
+    {
+        return detail::truepeak::largestFiniteMagnitude(v, n, start);
+    }
+    void raiseToEighthReadings(const T* a, const T* e, T* peak, int n) const
+    {
+        detail::truepeak::raiseToEighthReadings(a, e, peak, n);
+    }
+    T largestFiniteEighthCrest(const T* a, const T* e, int points, T start) const
+    {
+        return detail::truepeak::largestFiniteEighthCrest(a, e, points, start);
+    }
+};
+
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+/// The AVX2 copy; only run on a CPU that has it.
+template <class T>
+struct WideReadingKernels
+{
+    void raiseToReadings(const T* s, const T* q, const T* h, const T* t, T* peak, int n) const
+    {
+        detail::truepeak::avx2::raiseToReadings(s, q, h, t, peak, n);
+    }
+    T largestFiniteReading(const T* s, const T* q, const T* h, const T* t, int n, T start) const
+    {
+        return detail::truepeak::avx2::largestFiniteReading(s, q, h, t, n, start);
+    }
+    void raiseToMagnitudes(T* dst, const T* src, int n) const { detail::truepeak::avx2::raiseToMagnitudes(dst, src, n); }
+    T largestFiniteMagnitude(const T* v, int n, T start) const
+    {
+        return detail::truepeak::avx2::largestFiniteMagnitude(v, n, start);
+    }
+    void raiseToEighthReadings(const T* a, const T* e, T* peak, int n) const
+    {
+        detail::truepeak::avx2::raiseToEighthReadings(a, e, peak, n);
+    }
+    T largestFiniteEighthCrest(const T* a, const T* e, int points, T start) const
+    {
+        return detail::truepeak::avx2::largestFiniteEighthCrest(a, e, points, start);
+    }
+};
+#endif
+
+}   // namespace
+
+// The reading loops of the estimator and of the analyzer run on vectors where
+// a whole vector of positions is left and in their scalar form for the rest,
+// and a running maximum skips the vectors that cannot raise it. Given the
+// same grid, every kernel returns the bytes of its scalar form: on the
+// baseline copy and on the AVX2 one, for every count from none to 203
+// positions (whole vectors at every width and every length of remainder), on
+// grids with equal neighbours, zeros and values that are not finite, and for
+// running maxima that start below, among and above the readings.
+DSPARK_TEST(TruePeak_reading_kernels_match_their_scalar_forms)
+{
+    checkReadingKernels<float>(BaselineReadingKernels<float>());
+    checkReadingKernels<double>(BaselineReadingKernels<double>());
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (simd::runtimeDispatchSupported())
+    {
+        checkReadingKernels<float>(WideReadingKernels<float>());
+        checkReadingKernels<double>(WideReadingKernels<double>());
+    }
+#endif
+}
+
+// On each kernel set (the interpolated grid differs between them at rounding
+// level, so each is compared with itself), the readings do not depend on how
+// the stream is cut: one sample per call reads everything in the scalar
+// form, whole chunks read on vectors and a mixed pattern leaves every length
+// of remainder. On a programme with a crest every few samples and three
+// samples that are not finite: the per-sample readings are the same bytes
+// whatever the cut, with and without the Annex 2 guard, and the running
+// maximum is the largest finite reading for every cut.
+DSPARK_TEST(TruePeak_readings_do_not_depend_on_the_cut_on_either_kernel_set)
+{
+    const auto check = []<class T>()
+    {
+        const std::vector<T> x = crestProgramme<T>(9000);
+        constexpr int single[] = { 1 };
+        constexpr int whole[] = { 128 };
+        constexpr int mixed[] = { 1, 7, 128, 33, 64, 3, 127, 16, 5, 100, 2, 9 };
+        const bool dispatch = simd::isRuntimeDispatchActive();
+        for (const bool wide : { false, true })
+        {
+            simd::setRuntimeDispatch(wide && dispatch);
+            const std::vector<T> plain = estimatorReadings(x, single, false);
+            const std::vector<T> guarded = estimatorReadings(x, single, true);
+            const T largest = largestFiniteOf(plain);
+            EXPECT_GT(largest, T(0.5));
+            // The guard only raises readings, and the reconstruction stands
+            // above both samples of its interval often enough for the points
+            // between samples and their crests to matter.
+            bool raised = true;
+            size_t above = 0;
+            for (size_t i = 32; i < x.size(); ++i)
+            {
+                raised = raised && (guarded[i] >= plain[i]);
+                if (plain[i] > std::max(std::abs(x[i - 32]), std::abs(x[i - 31])) * T(1.02)) ++above;
+            }
+            EXPECT_TRUE(raised);
+            EXPECT_GT(above, x.size() / 20);
+            EXPECT_TRUE(sameBytes(estimatorReadings(x, whole, false), plain));
+            EXPECT_TRUE(sameBytes(estimatorReadings(x, mixed, false), plain));
+            EXPECT_TRUE(sameBytes(estimatorReadings(x, whole, true), guarded));
+            EXPECT_TRUE(sameBytes(estimatorReadings(x, mixed, true), guarded));
+            EXPECT_EQ(estimatorMax(x, single), largest);
+            EXPECT_EQ(estimatorMax(x, whole), largest);
+            EXPECT_EQ(estimatorMax(x, mixed), largest);
+
+            TruePeakAnalyzer<T> analyzer;
+            const AnalyzerReadings<T> eighth = analyzerReadings(analyzer, x, 1);
+            const AnalyzerReadings<T> blocks = analyzerReadings(analyzer, x, 128);
+            const AnalyzerReadings<T> odd = analyzerReadings(analyzer, x, 37);
+            const T largestEighth = largestFiniteOf(eighth.peak);
+            EXPECT_GT(largestEighth, T(0.5));
+            EXPECT_TRUE(sameBytes(blocks.peak, eighth.peak));
+            EXPECT_TRUE(sameBytes(odd.peak, eighth.peak));
+            EXPECT_TRUE(sameBytes(blocks.annex, eighth.annex));
+            EXPECT_TRUE(sameBytes(odd.annex, eighth.annex));
+            typename TruePeakAnalyzer<T>::Channel one, chunk, cut;
+            EXPECT_EQ(analyzerMax(analyzer, one, x, single), largestEighth);
+            EXPECT_EQ(analyzerMax(analyzer, chunk, x, whole), largestEighth);
+            EXPECT_EQ(analyzerMax(analyzer, cut, x, mixed), largestEighth);
+        }
+        simd::setRuntimeDispatch(dispatch);
     };
     check.template operator()<float>();
     check.template operator()<double>();

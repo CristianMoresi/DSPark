@@ -56,8 +56,8 @@ All notable user-facing changes to DSPark are documented here.
   material `Standard` reads low comes out quieter by what it let through
   (white noise 0.25 dB). Intermodulation as in sample-peak mode at the same
   lookahead (60 Hz + 7 kHz at the default: -63.0 dBc, double -58.9, against
-  -61.9 and -61.5). Detection costs about 1.8 times `Standard`'s per frame
-  (2.1 in double). `prepare()` now allocates the reading's kernels and
+  -61.9 and -61.5). A frame costs 2.1 to 2.7 times what it costs in
+  `Standard`, by compiler. `prepare()` now allocates the reading's kernels and
   histories and the gain histories of the longer lookahead whether or not
   the mode is used: 25 KB more for float stereo at 48 kHz, 41 KB in double.
   The state carries the choice (`truePeakPrecision`; older blobs restore
@@ -445,6 +445,36 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `TruePeakEstimator` and `TruePeakAnalyzer` (the true-peak modes of
+  `Limiter`, `LoudnessMeter`'s true peak and what reads them): the reading
+  loops (the largest grid point of every interval and the crests refined
+  around the grid points) run on vectors, on the AVX2 kernels when the
+  run-time dispatch is active, and give the same readings, bit for bit, on
+  every path. A compiler vectorises the scalar loop only when it may run the
+  vertex's division and comparisons for positions the source skips, so with
+  those that honour floating-point traps the readings cost two to three times
+  what they cost with the others. `processMax()` also skips, within a chunk,
+  every vector whose grid points cannot reach the maximum it holds (a crest
+  stands at most a quarter above the point it is centred on). Measured before
+  and after in one job per machine (GCC at -O2 and -O3, Clang and MSVC on
+  x64, GCC and Clang on arm64), the baseline kernels and the dispatched ones,
+  float and double, as the time after over the time before. The estimator's
+  per-sample readings with the Annex 2 guard: GCC 0.39 to 0.49 in float and
+  0.58 to 0.67 in double with the dispatch, 0.62 to 0.70 and 0.81 to 0.87 on
+  SSE2; MSVC 0.38 and 0.56, 0.57 and 0.75; Clang, which already vectorised
+  the loop, 0.85 and 0.70, 0.99 and 0.86; arm64 0.65 and 0.86 (GCC), 0.98
+  and 0.99 (Clang). Its running maximum: 0.37 to 0.68 and 0.52 to 0.83. The
+  analyzer's per-sample readings: 0.61 to 0.85 in float and 0.78 to 1.00 in
+  double (its 8x loops stay scalar at two NEON lanes, where the vector
+  division cost more than the few crests of that grid); its running maximum
+  0.49 to 0.84 and 0.65 to 1.00. A mono frame of `Limiter` in true-peak
+  mode: GCC 0.57 to 0.76 in float and 0.67 to 0.89 in double (at -O2 on x64
+  27.5 -> 16.1 ns and 34.1 -> 23.8), MSVC 0.63 and 0.70 (31.6 -> 19.9 and
+  38.4 -> 26.8), Clang 0.92 and 0.76 on x64, arm64 0.73 and 0.89 (GCC,
+  42.0 -> 30.9 and 57.2 -> 50.7) and 0.99 and 1.00 (Clang); with the
+  high-precision reading 0.72 to 0.89 in float and 0.79 to 1.00 in double.
+  No row of the 72 measured on the eight builds is slower outside the noise
+  of the runners (the largest, 3 %, in 37-sample chunks on one of them).
 - `FFTReal`, faster, with output that changes at rounding level;
   `FFTComplex` and the split engine read the same twiddles in another order
   and write the same output, bit for bit. A pass reads its twiddles as one

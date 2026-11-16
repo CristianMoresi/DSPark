@@ -548,8 +548,8 @@ public:
      * Standard let through (white noise 0.25 dB); the file description
      * gives the overshoot of both. The intermodulation is that of
      * sample-peak mode at the same lookahead (60 Hz + 7 kHz at the default:
-     * -63.0 dBc, double -58.9, against -61.9 and -61.5). Detection costs
-     * about 1.8 times Standard's per frame (2.1 in double), and prepare()
+     * -63.0 dBc, double -58.9, against -61.9 and -61.5). A frame costs 2.1
+     * to 2.7 times what it costs in Standard, by compiler, and prepare()
      * allocates its kernels (5 KB in float, 10 KB in double) and 6 KB (11 KB)
      * of history per channel whether or not it is used. Switching it during
      * playback moves the latency like a lookahead change; the reading's

@@ -203,9 +203,11 @@ inline EffectSlot makeLadderFilter()
     // Enum: LP6=0, LP12=1, LP18=2, LP24=3, BP12=4, HP24=5
     s.addChoice("Mode", {"LP6","LP12","LP18","LP24","BP12","HP24"}, 3);  // Default LP24 (Moog-style)
     // A/B: Feedback (default) saturates only the resonance loop; Stages
-    // saturates every stage (opt-in, solved per sample). Order MUST match
-    // dspark::LadderFilter<float>::Saturation (Feedback=0, Stages=1).
-    s.addChoice("Saturation", {"Feedback","Stages"}, 0);
+    // saturates every stage (opt-in, solved per sample); Input saturates the
+    // loop input and runs four sub-steps per sample (opt-in). Order MUST
+    // match dspark::LadderFilter<float>::Saturation (Feedback=0, Stages=1,
+    // Input=2).
+    s.addChoice("Saturation", {"Feedback","Stages","Input"}, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };

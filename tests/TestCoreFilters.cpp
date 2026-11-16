@@ -878,6 +878,282 @@ DSPARK_TEST(Ladder_stages_channel_pairs_match_single_channels)
 }
 
 // ============================================================================
+// LadderFilter - input saturation (Saturation::Input)
+// ============================================================================
+
+namespace
+{
+// The Input model's equations at a rate high enough to stand for the
+// continuous system: trapezoidal stages, exact tanh on the loop input, the
+// loop solved to convergence.
+struct LadderInputReference
+{
+    double G = 0.0, H = 1.0, G4 = 0.0, k = 0.0, d = 1.0;
+    std::array<double, 4> s{};
+
+    LadderInputReference(double rate, double fc, double res, double drive)
+    {
+        const double g = std::tan(pi<double> * fc / rate);
+        G = g / (1.0 + g);
+        H = 1.0 - G;
+        G4 = (G * G) * (G * G);
+        k = 4.0 * res;
+        d = drive;
+    }
+
+    double step(double x)
+    {
+        const double sum = H * (((G * G) * G) * s[0] + (G * G) * s[1] + G * s[2] + s[3]);
+        const double c = k * G4, r = d * (x - k * sum);
+        double u = r;
+        for (int it = 0; it < 60; ++it)
+        {
+            const double t = std::tanh(u);
+            const double delta = (u + c * t - r) / (1.0 + c * (1.0 - t * t));
+            u -= delta;
+            if (std::abs(delta) < 1e-15) break;
+        }
+        double in = std::tanh(u) / d;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            const double v = (in - s[i]) * G;
+            const double y = v + s[i];
+            s[i] = y + v;
+            in = y;
+        }
+        return in;
+    }
+};
+
+template <class F>
+void ladderInputSetup(F& filter, double fs, int channels, double fc, double res, double drive)
+{
+    using S = decltype(filter.getCutoff());
+    filter.prepare(AudioSpec{ fs, 512, channels });
+    filter.setCutoff(static_cast<S>(fc));
+    filter.setResonance(static_cast<S>(res));
+    filter.setDrive(static_cast<S>(drive));
+    filter.setMode(F::Mode::LP24);
+    filter.setSaturation(F::Saturation::Input);
+}
+
+// Magnitude of the discrete-time Fourier transform of h at freq.
+double ladderResponseAt(const std::vector<double>& h, double freq, double fs)
+{
+    const std::complex<double> step = std::polar(1.0, -twoPi<double> * freq / fs);
+    std::complex<double> acc(0, 0), w(1, 0);
+    for (double v : h)
+    {
+        acc += v * w;
+        w *= step;
+    }
+    return std::abs(acc);
+}
+} // namespace
+
+DSPARK_TEST(Ladder_input_mode_matches_its_equations)
+{
+    // One tanh on the loop input, linear stages, four sub-steps per sample.
+    // Against the same equations 32 times oversampled (exact tanh, the loop
+    // solved to convergence), a full-scale 110 Hz sine at resonance 0.5 and
+    // drive 3: the harmonics through the seventh land within 0.1 dB at a
+    // 2 kHz cutoff and at 12 kHz, in float and double. The per-stage model at
+    // 12 kHz is 2 dB off its own equations: it solves at the sample rate.
+    constexpr double fs = 48000.0, res = 0.5, drive = 3.0;
+    constexpr int perPeriod = 436, periods = 70, measured = 10, os = 32;
+    const int total = perPeriod * periods;
+    const double f0 = fs / perPeriod;
+    for (double fc : { 2000.0, 12000.0 })
+    {
+        LadderInputReference reference(fs * os, fc, res, drive);
+        std::vector<double> truth(static_cast<size_t>(total));
+        for (int n = 0; n < total; ++n)
+        {
+            double y = 0.0;
+            for (int j = 0; j < os; ++j)
+                y = reference.step(std::sin(twoPi<double> * f0 * (n + double(j + 1) / os) / fs));
+            truth[static_cast<size_t>(n)] = y;
+        }
+        LadderFilter<double> fd;
+        LadderFilter<float> ff;
+        ladderInputSetup(fd, fs, 1, fc, res, drive);
+        ladderInputSetup(ff, fs, 1, fc, res, drive);
+        std::vector<double> outD(truth.size()), outF(truth.size());
+        for (int n = 0; n < total; ++n)
+        {
+            const double x = std::sin(twoPi<double> * f0 * (n + 1) / fs);
+            outD[static_cast<size_t>(n)] = fd.processSample(x, 0);
+            outF[static_cast<size_t>(n)] = ff.processSample(static_cast<float>(x), 0);
+        }
+        const double r1 = ladderHarmonic(truth, perPeriod, measured, 1);
+        EXPECT_GT(ladderHarmonic(truth, perPeriod, measured, 3), 0.03 * r1);   // it does saturate
+        for (int m : { 1, 3, 5, 7 })
+        {
+            const double r = ladderHarmonic(truth, perPeriod, measured, m);
+            EXPECT_NEAR(20 * std::log10(ladderHarmonic(outD, perPeriod, measured, m) / r), 0.0, 0.1);
+            EXPECT_NEAR(20 * std::log10(ladderHarmonic(outF, perPeriod, measured, m) / r), 0.0, 0.1);
+        }
+    }
+}
+
+DSPARK_TEST(Ladder_input_resonance_is_in_tune_and_the_open_filter_is_flat)
+{
+    // Small signal. The analog ladder at resonance 0.95 (k = 3.8) peaks at
+    // 0.98714 of its cutoff. The Input model's peak lies within 1.5 cents of
+    // that at 1, 8 and 16 kHz, where the models that integrate at the sample
+    // rate are 0.05, 3.8 and 13 cents sharp. With the cutoff at 20 kHz and no
+    // resonance, 5 and 10 kHz pass within 0.75 dB of the analog four-pole
+    // gain (the level lost to the sub-steps is corrected).
+    constexpr double fs = 48000.0;
+    double peakRatio = 0.0, best = 0.0;
+    for (double x = 0.9; x < 1.05; x += 1e-6)
+    {
+        const std::complex<double> s(1.0, x);
+        const double m = 1.0 / std::abs((s * s) * (s * s) + 3.8);
+        if (m > best) { best = m; peakRatio = x; }
+    }
+    EXPECT_NEAR(peakRatio, 0.98714, 1e-4);
+    for (double fc : { 1000.0, 8000.0, 16000.0 })
+    {
+        LadderFilter<double> f;
+        ladderInputSetup(f, fs, 1, fc, 0.95, 1.0);
+        std::vector<double> h(32768);
+        for (size_t n = 0; n < h.size(); ++n) h[n] = f.processSample(n == 0 ? 1e-3 : 0.0, 0);
+        const double target = peakRatio * fc;
+        double bestCents = 0.0, bestMag = 0.0;
+        for (double cents = -4.0; cents <= 4.0; cents += 0.125)
+        {
+            const double mag = ladderResponseAt(h, target * std::pow(2.0, cents / 1200.0), fs);
+            if (mag > bestMag) { bestMag = mag; bestCents = cents; }
+        }
+        EXPECT_LT(std::abs(bestCents), 1.5);
+    }
+    for (double freq : { 5000.0, 10000.0 })
+    {
+        LadderFilter<double> f;
+        ladderInputSetup(f, fs, 1, 20000.0, 0.0, 1.0);
+        const int period = 48, settle = 100 * period, measure = 100 * period;
+        const double w = twoPi<double> * freq / fs;
+        double re = 0.0, im = 0.0;
+        for (int n = 0; n < settle + measure; ++n)
+        {
+            const double y = f.processSample(1e-3 * std::sin(w * n), 0);
+            if (n >= settle) { re += y * std::cos(w * n); im += y * std::sin(w * n); }
+        }
+        const double gainDb = 20.0 * std::log10(2.0 * std::sqrt(re * re + im * im) / measure / 1e-3);
+        const double analogDb = -40.0 * std::log10(1.0 + (freq / 20000.0) * (freq / 20000.0));
+        EXPECT_NEAR(gainDb, analogDb, 0.75);
+    }
+}
+
+DSPARK_TEST(Ladder_input_block_pair_and_per_sample_paths_agree)
+{
+    // The model's state is double and one function advances it: a block, the
+    // same samples one by one and a channel of a pair give the same output,
+    // bit for bit, across a cutoff change and in every mode.
+    using L = LadderFilter<float>;
+    constexpr int kN = 700;
+    std::vector<std::vector<float>> in(3, std::vector<float>(kN));
+    uint32_t rng = 0x1ADDu;
+    for (auto& ch : in)
+        for (auto& v : ch)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<float>(((rng >> 8) * (1.0 / 16777216.0)) - 0.5) * 1.8f;
+        }
+    for (L::Mode mode : { L::Mode::LP24, L::Mode::LP6, L::Mode::BP12, L::Mode::HP24 })
+    {
+        L multi;
+        ladderInputSetup(multi, 48000.0, 3, 3000.0, 0.9, 3.0);
+        multi.setMode(mode);
+        auto out = in;
+        for (int at = 0; at < kN; at += 175)
+        {
+            if (at == 350) multi.setCutoff(9000.0f);
+            float* ptr[3] = { out[0].data() + at, out[1].data() + at, out[2].data() + at };
+            multi.processBlock(AudioBufferView<float>(ptr, 3, 175));
+        }
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            L single;
+            ladderInputSetup(single, 48000.0, 1, 3000.0, 0.9, 3.0);
+            single.setMode(mode);
+            std::vector<float> alone(kN);
+            for (int n = 0; n < kN; ++n)
+            {
+                if (n == 350) single.setCutoff(9000.0f);
+                alone[static_cast<size_t>(n)] = single.processSample(in[static_cast<size_t>(ch)][static_cast<size_t>(n)], 0);
+            }
+            EXPECT_TRUE(alone == out[static_cast<size_t>(ch)]);
+        }
+    }
+}
+
+DSPARK_TEST(Ladder_input_switches_self_oscillation_and_state)
+{
+    using L = LadderFilter<float>;
+    // Switching the saturation model mid-stream hands the integrators over:
+    // a 220 Hz tone stays finite and bounded through every change.
+    {
+        L f;
+        ladderInputSetup(f, 48000.0, 1, 3000.0, 0.3, 1.0);
+        const L::Saturation order[] = { L::Saturation::Feedback, L::Saturation::Input, L::Saturation::Stages,
+                                        L::Saturation::Input, L::Saturation::Feedback };
+        double peak = 0.0;
+        bool finite = true;
+        int n = 0;
+        for (L::Saturation model : order)
+        {
+            f.setSaturation(model);
+            for (int i = 0; i < 2400; ++i, ++n)
+            {
+                const float y = f.processSample(0.5f * static_cast<float>(std::sin(twoPi<double> * 220.0 * n / 48000.0)), 0);
+                finite = finite && std::isfinite(y);
+                peak = std::max(peak, static_cast<double>(std::abs(y)));
+            }
+        }
+        EXPECT_TRUE(finite);
+        EXPECT_LT(peak, 1.0);
+        EXPECT_GT(peak, 0.1);
+    }
+    // Above resonance 1 the saturator bounds the oscillation: kicked by 1 ms
+    // of 0.1, it is still ringing half a second later and never leaves the
+    // range a knee-wide swing allows.
+    {
+        L f;
+        ladderInputSetup(f, 48000.0, 1, 2000.0, 1.15, 1.0);
+        double peak = 0.0, tail = 0.0;
+        for (int n = 0; n < 24000; ++n)
+        {
+            const double y = f.processSample(n < 48 ? 0.1f : 0.0f, 0);
+            peak = std::max(peak, std::abs(y));
+            if (n >= 19200) tail += y * y;
+        }
+        EXPECT_LT(peak, 2.0);
+        EXPECT_GT(std::sqrt(tail / 4800.0), 0.01);
+    }
+    // The model survives a state round trip, and a NaN sample does not
+    // silence the channel past the block it arrived in.
+    {
+        L f;
+        ladderInputSetup(f, 48000.0, 1, 1500.0, 0.9, 4.0);
+        const auto blob = f.getState();
+        L restored;
+        restored.prepare(AudioSpec{ 48000.0, 512, 1 });
+        EXPECT_TRUE(restored.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(restored.getSaturation() == L::Saturation::Input);
+        std::vector<float> block(256, 0.25f);
+        block[10] = std::numeric_limits<float>::quiet_NaN();
+        float* ptr[1] = { block.data() };
+        f.processBlock(AudioBufferView<float>(ptr, 1, 256));
+        std::fill(block.begin(), block.end(), 0.25f);
+        f.processBlock(AudioBufferView<float>(ptr, 1, 256));
+        EXPECT_TRUE(std::isfinite(block[255]));
+        EXPECT_GT(std::abs(block[255]), 0.01f);
+    }
+}
+
+// ============================================================================
 // StateVariableFilter - analytic exactness and robustness
 // ============================================================================
 

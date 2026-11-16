@@ -6,6 +6,37 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `LadderFilter::setSaturation(Saturation::Input)` (opt-in; `Feedback` and
+  `Stages` are unchanged and bit-identical): a third saturation model, with
+  linear stages and one saturator on the loop input, run in four sub-steps
+  per sample. Every sub-step closes the loop without delay: the loop gain
+  past the saturator stays below 0.036, so one Newton step from the explicit
+  value leaves the square of its error. The input is interpolated across the
+  sub-steps and the output is their mean, each with a one-pole level
+  correction. Measured at 48 kHz next to a fixed-cost ladder of the same
+  class written into the harness (four sub-steps, a cubic rational saturator
+  on the loop input, a sub-step of delay in the loop, polynomial tuning
+  corrections). Harmonics above -80 dBc of a full-scale 110 Hz sine against
+  each model's own equations solved 32x oversampled, over cutoffs from 250
+  Hz to 20 kHz, drive 1 and 3 and resonance 0 to 0.9: within 0.05 dB
+  (comparison 0.42; `Stages` 0.27 up to 2 kHz and 1.6 at 8 kHz). Resonance
+  peak against the analog one: within 0.25 cents up to an 8 kHz cutoff and
+  1.1 cents at 20 kHz (comparison -15.5 to +15.3; the other two models +3.8
+  at 8 kHz and +18 at 20 kHz). Small-signal response against the analog
+  four-pole with no resonance: within 0.5 dB up to 15 kHz at any cutoff and
+  -0.6 to -2.1 dB at 20 kHz (comparison -1.0 to -1.4 dB at 5 kHz, -4.4 to
+  -5.0 at 10 kHz and -11 to -13 at 15 kHz). Aliasing of a full-scale 5 kHz
+  tone at drive 3 over cutoffs from 500 Hz to 20 kHz: -45 to -61 dBc
+  (comparison -29 to -38; `Stages` -21 to -38 up to 12 kHz and -64 at 20
+  kHz, where this model gives -60). Cost, the same at every cutoff and
+  resonance: 53 to 74 ns per sample in mono depending on the machine (float;
+  GCC, Clang and MSVC on x64 and GCC on arm64), which on each machine and
+  setting is 0.47 to 0.85 times the comparison model, 0.30 to 0.95 times
+  `Stages` and 1.5 to 4.0 times `Feedback`; channel pairs advance together
+  at 35 to 48 ns per channel. Resonance above 1 (up to 1.2) self-oscillates
+  at a level the saturator sets; the HP24 output is taken from the saturated
+  loop input. The state carries the model, and the integrators carry over a
+  switch between models.
 - `Limiter::setTruePeakPrecision(TruePeakPrecision::High)` (opt-in; the
   default `Standard` is unchanged): true-peak mode reads with
   `TruePeakAnalyzer` (an 8x grid from a 512-tap first stage) instead of the

@@ -374,4 +374,309 @@ template <LadderTap Tap, FloatType T>
     else                                       out = u - 4.0 * y0 + 6.0 * y1 - 4.0 * y2 + y3;
     return static_cast<T>(out);
 }
+
+// ============================================================================
+// Input-saturating ladder (sub-stepped, delay-free loop)
+// ============================================================================
+
+#if defined(_MSC_VER) && !defined(__clang__)
+    #define DSPARK_LADDER_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_LADDER_INLINE inline __attribute__((always_inline))
+#else
+    #define DSPARK_LADDER_INLINE inline
+#endif
+
+/** @brief Sub-steps per sample of the input-saturating ladder. */
+inline constexpr int kLadderInputSubsteps = 4;
+
+/** @brief Where ladderTanh()'s rational function reaches 1, and that squared. */
+inline constexpr double kLadderTanhLimit = 6.297019181717114;
+inline constexpr double kLadderTanhLimit2 = kLadderTanhLimit * kLadderTanhLimit;
+
+/**
+ * @brief The two polynomials of ladderTanh() in a^2 (tanh(a) = a num / den),
+ *        each summed as two halves so that both are ready four operations
+ *        after a^2.
+ */
+inline void ladderTanhParts(double a2, double& num, double& den) noexcept
+{
+    const double a4 = a2 * a2;
+    const double a6 = a4 * a2;
+    num = ((34459425.0 + 4729725.0 * a2) + 135135.0 * a4) + a6 * (990.0 + a2);
+    den = ((34459425.0 + 16216200.0 * a2) + 945945.0 * a4) + a6 * (13860.0 + 45.0 * a2);
+}
+
+/** @brief Coefficients of ladderStepInput(), derived by makeLadderInputCoeffs(). */
+struct LadderInputCoeffs
+{
+    double G = 0.0, H = 1.0;       ///< One stage per sub-step: y = G in + H s, then s = 2 y - s.
+    double d = 1.0, invD = 1.0;    ///< Level scale of the saturator and its reciprocal.
+    double kd = 0.0;               ///< k d.
+    double c = 0.0;                ///< Loop gain past the saturator, k G^4.
+    double onePlusC = 1.0;
+    double kappa = 0.0;            ///< k times what one unit of saturator output adds to the next feedback sum.
+    double cS[4] = {};             ///< Feedback sum of the states: the last stage's output with no input.
+    double cAhead[4] = {};         ///< k d times that sum one sub-step on, from the states now.
+    double pre = 0.0, post = 0.0;  ///< Level corrections of the two rate changes.
+};
+
+/**
+ * @brief State of ladderStepInput(), in double whatever the sample type is.
+ *
+ * The integrators run at the sub-step rate, where a stage moves by a small
+ * fraction of its input per step, so they are kept at the precision of the
+ * arithmetic; a block and the same samples one by one then give the same
+ * output.
+ */
+struct LadderInputState
+{
+    double q[4] = {};         ///< Integrator states.
+    double ahead = 0.0;       ///< cAhead . q: k d times the feedback sum q reaches a sub-step on with no input.
+    double loopStates = 0.0;  ///< That term as the last sub-step formed it, from the states it started from,
+    double loopDrive = 0.0;   ///< and kappa times its saturator output: together, k d times the feedback sum of q.
+    double input = 0.0;       ///< Previous input after its level correction.
+    double output = 0.0;      ///< Previous output.
+};
+
+/** @brief Recomputes the carried sums after the states or the coefficients changed. */
+inline void ladderInputRefresh(LadderInputState& h, const LadderInputCoeffs& c) noexcept
+{
+    h.ahead = ((c.cAhead[0] * h.q[0] + c.cAhead[1] * h.q[1]) + c.cAhead[2] * h.q[2]) + c.cAhead[3] * h.q[3];
+    h.loopStates = c.kd * ((c.cS[0] * h.q[0] + c.cS[1] * h.q[1]) + (c.cS[2] * h.q[2] + c.cS[3] * h.q[3]));
+    h.loopDrive = 0.0;
+}
+
+/**
+ * @brief Derives the coefficients of the input-saturating ladder.
+ *
+ * The integrators are prewarped at the sub-step rate, so the cutoff is exact
+ * and the response below it is that of a ladder at
+ * (4 fs / pi) tan(pi fc / (4 fs)): within 0.2% of fc at 0.1 fs and 4.4% at
+ * 0.45 fs.
+ *
+ * @param cutoffRatio Cutoff as a fraction of the sample rate; held within
+ *                    (0, 0.499].
+ * @param res         Resonance; 1 is the self-oscillation boundary (k = 4).
+ * @param drive       Level scale of the saturator (> 0): the loop input
+ *                    saturates as tanh(drive * v) / drive.
+ */
+template <FloatType T>
+[[nodiscard]] inline LadderInputCoeffs makeLadderInputCoeffs(double cutoffRatio, T res, T drive) noexcept
+{
+    LadderInputCoeffs c;
+    const double ratio = cutoffRatio > 1e-6 ? std::min(cutoffRatio, 0.499) : 1e-6;
+    const double g = std::tan(pi<double> * ratio / kLadderInputSubsteps);
+    c.G = g / (1.0 + g);
+    c.H = 1.0 - c.G;
+    const double G2 = c.G * c.G;
+    const double power[5] = { 1.0, c.G, G2, G2 * c.G, G2 * G2 };
+    const double k = 4.0 * static_cast<double>(res);
+    c.d = static_cast<double>(drive);
+    c.invD = 1.0 / c.d;
+    c.kd = k * c.d;
+    c.c = k * power[4];
+    c.onePlusC = 1.0 + c.c;
+    // One sub-step of the four trapezoidal stages fed w: y_i = G^(i+1) w +
+    // sum_{j <= i} G^(i-j) H s_j, and each state moves to 2 y_i - s_i, so the
+    // states map as s' = a s + b w.
+    double a[4][4] = {}, b[4] = {};
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+            a[i][j] = j < i ? 2.0 * power[i - j] * c.H : (j == i ? 1.0 - 2.0 * c.G : 0.0);
+        b[i] = 2.0 * power[i + 1];
+        c.cS[i] = c.H * power[3 - i];
+    }
+    // The feedback sum one sub-step on is therefore (cS a) s + (cS b) w.
+    double perUnit = 0.0;
+    for (int j = 0; j < 4; ++j)
+    {
+        double sum = 0.0;
+        for (int i = 0; i < 4; ++i) sum += c.cS[i] * a[i][j];
+        c.cAhead[j] = c.kd * sum;
+        perUnit += c.cS[j] * b[j];
+    }
+    c.kappa = k * perUnit;
+    // The input is interpolated linearly over the sub-steps and the output is
+    // their mean; they lose 5.0 and 2.5 dB at 0.417 fs. A one-pole correction
+    // on each side, y = (1 + b) x - b y[-1], restores them within 0.25 dB up
+    // to there.
+    c.pre = 0.30;
+    c.post = 0.14;
+    return c;
+}
+
+/** @brief One channel's registers while ladderStepInput() runs a sample. */
+struct LadderInputLane
+{
+    double q0 = 0.0, q1 = 0.0, q2 = 0.0, q3 = 0.0;
+    double ahead = 0.0, kl = 0.0, kw = 0.0, R = 0.0;
+    double x = 0.0, xs = 0.0, dx = 0.0, acc = 0.0;
+
+    /** @brief Loads the state and the first sub-step's loop drive. */
+    template <FloatType T>
+    DSPARK_LADDER_INLINE void begin(T input, const LadderInputState& h, const LadderInputCoeffs& c) noexcept
+    {
+        const double xPrev = h.input;
+        x = (1.0 + c.pre) * static_cast<double>(input) - c.pre * xPrev;
+        q0 = h.q[0];
+        q1 = h.q[1];
+        q2 = h.q[2];
+        q3 = h.q[3];
+        dx = (x - xPrev) * (1.0 / kLadderInputSubsteps);
+        xs = xPrev + dx;
+        ahead = h.ahead;
+        // The same two terms a sub-step hands the next one, so the last
+        // saturator output of a sample reaches the first loop drive of the
+        // next through one subtraction as well.
+        R = (c.d * xs - h.loopStates) - h.loopDrive;
+        acc = 0.0;
+    }
+
+    /** @brief One sub-step: the loop input, the stages and the taps. */
+    template <LadderTap Tap>
+    DSPARK_LADDER_INLINE void substep(const LadderInputCoeffs& c) noexcept
+    {
+        // Saturated loop input, one Newton step from the explicit value:
+        // with tanh(R) = R nu / de, t / (1 + c (1 - t^2)) is
+        // R nu de / ((1 + c) de^2 - c R^2 nu^2). It is divided out twice,
+        // plain for the stages and scaled by kappa for the next loop drive,
+        // which then follows the division by one subtraction. Past the limit
+        // of the rational tanh the saturator is at 1 and the Newton step
+        // leaves it there (1 - t^2 = 0): a branch, with nothing to divide. A
+        // NaN drive takes it too, as -1.
+        kl = ahead;
+        double wk;
+        const double r2 = R * R;
+        if (r2 < kLadderTanhLimit2) [[likely]]
+        {
+            double nu, de;
+            ladderTanhParts(r2, nu, de);
+            const double nd = nu * de;
+            const double den = c.onePlusC * (de * de) - (c.c * r2) * (nu * nu);
+            wk = (R * nd) / den;
+            kw = ((c.kappa * R) * nd) / den;
+        }
+        else
+        {
+            wk = R > 0.0 ? 1.0 : -1.0;
+            kw = R > 0.0 ? c.kappa : -c.kappa;
+        }
+        xs += dx;
+        R = (c.d * xs - kl) - kw;
+        // The four stages in turn; each state moves to twice its output minus
+        // itself.
+        const double w = wk * c.invD;
+        const double y0 = c.G * w + c.H * q0;
+        const double y1 = c.G * y0 + c.H * q1;
+        const double y2 = c.G * y1 + c.H * q2;
+        const double y3 = c.G * y2 + c.H * q3;
+        if constexpr (Tap == LadderTap::LP6)       acc += y0;
+        else if constexpr (Tap == LadderTap::LP12) acc += y1;
+        else if constexpr (Tap == LadderTap::LP18) acc += y2;
+        else if constexpr (Tap == LadderTap::LP24) acc += y3;
+        else if constexpr (Tap == LadderTap::BP12) acc += y0 - y2;
+        else
+        {
+            // HP24: the binomial (1 - L)^4 on the cascade's input, the
+            // saturated loop input (see ladderStep()).
+            acc += ((w - 4.0 * y0) + 6.0 * y1) + (y3 - 4.0 * y2);
+        }
+        q0 = 2.0 * y0 - q0;
+        q1 = 2.0 * y1 - q1;
+        q2 = 2.0 * y2 - q2;
+        q3 = 2.0 * y3 - q3;
+        // For the sub-step after the next; the last stage's state joins last.
+        ahead = ((c.cAhead[0] * q0 + c.cAhead[1] * q1) + c.cAhead[2] * q2) + c.cAhead[3] * q3;
+    }
+
+    /** @brief Stores the state and returns the level-corrected mean of the sub-steps. */
+    template <FloatType T>
+    [[nodiscard]] DSPARK_LADDER_INLINE T finish(LadderInputState& h, const LadderInputCoeffs& c) const noexcept
+    {
+        h.q[0] = q0;
+        h.q[1] = q1;
+        h.q[2] = q2;
+        h.q[3] = q3;
+        h.ahead = ahead;
+        h.loopStates = kl;
+        h.loopDrive = kw;
+        h.input = x;
+        const double y = (1.0 + c.post) * (acc * (1.0 / kLadderInputSubsteps)) - c.post * h.output;
+        h.output = y;
+        return static_cast<T>(y);
+    }
+};
+
+/**
+ * @brief Advances the input-saturating ladder by one sample.
+ *
+ * Linear trapezoidal stages with one saturator on the loop input,
+ *
+ *     dy_i/dt = wc * (y_{i-1} - y_i),  y_0 = phi(x - k * y_4),
+ *     phi(v)  = tanh(drive * v) / drive,
+ *
+ * run in kLadderInputSubsteps sub-steps per sample: the input is
+ * interpolated linearly across them and the output is their mean, each with
+ * its level correction. The loop is closed without delay in every sub-step.
+ * With the cascade written y_4 = G^4 w + S (S from the states), the loop
+ * input u solves u + k G^4 phi(u) = x - k S. k G^4 stays below 0.036 at
+ * every setting (the sub-steps keep G small), so one Newton step from the
+ * explicit value r = x - k S leaves the square of that:
+ * phi(u) = t / (1 + k G^4 (1 - t^2)), t = tanh(drive r). The arithmetic is
+ * double whatever T is; the tanh is ladderTanh()'s rational function.
+ *
+ * What a sample costs is the path from one loop drive to the next, so that
+ * path is kept to the saturator and one subtraction: the feedback sum a
+ * sub-step leaves behind is formed as cAhead . s, from the states it started
+ * from, plus kappa times its saturator output, and the stages themselves
+ * advance off that path. The function is always inlined: a block loop then
+ * keeps the state in registers and loads the coefficients once.
+ *
+ * @param input Current input sample.
+ * @param h     State of the channel, updated in place. Its carried sums must
+ *              match its integrators and c (ladderInputRefresh() after
+ *              either changed outside this function).
+ * @param c     Coefficients from makeLadderInputCoeffs().
+ */
+template <LadderTap Tap, FloatType T>
+[[nodiscard]] DSPARK_LADDER_INLINE T ladderStepInput(T input, LadderInputState& h, const LadderInputCoeffs& c) noexcept
+{
+    LadderInputLane lane;
+    lane.begin(input, h, c);
+    for (int j = 0; j < kLadderInputSubsteps; ++j) lane.substep<Tap>(c);
+    return lane.finish<T>(h, c);
+}
+
+/**
+ * @brief ladderStepInput() on two channels at once, sub-step by sub-step.
+ *
+ * The two solves are independent, so taking their sub-steps in turn lets
+ * their dependency chains overlap. Each channel's arithmetic is that of
+ * ladderStepInput(): the outputs are the same.
+ *
+ * @param a  First channel's sample, replaced by its output.
+ * @param b  Second channel's sample, replaced by its output.
+ * @param ha First channel's state.
+ * @param hb Second channel's state.
+ * @param c  Coefficients from makeLadderInputCoeffs().
+ */
+template <LadderTap Tap, FloatType T>
+DSPARK_LADDER_INLINE void ladderStepInputPair(T& a, T& b, LadderInputState& ha, LadderInputState& hb,
+                                              const LadderInputCoeffs& c) noexcept
+{
+    LadderInputLane la, lb;
+    la.begin(a, ha, c);
+    lb.begin(b, hb, c);
+    for (int j = 0; j < kLadderInputSubsteps; ++j)
+    {
+        la.substep<Tap>(c);
+        lb.substep<Tap>(c);
+    }
+    a = la.finish<T>(ha, c);
+    b = lb.finish<T>(hb, c);
+}
+
+#undef DSPARK_LADDER_INLINE
 } // namespace dspark::detail

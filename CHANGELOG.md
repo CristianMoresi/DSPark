@@ -445,6 +445,49 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `FFTReal` from 16 double or 32 float samples on, in builds with vectors:
+  a new engine, faster on every machine measured, with output that changes
+  at rounding level. The samples are taken as W sequences of N/W points,
+  one in each lane of a W-lane vector (sample t of sequence j at x[W t +
+  j]), so a vector loaded from the signal holds one point of each: the
+  passes transform every sequence in its own lane, as a scalar transform
+  works on numbers, and shuffle nothing. They are real radix-4 passes on
+  packed half spectra (a first pass of four or eight samples without
+  twiddles, then passes that join four spectra into one of four times the
+  points), and one last step joins the W spectra, W bins at a time, into the
+  interleaved spectrum. The inverse runs the same steps backwards. Shorter
+  transforms, and builds without vectors, keep the half-size complex engine
+  and their output, bit for bit; `FFTComplex` is untouched. What a caller
+  sees: `getInverseStepCount()` returns other counts than before and a step
+  of `inverseStep()` may do nothing (the count is the same for every kernel
+  set of a build); `allocationBytes()` reports the new memory (the two work
+  buffers as before, and one table allocation per kernel set where the
+  constructor made five or six allocations); a unit impulse and a flat
+  spectrum still map to each other exactly, and the inverse still takes the
+  imaginary parts of DC and Nyquist as zero whatever they hold. Measured
+  before and after in one job per machine, forward plus inverse at 64 to
+  65536 points, as the time after over the time before: on arm64 (a server
+  core), GCC 0.71 to 0.87 in double and 0.77 to 0.83 in float, Clang 0.74 to
+  0.86 and 0.72 to 0.86; on x64 with SSE2, GCC 0.68 to 0.95 and 0.73 to
+  0.91, Clang 0.72 to 1.03 and 0.75 to 1.01, MSVC 0.70 to 0.94 and 0.63 to
+  0.92; built for AVX2 and FMA, GCC 0.78 to 0.96 and 0.77 to 1.01, Clang
+  0.75 to 0.94 and 0.63 to 1.03; through the run-time dispatch, GCC 0.75 to
+  0.99 and 0.83 to 0.99, Clang 0.77 to 0.99 and 0.66 to 1.07, MSVC 0.83 to
+  0.92 and 0.78 to 0.93. The rows at or above 1.0 come from one x64 server
+  CPU family, at 4096 points and more: the step that joins the lanes is
+  made of shuffles, which that CPU runs on fewer ports than the other
+  family measured, where the same sizes gave 0.85 to 0.96. Against a
+  reference FFT's ordered real transform in the same jobs (it leaves its
+  inverse unscaled), worst size, before -> after: on arm64, double 1.22 ->
+  0.99 and float 1.18 -> 0.94 (GCC), 1.22 -> 0.98 and 1.11 -> 0.94 (Clang);
+  on x64 with SSE2, double 1.11 -> 0.95 and float 1.08 -> 0.93 (GCC), 1.06
+  -> 0.85 and 0.97 -> 0.82 (Clang), 1.04 -> 0.89 and 1.08 -> 0.82 (MSVC);
+  built for AVX2, double 0.90 -> 0.87 and float 0.95 -> 0.73 (GCC), 0.95 ->
+  0.88 and 1.02 -> 0.72 (Clang). What decided the arm64 figures with GCC:
+  two neighbouring vectors stored as a pair take one vector operation on
+  that core where two single stores take two, and that compiler addressed
+  the streams of a pass in a form that has no store pair; giving each pair
+  a base register of its own took a tenth off every pass.
 - `PitchDetector` (analysis readout; `PitchFollower`, `PitchFollower::track()`
   and `PitchCorrector` read through it): a dip above the threshold no longer
   reads as a note on its own. Such a dip is what a narrow band of noise or

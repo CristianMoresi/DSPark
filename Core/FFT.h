@@ -50,30 +50,38 @@
  *   arithmetic itself. A pass reads its factors as one stream: the six of a
  *   butterfly group side by side, or, for the first pass, the six rows of a
  *   block of groups.
- * - **Inverse by conjugation**: ifft(x) = conj(fft(conj(x))) / N, folded into
- *   the conversion passes, so both directions share one set of kernels.
- * - **Real transforms** run a half-size complex FFT on the (even, odd) sample
- *   pairs and split its spectrum with a vectorised post-pass that takes bins
- *   k and N/2 - k together: with Z the half-size spectrum, d = Z[k] -
- *   conj(Z[N/2-k]) and the split factor c_k = (1 - j w^k) / 2, X[k] =
- *   conj(Z[N/2-k]) + c_k d and X[N/2-k] = conj(Z[k] - c_k d), one difference
- *   and one complex product for the two bins (the factors of k and N/2 - k
- *   are exact conjugates in the table). The inverse packs its input the same
- *   way.
+ * - **Inverse by conjugation** (complex transforms): ifft(x) =
+ *   conj(fft(conj(x))) / N, folded into the conversion passes, so both
+ *   directions share one set of kernels.
+ * - **Real transforms by lanes**: the N samples are W sequences of N/W
+ *   points, sample t of sequence j at x[W t + j], so a W-lane vector loaded
+ *   from the signal holds one point of each: the passes transform every
+ *   sequence in its own lane, as a scalar transform works on numbers, and
+ *   shuffle nothing. They are real radix-4 passes on packed half spectra (a
+ *   first pass of four or eight samples with no twiddles, then passes that
+ *   join four spectra into one of four times the points, whose two real
+ *   bins take a few additions each), and one last step joins the W spectra,
+ *   W bins at a time, into the interleaved spectrum: the only place where
+ *   lanes mix. The inverse runs the same steps backwards and scales in its
+ *   last pass. Every factor comes from the values of one eighth of a turn,
+ *   so the factors of mirrored bins are equal or opposite to the last bit,
+ *   and a unit impulse and a flat spectrum map to each other exactly.
+ *   Transforms shorter than 16 double or 32 float samples, and builds
+ *   without vectors, run a half-size complex FFT on the (even, odd) sample
+ *   pairs and split its spectrum with a post-pass that takes bins k and
+ *   N/2 - k together (one difference and one complex product for the two).
  * - **Zero allocations** after construction; forward()/inverse() are
  *   noexcept and accept pointers of any alignment. With the 32-byte kernels,
  *   interleaved data that starts on a 32-byte boundary costs a complex
- *   transform up to 17 % less (measured at 4096 double points) and a real
- *   one up to 4 %: a vector's storage is only sure of 16.
+ *   transform up to 17 % less (measured at 4096 double points): a vector's
+ *   storage is only sure of 16.
  *
  * Measured on hosted CI runners, real transforms, forward plus inverse, ns
  * per real point at 64 / 1024 / 4096 / 65536 points, double and then float,
  * each row on one machine (the machines differ between rows). SSE2 (GCC):
- * 2.0 / 2.6 / 3.3 / 4.9 and 1.5 / 1.4 / 1.6 / 2.2. Built for AVX2 and FMA
- * (GCC): 1.5 / 1.4 / 2.7 / 4.3 and 1.4 / 0.85 / 1.0 / 1.9. NEON on an arm64
- * server core (GCC): 3.1 / 4.2 / 5.0 / 7.4 and 2.0 / 2.3 / 2.7 / 3.9. With
- * each work buffer where its own allocation put it, the AVX2 run gave 1.6 /
- * 1.6 / 3.4 / 5.6 and 1.4 / 0.88 / 1.1 / 2.5.
+ * 1.3 / 2.0 / 2.4 / 3.4 and 0.93 / 1.0 / 1.2 / 1.7. Built for AVX2 and FMA
+ * (GCC): 1.2 / 1.3 / 2.4 / 3.8 and 1.1 / 0.75 / 1.0 / 1.7. NEON on an arm64
+ * server core (GCC): 2.2 / 3.4 / 4.2 / 6.2 and 1.6 / 1.9 / 2.3 / 3.1.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
  * thread at a time; give each thread its own instance.
@@ -1123,8 +1131,11 @@ private:
  * @class FFTReal
  * @brief FFT optimised for real-valued input signals (the common audio case).
  *
- * Runs a half-size complex FFT on the (even, odd) sample pairs and splits its
- * spectrum with a vectorised post-pass, saving about half the work.
+ * Transforms the samples as W interleaved sequences, one in each lane of a
+ * vector, with real radix-4 passes, and joins their spectra in one last step
+ * (see the file comment): about half the work of a complex transform of the
+ * same length. The shortest sizes run a half-size complex FFT on the (even,
+ * odd) sample pairs and split its spectrum with a post-pass.
  *
  * **Frequency domain layout**: N+2 elements (interleaved complex).
  * - Bins 0 to N/2 inclusive -> (N/2 + 1) complex values -> (N + 2) floats.
@@ -1274,10 +1285,12 @@ public:
      *        transform over several calls (a real-time thread that must not
      *        spend the whole transform in one callback).
      *
-     * Step 0 packs the spectrum, each later step is one pass over the data.
-     * Running steps 0 .. getInverseStepCount() - 1 in order, with no other
-     * transform on this instance in between, writes exactly what inverse()
-     * writes, bit for bit.
+     * Step 0 reads the spectrum and each later step is at most one pass over
+     * the data: the count is the same for every kernel set of the build, and
+     * a set whose transform has fewer passes does nothing in the steps right
+     * after the first. Running steps 0 .. getInverseStepCount() - 1 in order,
+     * with no other transform on this instance in between, writes exactly
+     * what inverse() writes, bit for bit.
      *
      * @param step     Step index, 0 .. getInverseStepCount() - 1.
      * @param freqData Input spectrum, N+2 elements (read by step 0 only).

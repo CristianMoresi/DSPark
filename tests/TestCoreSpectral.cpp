@@ -1073,7 +1073,8 @@ DSPARK_TEST(FFTReal_lane_kernels_match_the_complex_transform_at_every_width)
 
 // The step that joins the lanes transposes W vectors (lane k of each into
 // vector k), and the last inverse pass takes c - a b in one operation: both
-// as written, at every width a build's kernels have.
+// as written, at every width of the build's baseline (the dispatched copy's
+// vectors only exist inside its own code; the kernel test above runs them).
 template <typename O, typename T, int W>
 static void checkTransposeAndNegatedProduct()
 {
@@ -1116,15 +1117,6 @@ DSPARK_TEST(FFT_vectors_transpose_their_lanes_and_subtract_a_product)
                                     simd::kVecNarrowWidth<float>>();
     checkTransposeAndNegatedProduct<simd::Vec<double, simd::kVecNarrowWidth<double>>, double,
                                     simd::kVecNarrowWidth<double>>();
-#if defined(DSPARK_SIMD_DISPATCH_AVX2)
-    if (simd::isRuntimeDispatchActive())
-    {
-        checkTransposeAndNegatedProduct<simd::avx2::Vec<float, 8>, float, 8>();
-        checkTransposeAndNegatedProduct<simd::avx2::Vec<double, 4>, double, 4>();
-        checkTransposeAndNegatedProduct<simd::avx2::Vec<float, 4>, float, 4>();
-        checkTransposeAndNegatedProduct<simd::avx2::Vec<double, 2>, double, 2>();
-    }
-#endif
 }
 
 // A real signal has no imaginary part at DC or at Nyquist: the inverse takes

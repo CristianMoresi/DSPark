@@ -1802,9 +1802,9 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
             // the spectrum holds there: lane 0 of the first rising row and
             // of the last falling one.
             static constexpr T index[8] = { T(0), T(1), T(2), T(3), T(4), T(5), T(6), T(7) };
-            const auto first = O::lt(O::load(index), O::set1(T(0.5)));
-            di[0] = O::select(first, O::set1(T(0)), di[0]);
-            mi[half - 1] = O::select(first, O::set1(T(0)), mi[half - 1]);
+            const auto lane0 = O::lt(O::load(index), O::set1(T(0.5)));
+            di[0] = O::select(lane0, O::set1(T(0)), di[0]);
+            mi[half - 1] = O::select(lane0, O::set1(T(0)), mi[half - 1]);
         }
         V re[W], im[W];
         if constexpr (W == 2)

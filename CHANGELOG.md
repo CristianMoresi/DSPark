@@ -445,6 +445,68 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `PitchDetector` (analysis readout; `PitchFollower`, `PitchFollower::track()`
+  and `PitchCorrector` read through it): a dip above the threshold no longer
+  reads as a note on its own. Such a dip is what a narrow band of noise or
+  slow wander shows now and then, and it was all the first look asked for.
+  It must now repeat at the multiples of its period inside the analysis
+  window, as a tone does, and have a ground: the detections before it found
+  the same period, a detection reported a note within the last six, or the
+  input has just grown. While a note goes on, a period the window can test
+  (two of its multiples fit: from about 67 Hz at the default window) reads
+  wherever it lies, so a legato change is read at once, and its window test
+  passes from a lower ratio, since a glide or a wide vibrato blurs the far
+  multiples; a longer period, estimated over two or three periods, reads
+  only near the note. The noise suppression no longer starts a note in a
+  window with more than half its power below the lowest note it can read,
+  and to start one from the input's own dip the period must repeat over all
+  eight multiples almost as at the first. With the suppression off, a window
+  that reads unvoiced now leaves its own dip as the candidate the next
+  detections can agree with. Measured at 48 kHz at the defaults, window by
+  window, before and after; in brackets, where it applies, a clean-room port
+  of the frame stage of the probabilistic-threshold method followed by its
+  HMM decoded causally.
+  - Noise alone, 80 s each, windows read as a note. A band of noise of Q 5
+    at 60, 120 and 300 Hz and 1 kHz: 24.6%, 18.7%, 9.3% and 3.9% to 15.8%,
+    10.5%, 1.4% and none (35.9, 21.3, 5.4, 0.4). Of Q 2 at 60, 120 and 300
+    Hz: 10.2%, 4.3% and 0.36% to 3.8%, 0.8% and 0.01% (6.8, 1.1, none). Of
+    Q 10 at 60, 120 and 300 Hz and 1 kHz: 42.5%, 34.8%, 31.6% and 46.9% to
+    34.6%, 30.1%, 18.2% and 9.8% (64.2, 54.8, 53.9, 70.8). Brown noise, over
+    eight realisations of 80 s (59936 windows): 242 windows to 41 (38), and
+    106 to 32 with the suppression off. White and pink noise: none before or
+    after.
+  - Notes with gaps between them in continuous noise, 7500 windows per row,
+    right meaning within 50 cents. Notes of 47 to 67 Hz in pink noise at 10
+    and 5 dB SNR: 97.1% to 97.7% and 87.6% to 89.8% right, 1.6% to 1.0% and
+    4.3% to 1.6% wrong (at 0 dB 68.3% right either way, 1.4% to 1.2% wrong);
+    in brown noise at 5 dB 87.8% to 88.9% right and 4.1% to 2.7% wrong, with
+    the gaps read as a note in 0.2% of their windows before and under 0.1%
+    now. Notes of 70 to 1000 Hz in pink noise at 5 dB: 98.7% to 98.8% right,
+    0.7% to 0.5% wrong. The other rows read as before: white noise at 10, 5
+    and 0 dB, pink noise at 10 and 0 dB from 70 Hz up, 50 cents of vibrato
+    at 2 dB SNR and clean notes. With the suppression off: notes of 47 to 67
+    Hz in pink noise at 0 and 5 dB 12.4% to 14.5% and 74.9% to 76.4% right
+    (4.3% to 3.7% wrong at 5 dB), in brown noise at 5 dB 86.9% to 87.2%
+    (4.1% to 3.8% wrong); notes of 70 to 1000 Hz in pink noise at 0 and 5 dB
+    11.0% to 11.8% and 94.4% to 94.7%; the other rows as before.
+  - Legato melodies of 80 to 700 Hz with 25 ms glides, 30 s each: clean,
+    with 50 and 100 cents of vibrato, in white noise at 10, 5 and 0 dB SNR
+    and in pink noise at 5 and 0 dB. `PitchFollower` with its gate open and
+    no glide reads the same share of windows right and reaches each new note
+    as soon as before in every row, with the suppression off and on, but
+    two: pink noise at 0 dB with it off, 3.4% to 6.0%, and pink noise at 5
+    dB with it on, 93.3% to 93.2%, where the detector itself reads one
+    window more right and four fewer wrong (it no longer reads four windows
+    an octave below the note, which the follower had been folding back).
+    `PitchFollower::track()`: clean 95.2% to 95.6% right, 50 and 100 cents
+    of vibrato 96.3% to 96.8% and 95.7% to 96.7%, white noise at 10 dB 95.6%
+    to 95.9%, the other rows as before.
+  - Cost per input sample, before and after in one job (GCC; Clang in
+    brackets). A tone at 5 dB SNR, whose every detection now runs the window
+    test: 12.3 to 16.1 ns (19.4 to 25.0). Brown noise alone with the
+    suppression on: 90 to 47 ns (95 to 54); with it off, and pink noise
+    alone with it off, 28 to 29 ns and 29 to 30 ns (36 to 38, 46 to 48).
+    Clean tones, silence, white noise and a tone at 0 dB SNR: unchanged.
 - `FFTReal` and `FFTComplex` on arm64 builds other than macOS and iOS:
   transforms of up to 4096 double or 8192 float complex points take the bits
   between their first and last passes three at a time, in a radix-8 pass

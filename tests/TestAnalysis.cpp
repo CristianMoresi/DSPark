@@ -2213,12 +2213,161 @@ DSPARK_TEST(PitchDetector_noise_suppression_tests_multiples_over_two_windows)
     {
         const int off = bandNoiseVoicedWindows(band.first, band.second, false, 6u, 20.0);
         const int on = bandNoiseVoicedWindows(band.first, band.second, true, 6u, 20.0);
-        EXPECT_TRUE(on >= off);
+        // (With the suppression off a window that reads unvoiced leaves its
+        // own dip as the candidate for the next detections, so the two
+        // settings no longer read nested sets of windows.)
         excess += on - off;
     }
     std::cout << "  [pitch noise] band noise, 20 s of four bands: second read adds " << excess
               << " voiced windows\n";
     EXPECT_LT(excess, 16);
+}
+
+// A dip above the threshold was all a band of noise needed to read as a
+// note at the first look, with or without the noise suppression. Such a dip
+// must now repeat at its multiples inside the window, as a tone does, and
+// have a ground: the detections before it agree, a note goes on, or the
+// input grew. Windows read as a note, of 1867 (20 s): a Q 5 band at 1 kHz
+// 83, a Q 5 band at 300 Hz 200 and a Q 2 band at 120 Hz 69 before; 0, 44
+// and 12 now.
+DSPARK_TEST(PitchDetector_bands_of_noise_need_more_than_a_dip)
+{
+    const int high = bandNoiseVoicedWindows(1000.0, 5.0, true, 6u, 20.0);
+    const int highOff = bandNoiseVoicedWindows(1000.0, 5.0, false, 6u, 20.0);
+    const int mid = bandNoiseVoicedWindows(300.0, 5.0, true, 6u, 20.0);
+    const int low = bandNoiseVoicedWindows(120.0, 2.0, true, 6u, 20.0);
+    std::cout << "  [pitch noise] windows of band noise read as a note, of 1867: Q 5 at 1 kHz " << high
+              << " (suppression off " << highOff << "), Q 5 at 300 Hz " << mid << ", Q 2 at 120 Hz " << low << "\n";
+    EXPECT_LT(high, 15);
+    EXPECT_LT(highOff, 15);
+    EXPECT_LT(mid, 80);
+    EXPECT_LT(low, 40);
+}
+
+// Brown noise alone is a slope, not a floor: what the high-pass of the second
+// look leaves of it is a band just above its corner, and the noise
+// suppression read that band as a low note now and then. In a window with
+// most of its power below the lowest note the suppression now only continues
+// a note, and a long period at the first look needs a ground: of 7492
+// windows (80 s) 32 read as a note before, 10 now.
+DSPARK_TEST(PitchDetector_brown_noise_alone_starts_no_note)
+{
+    NoiseSource rng { 18u };
+    std::vector<float> x(static_cast<size_t>(48000 * 80));
+    double state = 0.0, peak = 0.0;
+    std::vector<double> raw(x.size());
+    for (int i = 0; i < 4000; ++i) state = 0.998 * state + 0.05 * rng.gauss();
+    for (double& v : raw)
+    {
+        state = 0.998 * state + 0.05 * rng.gauss();
+        v = state;
+        peak = std::max(peak, std::abs(v));
+    }
+    for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(0.5 * raw[i] / peak);
+    PitchDetector<float> pd;
+    pd.prepare(48000.0);
+    int voiced = 0, windows = 0;
+    for (size_t at = 0; at + 512 <= x.size(); at += 512)
+    {
+        pd.pushSamples(std::span<const float>(x.data() + at, 512));
+        if (at < 4096) continue;
+        ++windows;
+        if (pd.getFrequencyHz() > 0.0f) ++voiced;
+    }
+    std::cout << "  [pitch noise] brown noise alone, 80 s: " << voiced << " of " << windows
+              << " windows read as a note\n";
+    EXPECT_LT(voiced, 20);
+}
+
+namespace {
+
+/// A legato melody of harmonic notes (no gaps, 25 ms glides) in white noise
+/// at `snrDb`, read by the detector: detections within 50 cents of the pitch
+/// at the centre of their window, of all of them (so a note read late at a
+/// change counts against it) and of those whose window holds one note only.
+struct LegatoScore { int right = 0, all = 0, steadyRight = 0, steady = 0; };
+
+LegatoScore scoreLegato(double snrDb, bool suppression, uint64_t seed)
+{
+    const double fs = 48000.0;
+    const int hop = 512, window = 2048, notes = 24;
+    NoiseSource rng { seed };
+    std::vector<double> f0, signal;
+    std::vector<int> changeAt;
+    double phase[20] = {};
+    double semitone = 0.0, previous = 0.0;
+    for (int note = 0; note < notes; ++note)
+    {
+        previous = semitone;
+        semitone = std::clamp(semitone + (rng.uniform() < 0.5 ? -1.0 : 1.0) * (2.0 + std::floor(5.0 * rng.uniform())),
+                              -14.0, 10.0);
+        const int length = static_cast<int>(fs * (0.3 + 0.2 * rng.uniform()));
+        const int glide = note == 0 ? 0 : static_cast<int>(0.025 * fs);
+        if (note > 0) changeAt.push_back(static_cast<int>(f0.size()));
+        for (int k = 0; k < length; ++k)
+        {
+            const double s = k < glide ? previous + (semitone - previous) * k / glide : semitone;
+            const double f = 220.0 * std::pow(2.0, s / 12.0);
+            f0.push_back(f);
+            double v = 0.0;
+            for (int h = 1; h <= 20; ++h)
+            {
+                phase[h - 1] += 2.0 * pi<double> * f * h / fs;
+                v += std::sin(phase[h - 1]) / h;
+            }
+            signal.push_back(v);
+        }
+    }
+    double power = 0.0;
+    for (const double v : signal) power += v * v;
+    const double sigma = std::sqrt(power / static_cast<double>(signal.size()) / std::pow(10.0, snrDb / 10.0));
+    std::vector<float> x(signal.size());
+    for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(0.2 * (signal[i] + sigma * rng.gauss()));
+
+    PitchDetector<float> pd;
+    pd.prepare(fs);
+    pd.setNoiseSuppression(suppression);
+    LegatoScore score;
+    const int n = static_cast<int>(x.size());
+    for (int at = 0; at + hop <= n; at += hop)
+    {
+        pd.pushSamples(std::span<const float>(x.data() + at, static_cast<size_t>(hop)));
+        const int end = at + hop, begin = end - window;
+        if (begin < 0) continue;
+        const double hz = static_cast<double>(pd.getFrequencyHz());
+        const double truth = f0[static_cast<size_t>(end - window / 2)];
+        const bool right = hz > 0.0 && std::abs(1200.0 * std::log2(hz / truth)) < 50.0;
+        ++score.all;
+        if (right) ++score.right;
+        bool oneNote = true;
+        for (const int change : changeAt)
+            if (change + static_cast<int>(0.025 * fs) > begin && change < end) oneNote = false;
+        if (!oneNote) continue;
+        ++score.steady;
+        if (right) ++score.steadyRight;
+    }
+    return score;
+}
+
+} // namespace
+
+// The ground a dip above the threshold needs must not hold a melody back:
+// at a legato change no energy rises and the new note is far from the one
+// that went on. While a note goes on, a period the window can test reads
+// wherever it lies, so a melody in noise is read as it was: 850 of 904
+// detections right before and now, those across the changes included, and
+// all 761 whose window holds one note, with the noise suppression on or off.
+DSPARK_TEST(PitchDetector_legato_changes_in_noise_read_at_once)
+{
+    for (const bool suppression : { true, false })
+    {
+        const LegatoScore s = scoreLegato(5.0, suppression, 31u);
+        std::cout << "  [pitch noise] legato melody at 5 dB SNR, suppression " << (suppression ? "on" : "off")
+                  << ": " << s.right << " of " << s.all << " detections right, " << s.steadyRight << " of "
+                  << s.steady << " of those inside one note\n";
+        EXPECT_GT(s.right * 100, s.all * 93);
+        EXPECT_GT(s.steadyRight * 100, s.steady * 99);
+    }
 }
 
 // Notes below 67 Hz leave no multiple of their period inside the 48 kHz

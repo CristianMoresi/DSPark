@@ -35,27 +35,45 @@
  * removed (setNoiseSuppression(), on by default). None of them runs on a
  * window that reads voiced at once, so a clean tone costs what it did.
  *
+ * A dip between the threshold and the voicing ceiling is also what a narrow
+ * band of noise shows now and then. It reads as a note only when the window
+ * repeats at the multiples of its period, as a tone does, and when it has a
+ * ground: the detections before it found the same period, a detection
+ * reported a note within the last six, or the input has just grown. While a
+ * note goes on, a period the window can test (two of its multiples fit: from
+ * about 67 Hz at the default window) reads wherever it lies, so a legato
+ * change is read at once; a longer one, estimated over two or three periods,
+ * only near that note.
+ *
  * Measured at 48 kHz frame by frame on sustained harmonic notes (40
  * partials, spectral tilt 3 to 12 dB/octave, gaps in between) in continuous
  * noise: windows within 50 cents of the note, at the defaults, against the
  * frame stage of that method followed by its HMM decoded causally (a
  * clean-room port, in brackets). Notes of 70 to 1000 Hz in white noise at
  * 10, 5 and 0 dB SNR: 100, 99.3 and 97.5% (89.4, 32.7, 7.0); in pink noise
- * 99.6, 98.7 and 85.3% (98.4, 80.5, 13.4). Notes of 47 to 67 Hz in white
+ * 99.6, 98.8 and 85.3% (98.4, 80.5, 13.4). Notes of 47 to 67 Hz in white
  * noise at 5 and 0 dB: 99.5 and 95.7% (47.8, 14.0); in pink noise at 10, 5
- * and 0 dB: 97.1, 87.6 and 68.3% (83.5, 56.5, 17.1); in brown noise at 5
- * dB: 87.8% (85.7). Windows read wrong: under 1% from 70 Hz up, 1.4 to 4.3%
+ * and 0 dB: 97.7, 89.8 and 68.3% (83.5, 56.5, 17.1); in brown noise at 5
+ * dB: 88.9% (85.7). Windows read wrong: under 1% from 70 Hz up, 1.0 to 2.7%
  * below it in pink and brown noise (the port 0 to 16.3%). Gaps between the
- * notes read as a note in 0.2% of their windows in brown noise, none in
- * white or pink. With setNoiseSuppression(false) the 0 dB rows read 0.4 to
- * 12.4% and the 5 dB ones 74.9 to 94.4%. Noisy readings report their honest
- * confidence, about 0.76 at 5 dB and 0.5 at 0 dB, so a confidence gate keeps
- * ignoring them. Steady clean tones read exactly as before. Across a legato
- * note change two notes can share a longer
- * period (four periods of one, five of the other); a window whose dip lies
- * there reads unvoiced, not that period: on clean tones, sweeps and stepped
- * melodies at three rates the wrong readings fall from 184 to 46 of 66090,
- * with every correct reading kept.
+ * notes read as a note in under 0.1% of their windows in brown noise, none
+ * in white or pink. With setNoiseSuppression(false) the 0 dB rows read 0.4
+ * to 14.5% and the 5 dB ones 76.4 to 94.7%.
+ *
+ * Noise alone, 80 s each, windows read as a note (the port in brackets):
+ * white and pink none (none); a band of noise of Q 2 at 60, 120 and 300 Hz
+ * 3.8%, 0.8% and 0.01% (6.8, 1.1, none); of Q 5 at 60, 120 and 300 Hz and
+ * 1 kHz 15.8%, 10.5%, 1.4% and none (35.9, 21.3, 5.4, 0.4); of Q 10 at 60,
+ * 120 and 300 Hz and 1 kHz 34.6%, 30.1%, 18.2% and 9.8% (64.2, 54.8, 53.9,
+ * 70.8); brown noise, over eight realisations of 80 s, 0.07% (0.06).
+ *
+ * Noisy readings report their honest confidence, about 0.76 at 5 dB and
+ * 0.5 at 0 dB, so a confidence gate keeps ignoring them. Steady clean tones
+ * read exactly as before. Across a legato note change two notes can share a
+ * longer period (four periods of one, five of the other); a window whose
+ * dip lies there reads unvoiced, not that period: on clean tones, sweeps
+ * and stepped melodies at three rates the wrong readings fall from 184 to
+ * 46 of 66090, with every correct reading kept.
  *
  * Threading:
  * - prepare(): setup thread (allocates; not concurrent with pushSamples()).
@@ -224,6 +242,8 @@ public:
         survivalSlope_.assign(static_cast<size_t>(kSurvivalSteps) + 1, 0.0);
         cachedThreshold_ = T(-1);   // rebuild the prior tables at the first detection
         recent_.fill(0.0);
+        lastNote_ = 0.0;
+        sinceNote_ = 0;
         fftClean_ = std::make_unique<FFTReal<T>>(static_cast<size_t>(windowSize_) * 2);
 
         writePos_ = 0;
@@ -373,24 +393,32 @@ public:
      * the same period (a narrow band of noise wanders). The reading's
      * confidence stays the input's own dip at that period, about 0.5 at
      * 0 dB SNR, so a confidence gate keeps ignoring it. A reading through
-     * the noise therefore starts one or two detections after the tone.
+     * the noise therefore starts one or two detections after the tone. To
+     * start a note from the input's own dip, a period tested over all eight
+     * multiples must repeat at them almost as at the first; and in a window
+     * with most of its power below the lowest note it can read (rumble, or
+     * brown noise alone) the read only continues a note.
      *
      * The file description gives the frame-by-frame figures. With it on, a
      * note of 70 to 1000 Hz at 0 dB SNR reads right in 97.5% of its windows
-     * in white noise and 85.3% in pink (0.4 and 11.0% with it off), a note
-     * of 47 to 67 Hz in 95.7 and 68.3% (2.6 and 12.4%), and notes of 70 to
+     * in white noise and 85.3% in pink (0.4 and 11.8% with it off), a note
+     * of 47 to 67 Hz in 95.7 and 68.3% (2.6 and 14.5%), and notes of 70 to
      * 1000 Hz at 2 dB SNR with 50 cents of vibrato in 96.5% (12.2%).
      *
-     * Noise alone reads the same on or off, within 0.3% of windows over
-     * 20 s: white and pink none, brown 0.4% (off 0.1%), and a band of noise
-     * what the first looks read of it (Q 2 at 60 Hz 10.4%, at 120 Hz 4.7%;
-     * Q 5 at 60 Hz 25.1%, at 300 Hz 10.1%; Q 10 from 60 Hz to 1 kHz 33 to
-     * 47%). The read costs more than a detection, and only where it runs:
-     * about 145 ns per sample on a tone at 0 dB SNR and 100 on pink or brown
-     * noise alone, against 18 and 38 with it off. White noise alone, whose
-     * dip stays at the noise floor, costs 17 either way, and a window that
-     * reads voiced at once is not read again (15 to 18). Off, the output is
-     * that of the first looks. Control thread; relaxed atomic.
+     * Noise alone reads about the same on or off. Over 80 s of each, off:
+     * white and pink none; a band of noise of Q 2 at 60, 120 and 300 Hz
+     * 3.6%, 0.7% and none; of Q 5 at 60, 120 and 300 Hz and 1 kHz 16.4%,
+     * 10.3%, 1.5% and none; of Q 10 at 60, 120 and 300 Hz and 1 kHz 35.6%,
+     * 30.0%, 18.1% and 10.8%; brown noise, over eight realisations, 0.05%
+     * (0.07% on). The read costs more than a detection, and only where it
+     * runs: about 130 ns per sample on a tone at 0 dB SNR and 85 on pink
+     * noise alone, against 13 and 30 with it off; on brown noise alone 47
+     * against 29, since the read does not start a note there. White noise
+     * alone, whose dip stays at the noise floor, costs 12 either way, and a
+     * window that reads voiced at once is not read again (11 to 12); a tone
+     * at 5 dB SNR, whose dip lies above the threshold, pays the window test
+     * of the first look (16). Off, the output is that of the first looks.
+     * Control thread; relaxed atomic.
      */
     void setNoiseSuppression(bool on) noexcept
     {
@@ -424,6 +452,8 @@ public:
         for (RumbleSection& section : rumble_) section.s1 = section.s2 = 0.0;
         clearPending_ = 0;
         recent_.fill(0.0);
+        lastNote_ = 0.0;
+        sinceNote_ = 0;
         writePos_ = 0;
         samplesSinceLastDetect_ = 0;
         frequency_.store(T(0), std::memory_order_relaxed);
@@ -455,18 +485,52 @@ private:
         const T threshold = threshold_.load(std::memory_order_relaxed);
         if (threshold != cachedThreshold_) updatePrior(threshold);
         WindowReading reading = readWindow(currentWindow, energy, e1, threshold);
-        double secondCandidate = 0.0;   // period the second look could not confirm
-        // Slow wander alone dips at the long lags: brown noise read as a
-        // note in 0.75% of its windows. Where the window is mostly below its
-        // lowest note (kSubRumbleShare of its power in the two lowest bins),
-        // a dip above the threshold must also repeat at its multiples, as a
-        // tone does (periodPersists()); 0.11% of those windows then read.
-        if (reading.voiced && reading.dip >= static_cast<double>(threshold) && subShare >= kSubRumbleShare)
+        double secondCandidate = 0.0;   // period a look found and could not confirm
+        const bool suppressing = noiseSuppression_.load(std::memory_order_relaxed);
+        // A note a detection reported up to kNoteGaps detections ago goes on:
+        // the window may still hold part of it, or a glide away from it.
+        const bool noteGoesOn = lastNote_ > 0.0 && sinceNote_ <= kNoteGaps;
+        // A dip above the threshold is all a narrow band of noise or slow
+        // wander needs to read as a note: a Q 5 band of noise at 1 kHz read
+        // in 3.9% of its windows, a Q 2 band at 120 Hz in 4.1%, brown noise
+        // in 0.75%. A tone repeats at every multiple of its period, so such
+        // a dip must do so too (periodPersists()). Where the window is mostly
+        // below its lowest note (kSubRumbleShare of its power in the two
+        // lowest bins) the test runs over the whole history, as it always
+        // did; elsewhere over the window itself when it holds two multiples,
+        // and while a note goes on it passes from kGoingOnRatio, since a
+        // glide or a wide vibrato blurs the far multiples.
+        //
+        // The dip also needs a ground (hasGround()): the detections before
+        // it agree, it continues the note, or the input grew. With a note
+        // going on, a period short enough for the window test reads wherever
+        // it lies (a legato change is read at once); a longer one, whose
+        // estimate over two or three periods is coarse, only near the note.
+        // A period refused is this detection's candidate for the next ones.
+        if (reading.voiced && reading.dip >= static_cast<double>(threshold))
         {
             historySumsReady_ = false;
             double contrast = 0.0;
             const double period = static_cast<double>(parabolicInterp(rawDiff_.data(), reading.tau));
-            reading.voiced = periodPersists(history, period, contrast);
+            const int offset = windowTestOffset(period);
+            const double reach = suppressing ? kLongReachCents : kLongReachOffCents;
+            if (subShare >= kSubRumbleShare)
+            {
+                reading.voiced = periodPersists(history, period, contrast);
+                if (reading.voiced && offset == 0)
+                {
+                    reading.voiced = hasGround(history, period, noteGoesOn, reach);
+                    if (!reading.voiced) secondCandidate = period;
+                }
+            }
+            else
+            {
+                const bool persists = offset == 0 || periodPersists(history, period, contrast, offset)
+                                      || (noteGoesOn && persistRatio_ >= kGoingOnRatio);
+                reading.voiced = persists
+                    && ((offset > 0 && noteGoesOn) || hasGround(history, period, noteGoesOn, reach));
+                if (!reading.voiced) secondCandidate = period;
+            }
         }
 
         // A window that reads unvoiced is looked at once more without what
@@ -550,8 +614,15 @@ private:
         // period agrees with recent detections (agreesWithRecent()). The
         // confidence is the input's own dip there: a reading taken through
         // the noise stays a low-confidence one (about 0.5 at 0 dB SNR).
+        //
+        // The suppression assumes a noise floor. A window with most of its
+        // power below its lowest note (kRumbleBound of it in the two lowest
+        // bins) is a slope instead, and what the high-pass leaves of it is a
+        // band just above the corner, which reads like a low note: brown
+        // noise alone read in 0.20% of its windows that way. There the read
+        // only continues a note.
         double candidate = 0.0;
-        if (noiseSuppression_.load(std::memory_order_relaxed) && steady && dip < kFallbackCeiling)
+        if (suppressing && steady && dip < kFallbackCeiling && (noteGoesOn || subShare <= kRumbleBound))
         {
             historySumsReady_ = false;
             const T* clean = suppressNoise(currentWindow);
@@ -585,7 +656,11 @@ private:
             // the floor estimate, and pink noise. Not a dip at the floor that
             // noise alone reaches (kFallbackCeiling), nor a periodicity as
             // weak as low-passed noise shows or as strong as a narrow band of
-            // noise makes (kMinFallbackContrast, kMaxFallbackContrast).
+            // noise makes (kMinFallbackContrast, kMaxFallbackContrast). And
+            // to start a note, a period tested over all kMaxMultiple
+            // multiples must have repeated at them almost as at the first
+            // (kOwnStartRatio): a tone does, while the Q 2 band of noise at
+            // 300 Hz that read in 0.09% of its windows this way stays below.
             const double own = (tauEstimate >= 0)
                 ? static_cast<double>(parabolicInterp(rawDiff_.data(), tauEstimate)) : 0.0;
             if (tauEstimate >= 0 && dip < kFallbackCeiling
@@ -597,7 +672,9 @@ private:
                     && contrast >= kMinFallbackContrast && contrast <= kMaxFallbackContrast)
                 {
                     if (candidate == 0.0) candidate = period;
-                    if (agreesWithRecent(period))
+                    const bool starts = noteGoesOn || persistMultiples_ < kMaxMultiple
+                                        || persistRatio_ >= kOwnStartRatio;
+                    if (starts && agreesWithRecent(period))
                     {
                         rememberCandidate(period);
                         publish(static_cast<T>(period),
@@ -606,6 +683,20 @@ private:
                     }
                 }
             }
+        }
+        // With the suppression off nothing above leaves a candidate for a
+        // window that reads unvoiced, and a note in noise, whose dip hovers
+        // around the voicing ceiling, would find no agreement when it dips
+        // below again. Its own dip is the candidate then: as it is when the
+        // window could test it, and only when it repeats over the history
+        // when it is too long for that.
+        if (!suppressing && secondCandidate == 0.0 && steady && tauEstimate >= 0 && dip < kFallbackCeiling)
+        {
+            historySumsReady_ = false;
+            double contrast = 0.0;
+            const double period = static_cast<double>(parabolicInterp(rawDiff_.data(), tauEstimate));
+            if (windowTestOffset(period) > 0 || periodPersists(history, period, contrast))
+                secondCandidate = period;
         }
         rememberCandidate(candidate > 0.0 ? candidate : secondCandidate);
         publishUnvoiced();
@@ -749,9 +840,9 @@ private:
      *
      * A tone holds its period from one detection to the next; a narrow band
      * of noise wanders. A reading taken through the noise must be confirmed
-     * by the detections before it: over 20 s of band-limited noise at 60 to
-     * 1000 Hz and Q 2 to 10, the second read then voices at most 0.1% of
-     * windows more than the first reading alone (up to 5% without), while
+     * by the detections before it: over 80 s of band-limited noise at 60 to
+     * 1000 Hz and Q 2 to 10, the second read then voices at most 0.3% of
+     * windows more than the first looks alone (up to 5% without), while
      * a steady tone in noise is confirmed one or two hops after it is first
      * found, and 50 cents of vibrato at 5.5 Hz still agrees.
      */
@@ -766,16 +857,46 @@ private:
         return agree >= kAgreementsNeeded;
     }
 
+    /**
+     * @brief Whether a dip above the threshold may be read as a note: the
+     *        detections before it agree with its period, it continues the
+     *        note within `reachCents`, or the input grew.
+     *
+     * A band of noise reads as isolated detections: of the windows of a Q 2
+     * band at 120 Hz that read as a note, three in four stood alone. A note is
+     * not alone: its period was there one or two detections before, read or
+     * not (agreesWithRecent()), or a detection reported it moments ago, or
+     * it has just started and the window before held less than kRiseRatio
+     * of this one's energy.
+     * @param history    The input history, kHistoryWindows windows, oldest first.
+     * @param period     The period of the dip, in samples.
+     * @param noteGoesOn A detection reported a note up to kNoteGaps detections ago.
+     * @param reachCents How far from that note the period may lie.
+     */
+    [[nodiscard]] bool hasGround(const T* history, double period, bool noteGoesOn, double reachCents) noexcept
+    {
+        if (agreesWithRecent(period)) return true;
+        if (noteGoesOn && std::abs(1200.0 * std::log2(period / lastNote_)) <= reachCents) return true;
+        historyEnergy(history);
+        const double* sq = persistSq_.data();
+        const int split = historySize_ - windowSize_;
+        const double older = sq[split] - sq[0], newer = sq[historySize_] - sq[split];
+        return older < kRiseRatio * newer;
+    }
+
     void publish(T period, T confidence) noexcept
     {
         frequency_.store(static_cast<T>(sampleRate_) / period, std::memory_order_relaxed);
         confidence_.store(confidence, std::memory_order_relaxed);
+        lastNote_ = static_cast<double>(period);
+        sinceNote_ = 0;
     }
 
     void publishUnvoiced() noexcept
     {
         frequency_.store(T(0), std::memory_order_relaxed);
         confidence_.store(T(0), std::memory_order_relaxed);
+        if (sinceNote_ <= kNoteGaps) ++sinceNote_;
     }
 
     /**
@@ -1205,13 +1326,15 @@ private:
 
     /**
      * @brief Normalised correlation of the history with itself at `lag`, over
-     *        its first `span` samples (historyEnergy() must have run).
+     *        `span` samples from `offset` on (historyEnergy() must have run).
      */
-    [[nodiscard]] double historyCorrelation(const T* x, int lag, int span) const noexcept
+    [[nodiscard]] double historyCorrelation(const T* x, int lag, int span, int offset = 0) const noexcept
     {
-        const double* sq = persistSq_.data();
-        const double e = sq[span] + sq[lag + span] - sq[lag];
-        const double r = static_cast<double>(simd::dotProductT(x, x + lag, span));
+        // sq[0] is zero at the start of the history, so with no offset this
+        // is the sum it always was, to the last bit.
+        const double* sq = persistSq_.data() + offset;
+        const double e = sq[span] + sq[lag + span] - sq[lag] - sq[0];
+        const double r = static_cast<double>(simd::dotProductT(x + offset, x + offset + lag, span));
         return e > 0.0 ? 2.0 * r / e : 0.0;
     }
 
@@ -1303,26 +1426,36 @@ private:
      * of every period the detector reads, so the lowest notes are tested too,
      * and the longer span and the extra multiples make a narrow band of noise
      * less likely to pass than over the window alone.
+     *
+     * With `offset` the test runs over the part of the history from that
+     * sample on (windowTestOffset() gives the analysis window's): a note
+     * that has just started, or changed, repeats there and not yet over the
+     * whole history. The ratio of the multiples to the first and the highest
+     * multiple used are left in persistRatio_ and persistMultiples_.
      * @param history  The input history, kHistoryWindows windows, oldest first.
      * @param period   The period under test, in samples.
      * @param contrast Receives the periodic part of the correlation at one
      *                 period (0 when the test cannot run).
+     * @param offset   First sample of the history the test reads.
      */
-    [[nodiscard]] bool periodPersists(const T* history, double period, double& contrast) noexcept
+    [[nodiscard]] bool periodPersists(const T* history, double period, double& contrast, int offset = 0) noexcept
     {
         contrast = 0.0;
+        persistRatio_ = 0.0;
+        persistMultiples_ = 0;
         historyEnergy(history);
         if (!(period >= 2.0)) return false;
         const auto reach = [&](int k) noexcept {
             return static_cast<int>(std::lround((static_cast<double>(k) + 0.5) * period)) + 2;
         };
         const int minSpan = windowSize_ / 8;
-        const int n = historySize_;
+        const int n = historySize_ - offset;
         int kmax = kMaxMultiple;
         while (kmax >= 2 && n - reach(kmax) < minSpan) --kmax;
         if (kmax < 2) return false;
+        persistMultiples_ = kmax;
         const int span = n - reach(kmax);
-        const auto corr = [&](int lag) noexcept { return historyCorrelation(history, lag, span); };
+        const auto corr = [&](int lag) noexcept { return historyCorrelation(history, lag, span, offset); };
         const auto periodic = [&](int k) noexcept {
             const int c = static_cast<int>(std::lround(static_cast<double>(k) * period));
             const int h = static_cast<int>(std::lround(0.5 * period));
@@ -1334,7 +1467,20 @@ private:
         if (!(first > 0.0)) return false;
         double sum = 0.0;
         for (int k = 2; k <= kmax; ++k) sum += periodic(k);
+        persistRatio_ = sum / (first * static_cast<double>(kmax - 1));
         return sum >= kPersistRatio * first * static_cast<double>(kmax - 1);
+    }
+
+    /**
+     * @brief Where periodPersists() starts to test `period` over the analysis
+     *        window alone: the window's first sample in the history when two
+     *        multiples of the period fit in it, 0 when they do not (below
+     *        about 67 Hz at the automatic window).
+     */
+    [[nodiscard]] int windowTestOffset(double period) const noexcept
+    {
+        const int reach = static_cast<int>(std::lround(2.5 * period)) + 2;
+        return (windowSize_ - reach >= windowSize_ / 8) ? historySize_ - windowSize_ : 0;
     }
 
     /**
@@ -1521,9 +1667,36 @@ private:
     static constexpr double kRumbleCorner = 0.9;
     static constexpr double kRumbleShare = 0.02;
     /// Share of the window's power in its two lowest bins (below every note
-    /// it reads) from which a dip above the threshold must also pass
-    /// periodPersists() at the first look.
+    /// it reads) from which a dip above the threshold is tested over the
+    /// whole history, not over the window, at the first look.
     static constexpr double kSubRumbleShare = 0.10;
+    /// Detections a reported note outlives as the note that goes on: a
+    /// window's worth (four at the default hop) and two more for a glide.
+    static constexpr int kNoteGaps = 6;
+    /// Least ratio of the multiples to the first (persistRatio_) for a dip
+    /// above the threshold to pass its window test while a note goes on
+    /// (kPersistRatio otherwise): a glide or a wide vibrato blurs the far
+    /// multiples, and at 0.4 a legato melody with 100 cents of vibrato
+    /// still read one note change a detection late.
+    static constexpr double kGoingOnRatio = 0.3;
+    /// How far (cents) from the note that goes on a period too long for the
+    /// window test may lie at the first look: with the noise suppression on,
+    /// which reads the window again with a refined period, and with it off.
+    static constexpr double kLongReachCents = 50.0;
+    static constexpr double kLongReachOffCents = 100.0;
+    /// hasGround(): the input grew when the window before holds less than
+    /// this share of the analysis window's energy.
+    static constexpr double kRiseRatio = 0.5;
+    /// Share of the window's power in its two lowest bins above which the
+    /// noise suppression only continues a note. Of the readings through the
+    /// noise that brown noise alone gave, two in three came from such a
+    /// window; of those that started a low note in pink noise at 0 dB SNR,
+    /// none did.
+    static constexpr double kRumbleBound = 0.5;
+    /// Ratio of the multiples to the first that the input's own dip needs
+    /// to start a note through the noise when all kMaxMultiple multiples
+    /// were tested.
+    static constexpr double kOwnStartRatio = 0.9;
 
     /// Automatic-window policy: the span 2048 samples cover at 48 kHz,
     /// resolved inside [512, 16384] (covers 8 kHz .. 384 kHz without clamping).
@@ -1613,6 +1786,10 @@ private:
     };
     std::vector<DipGroup> dipGroups_;     // Same size as dipRecords_ (chooseDip())
     std::array<double, kRecentCandidates> recent_ {}; // Last detections' periods (agreesWithRecent())
+    double lastNote_ = 0.0;        // Period of the last note a detection reported (0: none yet)
+    int sinceNote_ = 0;            // Detections since then, counted up to kNoteGaps + 1
+    double persistRatio_ = 0.0;    // periodPersists(): mean of the multiples over the first
+    int persistMultiples_ = 0;     // periodPersists(): highest multiple it used
 };
 
 } // namespace dspark

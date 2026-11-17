@@ -1,0 +1,90 @@
+name: Rerun dropped jobs
+
+# A hosted runner sometimes never takes a job: GitHub then cancels it without
+# having run a single step ("The job was not acquired by Runner of type hosted
+# even after multiple attempts"). Nothing was built or tested, so the cancelled
+# run says nothing about the code. This workflow queues those jobs again, at
+# most twice per run.
+#
+# It leaves everything else as it is: a job that ran and failed, a run that a
+# person cancelled, and a run that a newer one replaced.
+#
+# Run by hand, it reports what it would do with any run and attempt, and
+# queues the jobs again only when asked to.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "Number of the run to examine"
+        required: true
+      attempt:
+        description: "Attempt of that run"
+        required: true
+        default: "1"
+      act:
+        description: "Queue the dropped jobs again (otherwise only report)"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  checks: read
+  contents: read
+
+jobs:
+  rerun:
+    name: Queue dropped jobs again
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion != 'success'
+          && github.event.workflow_run.run_attempt < 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Examine the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.event.workflow_run.id || inputs.run }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.attempt }}
+          ACT: ${{ github.event_name == 'workflow_run' || inputs.act }}
+        run: |
+          set -euo pipefail
+          case "$RUN$ATTEMPT" in
+            ''|*[!0-9]*) echo "The run and its attempt must be numbers."; exit 1 ;;
+          esac
+          jobs="repos/$GH_REPO/actions/runs/$RUN/attempts/$ATTEMPT/jobs?per_page=100"
+          unfinished=$(gh api --paginate "$jobs" \
+            --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .id')
+          if [ -z "$unfinished" ]; then
+            echo "Run $RUN, attempt $ATTEMPT: every job succeeded or was skipped. Nothing to do."
+            exit 0
+          fi
+          dropped=0
+          other=0
+          for job in $unfinished; do
+            name=$(gh api "repos/$GH_REPO/actions/jobs/$job" --jq '.name')
+            steps=$(gh api "repos/$GH_REPO/actions/jobs/$job" --jq '.steps | length')
+            notes=$(gh api "repos/$GH_REPO/check-runs/$job/annotations" \
+              --jq '[.[] | select(.message | test("was not acquired by Runner"))] | length')
+            if [ "$steps" = "0" ] && [ "$notes" != "0" ]; then
+              dropped=$((dropped + 1))
+              echo "Dropped before it started: $name"
+            else
+              other=$((other + 1))
+              echo "Ran, or was cancelled by someone: $name"
+            fi
+          done
+          if [ "$other" != "0" ]; then
+            echo "Run $RUN, attempt $ATTEMPT: $other job(s) ended for another reason. Left as it is."
+            exit 0
+          fi
+          if [ "$ACT" != "true" ]; then
+            echo "Run $RUN, attempt $ATTEMPT: $dropped dropped job(s) would be queued again."
+            exit 0
+          fi
+          echo "Run $RUN, attempt $ATTEMPT: queueing $dropped dropped job(s) again."
+          gh run rerun "$RUN" --failed

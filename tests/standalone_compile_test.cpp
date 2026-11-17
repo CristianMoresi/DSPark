@@ -112,6 +112,8 @@ void instantiate()
     SpectrumAnalyzer<T> sa;
     OnsetDetector<T> onset;
     BeatTracker<T> beats;
+    [[maybe_unused]] const auto bars =
+        DownbeatEstimator<T>::estimate(std::span<const T>(), 48000.0, std::span<const int64_t>());
     LoopFinder<T> loopFinder;
 
 #ifndef DSPARK_NO_FILE_IO

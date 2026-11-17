@@ -415,6 +415,7 @@
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
+ * | `DownbeatEstimator<T>`   | Analysis/DownbeatEstimator.h | Which beats open a bar: bar length (3 or 4) and first beat, from a signal and its beats (offline) |
  * | `LoudnessNormalizer<T>`  | Analysis/LoudnessNormalizer.h | Offline LUFS-target normalisation under a BS.1770 true-peak ceiling |
  * | `OfflineEnergyAnalyzer<T>` | Analysis/OfflineEnergyAnalyzer.h | Complete-source linked or separate mid/side RMS/peak maps, bounded input blocks |
  * | `OfflineTransientAnalyzer<T>` | Analysis/OfflineTransientAnalyzer.h | Complete-source attack/pulse maps with stereo energy pooling and time refinement |
@@ -788,6 +789,7 @@
 #include "Analysis/EnvelopeFollower.h"
 #include "Analysis/OnsetDetector.h"
 #include "Analysis/BeatTracker.h"
+#include "Analysis/DownbeatEstimator.h"
 #include "Analysis/LoudnessNormalizer.h"
 #include "Analysis/OfflineEnergyAnalyzer.h"
 #include "Analysis/OfflineTransientAnalyzer.h"

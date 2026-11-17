@@ -131,7 +131,7 @@ for complete programs.
 | Nonlinear and analog modeling | `Saturation`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `wdf::*` |
 | Time, pitch, and spatial processing | `Delay`, `AlgorithmicReverb`, `Reverb`, `PitchShifter`, `TimeStretch`, `PitchCorrector`, `GranularProcessor` |
 | Spectral processing | `FFTReal`, `Convolver`, `ZeroLatencyConvolver`, `SpectralProcessor`, `SpectralFreeze`, `SpectralDenoiser` |
-| Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `AudioIntervalAnalyzer`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `LoopFinder`, `DelayEstimator` |
+| Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `AudioIntervalAnalyzer`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `DownbeatEstimator`, `LoopFinder`, `DelayEstimator` |
 | Synthesis and music | `Synthesizer` (analog, FM and wavetable engines, samples, filters, envelopes, LFOs, modulation matrix), `Oscillator`, `WavetableOscillator`, `WavetableBank`, `Sampler`, `Lfo`, `ADSREnvelope`, `ChordDetector`, `KeyDetector`, `harmony::*` |
 | Infrastructure | `AudioBuffer`, `ProcessorChain`, `Resampler`, `Oversampling`, `Dither`, `SpscQueue`, versioned state blobs |
 | File I/O | WAV and MP3 read/write, Standard MIDI File read/write, native FLAC decode |

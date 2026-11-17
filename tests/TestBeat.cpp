@@ -14,6 +14,7 @@
 #include "dspark_test.h"
 #include "TestSignals.h"
 #include "../Analysis/BeatTracker.h"
+#include "../Analysis/DownbeatEstimator.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2006,5 +2007,215 @@ DSPARK_TEST(Beat_causal_level_under_a_tresillo_is_binary)
         EXPECT_LT(std::abs(octaves - std::round(octaves)), 0.06);
         EXPECT_GT(ratio, 0.9);
         EXPECT_LT(ratio, 2.2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DownbeatEstimator
+// ---------------------------------------------------------------------------
+
+namespace {
+
+template <typename T>
+struct BarSong
+{
+    std::vector<T> x;
+    std::vector<int64_t> beats;
+};
+
+// Bars of `meter` beats: a bass note struck on the first beat of every bar
+// and left to ring, a chord held through the bar (a loop of four, so that no
+// two neighbouring bars share one), and the same tick on every beat. The
+// beats given start `pickup` beats before the first bar line, so the first
+// bar line is beat `pickup`.
+template <typename T>
+BarSong<T> barSong(int meter, int bars, double bpm, int pickup, double gain = 1.0)
+{
+    constexpr double kTwoPi = 6.283185307179586476925;
+    const double beatSeconds = 60.0 / bpm, lead = 0.25;
+    const int beatCount = pickup + bars * meter;
+    BarSong<T> song;
+    song.x.assign(static_cast<size_t>((lead + beatCount * beatSeconds + 0.5) * kFs), T(0));
+    static constexpr double roots[4] = { 55.0, 73.42, 65.41, 49.0 };
+    for (int k = 0; k < beatCount; ++k)
+        song.beats.push_back(static_cast<int64_t>(std::llround((lead + k * beatSeconds) * kFs)));
+    for (size_t i = 0; i < song.x.size(); ++i)
+    {
+        const double t = static_cast<double>(i) / kFs - lead;
+        if (t < 0.0) continue;
+        const double beat = t / beatSeconds;
+        const int k = static_cast<int>(beat);
+        const double sinceBeat = (beat - k) * beatSeconds;
+        double v = 0.2 * std::exp(-sinceBeat / 0.004) * std::sin(kTwoPi * 3000.0 * sinceBeat);   // the tick
+        if (k < beatCount)
+        {
+            // Before the first bar line the bar that came before still sounds.
+            const int bar = k >= pickup ? (k - pickup) / meter : -1;
+            const double sinceBar = t - (pickup + bar * meter) * beatSeconds;
+            const double root = roots[static_cast<size_t>(((bar % 4) + 4) % 4)];
+            v += 0.4 * std::exp(-sinceBar / 0.35) * std::sin(kTwoPi * root * sinceBar);
+            const double fade = std::min(1.0, sinceBar / 0.01);
+            for (const double partial : { 4.0, 5.0, 6.0 })
+                v += 0.08 * fade * std::sin(kTwoPi * root * partial * sinceBar);
+        }
+        song.x[i] = static_cast<T>(gain * v);
+    }
+    return song;
+}
+
+template <typename T>
+void checkBarsAreFound()
+{
+    for (const int meter : { 4, 3 })
+        for (int pickup = 0; pickup < meter; ++pickup)
+        {
+            const int bars = 12;
+            const BarSong<T> song = barSong<T>(meter, bars, meter == 4 ? 120.0 : 138.0, pickup);
+            const auto found = DownbeatEstimator<T>::estimate(song.x, kFs, song.beats);
+            std::cout << "  bars of " << meter << ", " << pickup << " beats before the first: bar length "
+                      << found.beatsPerBar << ", first beat " << found.firstDownbeat << ", confidence "
+                      << static_cast<double>(found.confidence) << "\n";
+            EXPECT_EQ(found.beatsPerBar, meter);
+            EXPECT_EQ(found.firstDownbeat, pickup);
+            EXPECT_GT(static_cast<double>(found.confidence), 0.75);
+            EXPECT_EQ(found.downbeatSamples.size(), static_cast<size_t>(bars));
+            bool every = found.downbeatSamples.size() == static_cast<size_t>(bars);
+            for (size_t b = 0; every && b < found.downbeatSamples.size(); ++b)
+                every = found.downbeatSamples[b]
+                        == song.beats[static_cast<size_t>(pickup) + b * static_cast<size_t>(meter)];
+            EXPECT_TRUE(every);
+        }
+}
+
+} // namespace
+
+// The estimator names the bar length (3 or 4) and the beat that opens the
+// bar, wherever in the bar the beats it is given start.
+DSPARK_TEST(Downbeat_estimator_finds_bars_of_four_and_of_three)
+{
+    checkBarsAreFound<float>();
+    checkBarsAreFound<double>();
+}
+
+// A bar length the caller gives is the one used: bars of four read in twos
+// open on the beats that fall on a bar line or on its middle, and the same
+// bar length as the estimate gives the same answer.
+DSPARK_TEST(Downbeat_estimator_takes_the_bar_length_it_is_given)
+{
+    for (int pickup = 0; pickup < 4; ++pickup)
+    {
+        const BarSong<float> song = barSong<float>(4, 12, 120.0, pickup);
+        const auto inTwos = DownbeatEstimator<float>::estimate(song.x, kFs, song.beats, 2);
+        EXPECT_EQ(inTwos.beatsPerBar, 2);
+        EXPECT_EQ(inTwos.firstDownbeat, pickup % 2);
+        const auto estimated = DownbeatEstimator<float>::estimate(song.x, kFs, song.beats);
+        const auto inFours = DownbeatEstimator<float>::estimate(song.x, kFs, song.beats, 4);
+        EXPECT_EQ(inFours.beatsPerBar, 4);
+        EXPECT_EQ(inFours.firstDownbeat, estimated.firstDownbeat);
+        EXPECT_EQ(inFours.confidence, estimated.confidence);
+        EXPECT_TRUE(inFours.downbeatSamples == estimated.downbeatSamples);
+    }
+}
+
+// What cannot be read comes back empty, and never as a guess: an invalid
+// rate or bar length, beats out of order or outside the signal, too few
+// beats, or a signal shorter than the analysis window.
+DSPARK_TEST(Downbeat_estimator_reads_nothing_from_invalid_input)
+{
+    const BarSong<float> song = barSong<float>(4, 12, 120.0, 0);
+    const auto empty = [](const DownbeatEstimator<float>::Result& r) {
+        return r.beatsPerBar == 0 && r.firstDownbeat == -1 && r.confidence == 0.0f && r.downbeatSamples.empty();
+    };
+    using Estimator = DownbeatEstimator<float>;
+    EXPECT_TRUE(!empty(Estimator::estimate(song.x, kFs, song.beats)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, 0.0, song.beats)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, -kFs, song.beats)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, std::numeric_limits<double>::quiet_NaN(), song.beats)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, std::numeric_limits<double>::infinity(), song.beats)));
+    EXPECT_TRUE(empty(Estimator::estimate(std::span<const float>(), kFs, song.beats)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, song.beats, 1)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, song.beats, Estimator::kMaxBeatsPerBar + 1)));
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, song.beats, -4)));
+
+    std::vector<int64_t> beats = song.beats;
+    std::swap(beats[5], beats[6]);
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, beats)));          // out of order
+    beats = song.beats;
+    beats[7] = beats[6];
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, beats)));          // a beat twice
+    beats = song.beats;
+    beats.back() = static_cast<int64_t>(song.x.size());
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, beats)));          // past the end
+    beats = song.beats;
+    beats.front() = -1;
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, beats)));          // before the start
+    beats.assign(song.beats.begin(), song.beats.begin() + Estimator::kMinBeats - 1);
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, beats)));          // too few beats
+    beats.assign(song.beats.begin(), song.beats.begin() + 8);
+    EXPECT_TRUE(empty(Estimator::estimate(song.x, kFs, beats, 4)));       // two bars and no beat more
+
+    // A signal shorter than the analysis window, with enough beats inside it.
+    const std::vector<float> brief(song.x.begin(), song.x.begin() + 4000);
+    beats.clear();
+    for (int k = 0; k < 9; ++k) beats.push_back(400 * k);
+    EXPECT_TRUE(empty(Estimator::estimate(brief, kFs, beats)));
+}
+
+// The answer does not follow the level of the signal or a beat grid that
+// runs a little late, and samples that are not finite read as zeros.
+DSPARK_TEST(Downbeat_estimator_holds_under_level_offset_and_bad_samples)
+{
+    const BarSong<float> song = barSong<float>(4, 12, 120.0, 1);
+    const auto base = DownbeatEstimator<float>::estimate(song.x, kFs, song.beats);
+    EXPECT_EQ(base.beatsPerBar, 4);
+    EXPECT_EQ(base.firstDownbeat, 1);
+
+    const BarSong<float> quiet = barSong<float>(4, 12, 120.0, 1, 0.01);
+    const auto quietly = DownbeatEstimator<float>::estimate(quiet.x, kFs, quiet.beats);
+    EXPECT_EQ(quietly.beatsPerBar, 4);
+    EXPECT_EQ(quietly.firstDownbeat, 1);
+    EXPECT_NEAR(static_cast<double>(quietly.confidence), static_cast<double>(base.confidence), 0.02);
+
+    for (const double offsetMs : { -20.0, 20.0 })
+    {
+        std::vector<int64_t> beats = song.beats;
+        for (auto& b : beats) b += static_cast<int64_t>(offsetMs * 0.001 * kFs);
+        const auto shifted = DownbeatEstimator<float>::estimate(song.x, kFs, beats);
+        EXPECT_EQ(shifted.beatsPerBar, 4);
+        EXPECT_EQ(shifted.firstDownbeat, 1);
+    }
+
+    std::vector<float> dirty = song.x, zeroed = song.x;
+    for (size_t i = 5000; i < dirty.size(); i += 7919)
+    {
+        dirty[i] = (i % 2 == 0) ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+        zeroed[i] = 0.0f;
+    }
+    const auto fromDirty = DownbeatEstimator<float>::estimate(dirty, kFs, song.beats);
+    const auto fromZeroed = DownbeatEstimator<float>::estimate(zeroed, kFs, song.beats);
+    EXPECT_EQ(fromDirty.beatsPerBar, fromZeroed.beatsPerBar);
+    EXPECT_EQ(fromDirty.firstDownbeat, fromZeroed.firstDownbeat);
+    EXPECT_EQ(fromDirty.confidence, fromZeroed.confidence);
+    EXPECT_TRUE(std::isfinite(fromDirty.confidence));
+}
+
+// Beats laid over a held tone carry no bar: every cue is level, and what is
+// left is rounding. The answer then comes with a confidence near zero rather
+// than with the pattern of that rounding scaled up to a full deviation.
+DSPARK_TEST(Downbeat_estimator_is_unsure_where_nothing_marks_the_bar)
+{
+    std::vector<float> tone(static_cast<size_t>(26.0 * kFs));
+    for (size_t i = 0; i < tone.size(); ++i)
+        tone[i] = static_cast<float>(0.3 * std::sin(6.283185307179586476925 * 220.0 * static_cast<double>(i) / kFs)
+                                     + 0.2 * std::sin(6.283185307179586476925 * 90.0 * static_cast<double>(i) / kFs));
+    std::vector<int64_t> beats;
+    for (int k = 0; k < 48; ++k) beats.push_back(static_cast<int64_t>(std::llround((0.25 + 0.5 * k) * kFs)));
+    for (const int meter : { 0, 3, 4 })
+    {
+        const auto found = DownbeatEstimator<float>::estimate(tone, kFs, beats, meter);
+        std::cout << "  held tone, bar length asked " << meter << ": read " << found.beatsPerBar << ", confidence "
+                  << static_cast<double>(found.confidence) << "\n";
+        EXPECT_TRUE(meter == 0 ? (found.beatsPerBar == 3 || found.beatsPerBar == 4) : found.beatsPerBar == meter);
+        EXPECT_LT(static_cast<double>(found.confidence), 0.1);
     }
 }

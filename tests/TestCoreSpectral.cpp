@@ -984,6 +984,220 @@ DSPARK_TEST(FFTReal_inverse_in_steps_goes_on_in_a_copy)
     checkSteppedInverseSurvivesACopy<double>();
 }
 
+// The real transform by lanes (FftKernels.inl) at one lane count, on one copy
+// of the kernels, from the smallest size that count takes to 4096 samples:
+// the spectrum against the complex transform of the same samples (a route
+// that shares nothing with it), the inverse back to the samples, and the
+// three forms of the pass tables (each twiddle once, once per lane in the
+// short passes, once per lane in all of them) to the same bits.
+template <typename T, typename Forward, typename Inverse>
+static void checkLaneKernels(size_t lanes, double tolerance, Forward forward, Inverse inverse)
+{
+    unsigned int rng = 4242u;
+    for (size_t n = std::max(4 * lanes, 2 * lanes * lanes); n <= 4096; n *= 2)
+    {
+        std::vector<T> x(n), back(n), again(n);
+        std::vector<double> z(2 * n, 0.0);
+        for (size_t i = 0; i < n; ++i)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            x[i] = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+            z[2 * i] = static_cast<double>(x[i]);
+        }
+        FFTComplex<double> reference(n);
+        reference.forward(z.data());
+
+        detail::fft::WorkBuffers<T> work(n);
+        const detail::fft::RealLaneTables<T> once(n, lanes, 0), mixed(n, lanes, 32), all(n, lanes, n);
+        std::vector<T> spec(n + 2, T(-7)), specMixed(n + 2, T(-7)), specAll(n + 2, T(-7));
+        forward(once.plan(), x.data(), spec.data(), work.first(), work.second());
+        forward(mixed.plan(), x.data(), specMixed.data(), work.first(), work.second());
+        forward(all.plan(), x.data(), specAll.data(), work.first(), work.second());
+        EXPECT_EQ(std::memcmp(spec.data(), specMixed.data(), (n + 2) * sizeof(T)), 0);
+        EXPECT_EQ(std::memcmp(spec.data(), specAll.data(), (n + 2) * sizeof(T)), 0);
+
+        double err = 0.0, ref = 0.0;
+        for (size_t k = 0; k <= n / 2; ++k)
+        {
+            const double dr = static_cast<double>(spec[2 * k]) - z[2 * k];
+            const double di = static_cast<double>(spec[2 * k + 1]) - z[2 * k + 1];
+            err += dr * dr + di * di;
+            ref += z[2 * k] * z[2 * k] + z[2 * k + 1] * z[2 * k + 1];
+        }
+        EXPECT_LT(std::sqrt(err / ref), tolerance);
+
+        inverse(once.plan(), spec.data(), back.data(), work.first(), work.second());
+        inverse(all.plan(), spec.data(), again.data(), work.first(), work.second());
+        EXPECT_EQ(std::memcmp(back.data(), again.data(), n * sizeof(T)), 0);
+        double worst = 0.0;
+        for (size_t i = 0; i < n; ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(back[i]) - static_cast<double>(x[i])));
+        EXPECT_LT(worst, 10.0 * tolerance);
+    }
+}
+
+template <typename T>
+static void checkLaneKernelsAtEveryWidth(double tolerance)
+{
+    using Plan = detail::fft::RealPlan<T>;
+    const auto forward = [](const Plan& p, const T* time, T* freq, T* a, T* b) {
+        detail::fft::realForward(p, time, freq, a, b);
+    };
+    const auto inverse = [](const Plan& p, const T* freq, T* time, T* a, T* b) {
+        detail::fft::realInverse(p, freq, time, a, b);
+    };
+    if (detail::fft::kWide<T> > 1)
+        checkLaneKernels<T>(static_cast<size_t>(detail::fft::kWide<T>), tolerance, forward, inverse);
+    if (detail::fft::kNarrow<T> > 1 && detail::fft::kNarrow<T> != detail::fft::kWide<T>)
+        checkLaneKernels<T>(static_cast<size_t>(detail::fft::kNarrow<T>), tolerance, forward, inverse);
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (simd::isRuntimeDispatchActive())
+    {
+        const auto forwardWide = [](const Plan& p, const T* time, T* freq, T* a, T* b) {
+            detail::fft::avx2::realForward(p, time, freq, a, b);
+        };
+        const auto inverseWide = [](const Plan& p, const T* freq, T* time, T* a, T* b) {
+            detail::fft::avx2::realInverse(p, freq, time, a, b);
+        };
+        checkLaneKernels<T>(static_cast<size_t>(detail::fft::avx2::kWide<T>), tolerance, forwardWide, inverseWide);
+        checkLaneKernels<T>(static_cast<size_t>(detail::fft::avx2::kNarrow<T>), tolerance, forwardWide, inverseWide);
+    }
+#endif
+}
+
+DSPARK_TEST(FFTReal_lane_kernels_match_the_complex_transform_at_every_width)
+{
+    checkLaneKernelsAtEveryWidth<float>(2e-6);
+    checkLaneKernelsAtEveryWidth<double>(4e-15);
+}
+
+// The step that joins the lanes transposes W vectors (lane k of each into
+// vector k), and the last inverse pass takes c - a b in one operation: both
+// as written, at every width a build's kernels have.
+template <typename O, typename T, int W>
+static void checkTransposeAndNegatedProduct()
+{
+    T rows[8][8] = {}, out[8] = {};
+    typename O::V v[W];
+    for (int j = 0; j < W; ++j)
+    {
+        for (int k = 0; k < W; ++k) rows[j][k] = static_cast<T>(10 * j + k);
+        v[j] = O::load(rows[j]);
+    }
+    O::transpose(v);
+    bool transposed = true;
+    for (int k = 0; k < W; ++k)
+    {
+        O::store(out, v[k]);
+        for (int j = 0; j < W; ++j) transposed = transposed && out[j] == rows[j][k];
+    }
+    EXPECT_TRUE(transposed);
+
+    T a[8] = {}, b[8] = {}, c[8] = {};
+    for (int j = 0; j < W; ++j)
+    {
+        a[j] = static_cast<T>(j + 1);
+        b[j] = static_cast<T>(3 - j);
+        c[j] = static_cast<T>(100 + j);
+    }
+    O::store(out, O::nmadd(O::load(a), O::load(b), O::load(c)));
+    bool product = true;
+    for (int j = 0; j < W; ++j) product = product && out[j] == c[j] - a[j] * b[j];
+    EXPECT_TRUE(product);
+}
+
+DSPARK_TEST(FFT_vectors_transpose_their_lanes_and_subtract_a_product)
+{
+    checkTransposeAndNegatedProduct<simd::Vec<float, 1>, float, 1>();
+    checkTransposeAndNegatedProduct<simd::Vec<double, 1>, double, 1>();
+    checkTransposeAndNegatedProduct<simd::Vec<float, simd::kVecWidth<float>>, float, simd::kVecWidth<float>>();
+    checkTransposeAndNegatedProduct<simd::Vec<double, simd::kVecWidth<double>>, double, simd::kVecWidth<double>>();
+    checkTransposeAndNegatedProduct<simd::Vec<float, simd::kVecNarrowWidth<float>>, float,
+                                    simd::kVecNarrowWidth<float>>();
+    checkTransposeAndNegatedProduct<simd::Vec<double, simd::kVecNarrowWidth<double>>, double,
+                                    simd::kVecNarrowWidth<double>>();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (simd::isRuntimeDispatchActive())
+    {
+        checkTransposeAndNegatedProduct<simd::avx2::Vec<float, 8>, float, 8>();
+        checkTransposeAndNegatedProduct<simd::avx2::Vec<double, 4>, double, 4>();
+        checkTransposeAndNegatedProduct<simd::avx2::Vec<float, 4>, float, 4>();
+        checkTransposeAndNegatedProduct<simd::avx2::Vec<double, 2>, double, 2>();
+    }
+#endif
+}
+
+// A real signal has no imaginary part at DC or at Nyquist: the inverse does
+// not read those two values, whatever they hold, on either kernel set.
+template <typename T>
+static void checkInverseSkipsTheRealBinsImaginaryParts()
+{
+    unsigned int rng = 97531u;
+    for (size_t n = 4; n <= 4096; n *= 2)
+    {
+        std::vector<T> spec(n + 2), a(n), b(n, T(-7));
+        for (auto& v : spec)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+        }
+        spec[1] = T(0);
+        spec[n + 1] = T(0);
+        std::vector<T> dirty(spec);
+        dirty[1] = std::numeric_limits<T>::quiet_NaN();
+        dirty[n + 1] = std::numeric_limits<T>::infinity();
+        FFTReal<T> fft(n);
+        fft.inverse(spec.data(), a.data());
+        fft.inverse(dirty.data(), b.data());
+        EXPECT_EQ(std::memcmp(a.data(), b.data(), n * sizeof(T)), 0);
+    }
+}
+
+DSPARK_TEST(FFTReal_inverse_does_not_read_the_imaginary_parts_of_dc_and_nyquist)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool wide : { false, true })
+    {
+        simd::setRuntimeDispatch(wide && dispatch);
+        checkInverseSkipsTheRealBinsImaginaryParts<float>();
+        checkInverseSkipsTheRealBinsImaginaryParts<double>();
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
+// Callers size their schedules from getInverseStepCount() once: the count
+// belongs to the object and does not follow the kernel set in use, and the
+// steps of a set whose transform has fewer passes still end in the samples.
+DSPARK_TEST(FFTReal_inverse_step_count_does_not_follow_the_kernel_set)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    unsigned int rng = 1357u;
+    for (size_t n = 4; n <= 16384; n *= 2)
+    {
+        FFTReal<double> whole(n), stepped(n);
+        simd::setRuntimeDispatch(false);
+        const int steps = stepped.getInverseStepCount();
+        simd::setRuntimeDispatch(dispatch);
+        EXPECT_EQ(stepped.getInverseStepCount(), steps);
+
+        std::vector<double> spec(n + 2), a(n), b(n, -7.0);
+        for (auto& v : spec)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+        }
+        for (const bool wide : { false, true })
+        {
+            simd::setRuntimeDispatch(wide && dispatch);
+            whole.inverse(spec.data(), a.data());
+            for (int s = 0; s < steps; ++s)
+                stepped.inverseStep(s, spec.data(), b.data());
+            EXPECT_EQ(std::memcmp(a.data(), b.data(), n * sizeof(double)), 0);
+        }
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
 // ============================================================================
 // WindowFunctions
 // ============================================================================

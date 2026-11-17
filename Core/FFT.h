@@ -93,7 +93,6 @@
 #include <cstring>
 #include <functional>
 #include <numbers>
-#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -408,6 +407,10 @@ template <typename T>
 class SplitFFT
 {
 public:
+    /// An engine that holds nothing and must not be run (a real transform of a
+    /// size that runs by lanes keeps one of these).
+    SplitFFT() = default;
+
     explicit SplitFFT(size_t n, bool interleavedInput = false) : n_(n), work_(2 * n)
     {
         PlanPasses steps;
@@ -874,7 +877,7 @@ private:
         return 0;
     }
 
-    size_t n_;
+    size_t n_ = 0;
     WorkBuffers<T> work_;          ///< Ping-pong buffers, [re | im] each.
     std::vector<T> twiddles_;
     std::vector<T> inLaneTwiddles_;   ///< The first pass's, permuted for in-lane interleaved input.
@@ -1225,7 +1228,7 @@ public:
         // (even, odd) sample pairs are the complex input.
         const T* zr = nullptr;
         const T* zi = nullptr;
-        engine_->runFrom(timeData, false, zr, zi);
+        engine_.runFrom(timeData, false, zr, zi);
         unpackForward(zr, zi, freqData);
     }
 
@@ -1252,9 +1255,9 @@ public:
         }
         // Pack into the conjugated half-size spectrum, run the forward engine,
         // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M.
-        packInverseConj(freqData, engine_->inRe(), engine_->inIm());
+        packInverseConj(freqData, engine_.inRe(), engine_.inIm());
         const T scale = inverseScale();
-        engine_->runTo(timeData, scale, -scale);
+        engine_.runTo(timeData, scale, -scale);
     }
 
     /** @brief Returns the number of steps inverseStep() splits inverse() into
@@ -1263,7 +1266,7 @@ public:
     {
         if (!lanes_.empty())
             return static_cast<int>(std::max(lanes_.passes(), wideLanes_.passes())) + 1;
-        return static_cast<int>(engine_->runToStepCount()) + 1;
+        return static_cast<int>(engine_.runToStepCount()) + 1;
     }
 
     /**
@@ -1307,11 +1310,11 @@ public:
         }
         if (step <= 0)
         {
-            packInverseConj(freqData, engine_->inRe(), engine_->inIm());
+            packInverseConj(freqData, engine_.inRe(), engine_.inIm());
             return;
         }
         const T scale = inverseScale();
-        engine_->runToStep(static_cast<size_t>(step - 1), timeData, scale, -scale);
+        engine_.runToStep(static_cast<size_t>(step - 1), timeData, scale, -scale);
     }
 
     /**
@@ -1501,11 +1504,11 @@ private:
     }
 
     /// The half-size complex engine, for the sizes that run on it.
-    [[nodiscard]] static std::optional<detail::fft::SplitFFT<T>> makeEngine(size_t size)
+    [[nodiscard]] static detail::fft::SplitFFT<T> makeEngine(size_t size)
     {
         if (baseLanes(size) != 0)
-            return std::nullopt;
-        return std::optional<detail::fft::SplitFFT<T>>(std::in_place, size / 2, true);
+            return detail::fft::SplitFFT<T>();
+        return detail::fft::SplitFFT<T>(size / 2, true);
     }
 
     /// The tables of the dispatched kernels: their own where their lane count
@@ -1517,7 +1520,7 @@ private:
 
     size_t realSize_;
     size_t halfSize_;
-    std::optional<detail::fft::SplitFFT<T>> engine_;   ///< Sizes that do not run by lanes.
+    detail::fft::SplitFFT<T> engine_;    ///< Runs the sizes that do not go by lanes (empty otherwise).
     std::vector<T> splitRe_, splitIm_;   ///< Split factors c_k = (1 - j exp(-2 pi i k / N)) / 2.
     detail::fft::WorkBuffers<T> laneWork_;        ///< The two buffers of the transform by lanes.
     detail::fft::RealLaneTables<T> lanes_;        ///< The baseline kernels' tables (empty: engine_ runs).

@@ -1058,8 +1058,8 @@ DSPARK_TEST(OfflineProduct_allocation_failures_and_payload_bound)
         }
         EXPECT_TRUE(completed);
         // Every allocation point failed once (calls == index - 1 above). The
-        // setup makes 31 allocations on x86-64 builds with the runtime
-        // dispatch, where each FFT also keeps an in-lane twiddle copy, and 29
+        // setup makes 29 allocations on x86-64 builds with the runtime
+        // dispatch, where each FFT also keeps an in-lane twiddle copy, and 27
         // elsewhere (32-bit x86, arm64, SSE2 without the dispatch); far fewer
         // would mean the injection never reached the product's FFT windows.
         EXPECT_GT(injected, 24);

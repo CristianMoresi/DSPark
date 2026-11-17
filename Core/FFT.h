@@ -15,8 +15,9 @@
  *   permutation; each pass reads one buffer and writes the other in natural
  *   order. An odd log2(N) closes with one radix-8 pass (twiddle-free, the
  *   eighth roots entering as sqrt(1/2)) in place of a radix-4 and a radix-2
- *   pass, or with that pair where the radix-8 pass's rows would sit 4 KiB
- *   apart or more and share cache sets.
+ *   pass, or with that pair where the radix-8 pass's eight rows would sit a
+ *   way of the level-1 data cache apart or more (4 KiB on x86) and fill one
+ *   of its sets.
  * - **Blocked complex layout inside**: between passes the data is stored in
  *   blocks of 4 double or 8 float real parts followed by the same elements'
  *   imaginary parts, so every butterfly is plain vector arithmetic (no
@@ -37,6 +38,10 @@
  *   (its twiddles follow), and a double transform that ends in interleaved
  *   output keeps its blocks in that order, so its closing pass interleaves
  *   within halves. The lane-wise passes in between do not see the order.
+ * - **Work buffers on cache lines**: the two buffers the passes alternate
+ *   between share one allocation and each starts on a 64-byte boundary (the
+ *   second a whole number of 4 KiB pages after the first once a buffer is
+ *   that long), so no vector of a pass lies across two cache lines.
  * - **Twiddles in double**: every factor is computed directly with cos/sin in
  *   double precision (no recurrences), so the error stays at the level of the
  *   arithmetic itself. A pass reads its factors as one stream: the six of a
@@ -53,18 +58,19 @@
  *   are exact conjugates in the table). The inverse packs its input the same
  *   way.
  * - **Zero allocations** after construction; forward()/inverse() are
- *   noexcept and accept pointers of any alignment.
+ *   noexcept and accept pointers of any alignment. With the 32-byte kernels,
+ *   interleaved data that starts on a 32-byte boundary costs a complex
+ *   transform up to 17 % less (measured at 4096 double points) and a real
+ *   one up to 4 %: a vector's storage is only sure of 16.
  *
  * Measured on hosted CI runners, real transforms, forward plus inverse, ns
  * per real point at 64 / 1024 / 4096 / 65536 points, double and then float,
  * each row on one machine (the machines differ between rows). SSE2 (GCC):
- * 2.0 / 2.6 / 3.2 / 5.4 and 1.5 / 1.4 / 1.6 / 2.4. Built for AVX2 and FMA
- * (GCC): 1.9 / 1.5 / 2.8 / 3.5 and 1.5 / 0.91 / 1.1 / 1.7. NEON on an arm64
- * server core (GCC): 3.1 / 4.2 / 5.0 / 7.6 and 2.0 / 2.3 / 2.7 / 3.9. With
- * the split as two products per pair of bins and the twiddles of a pass as
- * six arrays, the same runs gave 2.1 / 2.7 / 3.3 / 5.3 and 1.6 / 1.5 / 1.6 /
- * 2.4, 1.9 / 1.6 / 2.8 / 3.7 and 1.5 / 0.94 / 1.2 / 1.8, and 3.3 / 4.4 / 5.2
- * / 8.1 and 2.1 / 2.4 / 2.8 / 4.0.
+ * 2.0 / 2.6 / 3.3 / 4.9 and 1.5 / 1.4 / 1.6 / 2.2. Built for AVX2 and FMA
+ * (GCC): 1.5 / 1.4 / 2.7 / 4.3 and 1.4 / 0.85 / 1.0 / 1.9. NEON on an arm64
+ * server core (GCC): 3.1 / 4.2 / 5.0 / 7.4 and 2.0 / 2.3 / 2.7 / 3.9. With
+ * each work buffer where its own allocation put it, the AVX2 run gave 1.6 /
+ * 1.6 / 3.4 / 5.6 and 1.4 / 0.88 / 1.1 / 2.5.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
  * thread at a time; give each thread its own instance.
@@ -150,6 +156,20 @@ struct TwiddleSpan
 /// radix8 mark the closing passes of length 2 and 8 (radix 4 otherwise).
 struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; bool radix8; };
 
+/// Bytes between the rows of a closing radix-8 pass from which the plan
+/// closes with a radix-4 and a radix-2 pass instead. The pass reads its eight
+/// rows together; spaced a way of the level-1 data cache apart they fill one
+/// set of an 8-way cache, and the pass then costs from the same to six times
+/// as much, by where the output lies. A way holds 4 KiB on x86 (32 KiB in 8
+/// ways, 48 KiB in 12); the arm64 cores measured hold 16 KiB, and rows 4 KiB
+/// apart cost them less than the two passes.
+#if defined(_M_AMD64) || defined(_M_X64) || defined(__x86_64__) || defined(__amd64__) \
+    || defined(_M_IX86) || defined(__i386__) || defined(__EMSCRIPTEN__)
+inline constexpr size_t kClosingRowReach = 4096;
+#else
+inline constexpr size_t kClosingRowReach = 8192;
+#endif
+
 /// The two ping-pong buffers, [re | im] each: x is read, y is written.
 template <typename T>
 struct Buffers { T* xr; T* xi; T* yr; T* yi; };
@@ -215,6 +235,89 @@ namespace detail {
 namespace fft {
 
 /**
+ * @class WorkBuffers
+ * @brief Two buffers of the same length in one allocation, each starting on
+ *        a 64-byte boundary, the second a whole number of 64-byte lines after
+ *        the first (of 4 KiB pages from 4 KiB per buffer).
+ *
+ * A pass reads one buffer and writes the other with vectors of up to 32
+ * bytes. A buffer that starts wherever its allocation does puts some of those
+ * vectors across two cache lines (with 32-byte vectors, every other one where
+ * the start is 16 bytes off, which is where the usual allocators put a large
+ * block): measured with the 32-byte kernels, transforms of a few thousand
+ * points and more then cost 1.2 to 1.6 times as much on one CPU family and
+ * 1.05 to 1.1 times on another, and shorter ones up to 1.15 times.
+ *
+ * Copies place their own buffers and carry the contents over; a moved-from
+ * object holds nothing.
+ */
+template <typename T>
+class WorkBuffers
+{
+public:
+    WorkBuffers() = default;
+
+    /// Two zeroed buffers of count values each.
+    explicit WorkBuffers(size_t count)
+        : count_(count), storage_(values(count), T(0)), lead_(leadOf(storage_.data()))
+    {
+    }
+
+    WorkBuffers(const WorkBuffers& other)
+        : count_(other.count_), storage_(other.storage_.size(), T(0)), lead_(leadOf(storage_.data()))
+    {
+        if (count_ > 0)
+            std::copy_n(other.first(), stride(count_) + count_, first());
+    }
+
+    WorkBuffers(WorkBuffers&& other) noexcept
+        : count_(std::exchange(other.count_, size_t{ 0 })), storage_(std::move(other.storage_)),
+          lead_(std::exchange(other.lead_, size_t{ 0 }))
+    {
+    }
+
+    WorkBuffers& operator=(WorkBuffers other) noexcept
+    {
+        std::swap(count_, other.count_);
+        storage_.swap(other.storage_);
+        std::swap(lead_, other.lead_);
+        return *this;
+    }
+
+    [[nodiscard]] T* first() noexcept { return storage_.data() + lead_; }
+    [[nodiscard]] const T* first() const noexcept { return storage_.data() + lead_; }
+    [[nodiscard]] T* second() noexcept { return first() + stride(count_); }
+    [[nodiscard]] const T* second() const noexcept { return first() + stride(count_); }
+
+    /// Values the constructor requests for two buffers of count values: the
+    /// first buffer rounded up to whole lines, the second, and room to reach
+    /// the first boundary.
+    [[nodiscard]] static constexpr size_t values(size_t count) noexcept
+    {
+        return (kLine - 1) + stride(count) + count;
+    }
+
+private:
+    static constexpr size_t kLine = 64 / sizeof(T);   ///< Values in 64 bytes.
+
+    static constexpr size_t stride(size_t count) noexcept
+    {
+        return (count + kLine - 1) / kLine * kLine;
+    }
+
+    /// Values from data to the next 64-byte boundary.
+    static size_t leadOf(const T* data) noexcept
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        return static_cast<size_t>((64 - address % 64) % 64) / sizeof(T);
+    }
+
+    size_t count_ = 0;
+    std::vector<T> storage_;
+    size_t lead_ = 0;
+};
+
+/**
  * @class SplitFFT
  * @brief The shared Stockham engine: a forward complex FFT of size N on
  *        split (re, im) arrays, ping-ponging between two work buffers.
@@ -223,11 +326,8 @@ template <typename T>
 class SplitFFT
 {
 public:
-    explicit SplitFFT(size_t n, bool interleavedInput = false) : n_(n)
+    explicit SplitFFT(size_t n, bool interleavedInput = false) : n_(n), work_(2 * n)
     {
-        bufA_.assign(2 * n_, T(0));
-        bufB_.assign(2 * n_, T(0));
-
         PlanPasses steps;
         const size_t passCount = buildPlan(n_, steps);
         passes_.assign(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(passCount));
@@ -281,9 +381,9 @@ public:
 
     /**
      * @brief Upper bound of the bytes the constructor requests for a
-     *        power-of-two size n: the two work buffers, the twiddle tables and
-     *        the pass plan, one allocation each, plus kAllocationOverhead per
-     *        allocation. Allocates nothing.
+     *        power-of-two size n: the two work buffers (one allocation), the
+     *        twiddle tables and the pass plan (one each), plus
+     *        kAllocationOverhead per allocation. Allocates nothing.
      */
     [[nodiscard]] static size_t allocationBytes(size_t n, bool interleavedInput) noexcept
     {
@@ -293,16 +393,16 @@ public:
         const size_t twiddles = last.radix2 || last.radix8 ? last.twOffset
                                                            : last.twOffset + 6 * (last.len / 4);
         const size_t inLane = inLaneTwiddleCount(steps, passCount, interleavedInput);
-        const size_t allocations = 3 + (twiddles > 0 ? 1 : 0) + (inLane > 0 ? 1 : 0);
-        return (4 * n + twiddles + inLane) * sizeof(T) + passCount * sizeof(Pass)
-             + allocations * kAllocationOverhead;
+        const size_t allocations = 2 + (twiddles > 0 ? 1 : 0) + (inLane > 0 ? 1 : 0);
+        return (WorkBuffers<T>::values(2 * n) + twiddles + inLane) * sizeof(T)
+             + passCount * sizeof(Pass) + allocations * kAllocationOverhead;
     }
 
     [[nodiscard]] size_t size() const noexcept { return n_; }
 
     /// Input buffers: fill inRe() / inIm() with N values each before run().
-    [[nodiscard]] T* inRe() noexcept { return bufA_.data(); }
-    [[nodiscard]] T* inIm() noexcept { return bufA_.data() + n_; }
+    [[nodiscard]] T* inRe() noexcept { return work_.first(); }
+    [[nodiscard]] T* inIm() noexcept { return work_.first() + n_; }
 
     /**
      * @brief Runs the forward transform of the input buffers.
@@ -335,7 +435,7 @@ public:
     {
         if (passes_.size() == 1)
         {
-            T* const re = bufB_.data();
+            T* const re = work_.second();
             T* const im = re + n_;
             onePass([&](size_t i, T& r, T& m) { readPair(data, conjugate, i, r, m); },
                     [&](size_t i, T r, T m) { re[i] = r; im[i] = m; });
@@ -401,7 +501,7 @@ public:
         // The first pass must not write over its own input: when that is the
         // second work buffer, the passes start from it.
         const std::less<const T*> before;
-        const T* const second = bufB_.data();
+        const T* const second = work_.second();
         if (!before(re, second) && before(re, second + 2 * n_))
         {
             std::swap(b.xr, b.yr);
@@ -456,7 +556,7 @@ public:
     {
         if (passes_.size() == 1)
         {
-            const T* const re = bufA_.data();
+            const T* const re = work_.first();
             const T* const im = re + n_;
             onePass([&](size_t i, T& r, T& m) { r = re[i]; m = im[i]; },
                     [&](size_t i, T r, T m) { out[2 * i] = r * scaleRe; out[2 * i + 1] = m * scaleIm; });
@@ -532,7 +632,7 @@ public:
 private:
     [[nodiscard]] Buffers<T> buffers() noexcept
     {
-        return { bufA_.data(), bufA_.data() + n_, bufB_.data(), bufB_.data() + n_ };
+        return { work_.first(), work_.first() + n_, work_.second(), work_.second() + n_ };
     }
 
     /// Interleaved pair i, conjugated if asked (by negation, as readInput()).
@@ -586,15 +686,15 @@ private:
     // Plan: radix-4 passes of length n, n/4, ... with stride 1, 4, ...; an
     // odd log2(N) closes with a radix-8 pass in place of a length-8 radix-4
     // pass and a radix-2 one, or with that pair where the radix-8 pass's
-    // eight output rows would sit 4 KiB apart or more (they then share cache
-    // sets and the pass slows down several times), where its rows would not
-    // fill a block of the work layout, and where it would be the first pass.
-    // The constructor and allocationBytes() both build it here.
+    // eight rows (n/8 elements of the blocked layout each, re and im) would
+    // sit kClosingRowReach apart or more, where its rows would not fill a
+    // block of the work layout, and where it would be the first pass. The
+    // constructor and allocationBytes() both build it here.
     static size_t buildPlan(size_t n, PlanPasses& out) noexcept
     {
         const bool odd = (std::countr_zero(n) & 1) != 0;
         const bool radix8 = odd && n >= 32 && n / 8 >= kBlock<T>
-                         && (n / 8) * sizeof(T) < 4096;
+                         && 2 * (n / 8) * sizeof(T) < plan::kClosingRowReach;
         size_t len = n, stride = 1, offset = 0, count = 0;
         while (len >= 4 && !(radix8 && len == 8))
         {
@@ -627,7 +727,7 @@ private:
     }
 
     size_t n_;
-    std::vector<T> bufA_, bufB_;   ///< Ping-pong buffers, [re | im] each.
+    WorkBuffers<T> work_;          ///< Ping-pong buffers, [re | im] each.
     std::vector<T> twiddles_;
     std::vector<T> inLaneTwiddles_;   ///< The first pass's, permuted for in-lane interleaved input.
     std::vector<Pass> passes_;

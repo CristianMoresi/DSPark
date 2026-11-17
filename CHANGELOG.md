@@ -445,6 +445,49 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `FFTReal`, `FFTComplex` and what runs on them, faster wherever the kernels
+  use 32-byte vectors (builds for AVX2, and x86-64 builds on a CPU with AVX2
+  through the run-time dispatch). The engine's two work buffers share one
+  allocation and each starts on a 64-byte boundary (the second a whole number
+  of 4 KiB pages after the first once a buffer is that long). They were two
+  vectors: the usual allocators hand a large block out 16 bytes past a page
+  boundary, so every other 32-byte load and store of every pass lay across
+  two cache lines. A copy of a transform object places its own buffers and
+  carries their contents over (a transform that `inverseStep()` left half way
+  goes on in the copy). A forward transform into interleaved output no longer
+  multiplies its last pass by unit scales (the same values). On x86 a
+  transform of 2048 double or 4096 float complex points (real: 4096 and 8192)
+  closes with a radix-4 and a radix-2 pass in place of the radix-8 one: its
+  eight rows sat exactly 4 KiB apart, a way of the level-1 data cache, and on
+  8-way caches the pass then cost up to six times as much, by where the
+  output lay; the output of those two sizes changes at rounding level, every
+  other output is the same bit for bit. `allocationBytes()` follows: one
+  request fewer per engine and up to 27 values more. Measured before and
+  after in one job per machine, forward plus inverse over 64 to 65536 real
+  points (complex: half as many points), as the time after over the time
+  before. Built for AVX2 and FMA (GCC and Clang, one CPU family): real
+  transforms 0.76 to 0.86 in double from 2048 points and 0.70 to 0.79 in
+  float from 8192, 0.89 to 1.00 below those sizes; complex ones 0.67 to 0.80
+  in double and 0.61 to 0.86 in float from 4096 points, 0.88 to 1.00 below,
+  but for 1.10 at 128 float points, where the caller's buffer started on a
+  32-byte boundary before the change and off one after (0.96 with it on one
+  in both). Baseline x86-64 builds through the dispatch: 0.65 to 0.85 from
+  those sizes and 0.90 to 0.99 below on that CPU family (GCC; 1.10 at the
+  same 128 points), 0.89 to 1.05 over all sizes on another (Clang), 0.83 to
+  1.02 with MSVC, whose standard library already aligns large blocks. On the
+  SSE2 and NEON kernels, whose vectors never lay across two lines: 0.93 to
+  1.03 from 512 points, except 1.05 (real) and 1.07 (complex) at the size
+  whose closing passes change, on a CPU with a 12-way cache that the radix-8
+  pass did not trouble, and 0.95 to 1.06 at 128 and 256 points; the complex
+  transforms on arm64 0.93 to 0.99 (the unit scales). At 64 points (a
+  transform of 70 ns) the same code moved by up to 30 % either way between
+  builds and machines. Against a reference FFT in the same jobs (its inverse
+  unscaled), worst size, before -> after: built for AVX2, real double 1.09 ->
+  0.95 and complex double 1.27 -> 0.89 (float below 1.0 but for 1.04 at 64
+  points with Clang, as before); with the SSE2 and NEON kernels the real
+  transforms stay where they were (double up to 1.08 with GCC on x64 and
+  1.22 on arm64), and the complex ones in double run at 0.73 to 0.89 of it
+  on x64 and 0.80 to 1.01 on arm64.
 - `TruePeakEstimator` and `TruePeakAnalyzer` (the true-peak modes of
   `Limiter`, `LoudnessMeter`'s true peak and what reads them): the reading
   loops (the largest grid point of every interval and the crests refined

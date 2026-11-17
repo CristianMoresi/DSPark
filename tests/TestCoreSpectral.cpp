@@ -20,6 +20,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -566,10 +567,10 @@ DSPARK_TEST(FFT_fused_split_runs_match_their_unfused_forms)
 
 // The passes keep the data in blocks of real parts followed by imaginary
 // parts, and an odd log2 size closes with a radix-8 pass where its rows stay
-// under 4 KiB apart (a radix-4 and a radix-2 pass further up): every size
-// from 2 to 65536, complex and real, forward and inverse, against a plain
-// radix-2 reference in double, with the vector kernels and with the
-// baseline ones. The real inverse also ignores the imaginary parts of its
+// closer than a way of the level-1 data cache (a radix-4 and a radix-2 pass
+// further up): every size from 2 to 65536, complex and real, forward and
+// inverse, against a plain radix-2 reference in double, with the vector
+// kernels and with the baseline ones. The real inverse also ignores the imaginary parts of its
 // DC and Nyquist bins, bit for bit, as a real signal has none there.
 template <typename T>
 static void checkFftAgainstReference(double tolerance)
@@ -770,6 +771,118 @@ DSPARK_TEST(FFTReal_inverse_steps_keep_the_kernel_set_they_begin_on)
 {
     checkSteppedInverseKeepsItsKernels<float>();
     checkSteppedInverseKeepsItsKernels<double>();
+}
+
+// The engine's two work buffers share one allocation and each starts on a
+// 64-byte boundary, so no vector of a pass lies across two cache lines. A
+// copy places its own buffers: the contents must come along, and a move
+// keeps the buffers where they are.
+template <typename T>
+static void checkWorkBuffers()
+{
+    using Buffers = detail::fft::WorkBuffers<T>;
+    const auto onLine = [](const T* p) { return reinterpret_cast<std::uintptr_t>(p) % 64 == 0; };
+    const auto holds = [](const Buffers& buffers, size_t count) {
+        bool same = true;
+        for (size_t i = 0; i < count; ++i)
+            same = same && buffers.first()[i] == static_cast<T>(i + 1)
+                        && buffers.second()[i] == -static_cast<T>(i + 1);
+        return same;
+    };
+    for (size_t count : { size_t{ 1 }, size_t{ 4 }, size_t{ 7 }, size_t{ 16 }, size_t{ 100 },
+                          size_t{ 512 }, size_t{ 4096 }, size_t{ 65536 } })
+    {
+        Buffers buffers(count);
+        EXPECT_TRUE(onLine(buffers.first()));
+        EXPECT_TRUE(onLine(buffers.second()));
+        EXPECT_TRUE(buffers.second() >= buffers.first() + count);
+        // From 4 KiB per buffer the second starts whole pages after the first.
+        if (count * sizeof(T) >= 4096 && (count & (count - 1)) == 0)
+        {
+            EXPECT_EQ(static_cast<size_t>(buffers.second() - buffers.first()) * sizeof(T) % 4096, size_t{ 0 });
+        }
+        bool zeroed = true;
+        for (size_t i = 0; i < count; ++i)
+        {
+            zeroed = zeroed && buffers.first()[i] == T(0) && buffers.second()[i] == T(0);
+            buffers.first()[i] = static_cast<T>(i + 1);
+            buffers.second()[i] = -static_cast<T>(i + 1);
+        }
+        EXPECT_TRUE(zeroed);
+
+        Buffers copy(buffers);
+        EXPECT_TRUE(copy.first() != buffers.first());
+        EXPECT_TRUE(onLine(copy.first()));
+        EXPECT_TRUE(onLine(copy.second()));
+        EXPECT_TRUE(holds(copy, count));
+
+        const T* const place = copy.first();
+        Buffers moved(std::move(copy));
+        EXPECT_TRUE(moved.first() == place);
+        EXPECT_TRUE(holds(moved, count));
+
+        Buffers assigned;
+        assigned = buffers;
+        EXPECT_TRUE(onLine(assigned.first()));
+        EXPECT_TRUE(onLine(assigned.second()));
+        EXPECT_TRUE(holds(assigned, count));
+        assigned = std::move(moved);
+        EXPECT_TRUE(assigned.first() == place);
+        EXPECT_TRUE(holds(assigned, count));
+        EXPECT_TRUE(holds(buffers, count));
+    }
+}
+
+DSPARK_TEST(FFT_work_buffers_start_on_cache_lines_and_survive_copies)
+{
+    checkWorkBuffers<float>();
+    checkWorkBuffers<double>();
+}
+
+// A transform that inverseStep() left half way lives in the work buffers: a
+// copy of the instance must go on from the same values, whichever buffer the
+// pass before the copy wrote, and so must the instance it was copied from.
+template <typename T>
+static void checkSteppedInverseSurvivesACopy()
+{
+    unsigned int rng = 31337u;
+    for (size_t n : { size_t{ 16 }, size_t{ 128 }, size_t{ 1024 }, size_t{ 8192 } })
+    {
+        std::vector<T> spec(n + 2);
+        for (auto& v : spec)
+        {
+            rng = rng * 1664525u + 1013904223u;
+            v = static_cast<T>(static_cast<double>(rng >> 8) / 8388608.0 - 1.0);
+        }
+        FFTReal<T> whole(n);
+        std::vector<T> expected(n), a(n), b(n);
+        whole.inverse(spec.data(), expected.data());
+        const int steps = whole.getInverseStepCount();
+        for (int cut = 1; cut < steps; ++cut)
+        {
+            FFTReal<T> first(n);
+            for (int s = 0; s < cut; ++s)
+                first.inverseStep(s, spec.data(), a.data());
+            FFTReal<T> second(first);
+            for (int s = cut; s < steps; ++s)
+            {
+                first.inverseStep(s, spec.data(), a.data());
+                second.inverseStep(s, spec.data(), b.data());
+            }
+            EXPECT_EQ(std::memcmp(a.data(), expected.data(), n * sizeof(T)), 0);
+            EXPECT_EQ(std::memcmp(b.data(), expected.data(), n * sizeof(T)), 0);
+        }
+        // A copy is a transform of its own: whole ones give the same values.
+        FFTReal<T> copy(whole);
+        copy.inverse(spec.data(), a.data());
+        EXPECT_EQ(std::memcmp(a.data(), expected.data(), n * sizeof(T)), 0);
+    }
+}
+
+DSPARK_TEST(FFTReal_inverse_in_steps_goes_on_in_a_copy)
+{
+    checkSteppedInverseSurvivesACopy<float>();
+    checkSteppedInverseSurvivesACopy<double>();
 }
 
 // ============================================================================

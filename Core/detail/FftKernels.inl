@@ -195,6 +195,32 @@ struct InterleavedInLaneSink
     }
 };
 
+/// InterleavedSink with unit scales: the outputs as they are, with no
+/// multiplication (a forward transform to interleaved output).
+template <typename T, int W>
+struct PlainInterleavedSink
+{
+    using O = Vec<T, W>;
+    T* data;
+    void write(size_t i, typename O::V r, typename O::V m) const noexcept
+    {
+        O::storeInterleave2(data + 2 * i, r, m);
+    }
+};
+
+/// PlainInterleavedSink for blocks in the in-lane order (kInLaneLayout); only
+/// instantiated at the width that has it.
+template <typename T, int W>
+struct PlainInterleavedInLaneSink
+{
+    using O = Vec<T, W>;
+    T* data;
+    void write(size_t i, typename O::V r, typename O::V m) const noexcept
+    {
+        O::storeInterleave2InLane(data + 2 * i, r, m);
+    }
+};
+
 /**
  * @brief One Stockham radix-4 DIF pass with stride s >= kBlock, blocked
  *        layout in and out, vectorised over the stride (twiddles broadcast
@@ -718,6 +744,12 @@ Sink<T, W> makeSink(T* data, T scaleRe, T scaleIm) noexcept
     return { data, Vec<T, W>::set1(scaleRe), Vec<T, W>::set1(scaleIm) };
 }
 
+template <typename T, int W, template <typename, int> class Sink>
+Sink<T, W> makeSink(T* data) noexcept
+{
+    return { data };
+}
+
 template <typename T, int W, template <typename, int> class Sink, typename... Args>
 void closingAt(const Pass& pass, const T* xr, const T* xi, bool blocked, Args... output) noexcept
 {
@@ -935,21 +967,30 @@ void packRealSpectrum(const T* in, T* zr, T* zi, size_t m, const T* cRe, const T
         packRealSpectrumAt<T, 1>(in, zr, zi, m, cRe, cIm);
 }
 
-/// Runs the closing pass with scaled interleaved output.
+/// Runs the closing pass with scaled interleaved output. Unit scales (a
+/// forward transform) are not multiplied in: the same values, since a
+/// product by one is exact.
 template <typename T>
 void closeInterleaved(const Pass& pass, const T* xr, const T* xi, bool blocked, bool inLane, T* out,
                       T scaleRe, T scaleIm) noexcept
 {
+    const bool unit = scaleRe == T(1) && scaleIm == T(1);
     if constexpr (kInLaneLayout<T>)
     {
         // inLaneLayoutFor() guarantees a blocked pass at the full width.
         if (inLane)
         {
-            closingAt<T, kWide<T>, InterleavedInLaneSink>(pass, xr, xi, true, out, scaleRe, scaleIm);
+            if (unit)
+                closingAt<T, kWide<T>, PlainInterleavedInLaneSink>(pass, xr, xi, true, out);
+            else
+                closingAt<T, kWide<T>, InterleavedInLaneSink>(pass, xr, xi, true, out, scaleRe, scaleIm);
             return;
         }
     }
-    closingPass<T, InterleavedSink>(pass, xr, xi, blocked, out, scaleRe, scaleIm);
+    if (unit)
+        closingPass<T, PlainInterleavedSink>(pass, xr, xi, blocked, out);
+    else
+        closingPass<T, InterleavedSink>(pass, xr, xi, blocked, out, scaleRe, scaleIm);
 }
 
 /**

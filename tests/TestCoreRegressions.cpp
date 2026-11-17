@@ -37,20 +37,6 @@ namespace {
 
 constexpr double kRegPi = 3.14159265358979323846;
 
-// Timing comparisons only mean something in optimised, uninstrumented builds.
-#if defined(_DEBUG) || defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) \
-    || ((defined(__GNUC__) || defined(__clang__)) && !defined(__OPTIMIZE__))
-constexpr bool kTimingReliable = false;
-#elif defined(__has_feature)
-  #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
-constexpr bool kTimingReliable = false;
-  #else
-constexpr bool kTimingReliable = true;
-  #endif
-#else
-constexpr bool kTimingReliable = true;
-#endif
-
 // Only the timing checks read it, and those compile out in instrumented builds.
 [[maybe_unused]] volatile double gRegSink = 0.0;
 

@@ -7623,7 +7623,16 @@ DSPARK_TEST(ConvReverb_long_ir_costs_like_a_non_uniform_engine)
             tZl = std::chrono::duration<double>(t2 - t1).count();
         }
     }
-    EXPECT_LT(tReverb, 4.0 * tZl);
+    // A comparison of two timings: instrumentation weighs on the two engines
+    // differently (4.01 was read once under ThreadSanitizer).
+    if constexpr (kTimingReliable)
+    {
+        EXPECT_LT(tReverb, 4.0 * tZl);
+    }
+    else
+    {
+        EXPECT_TRUE(tReverb > 0.0 && tZl > 0.0);
+    }
 }
 
 // A block longer than maxBlockSize lost its dry signal past that length.

@@ -13,6 +13,20 @@
 
 namespace dspark::test {
 
+// Timing comparisons only mean something in optimised, uninstrumented builds.
+#if defined(_DEBUG) || defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) \
+    || ((defined(__GNUC__) || defined(__clang__)) && !defined(__OPTIMIZE__))
+inline constexpr bool kTimingReliable = false;
+#elif defined(__has_feature)
+  #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+inline constexpr bool kTimingReliable = false;
+  #else
+inline constexpr bool kTimingReliable = true;
+  #endif
+#else
+inline constexpr bool kTimingReliable = true;
+#endif
+
 // ============================================================================
 // Test registry
 // ============================================================================

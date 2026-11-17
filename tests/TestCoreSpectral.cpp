@@ -1127,8 +1127,8 @@ DSPARK_TEST(FFT_vectors_transpose_their_lanes_and_subtract_a_product)
 #endif
 }
 
-// A real signal has no imaginary part at DC or at Nyquist: the inverse does
-// not read those two values, whatever they hold, on either kernel set.
+// A real signal has no imaginary part at DC or at Nyquist: the inverse takes
+// those two values as zero, whatever they hold, on either kernel set.
 template <typename T>
 static void checkInverseSkipsTheRealBinsImaginaryParts()
 {
@@ -1153,7 +1153,7 @@ static void checkInverseSkipsTheRealBinsImaginaryParts()
     }
 }
 
-DSPARK_TEST(FFTReal_inverse_does_not_read_the_imaginary_parts_of_dc_and_nyquist)
+DSPARK_TEST(FFTReal_inverse_ignores_the_imaginary_parts_of_dc_and_nyquist)
 {
     const bool dispatch = simd::isRuntimeDispatchActive();
     for (const bool wide : { false, true })

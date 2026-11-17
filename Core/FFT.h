@@ -1474,14 +1474,18 @@ private:
 
     /// Lanes that kernels with vectors of `wide` and `narrow` values give a
     /// transform of `size` samples: the widest vector whose lanes each hold
-    /// at least four points and at least one group of bins for the step that
-    /// joins them; 0 where the transform runs on the half-size complex
-    /// engine (sizes below that, and builds without vectors).
+    /// at least eight points and half the square of the lane count (16
+    /// samples at two lanes, 32 at four, 256 at eight); 0 where the transform
+    /// runs on the half-size complex engine (sizes below that, and builds
+    /// without vectors). The step that joins the lanes costs more the wider
+    /// the vector, and a shorter transform has too few passes to make up for
+    /// it: below those sizes the lanes measured the same as the other engine
+    /// or slower with one compiler or another.
     [[nodiscard]] static constexpr size_t lanesFor(size_t size, int wide, int narrow) noexcept
     {
         const auto fits = [size](int width) noexcept {
             const size_t lanes = static_cast<size_t>(width);
-            return width > 1 && size >= 4 * lanes && size >= 2 * lanes * lanes;
+            return width > 1 && size >= 8 * lanes && 2 * size >= lanes * lanes * lanes;
         };
         return fits(wide) ? static_cast<size_t>(wide) : fits(narrow) ? static_cast<size_t>(narrow) : size_t{ 0 };
     }

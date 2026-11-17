@@ -1058,11 +1058,12 @@ DSPARK_TEST(OfflineProduct_allocation_failures_and_payload_bound)
         }
         EXPECT_TRUE(completed);
         // Every allocation point failed once (calls == index - 1 above). The
-        // setup makes 29 allocations on x86-64 builds with the runtime
-        // dispatch, where each FFT also keeps an in-lane twiddle copy, and 27
-        // elsewhere (32-bit x86, arm64, SSE2 without the dispatch); far fewer
-        // would mean the injection never reached the product's FFT windows.
-        EXPECT_GT(injected, 24);
+        // setup makes 21 allocations where a real FFT keeps its two work
+        // buffers and one set of tables (two allocations), and one more
+        // per FFT on x86-64 builds with the runtime dispatch, where it keeps
+        // a second set for the other kernels; 17 or fewer would mean the
+        // injection never reached the product's FFT windows.
+        EXPECT_GT(injected, 19);
     }
 }
 
@@ -1433,7 +1434,10 @@ DSPARK_TEST(StereoGenerator_prepare_failures_preserve_stream_and_callbacks_do_no
             EXPECT_TRUE(effect.prepare({96000, 1024, 2}, {factor, 175}));
         }
         EXPECT_TRUE(finished);
-        EXPECT_GT(injected, 50);
+        // 48 allocation points where a real FFT makes two allocations (its
+        // work buffers and one set of tables), more where it keeps a second
+        // set for the run-time dispatch.
+        EXPECT_GT(injected, 44);
     }
 }
 

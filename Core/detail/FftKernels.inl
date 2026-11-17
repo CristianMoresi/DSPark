@@ -1765,8 +1765,8 @@ void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noe
  *
  * A[r] = X[i + r n] and A[W - 1 - r] = conj(X[(r + 1) n - i]) are the
  * W-point transform that a_j = sum_r A[r] exp(2 pi i j r / W) undoes, and
- * Y_j[i] = conj(w^(ji)) a_j. The imaginary parts of bins 0 and N/2 are not
- * read (a real signal has none).
+ * Y_j[i] = conj(w^(ji)) a_j. The imaginary parts of bins 0 and N/2 are taken
+ * as zero whatever they hold (a real signal has none).
  */
 template <typename T, int W>
 void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noexcept
@@ -1794,14 +1794,13 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
             loadSpectrumRows<T, W>(in, i0, n, dr, di, mr, mi, std::make_index_sequence<half>());
         if (i0 == 0)
         {
-            // Bins 0 and N/2 with their imaginary parts as zero.
-            T head[2 * W], tail[2 * W];
-            std::copy_n(in, 2 * w, head);
-            head[1] = T(0);
-            std::copy_n(in + 2 * (half * n - (w - 1)), 2 * w, tail);
-            tail[2 * w - 1] = T(0);
-            O::loadDeinterleave(head, dr[0], di[0]);
-            O::loadDeinterleaveReversed(tail, mr[half - 1], mi[half - 1]);
+            // Bins 0 and N/2 with their imaginary parts as zero, whatever
+            // the spectrum holds there: lane 0 of the first rising row and
+            // of the last falling one.
+            static constexpr T index[8] = { T(0), T(1), T(2), T(3), T(4), T(5), T(6), T(7) };
+            const auto first = O::lt(O::load(index), O::set1(T(0.5)));
+            di[0] = O::select(first, O::set1(T(0)), di[0]);
+            mi[half - 1] = O::select(first, O::set1(T(0)), mi[half - 1]);
         }
         V re[W], im[W];
         if constexpr (W == 2)

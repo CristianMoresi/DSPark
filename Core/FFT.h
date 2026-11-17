@@ -93,6 +93,7 @@
 #include <cstring>
 #include <functional>
 #include <numbers>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -217,6 +218,38 @@ struct Plan
 template <typename T>
 struct Closing { T* out; T scaleRe; T scaleIm; };
 
+/// What a real transform by lanes reads (detail/FftKernels.inl): `lanes`
+/// sequences of n points each, one per lane of a vector.
+template <typename T>
+struct RealPlan
+{
+    size_t n;               ///< Points of each lane's transform.
+    size_t lanes;           ///< Lanes: the transform has n * lanes samples.
+    bool first8;            ///< The first pass takes eight samples (log2 n odd), not four.
+    size_t twiddleRepeat;   ///< Times the pass tables hold each value: 1, or `lanes`.
+    const T* twiddles;      ///< The pass tables, by rising length of the spectra they join.
+    const T* turn;          ///< The factors of the step that joins the lanes.
+    const T* edge;          ///< The factors of the lanes' middle bin.
+    T scale;                ///< 1 / (n * lanes), for the inverse.
+
+    /// Points of the spectra the first pass leaves.
+    [[nodiscard]] constexpr size_t firstLength() const noexcept { return first8 ? 8 : 4; }
+
+    /// Values in the table of the pass that joins spectra of m points:
+    /// (re, im) of three factors for each bin 1 .. m/2 - 1.
+    [[nodiscard]] static constexpr size_t passValues(size_t m, size_t repeat) noexcept
+    {
+        return 6 * repeat * (m / 2 - 1);
+    }
+
+    /// Passes of a lane transform of n points, the first one included: one
+    /// per two bits, the first taking three where their number is odd.
+    [[nodiscard]] static constexpr size_t passCount(size_t n) noexcept
+    {
+        return static_cast<size_t>(std::countr_zero(n)) / 2;
+    }
+};
+
 } // namespace plan
 
 using plan::TwiddleSpan;
@@ -224,6 +257,7 @@ using plan::Pass;
 using plan::Buffers;
 using plan::Plan;
 using plan::Closing;
+using plan::RealPlan;
 
 /// Block of the work layout between passes (detail/FftKernels.inl): the
 /// widest vector any copy of the kernels uses, the same in every copy.
@@ -827,6 +861,114 @@ private:
     bool stepAvx2_ = false;           ///< The kernel set runToStep() chose at step 0.
 };
 
+/**
+ * @class RealLaneTables
+ * @brief The tables of a real transform by lanes (detail/FftKernels.inl) for
+ *        one lane count, in one allocation: the twiddles of its passes, the
+ *        factors of the step that joins the lanes and those of the lanes'
+ *        middle bin.
+ */
+template <typename T>
+class RealLaneTables
+{
+public:
+    RealLaneTables() = default;
+
+    /**
+     * @brief Builds the tables of a transform of `size` real samples.
+     * @param size   Samples: a power of two, at least 4 * lanes and 2 * lanes^2.
+     * @param lanes  Lanes of the kernels that will run it (2, 4 or 8).
+     * @param repeat Times each pass twiddle is stored: 1 for kernels that
+     *               broadcast it, `lanes` for kernels that load it as a
+     *               whole vector.
+     */
+    RealLaneTables(size_t size, size_t lanes, size_t repeat)
+        : n_(size / lanes), lanes_(lanes), repeat_(repeat), values_(valueCount(size, lanes, repeat))
+    {
+        constexpr double turn = -2.0 * std::numbers::pi_v<double>;
+        T* w = values_.data();
+        // Passes: w^(ji), j = 1 .. 3, w = exp(-2 pi i / 4m), for the bins i
+        // of the spectra of m points that the pass joins.
+        for (size_t m = firstLength(n_); m < n_; m *= 4)
+            for (size_t i = 1; i < m / 2; ++i)
+            {
+                const double a = turn * static_cast<double>(i) / static_cast<double>(4 * m);
+                for (size_t j = 1; j <= 3; ++j)
+                {
+                    w = std::fill_n(w, repeat_, static_cast<T>(std::cos(static_cast<double>(j) * a)));
+                    w = std::fill_n(w, repeat_, static_cast<T>(std::sin(static_cast<double>(j) * a)));
+                }
+            }
+        // The joining step: exp(-2 pi i j k / size) for the lanes j >= 1,
+        // the bins k of a group along a vector.
+        turn_ = static_cast<size_t>(w - values_.data());
+        for (size_t first = 0; first < n_ / 2; first += lanes_)
+            for (size_t j = 1; j < lanes_; ++j)
+            {
+                for (size_t t = 0; t < lanes_; ++t)
+                {
+                    const double a = turn * static_cast<double>(j * (first + t)) / static_cast<double>(size);
+                    w[t] = static_cast<T>(std::cos(a));
+                    w[lanes_ + t] = static_cast<T>(std::sin(a));
+                }
+                w += 2 * lanes_;
+            }
+        // The middle bin: cos and sin of pi j (2r + 1) / lanes, exact where
+        // the angle is a multiple of a quarter turn.
+        edge_ = static_cast<size_t>(w - values_.data());
+        const auto exact = [](double v) noexcept {
+            if (std::abs(v) < 1e-15) return 0.0;
+            if (std::abs(v - 1.0) < 1e-15) return 1.0;
+            if (std::abs(v + 1.0) < 1e-15) return -1.0;
+            return v;
+        };
+        const size_t half = lanes_ / 2;
+        for (size_t j = 0; j < lanes_; ++j)
+            for (size_t r = 0; r < half; ++r)
+            {
+                const double a = std::numbers::pi_v<double> * static_cast<double>(j * (2 * r + 1))
+                               / static_cast<double>(lanes_);
+                w[j * half + r] = static_cast<T>(exact(std::cos(a)));
+                w[lanes_ * half + j * half + r] = static_cast<T>(exact(std::sin(a)));
+            }
+    }
+
+    /// Values the constructor requests (one allocation).
+    [[nodiscard]] static constexpr size_t valueCount(size_t size, size_t lanes, size_t repeat) noexcept
+    {
+        const size_t n = size / lanes;
+        size_t count = (lanes - 1) * n + lanes * lanes;
+        for (size_t m = firstLength(n); m < n; m *= 4)
+            count += RealPlan<T>::passValues(m, repeat);
+        return count;
+    }
+
+    [[nodiscard]] bool empty() const noexcept { return lanes_ == 0; }
+
+    /// Passes of each lane's transform (0 when empty).
+    [[nodiscard]] size_t passes() const noexcept { return empty() ? 0 : RealPlan<T>::passCount(n_); }
+
+    [[nodiscard]] RealPlan<T> plan() const noexcept
+    {
+        return { n_, lanes_, firstLength(n_) == 8, repeat_, values_.data(), values_.data() + turn_,
+                 values_.data() + edge_, T(1) / static_cast<T>(n_ * lanes_) };
+    }
+
+private:
+    /// Points of the spectra the first pass leaves: eight where log2(n) is odd.
+    [[nodiscard]] static constexpr size_t firstLength(size_t n) noexcept
+    {
+        return (std::countr_zero(n) & 1) != 0 ? 8 : 4;
+    }
+
+    size_t n_ = 0;        ///< Points per lane.
+    size_t lanes_ = 0;
+    size_t repeat_ = 1;
+    size_t turn_ = 0;     ///< Where the joining step's factors start.
+    size_t edge_ = 0;     ///< Where the middle bin's start.
+    std::vector<T> values_;
+};
+
 } // namespace fft
 } // namespace detail
 
@@ -955,11 +1097,20 @@ public:
      *        asserts and degrades to the minimal valid size instead).
      */
     explicit FFTReal(size_t size)
-        : realSize_(validateSize(size))   // validates BEFORE the engine is built
-        , halfSize_(realSize_ / 2)        // derived from the VALIDATED size, so the
-        , engine_(realSize_ / 2, true)    // trio stays coherent when size degrades
+        : realSize_(validateSize(size))   // validates BEFORE anything is built
+        , halfSize_(realSize_ / 2)        // derived from the VALIDATED size, so
+        , engine_(makeEngine(realSize_))  // everything stays coherent when size degrades
     {
-        computeSplitFactors();
+        const size_t lanes = baseLanes(realSize_);
+        if (lanes == 0)
+        {
+            computeSplitFactors();
+            return;
+        }
+        laneWork_ = detail::fft::WorkBuffers<T>(realSize_);
+        lanes_ = detail::fft::RealLaneTables<T>(realSize_, lanes, baseTwiddleRepeat(lanes));
+        if (const size_t other = dispatchedLanes(realSize_); other != lanes)
+            wideLanes_ = detail::fft::RealLaneTables<T>(realSize_, other, 1);
     }
 
     /** @brief Returns the number of real input samples (N). */
@@ -985,9 +1136,21 @@ public:
     {
         if (size < 4 || (size & (size - 1)) != 0)
             return 0;
-        return detail::fft::SplitFFT<T>::allocationBytes(size / 2, true)
-             + 2 * (splitFactorCount(size / 2) * sizeof(T)
-                    + detail::fft::SplitFFT<T>::kAllocationOverhead);
+        constexpr size_t overhead = detail::fft::SplitFFT<T>::kAllocationOverhead;
+        const size_t lanes = baseLanes(size);
+        if (lanes == 0)
+            return detail::fft::SplitFFT<T>::allocationBytes(size / 2, true)
+                 + 2 * (splitFactorCount(size / 2) * sizeof(T) + overhead);
+        using Tables = detail::fft::RealLaneTables<T>;
+        size_t values = detail::fft::WorkBuffers<T>::values(size)
+                      + Tables::valueCount(size, lanes, baseTwiddleRepeat(lanes));
+        size_t allocations = 2;
+        if (const size_t other = dispatchedLanes(size); other != lanes)
+        {
+            values += Tables::valueCount(size, other, 1);
+            ++allocations;
+        }
+        return values * sizeof(T) + allocations * overhead;
     }
 
     /**
@@ -997,10 +1160,24 @@ public:
      */
     void forward(const T* timeData, T* freqData) noexcept
     {
+        if (!lanes_.empty())
+        {
+            T* const a = laneWork_.first();
+            T* const b = laneWork_.second();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+            if (simd::isRuntimeDispatchActive())
+            {
+                detail::fft::avx2::realForward(dispatchedTables().plan(), timeData, freqData, a, b);
+                return;
+            }
+#endif
+            detail::fft::realForward(lanes_.plan(), timeData, freqData, a, b);
+            return;
+        }
         // (even, odd) sample pairs are the complex input.
         const T* zr = nullptr;
         const T* zi = nullptr;
-        engine_.runFrom(timeData, false, zr, zi);
+        engine_->runFrom(timeData, false, zr, zi);
         unpackForward(zr, zi, freqData);
     }
 
@@ -1011,17 +1188,34 @@ public:
      */
     void inverse(const T* freqData, T* timeData) noexcept
     {
+        if (!lanes_.empty())
+        {
+            T* const a = laneWork_.first();
+            T* const b = laneWork_.second();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+            if (simd::isRuntimeDispatchActive())
+            {
+                detail::fft::avx2::realInverse(dispatchedTables().plan(), freqData, timeData, a, b);
+                return;
+            }
+#endif
+            detail::fft::realInverse(lanes_.plan(), freqData, timeData, a, b);
+            return;
+        }
         // Pack into the conjugated half-size spectrum, run the forward engine,
         // conjugate back and scale by 1/(N/2): ifft = conj(fft(conj)) / M.
-        packInverseConj(freqData, engine_.inRe(), engine_.inIm());
+        packInverseConj(freqData, engine_->inRe(), engine_->inIm());
         const T scale = inverseScale();
-        engine_.runTo(timeData, scale, -scale);
+        engine_->runTo(timeData, scale, -scale);
     }
 
-    /** @brief Returns the number of steps inverseStep() splits inverse() into. */
+    /** @brief Returns the number of steps inverseStep() splits inverse() into
+     *  (the same for the life of the object). */
     [[nodiscard]] int getInverseStepCount() const noexcept
     {
-        return static_cast<int>(engine_.runToStepCount()) + 1;
+        if (!lanes_.empty())
+            return static_cast<int>(std::max(lanes_.passes(), wideLanes_.passes())) + 1;
+        return static_cast<int>(engine_->runToStepCount()) + 1;
     }
 
     /**
@@ -1040,13 +1234,36 @@ public:
      */
     void inverseStep(int step, const T* freqData, T* timeData) noexcept
     {
+        if (!lanes_.empty())
+        {
+            // Step 0 chooses the kernel set and the later steps keep it. A
+            // set whose transform has fewer passes than the count leaves its
+            // spare steps right after the first, so the last step is always
+            // the one that writes the samples.
+            if (step <= 0) stepDispatched_ = simd::isRuntimeDispatchActive();
+            const detail::fft::RealLaneTables<T>& tables = stepDispatched_ ? dispatchedTables() : lanes_;
+            const int spare = getInverseStepCount() - 1 - static_cast<int>(tables.passes());
+            if (step > 0 && step <= spare) return;
+            const size_t own = step <= 0 ? size_t{ 0 } : static_cast<size_t>(step - spare);
+            T* const a = laneWork_.first();
+            T* const b = laneWork_.second();
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+            if (stepDispatched_)
+            {
+                detail::fft::avx2::realInverseStep(tables.plan(), own, freqData, timeData, a, b);
+                return;
+            }
+#endif
+            detail::fft::realInverseStep(tables.plan(), own, freqData, timeData, a, b);
+            return;
+        }
         if (step <= 0)
         {
-            packInverseConj(freqData, engine_.inRe(), engine_.inIm());
+            packInverseConj(freqData, engine_->inRe(), engine_->inIm());
             return;
         }
         const T scale = inverseScale();
-        engine_.runToStep(static_cast<size_t>(step - 1), timeData, scale, -scale);
+        engine_->runToStep(static_cast<size_t>(step - 1), timeData, scale, -scale);
     }
 
     /**
@@ -1204,10 +1421,70 @@ private:
     /// The inverse's 1/M for the half-size spectrum.
     [[nodiscard]] T inverseScale() const noexcept { return T(1) / static_cast<T>(halfSize_); }
 
+    /// Lanes that kernels with vectors of `wide` and `narrow` values give a
+    /// transform of `size` samples: the widest vector whose lanes each hold
+    /// at least four points and at least one group of bins for the step that
+    /// joins them; 0 where the transform runs on the half-size complex
+    /// engine (sizes below that, and builds without vectors).
+    [[nodiscard]] static constexpr size_t lanesFor(size_t size, int wide, int narrow) noexcept
+    {
+        const auto fits = [size](int width) noexcept {
+            const size_t lanes = static_cast<size_t>(width);
+            return width > 1 && size >= 4 * lanes && size >= 2 * lanes * lanes;
+        };
+        return fits(wide) ? static_cast<size_t>(wide) : fits(narrow) ? static_cast<size_t>(narrow) : size_t{ 0 };
+    }
+
+    /// Lanes of the build's baseline kernels for `size` samples.
+    [[nodiscard]] static constexpr size_t baseLanes(size_t size) noexcept
+    {
+        return lanesFor(size, detail::fft::kWide<T>, detail::fft::kNarrow<T>);
+    }
+
+    /// Lanes of the kernels that run when the run-time dispatch is active
+    /// (the baseline's where the build has no dispatch).
+    [[nodiscard]] static constexpr size_t dispatchedLanes(size_t size) noexcept
+    {
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+        return lanesFor(size, detail::fft::avx2::kWide<T>, detail::fft::avx2::kNarrow<T>);
+#else
+        return baseLanes(size);
+#endif
+    }
+
+    /// Times the baseline's pass tables hold each twiddle.
+    [[nodiscard]] static constexpr size_t baseTwiddleRepeat([[maybe_unused]] size_t lanes) noexcept
+    {
+#if defined(DSPARK_FFT_REAL_WHOLE_TWIDDLES)
+        return lanes;
+#else
+        return 1;
+#endif
+    }
+
+    /// The half-size complex engine, for the sizes that run on it.
+    [[nodiscard]] static std::optional<detail::fft::SplitFFT<T>> makeEngine(size_t size)
+    {
+        if (baseLanes(size) != 0)
+            return std::nullopt;
+        return std::optional<detail::fft::SplitFFT<T>>(std::in_place, size / 2, true);
+    }
+
+    /// The tables of the dispatched kernels: their own where their lane count
+    /// differs from the baseline's.
+    [[nodiscard]] const detail::fft::RealLaneTables<T>& dispatchedTables() const noexcept
+    {
+        return wideLanes_.empty() ? lanes_ : wideLanes_;
+    }
+
     size_t realSize_;
     size_t halfSize_;
-    detail::fft::SplitFFT<T> engine_;
+    std::optional<detail::fft::SplitFFT<T>> engine_;   ///< Sizes that do not run by lanes.
     std::vector<T> splitRe_, splitIm_;   ///< Split factors c_k = (1 - j exp(-2 pi i k / N)) / 2.
+    detail::fft::WorkBuffers<T> laneWork_;        ///< The two buffers of the transform by lanes.
+    detail::fft::RealLaneTables<T> lanes_;        ///< The baseline kernels' tables (empty: engine_ runs).
+    detail::fft::RealLaneTables<T> wideLanes_;    ///< The dispatched kernels' own tables.
+    bool stepDispatched_ = false;                 ///< The kernel set inverseStep() chose at step 0.
 };
 
 } // namespace dspark

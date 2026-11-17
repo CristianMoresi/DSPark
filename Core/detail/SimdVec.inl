@@ -34,6 +34,8 @@ struct Vec<T, 1>
     static V mulSub(V a, V b, V c, V d) noexcept { return a * b - c * d; }
     static V mulAdd(V a, V b, V c, V d) noexcept { return a * b + c * d; }
     static V madd(V a, V b, V c) noexcept { return a * b + c; }
+    static V nmadd(V a, V b, V c) noexcept { return c - a * b; }
+    static void transpose(V*) noexcept {}
     static V reverse(V v) noexcept { return v; }
     static void loadDeinterleave(const T* p, V& re, V& im) noexcept { re = p[0]; im = p[1]; }
     static void loadDeinterleaveReversed(const T* p, V& re, V& im) noexcept { re = p[0]; im = p[1]; }
@@ -74,10 +76,12 @@ struct Vec<float, 4>
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm_fmsub_ps(a, b, _mm_mul_ps(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_fmadd_ps(a, b, _mm_mul_ps(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm_fmadd_ps(a, b, c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm_fnmadd_ps(a, b, c); }
 #else
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm_sub_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), _mm_mul_ps(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm_add_ps(_mm_mul_ps(a, b), c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm_sub_ps(c, _mm_mul_ps(a, b)); }
 #endif
     /// Comparisons give a mask M (all bits of a lane set where it holds; false
     /// where an operand is not a number); both() and either() combine two,
@@ -98,6 +102,16 @@ struct Vec<float, 4>
     static bool any(M m) noexcept { return _mm_movemask_ps(m) != 0; }
     static V select(M m, V a, V b) noexcept { return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b)); }
     static V reverse(V v) noexcept { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 1, 2, 3)); }
+    /// Transposes W vectors in place: v[k] receives lane k of each, in order.
+    static void transpose(V* v) noexcept
+    {
+        const V a = _mm_unpacklo_ps(v[0], v[1]), b = _mm_unpacklo_ps(v[2], v[3]);
+        const V c = _mm_unpackhi_ps(v[0], v[1]), d = _mm_unpackhi_ps(v[2], v[3]);
+        v[0] = _mm_movelh_ps(a, b);
+        v[1] = _mm_movehl_ps(b, a);
+        v[2] = _mm_movelh_ps(c, d);
+        v[3] = _mm_movehl_ps(d, c);
+    }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
         const V a = _mm_loadu_ps(p), b = _mm_loadu_ps(p + 4);
@@ -144,10 +158,12 @@ struct Vec<double, 2>
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm_fmsub_pd(a, b, _mm_mul_pd(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_fmadd_pd(a, b, _mm_mul_pd(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm_fmadd_pd(a, b, c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm_fnmadd_pd(a, b, c); }
 #else
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm_sub_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), _mm_mul_pd(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm_add_pd(_mm_mul_pd(a, b), c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm_sub_pd(c, _mm_mul_pd(a, b)); }
 #endif
     /// Masks, select() and maxOf() as in Vec<float, 4>.
     using M = __m128d;
@@ -162,6 +178,13 @@ struct Vec<double, 2>
     static bool any(M m) noexcept { return _mm_movemask_pd(m) != 0; }
     static V select(M m, V a, V b) noexcept { return _mm_or_pd(_mm_and_pd(m, a), _mm_andnot_pd(m, b)); }
     static V reverse(V v) noexcept { return _mm_shuffle_pd(v, v, 1); }
+    /// transpose() as in Vec<float, 4>.
+    static void transpose(V* v) noexcept
+    {
+        const V a = _mm_unpacklo_pd(v[0], v[1]);
+        v[1] = _mm_unpackhi_pd(v[0], v[1]);
+        v[0] = a;
+    }
     static V set2(double lane0Value, double lane1Value) noexcept { return _mm_set_pd(lane1Value, lane0Value); }
     static double lane0(V v) noexcept { return _mm_cvtsd_f64(v); }
     static double lane1(V v) noexcept { return _mm_cvtsd_f64(_mm_unpackhi_pd(v, v)); }
@@ -229,6 +252,7 @@ struct Vec<float, 4>
     // Explicit fusion keeps vector and broadcast tails identical even when
     // GCC otherwise contracts their multiply/add expressions differently.
     static V madd(V a, V b, V c) noexcept { return vfmaq_f32(c, a, b); }
+    static V nmadd(V a, V b, V c) noexcept { return vfmsq_f32(c, a, b); }
     /// Comparisons give a mask M (all bits of a lane set where it holds; false
     /// where an operand is not a number); both() and either() combine two,
     /// any() tells whether a lane is set and select() takes a where the mask
@@ -248,6 +272,15 @@ struct Vec<float, 4>
     static bool any(M m) noexcept { return vmaxvq_u32(m) != 0; }
     static V select(M m, V a, V b) noexcept { return vbslq_f32(m, a, b); }
     static V reverse(V v) noexcept { const V r = vrev64q_f32(v); return vextq_f32(r, r, 2); }
+    /// Transposes W vectors in place: v[k] receives lane k of each, in order.
+    static void transpose(V* v) noexcept
+    {
+        const float32x4x2_t ab = vtrnq_f32(v[0], v[1]), cd = vtrnq_f32(v[2], v[3]);
+        v[0] = vcombine_f32(vget_low_f32(ab.val[0]), vget_low_f32(cd.val[0]));
+        v[1] = vcombine_f32(vget_low_f32(ab.val[1]), vget_low_f32(cd.val[1]));
+        v[2] = vcombine_f32(vget_high_f32(ab.val[0]), vget_high_f32(cd.val[0]));
+        v[3] = vcombine_f32(vget_high_f32(ab.val[1]), vget_high_f32(cd.val[1]));
+    }
     static void loadDeinterleave(const float* p, V& re, V& im) noexcept
     {
         const float32x4x2_t v = vld2q_f32(p);
@@ -293,6 +326,7 @@ struct Vec<double, 2>
     static V mulSub(V a, V b, V c, V d) noexcept { return vfmsq_f64(vmulq_f64(a, b), c, d); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return vfmaq_f64(vmulq_f64(a, b), c, d); }
     static V madd(V a, V b, V c) noexcept { return vfmaq_f64(c, a, b); }
+    static V nmadd(V a, V b, V c) noexcept { return vfmsq_f64(c, a, b); }
     /// Masks, select() and maxOf() as in Vec<float, 4>.
     using M = uint64x2_t;
     static V abs(V v) noexcept { return vabsq_f64(v); }
@@ -306,6 +340,13 @@ struct Vec<double, 2>
     static bool any(M m) noexcept { return (vgetq_lane_u64(m, 0) | vgetq_lane_u64(m, 1)) != 0; }
     static V select(M m, V a, V b) noexcept { return vbslq_f64(m, a, b); }
     static V reverse(V v) noexcept { return vextq_f64(v, v, 1); }
+    /// transpose() as in Vec<float, 4>.
+    static void transpose(V* v) noexcept
+    {
+        const V a = vzip1q_f64(v[0], v[1]);
+        v[1] = vzip2q_f64(v[0], v[1]);
+        v[0] = a;
+    }
     static V set2(double lane0Value, double lane1Value) noexcept { return vsetq_lane_f64(lane1Value, vdupq_n_f64(lane0Value), 1); }
     static double lane0(V v) noexcept { return vgetq_lane_f64(v, 0); }
     static double lane1(V v) noexcept { return vgetq_lane_f64(v, 1); }
@@ -372,10 +413,12 @@ struct Vec<float, 8>
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_fmsub_ps(a, b, _mm256_mul_ps(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_fmadd_ps(a, b, _mm256_mul_ps(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm256_fmadd_ps(a, b, c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm256_fnmadd_ps(a, b, c); }
 #else
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_sub_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), _mm256_mul_ps(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm256_add_ps(_mm256_mul_ps(a, b), c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm256_sub_ps(c, _mm256_mul_ps(a, b)); }
 #endif
     /// Masks, select() and maxOf() as in Vec<float, 4>.
     using M = __m256;
@@ -397,6 +440,26 @@ struct Vec<float, 8>
         const V swapped = _mm256_permute2f128_ps(v, v, 1);
         return _mm256_permute_ps(swapped, _MM_SHUFFLE(0, 1, 2, 3));
 #endif
+    }
+    /// transpose() as in Vec<float, 4>.
+    static void transpose(V* v) noexcept
+    {
+        const V a0 = _mm256_unpacklo_ps(v[0], v[1]), a1 = _mm256_unpackhi_ps(v[0], v[1]);
+        const V a2 = _mm256_unpacklo_ps(v[2], v[3]), a3 = _mm256_unpackhi_ps(v[2], v[3]);
+        const V a4 = _mm256_unpacklo_ps(v[4], v[5]), a5 = _mm256_unpackhi_ps(v[4], v[5]);
+        const V a6 = _mm256_unpacklo_ps(v[6], v[7]), a7 = _mm256_unpackhi_ps(v[6], v[7]);
+        const V b0 = _mm256_shuffle_ps(a0, a2, 0x44), b1 = _mm256_shuffle_ps(a0, a2, 0xEE);
+        const V b2 = _mm256_shuffle_ps(a1, a3, 0x44), b3 = _mm256_shuffle_ps(a1, a3, 0xEE);
+        const V b4 = _mm256_shuffle_ps(a4, a6, 0x44), b5 = _mm256_shuffle_ps(a4, a6, 0xEE);
+        const V b6 = _mm256_shuffle_ps(a5, a7, 0x44), b7 = _mm256_shuffle_ps(a5, a7, 0xEE);
+        v[0] = _mm256_permute2f128_ps(b0, b4, 0x20);
+        v[1] = _mm256_permute2f128_ps(b1, b5, 0x20);
+        v[2] = _mm256_permute2f128_ps(b2, b6, 0x20);
+        v[3] = _mm256_permute2f128_ps(b3, b7, 0x20);
+        v[4] = _mm256_permute2f128_ps(b0, b4, 0x31);
+        v[5] = _mm256_permute2f128_ps(b1, b5, 0x31);
+        v[6] = _mm256_permute2f128_ps(b2, b6, 0x31);
+        v[7] = _mm256_permute2f128_ps(b3, b7, 0x31);
     }
     /// loadDeinterleave() without crossing the 128-bit halves: the lanes come
     /// out in the order (0, 1, 4, 5, 2, 3, 6, 7).
@@ -470,10 +533,12 @@ struct Vec<double, 4>
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_fmsub_pd(a, b, _mm256_mul_pd(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_fmadd_pd(a, b, _mm256_mul_pd(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm256_fmadd_pd(a, b, c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm256_fnmadd_pd(a, b, c); }
 #else
     static V mulSub(V a, V b, V c, V d) noexcept { return _mm256_sub_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
     static V mulAdd(V a, V b, V c, V d) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), _mm256_mul_pd(c, d)); }
     static V madd(V a, V b, V c) noexcept { return _mm256_add_pd(_mm256_mul_pd(a, b), c); }
+    static V nmadd(V a, V b, V c) noexcept { return _mm256_sub_pd(c, _mm256_mul_pd(a, b)); }
 #endif
     /// The sum of the lanes, (l0 + l2) + (l1 + l3); sumLanes4() writes four
     /// of them in the same order.
@@ -508,6 +573,16 @@ struct Vec<double, 4>
         const V swapped = _mm256_permute2f128_pd(v, v, 1);
         return _mm256_permute_pd(swapped, 0x5);
 #endif
+    }
+    /// transpose() as in Vec<float, 4>.
+    static void transpose(V* v) noexcept
+    {
+        const V a = _mm256_unpacklo_pd(v[0], v[1]), b = _mm256_unpackhi_pd(v[0], v[1]);
+        const V c = _mm256_unpacklo_pd(v[2], v[3]), d = _mm256_unpackhi_pd(v[2], v[3]);
+        v[0] = _mm256_permute2f128_pd(a, c, 0x20);
+        v[1] = _mm256_permute2f128_pd(b, d, 0x20);
+        v[2] = _mm256_permute2f128_pd(a, c, 0x31);
+        v[3] = _mm256_permute2f128_pd(b, d, 0x31);
     }
     /// loadDeinterleave() without crossing the 128-bit halves: the lanes come
     /// out in the order (0, 2, 1, 3).

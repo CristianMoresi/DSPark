@@ -1227,3 +1227,657 @@ void transformToStep(const Plan<T>& p, Buffers<T>& b, size_t step, const Closing
         closeInterleaved(p.passes[p.passCount - 1], b.xr, b.xi, p.passCount > 1, inLane, c.out, c.scaleRe,
                          c.scaleIm);
 }
+
+// ---------------------------------------------------------------------------
+// The real transform by lanes (FFTReal).
+//
+// The N samples are W sequences of n = N / W points, point t of sequence j
+// at x[W t + j]: a vector loaded at a multiple of W holds one point of each.
+// The passes below work on such vectors as a scalar transform works on
+// numbers, so each sequence is transformed in its own lane and no pass
+// shuffles anything; one last step joins the W spectra into the spectrum of
+// the N samples, W bins of each at a time (the only place where lanes mix).
+//
+// A spectrum of m real points is kept packed in m elements: X[0] and X[m/2]
+// (both real) in elements 0 and 1, then the real and imaginary parts of
+// X[1] .. X[m/2 - 1] in elements 2i and 2i + 1. A buffer holds the spectra of
+// the sequences t0 + (n / m) t, t0 = 0 .. n/m - 1, one after another: the
+// samples themselves are that with m = 1. A pass joins the spectra t0,
+// t0 + q, t0 + 2q and t0 + 3q (q a quarter of the spectra) into the one of
+// t0 with four times the points; its twiddles depend on the bin alone, so
+// every group and every lane shares them.
+// ---------------------------------------------------------------------------
+
+/// One twiddle of a lane pass: a whole vector where the table repeats each
+/// value across the lanes, a broadcast otherwise.
+template <typename T, int W, bool Whole>
+inline typename Vec<T, W>::V laneTwiddle(const T* at) noexcept
+{
+    if constexpr (Whole) return Vec<T, W>::load(at);
+    else return Vec<T, W>::set1(*at);
+}
+
+/// The first pass of a lane transform whose log2(n) is even: the four-point
+/// spectra of the samples t0, t0 + n/4, t0 + n/2 and t0 + 3n/4.
+template <typename T, int W>
+void realFirst4(const T* in, T* out, size_t n) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    const size_t quarter = w * (n / 4);
+    for (const T* const end = in + quarter; in != end; in += w, out += 4 * w)
+    {
+        const V a0 = O::load(in), a1 = O::load(in + quarter);
+        const V a2 = O::load(in + 2 * quarter), a3 = O::load(in + 3 * quarter);
+        const V s02 = O::add(a0, a2), s13 = O::add(a1, a3);
+        O::store(out, O::add(s02, s13));           // X[0]
+        O::store(out + w, O::sub(s02, s13));       // X[2]
+        O::store(out + 2 * w, O::sub(a0, a2));     // X[1] = (a0 - a2) + j (a3 - a1)
+        O::store(out + 3 * w, O::sub(a3, a1));
+    }
+}
+
+/// The first pass where log2(n) is odd: the eight-point spectra of the
+/// samples t0 + k n/8, in one sweep (a radix-2 pass and a radix-4 pass over
+/// the samples would cost the same additions and one more sweep).
+template <typename T, int W>
+void realFirst8(const T* in, T* out, size_t n) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    const size_t eighth = w * (n / 8);
+    const V h = O::set1(static_cast<T>(0.70710678118654752440));
+    const V nh = O::set1(static_cast<T>(-0.70710678118654752440));
+    for (const T* const end = in + eighth; in != end; in += w, out += 8 * w)
+    {
+        const V x0 = O::load(in), x4 = O::load(in + 4 * eighth);
+        const V x1 = O::load(in + eighth), x5 = O::load(in + 5 * eighth);
+        const V x2 = O::load(in + 2 * eighth), x6 = O::load(in + 6 * eighth);
+        const V x3 = O::load(in + 3 * eighth), x7 = O::load(in + 7 * eighth);
+        const V s0 = O::add(x0, x4), s1 = O::add(x1, x5), s2 = O::add(x2, x6), s3 = O::add(x3, x7);
+        const V d0 = O::sub(x0, x4), d1 = O::sub(x1, x5), d2 = O::sub(x2, x6), d3 = O::sub(x3, x7);
+        const V s02 = O::add(s0, s2), s13 = O::add(s1, s3);
+        // The odd bins take the differences turned by w8^k: X[1] = d0 +
+        // h (d1 - d3) - j (d2 + h (d1 + d3)), X[3] = d0 - h (d1 - d3) +
+        // j (d2 - h (d1 + d3)), h = sqrt(1/2).
+        const V p = O::mul(h, O::sub(d1, d3)), r = O::mul(nh, O::add(d1, d3));
+        O::store(out, O::add(s02, s13));           // X[0]
+        O::store(out + w, O::sub(s02, s13));       // X[4]
+        O::store(out + 2 * w, O::add(d0, p));      // X[1]
+        O::store(out + 3 * w, O::sub(r, d2));
+        O::store(out + 4 * w, O::sub(s0, s2));     // X[2]
+        O::store(out + 5 * w, O::sub(s3, s1));
+        O::store(out + 6 * w, O::sub(d0, p));      // X[3]
+        O::store(out + 7 * w, O::add(d2, r));
+    }
+}
+
+/**
+ * @brief Joins four spectra of m points (m >= 4) into one of 4m, for every
+ *        group of the buffer: Z[k] = sum_j w^(jk) X_j[k mod m], w =
+ *        exp(-2 pi i / 4m).
+ *
+ * With t_j = w^(ji) X_j[i] for a bin 0 < i < m/2, u0 = X_0 + t2, u1 = X_0 -
+ * t2, u2 = t1 + t3 and u3 = t3 - t1, the four bins that bin i reaches are
+ * Z[i] = u0 + u2, Z[2m - i] = conj(u0 - u2), Z[m + i] = u1 + j u3 and
+ * Z[m - i] = conj(u1 - j u3). Bins 0 and m/2 of the inputs are real and
+ * take a few additions each.
+ *
+ * @param in  n / m spectra of m points.
+ * @param out Receives n / 4m spectra of 4m points.
+ * @param tw  (re, im) of w^i, w^2i, w^3i for i = 1 .. m/2 - 1.
+ */
+template <typename T, int W, bool Whole>
+void realRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    constexpr size_t tl = Whole ? w : 1;
+    const size_t quarter = w * (n / 4);   // between the four spectra that join
+    const size_t run = w * m;             // one of them
+    const V h = O::set1(static_cast<T>(0.70710678118654752440));
+    const V nh = O::set1(static_cast<T>(-0.70710678118654752440));
+    for (const T* const end = in + quarter; in != end; in += run, out += 4 * run)
+    {
+        const T* const x0 = in;
+        const T* const x1 = in + quarter;
+        const T* const x2 = in + 2 * quarter;
+        const T* const x3 = in + 3 * quarter;
+        {
+            // Bin 0 of each: bins 0, 2m (both real) and m.
+            const V a0 = O::load(x0), a1 = O::load(x1), a2 = O::load(x2), a3 = O::load(x3);
+            const V s02 = O::add(a0, a2), s13 = O::add(a1, a3);
+            O::store(out, O::add(s02, s13));
+            O::store(out + w, O::sub(s02, s13));
+            O::store(out + 2 * run, O::sub(a0, a2));
+            O::store(out + 2 * run + w, O::sub(a3, a1));
+        }
+        {
+            // Bin m/2 of each: bins m/2 and 3m/2, turned by the eighth roots.
+            const V b0 = O::load(x0 + w), b1 = O::load(x1 + w), b2 = O::load(x2 + w), b3 = O::load(x3 + w);
+            const V p = O::mul(h, O::sub(b1, b3)), r = O::mul(nh, O::add(b1, b3));
+            O::store(out + run, O::add(b0, p));
+            O::store(out + run + w, O::sub(r, b2));
+            O::store(out + 3 * run, O::sub(b0, p));
+            O::store(out + 3 * run + w, O::add(b2, r));
+        }
+        const T* t = tw;
+        for (size_t e = 2 * w; e < run; e += 2 * w, t += 6 * tl)
+        {
+            const V ar = O::load(x0 + e), ai = O::load(x0 + e + w);
+            const V br = O::load(x1 + e), bi = O::load(x1 + e + w);
+            const V cr = O::load(x2 + e), ci = O::load(x2 + e + w);
+            const V dr = O::load(x3 + e), di = O::load(x3 + e + w);
+            const V w1r = laneTwiddle<T, W, Whole>(t), w1i = laneTwiddle<T, W, Whole>(t + tl);
+            const V w2r = laneTwiddle<T, W, Whole>(t + 2 * tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
+            const V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl), w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
+            const V t1r = O::mulSub(w1r, br, w1i, bi), t1i = O::mulAdd(w1r, bi, w1i, br);
+            const V t2r = O::mulSub(w2r, cr, w2i, ci), t2i = O::mulAdd(w2r, ci, w2i, cr);
+            const V t3r = O::mulSub(w3r, dr, w3i, di), t3i = O::mulAdd(w3r, di, w3i, dr);
+            const V u0r = O::add(ar, t2r), u0i = O::add(ai, t2i);
+            const V u1r = O::sub(ar, t2r), u1i = O::sub(ai, t2i);
+            const V u2r = O::add(t1r, t3r), u2i = O::add(t1i, t3i);
+            const V u3r = O::sub(t3r, t1r), u3i = O::sub(t3i, t1i);
+            T* const z0 = out + e;               // bin i
+            T* const z1 = out + 2 * run - e;     // bin m - i
+            T* const z2 = out + 2 * run + e;     // bin m + i
+            T* const z3 = out + 4 * run - e;     // bin 2m - i
+            O::store(z0, O::add(u0r, u2r));
+            O::store(z0 + w, O::add(u0i, u2i));
+            O::store(z1, O::add(u1r, u3i));
+            O::store(z1 + w, O::sub(u3r, u1i));
+            O::store(z2, O::sub(u1r, u3i));
+            O::store(z2 + w, O::add(u1i, u3r));
+            O::store(z3, O::sub(u0r, u2r));
+            O::store(z3 + w, O::sub(u2i, u0i));
+        }
+    }
+}
+
+/// realRadix4() undone, four times over: splits the spectra of 4m points
+/// into four of m (the same twiddles, conjugated).
+template <typename T, int W, bool Whole>
+void realInverseRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    constexpr size_t tl = Whole ? w : 1;
+    const size_t quarter = w * (n / 4);
+    const size_t run = w * m;
+    const V k = O::set1(static_cast<T>(1.41421356237309504880));
+    const V nk = O::set1(static_cast<T>(-1.41421356237309504880));
+    for (T* const end = out + quarter; out != end; out += run, in += 4 * run)
+    {
+        T* const x0 = out;
+        T* const x1 = out + quarter;
+        T* const x2 = out + 2 * quarter;
+        T* const x3 = out + 3 * quarter;
+        {
+            const V z0 = O::load(in), z2 = O::load(in + w);
+            const V zr = O::load(in + 2 * run), zi = O::load(in + 2 * run + w);
+            const V s = O::add(z0, z2), d = O::sub(z0, z2);
+            const V zr2 = O::add(zr, zr), zi2 = O::add(zi, zi);
+            O::store(x0, O::add(s, zr2));
+            O::store(x1, O::sub(d, zi2));
+            O::store(x2, O::sub(s, zr2));
+            O::store(x3, O::add(d, zi2));
+        }
+        {
+            const V pr = O::load(in + run), pi = O::load(in + run + w);
+            const V qr = O::load(in + 3 * run), qi = O::load(in + 3 * run + w);
+            const V a = O::add(pr, qr), b = O::sub(pr, qr), c = O::sub(qi, pi), d = O::add(pi, qi);
+            O::store(x0 + w, O::add(a, a));
+            O::store(x1 + w, O::mul(k, O::sub(b, d)));
+            O::store(x2 + w, O::add(c, c));
+            O::store(x3 + w, O::mul(nk, O::add(b, d)));
+        }
+        const T* t = tw;
+        for (size_t e = 2 * w; e < run; e += 2 * w, t += 6 * tl)
+        {
+            const T* const z0 = in + e;               // bin i
+            const T* const z1 = in + 2 * run - e;     // bin m - i
+            const T* const z2 = in + 2 * run + e;     // bin m + i
+            const T* const z3 = in + 4 * run - e;     // bin 2m - i
+            const V pr = O::load(z0), pi = O::load(z0 + w);
+            const V sr = O::load(z1), si = O::load(z1 + w);
+            const V rr = O::load(z2), ri = O::load(z2 + w);
+            const V qr = O::load(z3), qi = O::load(z3 + w);
+            // 2 u0 = Z[i] + conj(Z[2m - i]), 2 u2 their difference; 2 u1 =
+            // Z[m + i] + conj(Z[m - i]) and 2 u3 = (f, -g).
+            const V e0r = O::add(pr, qr), e0i = O::sub(pi, qi);
+            const V e2r = O::sub(pr, qr), e2i = O::add(pi, qi);
+            const V e1r = O::add(rr, sr), e1i = O::sub(ri, si);
+            const V f = O::add(ri, si), g = O::sub(rr, sr);
+            const V t1r = O::sub(e2r, f), t1i = O::add(e2i, g);
+            const V t2r = O::sub(e0r, e1r), t2i = O::sub(e0i, e1i);
+            const V t3r = O::add(e2r, f), t3i = O::sub(e2i, g);
+            const V w1r = laneTwiddle<T, W, Whole>(t), w1i = laneTwiddle<T, W, Whole>(t + tl);
+            const V w2r = laneTwiddle<T, W, Whole>(t + 2 * tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
+            const V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl), w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
+            O::store(x0 + e, O::add(e0r, e1r));
+            O::store(x0 + e + w, O::add(e0i, e1i));
+            O::store(x1 + e, O::mulAdd(w1r, t1r, w1i, t1i));
+            O::store(x1 + e + w, O::mulSub(w1r, t1i, w1i, t1r));
+            O::store(x2 + e, O::mulAdd(w2r, t2r, w2i, t2i));
+            O::store(x2 + e + w, O::mulSub(w2r, t2i, w2i, t2r));
+            O::store(x3 + e, O::mulAdd(w3r, t3r, w3i, t3i));
+            O::store(x3 + e + w, O::mulSub(w3r, t3i, w3i, t3r));
+        }
+    }
+}
+
+/// realFirst4() undone and scaled: the samples from the four-point spectra.
+template <typename T, int W>
+void realLast4(const T* in, T* out, size_t n, T scale) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    const size_t quarter = w * (n / 4);
+    const V c = O::set1(scale), c2 = O::set1(scale + scale);
+    for (T* const end = out + quarter; out != end; out += w, in += 4 * w)
+    {
+        const V z0 = O::load(in), z2 = O::load(in + w);
+        const V zr = O::load(in + 2 * w), zi = O::load(in + 3 * w);
+        const V s = O::mul(O::add(z0, z2), c), d = O::mul(O::sub(z0, z2), c);
+        O::store(out, O::madd(zr, c2, s));
+        O::store(out + quarter, O::nmadd(zi, c2, d));
+        O::store(out + 2 * quarter, O::nmadd(zr, c2, s));
+        O::store(out + 3 * quarter, O::madd(zi, c2, d));
+    }
+}
+
+/// realFirst8() undone and scaled.
+template <typename T, int W>
+void realLast8(const T* in, T* out, size_t n, T scale) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    const size_t eighth = w * (n / 8);
+    const V c = O::set1(scale), c2 = O::set1(scale + scale);
+    const V kc = O::set1(static_cast<T>(1.41421356237309504880) * scale);
+    const V nkc = O::set1(static_cast<T>(-1.41421356237309504880) * scale);
+    for (T* const end = out + eighth; out != end; out += w, in += 8 * w)
+    {
+        const V z0 = O::load(in), z4 = O::load(in + w);
+        const V pr = O::load(in + 2 * w), pi = O::load(in + 3 * w);
+        const V z2r = O::load(in + 4 * w), z2i = O::load(in + 5 * w);
+        const V qr = O::load(in + 6 * w), qi = O::load(in + 7 * w);
+        // The sums of the sample pairs four apart, from the even bins ...
+        const V s = O::mul(O::add(z0, z4), c), d = O::mul(O::sub(z0, z4), c);
+        const V s0 = O::madd(z2r, c2, s), s2 = O::nmadd(z2r, c2, s);
+        const V s1 = O::nmadd(z2i, c2, d), s3 = O::madd(z2i, c2, d);
+        // ... and their differences, from the odd ones.
+        const V a = O::add(pr, qr), b = O::sub(pr, qr), g = O::sub(qi, pi), e = O::add(pi, qi);
+        const V d0 = O::mul(a, c2), d2 = O::mul(g, c2);
+        const V d1 = O::mul(kc, O::sub(b, e)), d3 = O::mul(nkc, O::add(b, e));
+        O::store(out, O::add(s0, d0));
+        O::store(out + eighth, O::add(s1, d1));
+        O::store(out + 2 * eighth, O::add(s2, d2));
+        O::store(out + 3 * eighth, O::add(s3, d3));
+        O::store(out + 4 * eighth, O::sub(s0, d0));
+        O::store(out + 5 * eighth, O::sub(s1, d1));
+        O::store(out + 6 * eighth, O::sub(s2, d2));
+        O::store(out + 7 * eighth, O::sub(s3, d3));
+    }
+}
+
+/**
+ * @brief The last step of the forward transform: joins the W lanes' spectra
+ *        of n points into the spectrum of the N = W n samples, as interleaved
+ *        (re, im) bins 0 .. N/2.
+ *
+ * It is the pass that joins W spectra, with the spectra in the lanes: a_j =
+ * w^(ji) Y_j[i] (w = exp(-2 pi i / N)) and A = the W-point transform of a
+ * give X[i + r n] = A[r] and X[(r + 1) n - i] = conj(A[W - 1 - r]) for r <
+ * W/2. W bins i go at a time: their 2W vectors are transposed, so that each
+ * lane's values lie along a vector, and the results leave as W/2 runs of W
+ * rising bins and W/2 runs of W falling ones. Bin 0 goes with the others (its
+ * imaginary part taken as zero; what it writes twice, it writes equal), bin
+ * n/2 on its own after them.
+ *
+ * @param in   The lanes' packed spectra (n elements).
+ * @param out  Receives N + 2 values.
+ * @param tw   For every group of W bins and every lane j = 1 .. W - 1, the
+ *             real and the imaginary parts of w^(ji) over the group's bins.
+ * @param edge cos then sin of pi j (2r + 1) / W at [j W/2 + r].
+ */
+template <typename T, int W>
+void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    constexpr size_t half = w / 2;
+    T middle[W];
+    O::store(middle, O::load(in + w));
+    for (size_t i0 = 0; i0 < n / 2; i0 += w, in += 2 * w * w, tw += 2 * (w - 1) * w)
+    {
+        V re[W], im[W];
+        for (size_t t = 0; t < w; ++t)
+        {
+            re[t] = O::load(in + 2 * t * w);
+            im[t] = O::load(in + (2 * t + 1) * w);
+        }
+        if (i0 == 0) im[0] = O::set1(T(0));   // that element holds bin n/2
+        O::transpose(re);
+        O::transpose(im);
+        for (size_t j = 1; j < w; ++j)
+        {
+            const V wr = O::load(tw + 2 * (j - 1) * w), wi = O::load(tw + (2 * j - 1) * w);
+            const V r = O::mulSub(wr, re[j], wi, im[j]);
+            im[j] = O::mulAdd(wr, im[j], wi, re[j]);
+            re[j] = r;
+        }
+        // Rising bins i + r n and falling bins (r + 1) n - i; the falling
+        // ones go first, so that bin 0's doubles end as the rising values.
+        const auto rising = [&](size_t r) noexcept { return out + 2 * (i0 + r * n); };
+        const auto falling = [&](size_t r) noexcept { return out + 2 * ((r + 1) * n - i0 - (w - 1)); };
+        if constexpr (W == 2)
+        {
+            O::storeInterleave2Reversed(falling(0), O::sub(re[0], re[1]), O::sub(im[1], im[0]));
+            O::storeInterleave2(rising(0), O::add(re[0], re[1]), O::add(im[0], im[1]));
+        }
+        else if constexpr (W == 4)
+        {
+            const V u0r = O::add(re[0], re[2]), u0i = O::add(im[0], im[2]);
+            const V u1r = O::sub(re[0], re[2]), u1i = O::sub(im[0], im[2]);
+            const V u2r = O::add(re[1], re[3]), u2i = O::add(im[1], im[3]);
+            const V u3r = O::sub(re[3], re[1]), u3i = O::sub(im[3], im[1]);
+            O::storeInterleave2Reversed(falling(0), O::add(u1r, u3i), O::sub(u3r, u1i));
+            O::storeInterleave2Reversed(falling(1), O::sub(u0r, u2r), O::sub(u2i, u0i));
+            O::storeInterleave2(rising(0), O::add(u0r, u2r), O::add(u0i, u2i));
+            O::storeInterleave2(rising(1), O::sub(u1r, u3i), O::add(u1i, u3r));
+        }
+        else
+        {
+            // Eight lanes: the even outputs are the four-point transform of
+            // p_j = a_j + a_(j+4), the odd ones that of q_j = a_j - a_(j+4)
+            // turned by w8^j.
+            const V h = O::set1(static_cast<T>(0.70710678118654752440));
+            const V nh = O::set1(static_cast<T>(-0.70710678118654752440));
+            const V p0r = O::add(re[0], re[4]), p0i = O::add(im[0], im[4]);
+            const V p1r = O::add(re[1], re[5]), p1i = O::add(im[1], im[5]);
+            const V p2r = O::add(re[2], re[6]), p2i = O::add(im[2], im[6]);
+            const V p3r = O::add(re[3], re[7]), p3i = O::add(im[3], im[7]);
+            const V q0r = O::sub(re[0], re[4]), q0i = O::sub(im[0], im[4]);
+            const V q1r = O::sub(re[1], re[5]), q1i = O::sub(im[1], im[5]);
+            const V q2r = O::sub(re[2], re[6]), q2i = O::sub(im[2], im[6]);
+            const V q3r = O::sub(re[3], re[7]), q3i = O::sub(im[3], im[7]);
+            const V u0r = O::add(p0r, p2r), u0i = O::add(p0i, p2i);
+            const V u1r = O::sub(p0r, p2r), u1i = O::sub(p0i, p2i);
+            const V u2r = O::add(p1r, p3r), u2i = O::add(p1i, p3i);
+            const V u3r = O::sub(p3r, p1r), u3i = O::sub(p3i, p1i);
+            const V v0r = O::add(q0r, q2i), v0i = O::sub(q0i, q2r);
+            const V v1r = O::sub(q0r, q2i), v1i = O::add(q0i, q2r);
+            const V m1 = O::sub(q1r, q3r), m2 = O::add(q1i, q3i);
+            const V m3 = O::sub(q1i, q3i), m4 = O::add(q1r, q3r);
+            const V k1 = O::mul(h, O::add(m1, m2)), k2 = O::mul(h, O::sub(m3, m4));
+            const V k3 = O::mul(nh, O::add(m3, m4)), k4 = O::mul(h, O::sub(m1, m2));
+            O::storeInterleave2Reversed(falling(0), O::add(v1r, k4), O::sub(k3, v1i));   // conj(A[7])
+            O::storeInterleave2Reversed(falling(1), O::add(u1r, u3i), O::sub(u3r, u1i)); // conj(A[6])
+            O::storeInterleave2Reversed(falling(2), O::sub(v0r, k1), O::sub(k2, v0i));   // conj(A[5])
+            O::storeInterleave2Reversed(falling(3), O::sub(u0r, u2r), O::sub(u2i, u0i)); // conj(A[4])
+            O::storeInterleave2(rising(0), O::add(u0r, u2r), O::add(u0i, u2i));           // A[0]
+            O::storeInterleave2(rising(1), O::add(v0r, k1), O::add(v0i, k2));             // A[1]
+            O::storeInterleave2(rising(2), O::sub(u1r, u3i), O::add(u1i, u3r));           // A[2]
+            O::storeInterleave2(rising(3), O::sub(v1r, k4), O::add(v1i, k3));             // A[3]
+        }
+    }
+    // Bin n/2 of the lanes is real: X[n/2 + r n] = sum_j Y_j[n/2] exp(-pi i j (2r + 1) / W).
+    for (size_t r = 0; r < half; ++r)
+    {
+        T sumRe = T(0), sumIm = T(0);
+        for (size_t j = 0; j < w; ++j)
+        {
+            sumRe += middle[j] * edge[j * half + r];
+            sumIm -= middle[j] * edge[w * half + j * half + r];
+        }
+        out[2 * (n / 2 + r * n)] = sumRe;
+        out[2 * (n / 2 + r * n) + 1] = sumIm;
+    }
+    out[1] = T(0);
+    out[w * n + 1] = T(0);
+}
+
+/**
+ * @brief realFinalize() undone: the lanes' packed spectra, W times too large,
+ *        from the N/2 + 1 interleaved bins.
+ *
+ * A[r] = X[i + r n] and A[W - 1 - r] = conj(X[(r + 1) n - i]) are the
+ * W-point transform that a_j = sum_r A[r] exp(2 pi i j r / W) undoes, and
+ * Y_j[i] = conj(w^(ji)) a_j. The imaginary parts of bins 0 and N/2 are not
+ * read (a real signal has none).
+ */
+template <typename T, int W>
+void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t w = static_cast<size_t>(W);
+    constexpr size_t half = w / 2;
+    T* const first = out;
+    for (size_t i0 = 0; i0 < n / 2; i0 += w, out += 2 * w * w, tw += 2 * (w - 1) * w)
+    {
+        V dr[W / 2], di[W / 2], mr[W / 2], mi[W / 2];   // rising and falling bins
+        for (size_t r = 0; r < half; ++r)
+        {
+            O::loadDeinterleave(in + 2 * (i0 + r * n), dr[r], di[r]);
+            O::loadDeinterleaveReversed(in + 2 * ((r + 1) * n - i0 - (w - 1)), mr[r], mi[r]);
+        }
+        if (i0 == 0)
+        {
+            // Bins 0 and N/2 with their imaginary parts as zero.
+            T head[2 * W], tail[2 * W];
+            std::copy_n(in, 2 * w, head);
+            head[1] = T(0);
+            std::copy_n(in + 2 * (half * n - (w - 1)), 2 * w, tail);
+            tail[2 * w - 1] = T(0);
+            O::loadDeinterleave(head, dr[0], di[0]);
+            O::loadDeinterleaveReversed(tail, mr[half - 1], mi[half - 1]);
+        }
+        V re[W], im[W];
+        if constexpr (W == 2)
+        {
+            re[0] = O::add(dr[0], mr[0]);
+            im[0] = O::sub(di[0], mi[0]);
+            re[1] = O::sub(dr[0], mr[0]);
+            im[1] = O::add(di[0], mi[0]);
+        }
+        else if constexpr (W == 4)
+        {
+            // A[0] = X[i], A[1] = X[n + i], A[2] = conj(X[2n - i]), A[3] = conj(X[n - i]).
+            const V e0r = O::add(dr[0], mr[1]), e0i = O::sub(di[0], mi[1]);
+            const V e1r = O::sub(dr[0], mr[1]), e1i = O::add(di[0], mi[1]);
+            const V e2r = O::add(dr[1], mr[0]), e2i = O::sub(di[1], mi[0]);
+            const V e3r = O::sub(dr[1], mr[0]), e3i = O::add(di[1], mi[0]);
+            re[0] = O::add(e0r, e2r);
+            im[0] = O::add(e0i, e2i);
+            re[1] = O::sub(e1r, e3i);
+            im[1] = O::add(e1i, e3r);
+            re[2] = O::sub(e0r, e2r);
+            im[2] = O::sub(e0i, e2i);
+            re[3] = O::add(e1r, e3i);
+            im[3] = O::sub(e1i, e3r);
+        }
+        else
+        {
+            // Even A: X[i], X[2n + i], conj(X[4n - i]), conj(X[2n - i]); odd
+            // A: X[n + i], X[3n + i], conj(X[3n - i]), conj(X[n - i]). a_j =
+            // P_j + conj(w8^j) Q_j and a_(j+4) = P_j - conj(w8^j) Q_j, P and
+            // Q their four-point inverse transforms.
+            const V h = O::set1(static_cast<T>(0.70710678118654752440));
+            const V nh = O::set1(static_cast<T>(-0.70710678118654752440));
+            const V e0r = O::add(dr[0], mr[3]), e0i = O::sub(di[0], mi[3]);
+            const V e1r = O::sub(dr[0], mr[3]), e1i = O::add(di[0], mi[3]);
+            const V e2r = O::add(dr[2], mr[1]), e2i = O::sub(di[2], mi[1]);
+            const V e3r = O::sub(dr[2], mr[1]), e3i = O::add(di[2], mi[1]);
+            const V f0r = O::add(dr[1], mr[2]), f0i = O::sub(di[1], mi[2]);
+            const V f1r = O::sub(dr[1], mr[2]), f1i = O::add(di[1], mi[2]);
+            const V f2r = O::add(dr[3], mr[0]), f2i = O::sub(di[3], mi[0]);
+            const V f3r = O::sub(dr[3], mr[0]), f3i = O::add(di[3], mi[0]);
+            const V p0r = O::add(e0r, e2r), p0i = O::add(e0i, e2i);
+            const V p1r = O::sub(e1r, e3i), p1i = O::add(e1i, e3r);
+            const V p2r = O::sub(e0r, e2r), p2i = O::sub(e0i, e2i);
+            const V p3r = O::add(e1r, e3i), p3i = O::sub(e1i, e3r);
+            const V q0r = O::add(f0r, f2r), q0i = O::add(f0i, f2i);
+            const V q1r = O::sub(f1r, f3i), q1i = O::add(f1i, f3r);
+            const V q2r = O::sub(f0r, f2r), q2i = O::sub(f0i, f2i);
+            const V q3r = O::add(f1r, f3i), q3i = O::sub(f1i, f3r);
+            const V t1r = O::mul(h, O::sub(q1r, q1i)), t1i = O::mul(h, O::add(q1r, q1i));
+            const V t3r = O::mul(nh, O::add(q3r, q3i)), t3i = O::mul(h, O::sub(q3r, q3i));
+            re[0] = O::add(p0r, q0r);
+            im[0] = O::add(p0i, q0i);
+            re[4] = O::sub(p0r, q0r);
+            im[4] = O::sub(p0i, q0i);
+            re[1] = O::add(p1r, t1r);
+            im[1] = O::add(p1i, t1i);
+            re[5] = O::sub(p1r, t1r);
+            im[5] = O::sub(p1i, t1i);
+            re[2] = O::sub(p2r, q2i);
+            im[2] = O::add(p2i, q2r);
+            re[6] = O::add(p2r, q2i);
+            im[6] = O::sub(p2i, q2r);
+            re[3] = O::add(p3r, t3r);
+            im[3] = O::add(p3i, t3i);
+            re[7] = O::sub(p3r, t3r);
+            im[7] = O::sub(p3i, t3i);
+        }
+        for (size_t j = 1; j < w; ++j)
+        {
+            const V wr = O::load(tw + 2 * (j - 1) * w), wi = O::load(tw + (2 * j - 1) * w);
+            const V r = O::mulAdd(wr, re[j], wi, im[j]);
+            im[j] = O::mulSub(wr, im[j], wi, re[j]);
+            re[j] = r;
+        }
+        O::transpose(re);
+        O::transpose(im);
+        for (size_t t = 0; t < w; ++t)
+        {
+            O::store(out + 2 * t * w, re[t]);
+            O::store(out + (2 * t + 1) * w, im[t]);
+        }
+    }
+    // Bin n/2 of the lanes: W Y_j[n/2] = 2 Re sum_r X[n/2 + r n] exp(pi i j (2r + 1) / W).
+    T middle[W];
+    for (size_t j = 0; j < w; ++j)
+    {
+        T sum = T(0);
+        for (size_t r = 0; r < half; ++r)
+        {
+            const T* const x = in + 2 * (n / 2 + r * n);
+            sum += x[0] * edge[j * half + r] - x[1] * edge[w * half + j * half + r];
+        }
+        middle[j] = sum + sum;
+    }
+    O::store(first + w, O::load(middle));
+}
+
+/// The forward transform at W lanes: the passes between the two work buffers
+/// a and b (N values each), the first one reading the samples.
+template <typename T, int W, bool Whole>
+void realForwardAt(const RealPlan<T>& p, const T* time, T* freq, T* a, T* b) noexcept
+{
+    const size_t n = p.n;
+    if (p.first8)
+        realFirst8<T, W>(time, a, n);
+    else
+        realFirst4<T, W>(time, a, n);
+    const T* tw = p.twiddles;
+    T* src = a;
+    T* dst = b;
+    for (size_t m = p.firstLength(); m < n; m *= 4)
+    {
+        realRadix4<T, W, Whole>(src, dst, n, m, tw);
+        tw += RealPlan<T>::passValues(m, p.twiddleRepeat);
+        std::swap(src, dst);
+    }
+    realFinalize<T, W>(src, freq, n, p.turn, p.edge);
+}
+
+/// One step of the inverse at W lanes: step 0 reads the spectrum into a,
+/// each later step is one pass (they alternate between a and b, so the
+/// buffer a step reads follows from its index) and the last one writes the
+/// scaled samples.
+template <typename T, int W, bool Whole>
+void realInverseStepAt(const RealPlan<T>& p, size_t step, const T* freq, T* time, T* a, T* b) noexcept
+{
+    const size_t n = p.n;
+    if (step == 0)
+    {
+        realPrepare<T, W>(freq, a, n, p.turn, p.edge);
+        return;
+    }
+    const size_t pass = step - 1;
+    const T* const src = (pass & 1) == 0 ? a : b;
+    T* const dst = (pass & 1) == 0 ? b : a;
+    const size_t m = (n / 4) >> (2 * pass);   // points of the spectra this pass leaves
+    if (m >= p.firstLength())
+    {
+        const T* tw = p.twiddles;
+        for (size_t below = p.firstLength(); below < m; below *= 4)
+            tw += RealPlan<T>::passValues(below, p.twiddleRepeat);
+        realInverseRadix4<T, W, Whole>(src, dst, n, m, tw);
+    }
+    else if (p.first8)
+        realLast8<T, W>(src, time, n, p.scale);
+    else
+        realLast4<T, W>(src, time, n, p.scale);
+}
+
+/// The forward real transform of a plan, at the plan's lanes (FFTReal).
+template <typename T>
+void realForward([[maybe_unused]] const RealPlan<T>& p, [[maybe_unused]] const T* time,
+                 [[maybe_unused]] T* freq, [[maybe_unused]] T* a, [[maybe_unused]] T* b) noexcept
+{
+    if constexpr (kNarrow<T> > 1)
+    {
+        const bool whole = p.twiddleRepeat > 1;
+        if (p.lanes == static_cast<size_t>(kWide<T>))
+        {
+            if (whole) realForwardAt<T, kWide<T>, true>(p, time, freq, a, b);
+            else realForwardAt<T, kWide<T>, false>(p, time, freq, a, b);
+        }
+        else
+        {
+            if (whole) realForwardAt<T, kNarrow<T>, true>(p, time, freq, a, b);
+            else realForwardAt<T, kNarrow<T>, false>(p, time, freq, a, b);
+        }
+    }
+}
+
+/// One step of the inverse real transform of a plan (FFTReal::inverseStep()).
+template <typename T>
+void realInverseStep([[maybe_unused]] const RealPlan<T>& p, [[maybe_unused]] size_t step,
+                     [[maybe_unused]] const T* freq, [[maybe_unused]] T* time, [[maybe_unused]] T* a,
+                     [[maybe_unused]] T* b) noexcept
+{
+    if constexpr (kNarrow<T> > 1)
+    {
+        const bool whole = p.twiddleRepeat > 1;
+        if (p.lanes == static_cast<size_t>(kWide<T>))
+        {
+            if (whole) realInverseStepAt<T, kWide<T>, true>(p, step, freq, time, a, b);
+            else realInverseStepAt<T, kWide<T>, false>(p, step, freq, time, a, b);
+        }
+        else
+        {
+            if (whole) realInverseStepAt<T, kNarrow<T>, true>(p, step, freq, time, a, b);
+            else realInverseStepAt<T, kNarrow<T>, false>(p, step, freq, time, a, b);
+        }
+    }
+}
+
+/// The inverse real transform of a plan: its steps in order.
+template <typename T>
+void realInverse(const RealPlan<T>& p, const T* freq, T* time, T* a, T* b) noexcept
+{
+    const size_t steps = RealPlan<T>::passCount(p.n) + 1;
+    for (size_t step = 0; step < steps; ++step)
+        realInverseStep(p, step, freq, time, a, b);
+}

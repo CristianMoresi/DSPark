@@ -1273,22 +1273,6 @@ inline void storePair(T* at, typename Vec<T, W>::V first, typename Vec<T, W>::V 
     Vec<T, W>::store(at + W, second);
 }
 
-/// Marks the last use of a factor that two products share. GCC for arm64
-/// computes a sum of products a b + c d as a product followed by a fused
-/// multiply-add that must overwrite it; where the product could not take the
-/// place of one of its operands, that compiler first copies it to another
-/// register (one more vector operation, three per butterfly of an inverse
-/// pass). Used between the two products of a factor, this makes the second
-/// one the factor's last use, so it takes the factor's register and the sum
-/// stays there. It emits nothing.
-template <typename T, int W>
-inline void lastUse([[maybe_unused]] typename Vec<T, W>::V& factor) noexcept
-{
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
-    __asm__("" : "+w"(factor));
-#endif
-}
-
 /// The first pass of a lane transform whose log2(n) is even: the four-point
 /// spectra of the samples t0, t0 + n/4, t0 + n/2 and t0 + 3n/4.
 template <typename T, int W>
@@ -1465,17 +1449,13 @@ void realInverseRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noe
             const V t1r = O::sub(e2r, f), t1i = O::add(e2i, g);
             const V t2r = O::sub(e0r, e1r), t2i = O::sub(e0i, e1i);
             const V t3r = O::add(e2r, f), t3i = O::sub(e2i, g);
-            V w1r = laneTwiddle<T, W, Whole>(t), w2r = laneTwiddle<T, W, Whole>(t + 2 * tl);
-            V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl);
-            const V w1i = laneTwiddle<T, W, Whole>(t + tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
-            const V w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
-            // conj(w) T: the imaginary parts first (see lastUse()).
+            const V w1r = laneTwiddle<T, W, Whole>(t), w1i = laneTwiddle<T, W, Whole>(t + tl);
+            const V w2r = laneTwiddle<T, W, Whole>(t + 2 * tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
+            const V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl), w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
+            // conj(w) T.
             const V y1i = O::mulSub(w1r, t1i, w1i, t1r);
             const V y2i = O::mulSub(w2r, t2i, w2i, t2r);
             const V y3i = O::mulSub(w3r, t3i, w3i, t3r);
-            lastUse<T, W>(w1r);
-            lastUse<T, W>(w2r);
-            lastUse<T, W>(w3r);
             storePair<T, W>(x0 + e, O::add(e0r, e1r), O::add(e0i, e1i));
             storePair<T, W>(x1 + e, O::mulAdd(w1r, t1r, w1i, t1i), y1i);
             storePair<T, W>(x2 + e, O::mulAdd(w2r, t2r, w2i, t2i), y2i);
@@ -1483,6 +1463,17 @@ void realInverseRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noe
         }
     }
 }
+
+/// Whether the last pass of the inverse takes two groups at a time. Their
+/// samples are neighbours in each of the output runs, so they leave as store
+/// pairs: on arm64 one vector operation per pair where single stores take
+/// two. Elsewhere a pair is two stores all the same, and two groups of eight
+/// would not fit the sixteen registers of x86-64.
+#if defined(DSPARK_SIMD_NEON)
+inline constexpr bool kLastPassPairs = true;
+#else
+inline constexpr bool kLastPassPairs = false;
+#endif
 
 /// realFirst4() undone and scaled: the samples from the four-point spectra.
 template <typename T, int W>
@@ -1493,15 +1484,37 @@ void realLast4(const T* in, T* out, size_t n, T scale) noexcept
     constexpr size_t w = static_cast<size_t>(W);
     const size_t quarter = w * (n / 4);
     const V c = O::set1(scale), c2 = O::set1(scale + scale);
-    for (T* const end = out + quarter; out != end; out += w, in += 4 * w)
-    {
-        const V z0 = O::load(in), z2 = O::load(in + w);
-        const V zr = O::load(in + 2 * w), zi = O::load(in + 3 * w);
+    const auto group = [&](const T* z, V& x0, V& x1, V& x2, V& x3) noexcept {
+        const V z0 = O::load(z), z2 = O::load(z + w);
+        const V zr = O::load(z + 2 * w), zi = O::load(z + 3 * w);
         const V s = O::mul(O::add(z0, z2), c), d = O::mul(O::sub(z0, z2), c);
-        O::store(out, O::madd(zr, c2, s));
-        O::store(out + quarter, O::nmadd(zi, c2, d));
-        O::store(out + 2 * quarter, O::nmadd(zr, c2, s));
-        O::store(out + 3 * quarter, O::madd(zi, c2, d));
+        x0 = O::madd(zr, c2, s);
+        x1 = O::nmadd(zi, c2, d);
+        x2 = O::nmadd(zr, c2, s);
+        x3 = O::madd(zi, c2, d);
+    };
+    T* const end = out + quarter;
+    if constexpr (kLastPassPairs)
+    {
+        for (; out + w < end; out += 2 * w, in += 8 * w)
+        {
+            V a0, a1, a2, a3, b0, b1, b2, b3;
+            group(in, a0, a1, a2, a3);
+            group(in + 4 * w, b0, b1, b2, b3);
+            storePair<T, W>(out, a0, b0);
+            storePair<T, W>(out + quarter, a1, b1);
+            storePair<T, W>(out + 2 * quarter, a2, b2);
+            storePair<T, W>(out + 3 * quarter, a3, b3);
+        }
+    }
+    for (; out != end; out += w, in += 4 * w)
+    {
+        V x0, x1, x2, x3;
+        group(in, x0, x1, x2, x3);
+        O::store(out, x0);
+        O::store(out + quarter, x1);
+        O::store(out + 2 * quarter, x2);
+        O::store(out + 3 * quarter, x3);
     }
 }
 
@@ -1516,28 +1529,58 @@ void realLast8(const T* in, T* out, size_t n, T scale) noexcept
     const V c = O::set1(scale), c2 = O::set1(scale + scale);
     const V kc = O::set1(static_cast<T>(1.41421356237309504880) * scale);
     const V nkc = O::set1(static_cast<T>(-1.41421356237309504880) * scale);
-    for (T* const end = out + eighth; out != end; out += w, in += 8 * w)
-    {
-        const V z0 = O::load(in), z4 = O::load(in + w);
-        const V pr = O::load(in + 2 * w), pi = O::load(in + 3 * w);
-        const V z2r = O::load(in + 4 * w), z2i = O::load(in + 5 * w);
-        const V qr = O::load(in + 6 * w), qi = O::load(in + 7 * w);
-        // The sums of the sample pairs four apart, from the even bins ...
+    // x[0 .. 7] of one group: the sums of the sample pairs four apart (from
+    // the even bins) plus and minus their differences (from the odd ones).
+    const auto group = [&](const T* z, V& x0, V& x1, V& x2, V& x3, V& x4, V& x5, V& x6, V& x7) noexcept {
+        const V z0 = O::load(z), z4 = O::load(z + w);
+        const V pr = O::load(z + 2 * w), pi = O::load(z + 3 * w);
+        const V z2r = O::load(z + 4 * w), z2i = O::load(z + 5 * w);
+        const V qr = O::load(z + 6 * w), qi = O::load(z + 7 * w);
         const V s = O::mul(O::add(z0, z4), c), d = O::mul(O::sub(z0, z4), c);
         const V s0 = O::madd(z2r, c2, s), s2 = O::nmadd(z2r, c2, s);
         const V s1 = O::nmadd(z2i, c2, d), s3 = O::madd(z2i, c2, d);
-        // ... and their differences, from the odd ones.
         const V a = O::add(pr, qr), b = O::sub(pr, qr), g = O::sub(qi, pi), e = O::add(pi, qi);
         const V d0 = O::mul(a, c2), d2 = O::mul(g, c2);
         const V d1 = O::mul(kc, O::sub(b, e)), d3 = O::mul(nkc, O::add(b, e));
-        O::store(out, O::add(s0, d0));
-        O::store(out + eighth, O::add(s1, d1));
-        O::store(out + 2 * eighth, O::add(s2, d2));
-        O::store(out + 3 * eighth, O::add(s3, d3));
-        O::store(out + 4 * eighth, O::sub(s0, d0));
-        O::store(out + 5 * eighth, O::sub(s1, d1));
-        O::store(out + 6 * eighth, O::sub(s2, d2));
-        O::store(out + 7 * eighth, O::sub(s3, d3));
+        x0 = O::add(s0, d0);
+        x1 = O::add(s1, d1);
+        x2 = O::add(s2, d2);
+        x3 = O::add(s3, d3);
+        x4 = O::sub(s0, d0);
+        x5 = O::sub(s1, d1);
+        x6 = O::sub(s2, d2);
+        x7 = O::sub(s3, d3);
+    };
+    T* const end = out + eighth;
+    if constexpr (kLastPassPairs)
+    {
+        for (; out + w < end; out += 2 * w, in += 16 * w)
+        {
+            V a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7;
+            group(in, a0, a1, a2, a3, a4, a5, a6, a7);
+            group(in + 8 * w, b0, b1, b2, b3, b4, b5, b6, b7);
+            storePair<T, W>(out, a0, b0);
+            storePair<T, W>(out + eighth, a1, b1);
+            storePair<T, W>(out + 2 * eighth, a2, b2);
+            storePair<T, W>(out + 3 * eighth, a3, b3);
+            storePair<T, W>(out + 4 * eighth, a4, b4);
+            storePair<T, W>(out + 5 * eighth, a5, b5);
+            storePair<T, W>(out + 6 * eighth, a6, b6);
+            storePair<T, W>(out + 7 * eighth, a7, b7);
+        }
+    }
+    for (; out != end; out += w, in += 8 * w)
+    {
+        V x0, x1, x2, x3, x4, x5, x6, x7;
+        group(in, x0, x1, x2, x3, x4, x5, x6, x7);
+        O::store(out, x0);
+        O::store(out + eighth, x1);
+        O::store(out + 2 * eighth, x2);
+        O::store(out + 3 * eighth, x3);
+        O::store(out + 4 * eighth, x4);
+        O::store(out + 5 * eighth, x5);
+        O::store(out + 6 * eighth, x6);
+        O::store(out + 7 * eighth, x7);
     }
 }
 
@@ -1570,12 +1613,10 @@ inline void turnLane(typename Vec<T, W>::V& re, typename Vec<T, W>::V& im, const
 {
     using O = Vec<T, W>;
     using V = typename O::V;
-    V wr = O::load(tw);
-    const V wi = O::load(tw + W);
+    const V wr = O::load(tw), wi = O::load(tw + W);
     if constexpr (Conjugate)
     {
         const V i = O::mulSub(wr, im, wi, re);
-        lastUse<T, W>(wr);
         re = O::mulAdd(wr, re, wi, im);
         im = i;
     }

@@ -13,11 +13,14 @@
  * Engine:
  * - **Stockham autosort, radix 4**: log4(N) passes with no bit-reversal
  *   permutation; each pass reads one buffer and writes the other in natural
- *   order. An odd log2(N) closes with one radix-8 pass (twiddle-free, the
- *   eighth roots entering as sqrt(1/2)) in place of a radix-4 and a radix-2
- *   pass, or with that pair where the radix-8 pass's eight rows would sit a
- *   way of the level-1 data cache apart or more (4 KiB on x86) and fill one
- *   of its sets.
+ *   order. On arm64 other than macOS and iOS builds, transforms of up to
+ *   4096 double or 8192 float complex points take the bits between the first
+ *   pass and the last three at a time (a radix-8 pass with twiddles) where
+ *   that saves a pass over the data. An odd log2(N) closes with one radix-8
+ *   pass (twiddle-free, the eighth roots entering as sqrt(1/2)) in place of
+ *   a radix-4 and a radix-2 pass, or with that pair where the radix-8 pass's
+ *   eight rows would sit a way of the level-1 data cache apart or more (4
+ *   KiB on x86) and fill one of its sets.
  * - **Blocked complex layout inside**: between passes the data is stored in
  *   blocks of 4 double or 8 float real parts followed by the same elements'
  *   imaginary parts, so every butterfly is plain vector arithmetic (no
@@ -153,8 +156,10 @@ struct TwiddleSpan
 };
 
 /// One pass of the plan: its length, stride and twiddle offset. radix2 and
-/// radix8 mark the closing passes of length 2 and 8 (radix 4 otherwise).
-struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; bool radix8; };
+/// radix8 mark the closing passes of length 2 and 8, twiddled8 a radix-8 pass
+/// with twiddles (fourteen factors per butterfly group, each repeated across
+/// a vector); radix 4 otherwise.
+struct Pass { size_t len; size_t stride; size_t twOffset; bool radix2; bool radix8; bool twiddled8; };
 
 /// Bytes between the rows of a closing radix-8 pass from which the plan
 /// closes with a radix-4 and a radix-2 pass instead. The pass reads its eight
@@ -169,6 +174,28 @@ inline constexpr size_t kClosingRowReach = 4096;
 #else
 inline constexpr size_t kClosingRowReach = 8192;
 #endif
+
+/// Whether plans take three bits per pass, with twiddles, between the first
+/// pass and the closing one where that saves a pass over the data. It needs
+/// registers for the sixteen vectors of a radix-8 butterfly and its
+/// temporaries (32 on arm64; with the 16 of x86-64 such plans measured slower
+/// at most sizes), and it pays where vector operations are what bounds a
+/// pass: 2 to 5 % of a transform on an arm64 server core with two vector
+/// pipes. On the arm64 cores of the macOS machines measured, which have four,
+/// the same plans ran 7 to 12 % slower at 512 real points, so macOS and iOS
+/// builds keep to radix 4.
+#if defined(DSPARK_SIMD_NEON) && !defined(__APPLE__)
+inline constexpr bool kTwiddledRadix8 = true;
+#else
+inline constexpr bool kTwiddledRadix8 = false;
+#endif
+
+/// Bytes between the eight input rows of a twiddled radix-8 pass (an eighth
+/// of the transform) from which a plan keeps to radix-4 passes: from 16 KiB
+/// on, the pass no longer measured faster than the two it replaces (its
+/// eight input rows and eight output rows then compete for the same sets of
+/// the level-1 data cache).
+inline constexpr size_t kTwiddled8RowReach = 16384;
 
 /// The two ping-pong buffers, [re | im] each: x is read, y is written.
 template <typename T>
@@ -329,16 +356,34 @@ public:
     explicit SplitFFT(size_t n, bool interleavedInput = false) : n_(n), work_(2 * n)
     {
         PlanPasses steps;
-        const size_t passCount = buildPlan(n_, steps);
+        size_t offset = 0;
+        const size_t passCount = buildPlan(n_, steps, offset);
         passes_.assign(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(passCount));
-        const Pass& last = passes_.back();
-        const size_t offset = last.radix2 || last.radix8 ? last.twOffset
-                                                         : last.twOffset + 6 * (last.len / 4);
 
         twiddles_.assign(offset, T(0));
         for (const Pass& pass : passes_)
         {
             if (pass.radix2 || pass.radix8) continue;
+            if (pass.twiddled8)
+            {
+                // w^(kp), k = 1 .. 7: the fourteen values of a group together,
+                // each one a whole vector of the width the pass runs at (it
+                // loads them: a broadcast would take a vector operation).
+                constexpr size_t lanes = static_cast<size_t>(kWide<T>);
+                T* const w = twiddles_.data() + pass.twOffset;
+                for (size_t p = 0; p < pass.len / 8; ++p)
+                {
+                    const double a = -2.0 * std::numbers::pi_v<double> * static_cast<double>(p)
+                                   / static_cast<double>(pass.len);
+                    for (size_t k = 1; k <= 7; ++k)
+                    {
+                        T* const at = w + lanes * (14 * p + 2 * (k - 1));
+                        std::fill_n(at, lanes, static_cast<T>(std::cos(static_cast<double>(k) * a)));
+                        std::fill_n(at + lanes, lanes, static_cast<T>(std::sin(static_cast<double>(k) * a)));
+                    }
+                }
+                continue;
+            }
             const size_t n1 = pass.len / 4;
             const size_t block = TwiddleSpan<T>::firstBlock(n1, kBlock<T>);
             T* w = twiddles_.data() + pass.twOffset;
@@ -388,10 +433,8 @@ public:
     [[nodiscard]] static size_t allocationBytes(size_t n, bool interleavedInput) noexcept
     {
         PlanPasses steps;
-        const size_t passCount = buildPlan(n, steps);
-        const Pass& last = steps[passCount - 1];
-        const size_t twiddles = last.radix2 || last.radix8 ? last.twOffset
-                                                           : last.twOffset + 6 * (last.len / 4);
+        size_t twiddles = 0;
+        const size_t passCount = buildPlan(n, steps, twiddles);
         const size_t inLane = inLaneTwiddleCount(steps, passCount, interleavedInput);
         const size_t allocations = 2 + (twiddles > 0 ? 1 : 0) + (inLane > 0 ? 1 : 0);
         return (WorkBuffers<T>::values(2 * n) + twiddles + inLane) * sizeof(T)
@@ -683,30 +726,80 @@ private:
     /// Room for every plan up to 2^63 points (one pass per factor of four).
     using PlanPasses = std::array<Pass, 40>;
 
-    // Plan: radix-4 passes of length n, n/4, ... with stride 1, 4, ...; an
-    // odd log2(N) closes with a radix-8 pass in place of a length-8 radix-4
-    // pass and a radix-2 one, or with that pair where the radix-8 pass's
-    // eight rows (n/8 elements of the blocked layout each, re and im) would
-    // sit kClosingRowReach apart or more, where its rows would not fill a
-    // block of the work layout, and where it would be the first pass. The
-    // constructor and allocationBytes() both build it here.
-    static size_t buildPlan(size_t n, PlanPasses& out) noexcept
+    // Plan: a first radix-4 pass, twiddled passes and a closing pass without
+    // twiddles. With radix-4 passes alone, an odd log2(N) closes with a
+    // radix-8 pass in place of a length-8 radix-4 pass and a radix-2 one, or
+    // with that pair where the radix-8 pass's eight rows (n/8 elements of the
+    // blocked layout each, re and im) would sit kClosingRowReach apart or
+    // more, where its rows would not fill a block of the work layout, and
+    // where it would be the first pass. Where kTwiddledRadix8, and up to the
+    // size whose eighths sit kTwiddled8RowReach apart, the bits between the
+    // first pass and the closing one go three at a time (a twiddled radix-8
+    // pass), after the one or two radix-4 passes that the count leaves over,
+    // and the closing pass is the radix-8 one whenever it may be (per bit it
+    // is the cheapest pass) and the radix-4 one otherwise.
+    // The constructor and allocationBytes() both build it here; twiddleValues
+    // receives the size of the twiddle table.
+    static size_t buildPlan(size_t n, PlanPasses& out, size_t& twiddleValues) noexcept
     {
-        const bool odd = (std::countr_zero(n) & 1) != 0;
-        const bool radix8 = odd && n >= 32 && n / 8 >= kBlock<T>
-                         && 2 * (n / 8) * sizeof(T) < plan::kClosingRowReach;
+        const size_t bits = static_cast<size_t>(std::countr_zero(n));
         size_t len = n, stride = 1, offset = 0, count = 0;
-        while (len >= 4 && !(radix8 && len == 8))
-        {
-            out[count++] = { len, stride, offset, false, false };
+        const auto radix4 = [&]() noexcept {
+            out[count++] = { len, stride, offset, false, false, false };
             offset += 6 * (len / 4);
             len /= 4;
             stride *= 4;
+        };
+        const auto twiddled8 = [&]() noexcept {
+            out[count++] = { len, stride, offset, false, false, true };
+            offset += 14 * static_cast<size_t>(kWide<T>) * (len / 8);
+            len /= 8;
+            stride *= 8;
+        };
+        if (bits >= 2)
+        {
+            const size_t rest = bits - 2;   // bits after the first pass
+            const bool closing8 = n >= 32 && n / 8 >= kBlock<T>
+                               && 2 * (n / 8) * sizeof(T) < plan::kClosingRowReach;
+            // Bits of the closing pass (0: the first pass is the only one),
+            // and the radix-4 and twiddled radix-8 passes before it.
+            size_t closing = 0, fours = 0, eights = 0;
+            if (rest > 0)
+            {
+                closing = (rest & 1) == 0 ? 2 : closing8 ? 3 : 1;
+                fours = (rest - closing) / 2;
+                if constexpr (plan::kTwiddledRadix8)
+                {
+                    const size_t c = closing8 && rest >= 3 && rest != 4 ? 3 : 2;
+                    if (rest >= c + 3 && 2 * (n / 8) * sizeof(T) < plan::kTwiddled8RowReach)
+                    {
+                        const size_t between = rest - c;
+                        // Remainders 0, 1 and 2 of three leave 0, 2 and 1 radix-4 passes.
+                        const size_t f = (3 - between % 3) % 3;
+                        const size_t e = (between - 2 * f) / 3;
+                        // A twiddled radix-8 pass needs whole blocks of stride.
+                        if (between >= 2 * f && e > 0 && (size_t{ 4 } << (2 * f)) >= kBlock<T>)
+                        {
+                            closing = c;
+                            fours = f;
+                            eights = e;
+                        }
+                    }
+                }
+            }
+            radix4();
+            for (size_t i = 0; i < fours; ++i) radix4();
+            for (size_t i = 0; i < eights; ++i) twiddled8();
+            if (closing == 2)
+                radix4();
+            else if (closing == 3)
+                out[count++] = { 8, stride, offset, false, true, false };
+            else if (closing == 1)
+                out[count++] = { 2, stride, offset, true, false, false };
         }
-        if (len == 8)
-            out[count++] = { 8, stride, offset, false, true };
-        else if (len == 2)
-            out[count++] = { 2, stride, offset, true, false };
+        else
+            out[count++] = { 2, stride, offset, true, false, false };
+        twiddleValues = offset;
         return count;
     }
 

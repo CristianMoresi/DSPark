@@ -324,6 +324,98 @@ void radix4Blocked(const T* x, T* y, size_t n, size_t s, const TwiddleSpan<T>& t
 }
 
 /**
+ * @brief One Stockham radix-8 DIF pass with stride s >= kBlock, blocked
+ *        layout in and out, vectorised over the stride: three bits of the
+ *        transform in one pass over the data.
+ *
+ * y[q + s(8p + k)] = w^(kp) * sum_r x[q + s(p + r n/8)] w8^(r k), the sum
+ * split as radix8LastBlocked() splits it: two 4-point transforms, of the sums
+ * x_r + x_(r+4) (even k) and of the differences times w8^r (odd k). tw holds
+ * the fourteen factors of each group together, w^(kp) for k = 1 .. 7, real
+ * part then imaginary part, each as a whole vector of W equal values: the
+ * butterfly's sixteen vectors and its temporaries leave no register to keep
+ * the factors in, and loading them where they are used takes no vector
+ * operation, which a broadcast would.
+ */
+template <typename T, int W>
+void radix8Blocked(const T* x, T* y, size_t n, size_t s, const T* tw) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    constexpr size_t B = kBlock<T>;
+    const size_t n1 = n / 8;
+    const size_t rowIn = 2 * s * n1, rowOut = 2 * s;
+    const V h = O::set1(static_cast<T>(0.70710678118654752440));
+    const V nh = O::set1(static_cast<T>(-0.70710678118654752440));
+    constexpr size_t L = static_cast<size_t>(W);
+    // Row k of a group: the value times w^(kp), w at the factor's two vectors.
+    const auto twisted = [](T* dst, V r, V m, const T* w) noexcept {
+        const V wr = O::load(w), wi = O::load(w + static_cast<size_t>(W));
+        O::store(dst, O::mulSub(r, wr, m, wi));
+        O::store(dst + kBlock<T>, O::mulAdd(r, wi, m, wr));
+    };
+    for (size_t p = 0; p < n1; ++p)
+    {
+        const T* const t = tw + 14 * L * p;
+        const T* const a = x + 2 * s * p;
+        T* const y0 = y + 16 * s * p;
+        for (size_t q = 0; q < 2 * s; q += 2 * B)
+        {
+            for (size_t hh = q; hh < q + B; hh += W)
+            {
+                const T* const lo = a + hh;
+                const T* const hi = lo + 4 * rowIn;
+                T* const o = y0 + hh;
+                // Sums and differences of rows r and r + 4.
+                const V x0r = O::load(lo), x0i = O::load(lo + B);
+                const V x4r = O::load(hi), x4i = O::load(hi + B);
+                const V u0r = O::add(x0r, x4r), u0i = O::add(x0i, x4i);
+                const V v0r = O::sub(x0r, x4r), v0i = O::sub(x0i, x4i);
+                const V x1r = O::load(lo + rowIn), x1i = O::load(lo + rowIn + B);
+                const V x5r = O::load(hi + rowIn), x5i = O::load(hi + rowIn + B);
+                const V u1r = O::add(x1r, x5r), u1i = O::add(x1i, x5i);
+                const V v1r = O::sub(x1r, x5r), v1i = O::sub(x1i, x5i);
+                const V x2r = O::load(lo + 2 * rowIn), x2i = O::load(lo + 2 * rowIn + B);
+                const V x6r = O::load(hi + 2 * rowIn), x6i = O::load(hi + 2 * rowIn + B);
+                const V u2r = O::add(x2r, x6r), u2i = O::add(x2i, x6i);
+                const V v2r = O::sub(x2r, x6r), v2i = O::sub(x2i, x6i);
+                const V x3r = O::load(lo + 3 * rowIn), x3i = O::load(lo + 3 * rowIn + B);
+                const V x7r = O::load(hi + 3 * rowIn), x7i = O::load(hi + 3 * rowIn + B);
+                const V u3r = O::add(x3r, x7r), u3i = O::add(x3i, x7i);
+                const V v3r = O::sub(x3r, x7r), v3i = O::sub(x3i, x7i);
+                // Even rows: the 4-point transform of the sums.
+                {
+                    const V apcR = O::add(u0r, u2r), apcI = O::add(u0i, u2i);
+                    const V amcR = O::sub(u0r, u2r), amcI = O::sub(u0i, u2i);
+                    const V bpdR = O::add(u1r, u3r), bpdI = O::add(u1i, u3i);
+                    const V bmdR = O::sub(u1r, u3r), bmdI = O::sub(u1i, u3i);
+                    O::store(o,     O::add(apcR, bpdR));
+                    O::store(o + B, O::add(apcI, bpdI));
+                    twisted(o + 2 * rowOut, O::add(amcR, bmdI), O::sub(amcI, bmdR), t + 2 * L);
+                    twisted(o + 4 * rowOut, O::sub(apcR, bpdR), O::sub(apcI, bpdI), t + 6 * L);
+                    twisted(o + 6 * rowOut, O::sub(amcR, bmdI), O::add(amcI, bmdR), t + 10 * L);
+                }
+                // Odd rows: the 4-point transform of the differences times
+                // w8^r, that is 1, (1 - j) / sqrt 2, -j and -(1 + j) / sqrt 2.
+                // The products by sqrt(1/2) join the sums they feed.
+                {
+                    const V apcR = O::add(v0r, v2i), apcI = O::sub(v0i, v2r);
+                    const V amcR = O::sub(v0r, v2i), amcI = O::add(v0i, v2r);
+                    const V m1r = O::add(v1r, v1i), m1i = O::sub(v1i, v1r);
+                    const V n3r = O::sub(v3i, v3r), g3 = O::add(v3r, v3i);
+                    const V sr = O::add(m1r, n3r), si = O::sub(m1i, g3);
+                    const V dr = O::sub(m1r, n3r), di = O::add(m1i, g3);
+                    twisted(o + rowOut,     O::madd(sr, h, apcR),  O::madd(si, h, apcI),  t);
+                    twisted(o + 3 * rowOut, O::madd(di, h, amcR),  O::madd(dr, nh, amcI), t + 4 * L);
+                    twisted(o + 5 * rowOut, O::madd(sr, nh, apcR), O::madd(si, nh, apcI), t + 8 * L);
+                    twisted(o + 7 * rowOut, O::madd(di, nh, amcR), O::madd(dr, h, amcI),  t + 12 * L);
+                }
+            }
+        }
+    }
+}
+
+/**
  * @brief radix4Blocked() for a stride of half a block: two butterfly groups
  *        share each block, p even in its first half and p + 1 in its second,
  *        so the groups run in pairs at fixed offsets.
@@ -671,7 +763,7 @@ void firstPassAs(const Pass& pass, const T* twiddles, const T* inLaneTwiddles, T
         if constexpr (Source<T, wide>::inLane)
         {
             // The same twiddles, permuted as the in-lane input (see SplitFFT).
-            const Pass permuted { pass.len, pass.stride, 0, false, false };
+            const Pass permuted { pass.len, pass.stride, 0, false, false, false };
             radix4First<T, wide, Source<T, wide>, InLaneOut>(Source<T, wide> { input... }, y, pass.len,
                                                               twiddleSpanOf(permuted, inLaneTwiddles));
         }
@@ -712,12 +804,18 @@ bool inLaneLayoutFor(const Pass* passes, size_t passCount) noexcept
         return false;
 }
 
-/// Runs a radix-4 pass of stride > 1 at the widest vector its stride allows,
-/// blocked layout in and out. Strides are powers of 4, so the only one below
-/// the block is 4, half a float block.
+/// Runs a twiddled pass of stride > 1 at the widest vector its stride allows,
+/// blocked layout in and out. The radix-8 ones come with whole blocks of
+/// stride; of the radix-4 ones, the only stride below the block is 4, half a
+/// float block.
 template <typename T>
 void stridedPass(const Pass& pass, const T* twiddles, const Buffers<T>& b) noexcept
 {
+    if (pass.twiddled8)
+    {
+        radix8Blocked<T, kWide<T>>(b.xr, b.yr, pass.len, pass.stride, twiddles + pass.twOffset);
+        return;
+    }
     const TwiddleSpan<T> tw = twiddleSpanOf(pass, twiddles);
     constexpr int narrow = kNarrow<T>;
     if (pass.stride >= kBlock<T>)

@@ -445,6 +445,25 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `FFTReal` and `FFTComplex` on arm64 builds other than macOS and iOS:
+  transforms of up to 4096 double or 8192 float complex points take the bits
+  between their first and last passes three at a time, in a radix-8 pass
+  with twiddles, where that saves a pass over the data: 256, 1024, 2048 and
+  4096 complex points in double and 1024 and 4096 in float (real transforms
+  of twice those sizes). The factors of such a pass sit in its table as
+  whole vectors, fourteen per butterfly group, and are loaded where they are
+  used. The output of those sizes changes at rounding level;
+  `allocationBytes()` follows the larger table. Measured before and after in
+  one job per compiler on an arm64 server core, forward plus inverse, as the
+  time after over the time before at those sizes: real transforms 0.96 to
+  0.97 in double and in float with GCC, 0.97 to 0.99 and 0.97 to 0.98 with
+  Clang; complex ones 0.95 to 0.97 and 0.95 to 0.96 with GCC, 0.96 to 0.99
+  and 0.96 to 0.97 with Clang; every other size within 1 %. The same plans
+  measured 7 to 12 % slower at 512 real points on the arm64 cores of the
+  macOS machines, and slower at most sizes on x86-64, whose sixteen vector
+  registers do not hold the butterfly: those builds keep their plans. From
+  8192 double complex points on the pass no longer paid on the server core
+  either (0.96 to 0.97 with one compiler, 1.00 to 1.02 with the other).
 - `FFTReal`, `FFTComplex` and what runs on them, faster wherever the kernels
   use 32-byte vectors (builds for AVX2, and x86-64 builds on a CPU with AVX2
   through the run-time dispatch). The engine's two work buffers share one

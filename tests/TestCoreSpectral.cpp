@@ -773,6 +773,105 @@ DSPARK_TEST(FFTReal_inverse_steps_keep_the_kernel_set_they_begin_on)
     checkSteppedInverseKeepsItsKernels<double>();
 }
 
+// A twiddled radix-8 pass takes three bits of the transform in one pass over
+// the data (the plans of the targets with registers for it use it between
+// the first pass and the closing one). Every output against its definition,
+// y[q + s(8p + k)] = w^(kp) * sum_r x[q + s(p + r n/8)] w8^(r k), in the
+// blocked layout: scalar, at both vector widths and on the dispatched
+// kernels, for strides of one block and of several.
+template <typename T, typename Kernel>
+static void checkTwiddledRadix8With(size_t lanes, Kernel kernel)
+{
+    using C = std::complex<double>;
+    const size_t B = detail::fft::kBlock<T>;
+    const double eps = static_cast<double>(std::numeric_limits<T>::epsilon());
+    const double pi = 3.14159265358979323846;
+    unsigned int rng = 20261117u;
+    const auto next = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<double>(rng >> 8) / 8388608.0 - 1.0;
+    };
+    for (const size_t n : { size_t{ 8 }, size_t{ 16 }, size_t{ 64 } })
+    {
+        for (const size_t s : { B, 2 * B, 8 * B })
+        {
+            const size_t total = n * s, n1 = n / 8;
+            std::vector<T> x(2 * total), y(2 * total, T(-3)), tw(14 * lanes * n1);
+            std::vector<C> in(total);
+            for (size_t i = 0; i < total; ++i)
+            {
+                const size_t at = detail::fft::blockedOffset<T>(i);
+                x[at] = static_cast<T>(next());
+                x[at + B] = static_cast<T>(next());
+                in[i] = C(static_cast<double>(x[at]), static_cast<double>(x[at + B]));
+            }
+            for (size_t p = 0; p < n1; ++p)
+            {
+                for (size_t k = 1; k <= 7; ++k)
+                {
+                    const double a = -2.0 * pi * static_cast<double>(k * p) / static_cast<double>(n);
+                    // Each factor as a vector of the kernel's width.
+                    T* const at = tw.data() + lanes * (14 * p + 2 * (k - 1));
+                    std::fill_n(at, lanes, static_cast<T>(std::cos(a)));
+                    std::fill_n(at + lanes, lanes, static_cast<T>(std::sin(a)));
+                }
+            }
+            kernel(x.data(), y.data(), n, s, tw.data());
+            double worst = 0.0, peak = 0.0;
+            for (size_t q = 0; q < s; ++q)
+            {
+                for (size_t p = 0; p < n1; ++p)
+                {
+                    for (size_t k = 0; k < 8; ++k)
+                    {
+                        C sum(0.0, 0.0);
+                        for (size_t r = 0; r < 8; ++r)
+                            sum += in[q + s * (p + r * n1)]
+                                 * std::polar(1.0, -2.0 * pi * static_cast<double>((r * k) % 8) / 8.0);
+                        sum *= std::polar(1.0, -2.0 * pi * static_cast<double>(k * p) / static_cast<double>(n));
+                        const size_t at = detail::fft::blockedOffset<T>(q + s * (8 * p + k));
+                        worst = std::max({ worst, std::abs(static_cast<double>(y[at]) - sum.real()),
+                                           std::abs(static_cast<double>(y[at + B]) - sum.imag()) });
+                        peak = std::max(peak, std::abs(sum));
+                    }
+                }
+            }
+            EXPECT_TRUE(worst <= 64.0 * eps * peak);
+        }
+    }
+}
+
+template <typename T>
+static void checkTwiddledRadix8()
+{
+    checkTwiddledRadix8With<T>(1, [](const T* x, T* y, size_t n, size_t s, const T* tw) {
+        detail::fft::radix8Blocked<T, 1>(x, y, n, s, tw);
+    });
+    checkTwiddledRadix8With<T>(static_cast<size_t>(detail::fft::kNarrow<T>),
+                               [](const T* x, T* y, size_t n, size_t s, const T* tw) {
+        detail::fft::radix8Blocked<T, detail::fft::kNarrow<T>>(x, y, n, s, tw);
+    });
+    checkTwiddledRadix8With<T>(static_cast<size_t>(detail::fft::kWide<T>),
+                               [](const T* x, T* y, size_t n, size_t s, const T* tw) {
+        detail::fft::radix8Blocked<T, detail::fft::kWide<T>>(x, y, n, s, tw);
+    });
+#if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (simd::runtimeDispatchSupported())
+    {
+        checkTwiddledRadix8With<T>(static_cast<size_t>(detail::fft::avx2::kWide<T>),
+                                   [](const T* x, T* y, size_t n, size_t s, const T* tw) {
+            detail::fft::avx2::radix8Blocked<T, detail::fft::avx2::kWide<T>>(x, y, n, s, tw);
+        });
+    }
+#endif
+}
+
+DSPARK_TEST(FFT_twiddled_radix8_pass_matches_its_definition)
+{
+    checkTwiddledRadix8<float>();
+    checkTwiddledRadix8<double>();
+}
+
 // The engine's two work buffers share one allocation and each starts on a
 // 64-byte boundary, so no vector of a pass lies across two cache lines. A
 // copy places its own buffers: the contents must come along, and a move

@@ -198,6 +198,19 @@ inline constexpr bool kTwiddledRadix8 = false;
 /// the level-1 data cache).
 inline constexpr size_t kTwiddled8RowReach = 16384;
 
+/// Longest spectra (in points) whose joining pass, in a real transform by
+/// lanes, keeps each twiddle as a whole vector for the baseline kernels to
+/// load; longer ones keep it once and the pass broadcasts it. A broadcast
+/// from memory takes a shuffle on SSE2 and a vector operation on arm64, six
+/// per butterfly, where the load takes none; the tables of the long passes
+/// would then be as large as the data they turn, and cost more than they
+/// save once the transform leaves the level-2 cache. AVX broadcasts for free.
+#if (defined(DSPARK_SIMD_SSE2) && !defined(DSPARK_SIMD_AVX)) || defined(DSPARK_SIMD_NEON)
+inline constexpr size_t kRealWholeTwiddleReach = 256;
+#else
+inline constexpr size_t kRealWholeTwiddleReach = 0;
+#endif
+
 /// The two ping-pong buffers, [re | im] each: x is read, y is written.
 template <typename T>
 struct Buffers { T* xr; T* xi; T* yr; T* yi; };
@@ -226,7 +239,7 @@ struct RealPlan
     size_t n;               ///< Points of each lane's transform.
     size_t lanes;           ///< Lanes: the transform has n * lanes samples.
     bool first8;            ///< The first pass takes eight samples (log2 n odd), not four.
-    size_t twiddleRepeat;   ///< Times the pass tables hold each value: 1, or `lanes`.
+    size_t wholeReach;      ///< Passes joining spectra of up to this many points hold each twiddle `lanes` times.
     const T* twiddles;      ///< The pass tables, by rising length of the spectra they join.
     const T* turn;          ///< The factors of the step that joins the lanes.
     const T* edge;          ///< The factors of the lanes' middle bin.
@@ -236,10 +249,18 @@ struct RealPlan
     [[nodiscard]] constexpr size_t firstLength() const noexcept { return first8 ? 8 : 4; }
 
     /// Values in the table of the pass that joins spectra of m points:
-    /// (re, im) of three factors for each bin 1 .. m/2 - 1.
+    /// (re, im) of three factors for each bin 1 .. m/2 - 1, each one
+    /// `repeat` times.
     [[nodiscard]] static constexpr size_t passValues(size_t m, size_t repeat) noexcept
     {
         return 6 * repeat * (m / 2 - 1);
+    }
+
+    /// Times the table of the pass that joins spectra of m points holds
+    /// each value.
+    [[nodiscard]] static constexpr size_t repeatFor(size_t m, size_t lanes, size_t wholeReach) noexcept
+    {
+        return m <= wholeReach ? lanes : 1;
     }
 
     /// Passes of a lane transform of n points, the first one included: one
@@ -876,29 +897,30 @@ public:
 
     /**
      * @brief Builds the tables of a transform of `size` real samples.
-     * @param size   Samples: a power of two, at least 4 * lanes and 2 * lanes^2.
-     * @param lanes  Lanes of the kernels that will run it (2, 4 or 8).
-     * @param repeat Times each pass twiddle is stored: 1 for kernels that
-     *               broadcast it, `lanes` for kernels that load it as a
-     *               whole vector.
+     * @param size       Samples: a power of two, at least 4 * lanes and 2 * lanes^2.
+     * @param lanes      Lanes of the kernels that will run it (2, 4 or 8).
+     * @param wholeReach Passes that join spectra of up to this many points
+     *                   keep each twiddle `lanes` times, for kernels that
+     *                   load it as a whole vector; the others keep it once.
      */
-    RealLaneTables(size_t size, size_t lanes, size_t repeat)
-        : n_(size / lanes), lanes_(lanes), repeat_(repeat), values_(valueCount(size, lanes, repeat))
+    RealLaneTables(size_t size, size_t lanes, size_t wholeReach)
+        : n_(size / lanes), lanes_(lanes), wholeReach_(wholeReach), values_(valueCount(size, lanes, wholeReach))
     {
-        constexpr double turn = -2.0 * std::numbers::pi_v<double>;
         T* w = values_.data();
+        double c = 0.0, s = 0.0;
         // Passes: w^(ji), j = 1 .. 3, w = exp(-2 pi i / 4m), for the bins i
         // of the spectra of m points that the pass joins.
         for (size_t m = firstLength(n_); m < n_; m *= 4)
+        {
+            const size_t repeat = RealPlan<T>::repeatFor(m, lanes_, wholeReach_);
             for (size_t i = 1; i < m / 2; ++i)
-            {
-                const double a = turn * static_cast<double>(i) / static_cast<double>(4 * m);
                 for (size_t j = 1; j <= 3; ++j)
                 {
-                    w = std::fill_n(w, repeat_, static_cast<T>(std::cos(static_cast<double>(j) * a)));
-                    w = std::fill_n(w, repeat_, static_cast<T>(std::sin(static_cast<double>(j) * a)));
+                    unit(j * i, 4 * m, c, s);
+                    w = std::fill_n(w, repeat, static_cast<T>(c));
+                    w = std::fill_n(w, repeat, static_cast<T>(0.0 - s));
                 }
-            }
+        }
         // The joining step: exp(-2 pi i j k / size) for the lanes j >= 1,
         // the bins k of a group along a vector.
         turn_ = static_cast<size_t>(w - values_.data());
@@ -907,39 +929,31 @@ public:
             {
                 for (size_t t = 0; t < lanes_; ++t)
                 {
-                    const double a = turn * static_cast<double>(j * (first + t)) / static_cast<double>(size);
-                    w[t] = static_cast<T>(std::cos(a));
-                    w[lanes_ + t] = static_cast<T>(std::sin(a));
+                    unit(j * (first + t), size, c, s);
+                    w[t] = static_cast<T>(c);
+                    w[lanes_ + t] = static_cast<T>(0.0 - s);
                 }
                 w += 2 * lanes_;
             }
-        // The middle bin: cos and sin of pi j (2r + 1) / lanes, exact where
-        // the angle is a multiple of a quarter turn.
+        // The middle bin: cos and sin of pi j (2r + 1) / lanes.
         edge_ = static_cast<size_t>(w - values_.data());
-        const auto exact = [](double v) noexcept {
-            if (std::abs(v) < 1e-15) return 0.0;
-            if (std::abs(v - 1.0) < 1e-15) return 1.0;
-            if (std::abs(v + 1.0) < 1e-15) return -1.0;
-            return v;
-        };
         const size_t half = lanes_ / 2;
         for (size_t j = 0; j < lanes_; ++j)
             for (size_t r = 0; r < half; ++r)
             {
-                const double a = std::numbers::pi_v<double> * static_cast<double>(j * (2 * r + 1))
-                               / static_cast<double>(lanes_);
-                w[j * half + r] = static_cast<T>(exact(std::cos(a)));
-                w[lanes_ * half + j * half + r] = static_cast<T>(exact(std::sin(a)));
+                unit(j * (2 * r + 1), 2 * lanes_, c, s);
+                w[j * half + r] = static_cast<T>(c);
+                w[lanes_ * half + j * half + r] = static_cast<T>(s);
             }
     }
 
     /// Values the constructor requests (one allocation).
-    [[nodiscard]] static constexpr size_t valueCount(size_t size, size_t lanes, size_t repeat) noexcept
+    [[nodiscard]] static constexpr size_t valueCount(size_t size, size_t lanes, size_t wholeReach) noexcept
     {
         const size_t n = size / lanes;
         size_t count = (lanes - 1) * n + lanes * lanes;
         for (size_t m = firstLength(n); m < n; m *= 4)
-            count += RealPlan<T>::passValues(m, repeat);
+            count += RealPlan<T>::passValues(m, RealPlan<T>::repeatFor(m, lanes, wholeReach));
         return count;
     }
 
@@ -950,7 +964,7 @@ public:
 
     [[nodiscard]] RealPlan<T> plan() const noexcept
     {
-        return { n_, lanes_, firstLength(n_) == 8, repeat_, values_.data(), values_.data() + turn_,
+        return { n_, lanes_, firstLength(n_) == 8, wholeReach_, values_.data(), values_.data() + turn_,
                  values_.data() + edge_, T(1) / static_cast<T>(n_ * lanes_) };
     }
 
@@ -961,9 +975,43 @@ private:
         return (std::countr_zero(n) & 1) != 0 ? 8 : 4;
     }
 
+    /// cos and sin of 2 pi k / count (count a power of two, at least 4) with
+    /// the symmetries of the circle exact: the values of an eighth of a turn
+    /// serve the whole of it, so that the factors of mirrored bins are
+    /// equal or opposite to the last bit and what must cancel does.
+    static void unit(size_t k, size_t count, double& c, double& s) noexcept
+    {
+        const size_t quarter = count / 4;
+        const size_t rest = k % quarter;
+        const double step = 2.0 * std::numbers::pi_v<double> / static_cast<double>(count);
+        double x = 1.0, y = 0.0;
+        if (rest != 0)
+        {
+            if (2 * rest == quarter)
+                x = y = 0.70710678118654752440;
+            else if (2 * rest < quarter)
+            {
+                x = std::cos(step * static_cast<double>(rest));
+                y = std::sin(step * static_cast<double>(rest));
+            }
+            else
+            {
+                x = std::sin(step * static_cast<double>(quarter - rest));
+                y = std::cos(step * static_cast<double>(quarter - rest));
+            }
+        }
+        switch ((k / quarter) & 3)   // quarter turns
+        {
+            case 0: c = x; s = y; break;
+            case 1: c = 0.0 - y; s = x; break;   // zeros stay positive
+            case 2: c = 0.0 - x; s = 0.0 - y; break;
+            default: c = y; s = 0.0 - x; break;
+        }
+    }
+
     size_t n_ = 0;        ///< Points per lane.
     size_t lanes_ = 0;
-    size_t repeat_ = 1;
+    size_t wholeReach_ = 0;
     size_t turn_ = 0;     ///< Where the joining step's factors start.
     size_t edge_ = 0;     ///< Where the middle bin's start.
     std::vector<T> values_;
@@ -1108,9 +1156,9 @@ public:
             return;
         }
         laneWork_ = detail::fft::WorkBuffers<T>(realSize_);
-        lanes_ = detail::fft::RealLaneTables<T>(realSize_, lanes, baseTwiddleRepeat(lanes));
+        lanes_ = detail::fft::RealLaneTables<T>(realSize_, lanes, detail::fft::plan::kRealWholeTwiddleReach);
         if (const size_t other = dispatchedLanes(realSize_); other != lanes)
-            wideLanes_ = detail::fft::RealLaneTables<T>(realSize_, other, 1);
+            wideLanes_ = detail::fft::RealLaneTables<T>(realSize_, other, 0);
     }
 
     /** @brief Returns the number of real input samples (N). */
@@ -1143,11 +1191,11 @@ public:
                  + 2 * (splitFactorCount(size / 2) * sizeof(T) + overhead);
         using Tables = detail::fft::RealLaneTables<T>;
         size_t values = detail::fft::WorkBuffers<T>::values(size)
-                      + Tables::valueCount(size, lanes, baseTwiddleRepeat(lanes));
+                      + Tables::valueCount(size, lanes, detail::fft::plan::kRealWholeTwiddleReach);
         size_t allocations = 2;
         if (const size_t other = dispatchedLanes(size); other != lanes)
         {
-            values += Tables::valueCount(size, other, 1);
+            values += Tables::valueCount(size, other, 0);
             ++allocations;
         }
         return values * sizeof(T) + allocations * overhead;
@@ -1449,16 +1497,6 @@ private:
         return lanesFor(size, detail::fft::avx2::kWide<T>, detail::fft::avx2::kNarrow<T>);
 #else
         return baseLanes(size);
-#endif
-    }
-
-    /// Times the baseline's pass tables hold each twiddle.
-    [[nodiscard]] static constexpr size_t baseTwiddleRepeat([[maybe_unused]] size_t lanes) noexcept
-    {
-#if defined(DSPARK_FFT_REAL_WHOLE_TWIDDLES)
-        return lanes;
-#else
-        return 1;
 #endif
     }
 

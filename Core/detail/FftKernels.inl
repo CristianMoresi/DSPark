@@ -1527,6 +1527,74 @@ void realLast8(const T* in, T* out, size_t n, T scale) noexcept
     }
 }
 
+/// The W bins of a group from the lanes' packed spectra: their real parts in
+/// re[0 .. W - 1] and their imaginary parts in im (elements 2t and 2t + 1).
+/// Written out by index, as are the helpers below: the vectors then stay in
+/// registers with every compiler.
+template <typename T, int W, size_t... I>
+inline void loadLaneBins(const T* in, typename Vec<T, W>::V* re, typename Vec<T, W>::V* im,
+                         std::index_sequence<I...>) noexcept
+{
+    using O = Vec<T, W>;
+    constexpr size_t w = static_cast<size_t>(W);
+    ((re[I] = O::load(in + 2 * I * w), im[I] = O::load(in + (2 * I + 1) * w)), ...);
+}
+
+/// loadLaneBins() the other way.
+template <typename T, int W, size_t... I>
+inline void storeLaneBins(T* out, const typename Vec<T, W>::V* re, const typename Vec<T, W>::V* im,
+                          std::index_sequence<I...>) noexcept
+{
+    using O = Vec<T, W>;
+    constexpr size_t w = static_cast<size_t>(W);
+    ((O::store(out + 2 * I * w, re[I]), O::store(out + (2 * I + 1) * w, im[I])), ...);
+}
+
+/// One lane's values times its factors (at tw: real parts, then imaginary
+/// parts), or times their conjugates.
+template <typename T, int W, bool Conjugate>
+inline void turnLane(typename Vec<T, W>::V& re, typename Vec<T, W>::V& im, const T* tw) noexcept
+{
+    using O = Vec<T, W>;
+    using V = typename O::V;
+    const V wr = O::load(tw), wi = O::load(tw + W);
+    if constexpr (Conjugate)
+    {
+        const V r = O::mulAdd(wr, re, wi, im);
+        im = O::mulSub(wr, im, wi, re);
+        re = r;
+    }
+    else
+    {
+        const V r = O::mulSub(wr, re, wi, im);
+        im = O::mulAdd(wr, im, wi, re);
+        re = r;
+    }
+}
+
+/// Lanes 1 .. W - 1 times their factors (J runs over 0 .. W - 2).
+template <typename T, int W, bool Conjugate, size_t... J>
+inline void turnLanes(typename Vec<T, W>::V* re, typename Vec<T, W>::V* im, const T* tw,
+                      std::index_sequence<J...>) noexcept
+{
+    constexpr size_t w = static_cast<size_t>(W);
+    (turnLane<T, W, Conjugate>(re[J + 1], im[J + 1], tw + 2 * J * w), ...);
+}
+
+/// The rising rows of bins i0 + r n and the falling rows (r + 1) n - i0 - t
+/// of the interleaved spectrum, r = 0 .. W/2 - 1, with the falling ones
+/// turned so that lane t holds the bin that pairs with i0 + t.
+template <typename T, int W, size_t... R>
+inline void loadSpectrumRows(const T* in, size_t i0, size_t n, typename Vec<T, W>::V* dr,
+                             typename Vec<T, W>::V* di, typename Vec<T, W>::V* mr,
+                             typename Vec<T, W>::V* mi, std::index_sequence<R...>) noexcept
+{
+    using O = Vec<T, W>;
+    constexpr size_t w = static_cast<size_t>(W);
+    ((O::loadDeinterleave(in + 2 * (i0 + R * n), dr[R], di[R]),
+      O::loadDeinterleaveReversed(in + 2 * ((R + 1) * n - i0 - (w - 1)), mr[R], mi[R])), ...);
+}
+
 /**
  * @brief The last step of the forward transform: joins the W lanes' spectra
  *        of n points into the spectrum of the N = W n samples, as interleaved
@@ -1559,21 +1627,11 @@ void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noe
     for (size_t i0 = 0; i0 < n / 2; i0 += w, in += 2 * w * w, tw += 2 * (w - 1) * w)
     {
         V re[W], im[W];
-        for (size_t t = 0; t < w; ++t)
-        {
-            re[t] = O::load(in + 2 * t * w);
-            im[t] = O::load(in + (2 * t + 1) * w);
-        }
+        loadLaneBins<T, W>(in, re, im, std::make_index_sequence<w>());
         if (i0 == 0) im[0] = O::set1(T(0));   // that element holds bin n/2
         O::transpose(re);
         O::transpose(im);
-        for (size_t j = 1; j < w; ++j)
-        {
-            const V wr = O::load(tw + 2 * (j - 1) * w), wi = O::load(tw + (2 * j - 1) * w);
-            const V r = O::mulSub(wr, re[j], wi, im[j]);
-            im[j] = O::mulAdd(wr, im[j], wi, re[j]);
-            re[j] = r;
-        }
+        turnLanes<T, W, false>(re, im, tw, std::make_index_sequence<w - 1>());
         // Rising bins i + r n and falling bins (r + 1) n - i; the falling
         // ones go first, so that bin 0's doubles end as the rising values.
         const auto rising = [&](size_t r) noexcept { return out + 2 * (i0 + r * n); };
@@ -1665,11 +1723,7 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
     for (size_t i0 = 0; i0 < n / 2; i0 += w, out += 2 * w * w, tw += 2 * (w - 1) * w)
     {
         V dr[W / 2], di[W / 2], mr[W / 2], mi[W / 2];   // rising and falling bins
-        for (size_t r = 0; r < half; ++r)
-        {
-            O::loadDeinterleave(in + 2 * (i0 + r * n), dr[r], di[r]);
-            O::loadDeinterleaveReversed(in + 2 * ((r + 1) * n - i0 - (w - 1)), mr[r], mi[r]);
-        }
+        loadSpectrumRows<T, W>(in, i0, n, dr, di, mr, mi, std::make_index_sequence<half>());
         if (i0 == 0)
         {
             // Bins 0 and N/2 with their imaginary parts as zero.
@@ -1748,31 +1802,31 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
             re[7] = O::sub(p3r, t3r);
             im[7] = O::sub(p3i, t3i);
         }
-        for (size_t j = 1; j < w; ++j)
-        {
-            const V wr = O::load(tw + 2 * (j - 1) * w), wi = O::load(tw + (2 * j - 1) * w);
-            const V r = O::mulAdd(wr, re[j], wi, im[j]);
-            im[j] = O::mulSub(wr, im[j], wi, re[j]);
-            re[j] = r;
-        }
+        turnLanes<T, W, true>(re, im, tw, std::make_index_sequence<w - 1>());
         O::transpose(re);
         O::transpose(im);
-        for (size_t t = 0; t < w; ++t)
-        {
-            O::store(out + 2 * t * w, re[t]);
-            O::store(out + (2 * t + 1) * w, im[t]);
-        }
+        storeLaneBins<T, W>(out, re, im, std::make_index_sequence<w>());
     }
     // Bin n/2 of the lanes: W Y_j[n/2] = 2 Re sum_r X[n/2 + r n] exp(pi i j (2r + 1) / W).
+    // Rows r and W/2 - 1 - r have equal or opposite factors and are added
+    // first: equal bins (a flat spectrum) then cancel to the last bit.
     T middle[W];
     for (size_t j = 0; j < w; ++j)
     {
+        const T* const cosines = edge + j * half;
+        const T* const sines = edge + w * half + j * half;
+        const auto bin = [&](size_t r) noexcept { return in + 2 * (n / 2 + r * n); };
         T sum = T(0);
-        for (size_t r = 0; r < half; ++r)
-        {
-            const T* const x = in + 2 * (n / 2 + r * n);
-            sum += x[0] * edge[j * half + r] - x[1] * edge[w * half + j * half + r];
-        }
+        if constexpr (W == 2)
+            sum = bin(0)[0] * cosines[0] - bin(0)[1] * sines[0];
+        else
+            for (size_t r = 0; r < half / 2; ++r)
+            {
+                const size_t m = half - 1 - r;
+                const T* const x = bin(r);
+                const T* const y = bin(m);
+                sum += (x[0] * cosines[r] + y[0] * cosines[m]) - (x[1] * sines[r] + y[1] * sines[m]);
+            }
         middle[j] = sum + sum;
     }
     O::store(first + w, O::load(middle));
@@ -1780,7 +1834,7 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
 
 /// The forward transform at W lanes: the passes between the two work buffers
 /// a and b (N values each), the first one reading the samples.
-template <typename T, int W, bool Whole>
+template <typename T, int W>
 void realForwardAt(const RealPlan<T>& p, const T* time, T* freq, T* a, T* b) noexcept
 {
     const size_t n = p.n;
@@ -1793,8 +1847,11 @@ void realForwardAt(const RealPlan<T>& p, const T* time, T* freq, T* a, T* b) noe
     T* dst = b;
     for (size_t m = p.firstLength(); m < n; m *= 4)
     {
-        realRadix4<T, W, Whole>(src, dst, n, m, tw);
-        tw += RealPlan<T>::passValues(m, p.twiddleRepeat);
+        if (m <= p.wholeReach)
+            realRadix4<T, W, true>(src, dst, n, m, tw);
+        else
+            realRadix4<T, W, false>(src, dst, n, m, tw);
+        tw += RealPlan<T>::passValues(m, RealPlan<T>::repeatFor(m, p.lanes, p.wholeReach));
         std::swap(src, dst);
     }
     realFinalize<T, W>(src, freq, n, p.turn, p.edge);
@@ -1804,7 +1861,7 @@ void realForwardAt(const RealPlan<T>& p, const T* time, T* freq, T* a, T* b) noe
 /// each later step is one pass (they alternate between a and b, so the
 /// buffer a step reads follows from its index) and the last one writes the
 /// scaled samples.
-template <typename T, int W, bool Whole>
+template <typename T, int W>
 void realInverseStepAt(const RealPlan<T>& p, size_t step, const T* freq, T* time, T* a, T* b) noexcept
 {
     const size_t n = p.n;
@@ -1821,8 +1878,11 @@ void realInverseStepAt(const RealPlan<T>& p, size_t step, const T* freq, T* time
     {
         const T* tw = p.twiddles;
         for (size_t below = p.firstLength(); below < m; below *= 4)
-            tw += RealPlan<T>::passValues(below, p.twiddleRepeat);
-        realInverseRadix4<T, W, Whole>(src, dst, n, m, tw);
+            tw += RealPlan<T>::passValues(below, RealPlan<T>::repeatFor(below, p.lanes, p.wholeReach));
+        if (m <= p.wholeReach)
+            realInverseRadix4<T, W, true>(src, dst, n, m, tw);
+        else
+            realInverseRadix4<T, W, false>(src, dst, n, m, tw);
     }
     else if (p.first8)
         realLast8<T, W>(src, time, n, p.scale);
@@ -1837,17 +1897,10 @@ void realForward([[maybe_unused]] const RealPlan<T>& p, [[maybe_unused]] const T
 {
     if constexpr (kNarrow<T> > 1)
     {
-        const bool whole = p.twiddleRepeat > 1;
         if (p.lanes == static_cast<size_t>(kWide<T>))
-        {
-            if (whole) realForwardAt<T, kWide<T>, true>(p, time, freq, a, b);
-            else realForwardAt<T, kWide<T>, false>(p, time, freq, a, b);
-        }
+            realForwardAt<T, kWide<T>>(p, time, freq, a, b);
         else
-        {
-            if (whole) realForwardAt<T, kNarrow<T>, true>(p, time, freq, a, b);
-            else realForwardAt<T, kNarrow<T>, false>(p, time, freq, a, b);
-        }
+            realForwardAt<T, kNarrow<T>>(p, time, freq, a, b);
     }
 }
 
@@ -1859,17 +1912,10 @@ void realInverseStep([[maybe_unused]] const RealPlan<T>& p, [[maybe_unused]] siz
 {
     if constexpr (kNarrow<T> > 1)
     {
-        const bool whole = p.twiddleRepeat > 1;
         if (p.lanes == static_cast<size_t>(kWide<T>))
-        {
-            if (whole) realInverseStepAt<T, kWide<T>, true>(p, step, freq, time, a, b);
-            else realInverseStepAt<T, kWide<T>, false>(p, step, freq, time, a, b);
-        }
+            realInverseStepAt<T, kWide<T>>(p, step, freq, time, a, b);
         else
-        {
-            if (whole) realInverseStepAt<T, kNarrow<T>, true>(p, step, freq, time, a, b);
-            else realInverseStepAt<T, kNarrow<T>, false>(p, step, freq, time, a, b);
-        }
+            realInverseStepAt<T, kNarrow<T>>(p, step, freq, time, a, b);
     }
 }
 

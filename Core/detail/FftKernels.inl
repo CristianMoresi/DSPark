@@ -1273,6 +1273,22 @@ inline void storePair(T* at, typename Vec<T, W>::V first, typename Vec<T, W>::V 
     Vec<T, W>::store(at + W, second);
 }
 
+/// Marks the last use of a factor that two products share. GCC for arm64
+/// computes a sum of products a b + c d as a product followed by a fused
+/// multiply-add that must overwrite it; where the product could not take the
+/// place of one of its operands, that compiler first copies it to another
+/// register (one more vector operation, three per butterfly of an inverse
+/// pass). Used between the two products of a factor, this makes the second
+/// one the factor's last use, so it takes the factor's register and the sum
+/// stays there. It emits nothing.
+template <typename T, int W>
+inline void lastUse([[maybe_unused]] typename Vec<T, W>::V& factor) noexcept
+{
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+    __asm__("" : "+w"(factor));
+#endif
+}
+
 /// The first pass of a lane transform whose log2(n) is even: the four-point
 /// spectra of the samples t0, t0 + n/4, t0 + n/2 and t0 + 3n/4.
 template <typename T, int W>
@@ -1449,13 +1465,21 @@ void realInverseRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noe
             const V t1r = O::sub(e2r, f), t1i = O::add(e2i, g);
             const V t2r = O::sub(e0r, e1r), t2i = O::sub(e0i, e1i);
             const V t3r = O::add(e2r, f), t3i = O::sub(e2i, g);
-            const V w1r = laneTwiddle<T, W, Whole>(t), w1i = laneTwiddle<T, W, Whole>(t + tl);
-            const V w2r = laneTwiddle<T, W, Whole>(t + 2 * tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
-            const V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl), w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
+            V w1r = laneTwiddle<T, W, Whole>(t), w2r = laneTwiddle<T, W, Whole>(t + 2 * tl);
+            V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl);
+            const V w1i = laneTwiddle<T, W, Whole>(t + tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
+            const V w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
+            // conj(w) T: the imaginary parts first (see lastUse()).
+            const V y1i = O::mulSub(w1r, t1i, w1i, t1r);
+            const V y2i = O::mulSub(w2r, t2i, w2i, t2r);
+            const V y3i = O::mulSub(w3r, t3i, w3i, t3r);
+            lastUse<T, W>(w1r);
+            lastUse<T, W>(w2r);
+            lastUse<T, W>(w3r);
             storePair<T, W>(x0 + e, O::add(e0r, e1r), O::add(e0i, e1i));
-            storePair<T, W>(x1 + e, O::mulAdd(w1r, t1r, w1i, t1i), O::mulSub(w1r, t1i, w1i, t1r));
-            storePair<T, W>(x2 + e, O::mulAdd(w2r, t2r, w2i, t2i), O::mulSub(w2r, t2i, w2i, t2r));
-            storePair<T, W>(x3 + e, O::mulAdd(w3r, t3r, w3i, t3i), O::mulSub(w3r, t3i, w3i, t3r));
+            storePair<T, W>(x1 + e, O::mulAdd(w1r, t1r, w1i, t1i), y1i);
+            storePair<T, W>(x2 + e, O::mulAdd(w2r, t2r, w2i, t2i), y2i);
+            storePair<T, W>(x3 + e, O::mulAdd(w3r, t3r, w3i, t3i), y3i);
         }
     }
 }
@@ -1546,12 +1570,14 @@ inline void turnLane(typename Vec<T, W>::V& re, typename Vec<T, W>::V& im, const
 {
     using O = Vec<T, W>;
     using V = typename O::V;
-    const V wr = O::load(tw), wi = O::load(tw + W);
+    V wr = O::load(tw);
+    const V wi = O::load(tw + W);
     if constexpr (Conjugate)
     {
-        const V r = O::mulAdd(wr, re, wi, im);
-        im = O::mulSub(wr, im, wi, re);
-        re = r;
+        const V i = O::mulSub(wr, im, wi, re);
+        lastUse<T, W>(wr);
+        re = O::mulAdd(wr, re, wi, im);
+        im = i;
     }
     else
     {
@@ -1712,7 +1738,19 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
     for (size_t i0 = 0; i0 < n / 2; i0 += w, out += 2 * w * w, tw += 2 * (w - 1) * w)
     {
         V dr[W / 2], di[W / 2], mr[W / 2], mi[W / 2];   // rising and falling bins
-        loadSpectrumRows<T, W>(in, i0, n, dr, di, mr, mi, std::make_index_sequence<half>());
+        if constexpr (W == 2)
+        {
+            // Two loads and a transposition: the load that takes a pair of
+            // vectors apart wants neighbouring registers, which costs one
+            // compiler two copies.
+            V rising[2] = { O::load(in + 2 * i0), O::load(in + 2 * i0 + w) };
+            O::transpose(rising);
+            dr[0] = rising[0];
+            di[0] = rising[1];
+            O::loadDeinterleaveReversed(in + 2 * (n - i0 - (w - 1)), mr[0], mi[0]);
+        }
+        else
+            loadSpectrumRows<T, W>(in, i0, n, dr, di, mr, mi, std::make_index_sequence<half>());
         if (i0 == 0)
         {
             // Bins 0 and N/2 with their imaginary parts as zero.

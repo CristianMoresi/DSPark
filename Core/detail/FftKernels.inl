@@ -1257,6 +1257,22 @@ inline typename Vec<T, W>::V laneTwiddle(const T* at) noexcept
     else return Vec<T, W>::set1(*at);
 }
 
+/// Two vectors stored side by side. GCC for arm64 addresses the streams of a
+/// pass as a base plus a shared index, a form with no store-pair instruction,
+/// and writes each vector on its own; on the arm64 server core measured, a
+/// pair takes one vector operation where two single stores take two (a tenth
+/// of a pass). Hiding the address from that compiler gives the pair a base
+/// register of its own, and the two stores leave as one instruction.
+template <typename T, int W>
+inline void storePair(T* at, typename Vec<T, W>::V first, typename Vec<T, W>::V second) noexcept
+{
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+    __asm__("" : "+r"(at));
+#endif
+    Vec<T, W>::store(at, first);
+    Vec<T, W>::store(at + W, second);
+}
+
 /// The first pass of a lane transform whose log2(n) is even: the four-point
 /// spectra of the samples t0, t0 + n/4, t0 + n/2 and t0 + 3n/4.
 template <typename T, int W>
@@ -1271,10 +1287,8 @@ void realFirst4(const T* in, T* out, size_t n) noexcept
         const V a0 = O::load(in), a1 = O::load(in + quarter);
         const V a2 = O::load(in + 2 * quarter), a3 = O::load(in + 3 * quarter);
         const V s02 = O::add(a0, a2), s13 = O::add(a1, a3);
-        O::store(out, O::add(s02, s13));           // X[0]
-        O::store(out + w, O::sub(s02, s13));       // X[2]
-        O::store(out + 2 * w, O::sub(a0, a2));     // X[1] = (a0 - a2) + j (a3 - a1)
-        O::store(out + 3 * w, O::sub(a3, a1));
+        storePair<T, W>(out, O::add(s02, s13), O::sub(s02, s13));         // X[0], X[2]
+        storePair<T, W>(out + 2 * w, O::sub(a0, a2), O::sub(a3, a1));     // X[1] = (a0 - a2) + j (a3 - a1)
     }
 }
 
@@ -1303,14 +1317,10 @@ void realFirst8(const T* in, T* out, size_t n) noexcept
         // h (d1 - d3) - j (d2 + h (d1 + d3)), X[3] = d0 - h (d1 - d3) +
         // j (d2 - h (d1 + d3)), h = sqrt(1/2).
         const V p = O::mul(h, O::sub(d1, d3)), r = O::mul(nh, O::add(d1, d3));
-        O::store(out, O::add(s02, s13));           // X[0]
-        O::store(out + w, O::sub(s02, s13));       // X[4]
-        O::store(out + 2 * w, O::add(d0, p));      // X[1]
-        O::store(out + 3 * w, O::sub(r, d2));
-        O::store(out + 4 * w, O::sub(s0, s2));     // X[2]
-        O::store(out + 5 * w, O::sub(s3, s1));
-        O::store(out + 6 * w, O::sub(d0, p));      // X[3]
-        O::store(out + 7 * w, O::add(d2, r));
+        storePair<T, W>(out, O::add(s02, s13), O::sub(s02, s13));     // X[0], X[4]
+        storePair<T, W>(out + 2 * w, O::add(d0, p), O::sub(r, d2));   // X[1]
+        storePair<T, W>(out + 4 * w, O::sub(s0, s2), O::sub(s3, s1)); // X[2]
+        storePair<T, W>(out + 6 * w, O::sub(d0, p), O::add(d2, r));   // X[3]
     }
 }
 
@@ -1350,19 +1360,15 @@ void realRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noexcept
             // Bin 0 of each: bins 0, 2m (both real) and m.
             const V a0 = O::load(x0), a1 = O::load(x1), a2 = O::load(x2), a3 = O::load(x3);
             const V s02 = O::add(a0, a2), s13 = O::add(a1, a3);
-            O::store(out, O::add(s02, s13));
-            O::store(out + w, O::sub(s02, s13));
-            O::store(out + 2 * run, O::sub(a0, a2));
-            O::store(out + 2 * run + w, O::sub(a3, a1));
+            storePair<T, W>(out, O::add(s02, s13), O::sub(s02, s13));
+            storePair<T, W>(out + 2 * run, O::sub(a0, a2), O::sub(a3, a1));
         }
         {
             // Bin m/2 of each: bins m/2 and 3m/2, turned by the eighth roots.
             const V b0 = O::load(x0 + w), b1 = O::load(x1 + w), b2 = O::load(x2 + w), b3 = O::load(x3 + w);
             const V p = O::mul(h, O::sub(b1, b3)), r = O::mul(nh, O::add(b1, b3));
-            O::store(out + run, O::add(b0, p));
-            O::store(out + run + w, O::sub(r, b2));
-            O::store(out + 3 * run, O::sub(b0, p));
-            O::store(out + 3 * run + w, O::add(b2, r));
+            storePair<T, W>(out + run, O::add(b0, p), O::sub(r, b2));
+            storePair<T, W>(out + 3 * run, O::sub(b0, p), O::add(b2, r));
         }
         const T* t = tw;
         for (size_t e = 2 * w; e < run; e += 2 * w, t += 6 * tl)
@@ -1381,18 +1387,10 @@ void realRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noexcept
             const V u1r = O::sub(ar, t2r), u1i = O::sub(ai, t2i);
             const V u2r = O::add(t1r, t3r), u2i = O::add(t1i, t3i);
             const V u3r = O::sub(t3r, t1r), u3i = O::sub(t3i, t1i);
-            T* const z0 = out + e;               // bin i
-            T* const z1 = out + 2 * run - e;     // bin m - i
-            T* const z2 = out + 2 * run + e;     // bin m + i
-            T* const z3 = out + 4 * run - e;     // bin 2m - i
-            O::store(z0, O::add(u0r, u2r));
-            O::store(z0 + w, O::add(u0i, u2i));
-            O::store(z1, O::add(u1r, u3i));
-            O::store(z1 + w, O::sub(u3r, u1i));
-            O::store(z2, O::sub(u1r, u3i));
-            O::store(z2 + w, O::add(u1i, u3r));
-            O::store(z3, O::sub(u0r, u2r));
-            O::store(z3 + w, O::sub(u2i, u0i));
+            storePair<T, W>(out + e, O::add(u0r, u2r), O::add(u0i, u2i));             // bin i
+            storePair<T, W>(out + 2 * run - e, O::add(u1r, u3i), O::sub(u3r, u1i));   // bin m - i
+            storePair<T, W>(out + 2 * run + e, O::sub(u1r, u3i), O::add(u1i, u3r));   // bin m + i
+            storePair<T, W>(out + 4 * run - e, O::sub(u0r, u2r), O::sub(u2i, u0i));   // bin 2m - i
         }
     }
 }
@@ -1417,23 +1415,19 @@ void realInverseRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noe
         T* const x2 = out + 2 * quarter;
         T* const x3 = out + 3 * quarter;
         {
+            // Bins 0, 2m and m give bin 0 of each of the four; bins m/2 and
+            // 3m/2 give their bin m/2, which sits next to it.
             const V z0 = O::load(in), z2 = O::load(in + w);
             const V zr = O::load(in + 2 * run), zi = O::load(in + 2 * run + w);
-            const V s = O::add(z0, z2), d = O::sub(z0, z2);
-            const V zr2 = O::add(zr, zr), zi2 = O::add(zi, zi);
-            O::store(x0, O::add(s, zr2));
-            O::store(x1, O::sub(d, zi2));
-            O::store(x2, O::sub(s, zr2));
-            O::store(x3, O::add(d, zi2));
-        }
-        {
             const V pr = O::load(in + run), pi = O::load(in + run + w);
             const V qr = O::load(in + 3 * run), qi = O::load(in + 3 * run + w);
-            const V a = O::add(pr, qr), b = O::sub(pr, qr), c = O::sub(qi, pi), d = O::add(pi, qi);
-            O::store(x0 + w, O::add(a, a));
-            O::store(x1 + w, O::mul(k, O::sub(b, d)));
-            O::store(x2 + w, O::add(c, c));
-            O::store(x3 + w, O::mul(nk, O::add(b, d)));
+            const V s = O::add(z0, z2), d = O::sub(z0, z2);
+            const V zr2 = O::add(zr, zr), zi2 = O::add(zi, zi);
+            const V a = O::add(pr, qr), b = O::sub(pr, qr), c = O::sub(qi, pi), g = O::add(pi, qi);
+            storePair<T, W>(x0, O::add(s, zr2), O::add(a, a));
+            storePair<T, W>(x1, O::sub(d, zi2), O::mul(k, O::sub(b, g)));
+            storePair<T, W>(x2, O::sub(s, zr2), O::add(c, c));
+            storePair<T, W>(x3, O::add(d, zi2), O::mul(nk, O::add(b, g)));
         }
         const T* t = tw;
         for (size_t e = 2 * w; e < run; e += 2 * w, t += 6 * tl)
@@ -1458,14 +1452,10 @@ void realInverseRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noe
             const V w1r = laneTwiddle<T, W, Whole>(t), w1i = laneTwiddle<T, W, Whole>(t + tl);
             const V w2r = laneTwiddle<T, W, Whole>(t + 2 * tl), w2i = laneTwiddle<T, W, Whole>(t + 3 * tl);
             const V w3r = laneTwiddle<T, W, Whole>(t + 4 * tl), w3i = laneTwiddle<T, W, Whole>(t + 5 * tl);
-            O::store(x0 + e, O::add(e0r, e1r));
-            O::store(x0 + e + w, O::add(e0i, e1i));
-            O::store(x1 + e, O::mulAdd(w1r, t1r, w1i, t1i));
-            O::store(x1 + e + w, O::mulSub(w1r, t1i, w1i, t1r));
-            O::store(x2 + e, O::mulAdd(w2r, t2r, w2i, t2i));
-            O::store(x2 + e + w, O::mulSub(w2r, t2i, w2i, t2r));
-            O::store(x3 + e, O::mulAdd(w3r, t3r, w3i, t3i));
-            O::store(x3 + e + w, O::mulSub(w3r, t3i, w3i, t3r));
+            storePair<T, W>(x0 + e, O::add(e0r, e1r), O::add(e0i, e1i));
+            storePair<T, W>(x1 + e, O::mulAdd(w1r, t1r, w1i, t1i), O::mulSub(w1r, t1i, w1i, t1r));
+            storePair<T, W>(x2 + e, O::mulAdd(w2r, t2r, w2i, t2i), O::mulSub(w2r, t2i, w2i, t2r));
+            storePair<T, W>(x3 + e, O::mulAdd(w3r, t3r, w3i, t3i), O::mulSub(w3r, t3i, w3i, t3r));
         }
     }
 }
@@ -1545,9 +1535,8 @@ template <typename T, int W, size_t... I>
 inline void storeLaneBins(T* out, const typename Vec<T, W>::V* re, const typename Vec<T, W>::V* im,
                           std::index_sequence<I...>) noexcept
 {
-    using O = Vec<T, W>;
     constexpr size_t w = static_cast<size_t>(W);
-    ((O::store(out + 2 * I * w, re[I]), O::store(out + (2 * I + 1) * w, im[I])), ...);
+    (storePair<T, W>(out + 2 * I * w, re[I], im[I]), ...);
 }
 
 /// One lane's values times its factors (at tw: real parts, then imaginary

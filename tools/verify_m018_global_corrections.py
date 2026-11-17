@@ -1606,10 +1606,12 @@ def allocation_thread_errors(root: Path, overrides: dict[str, str] | None = None
 
 def sanitizer_workflow_errors(ci: str, cmake: str) -> list[str]:
     errors: list[str] = []
-    for job in ("tests", "sanitizers", "tsan"):
+    # The ThreadSanitizer job runs the ordinary suite instrumented: 37 minutes
+    # on the faster hosted machines, 58 on the slower ones.
+    for job, limit in (("tests", "60"), ("sanitizers", "60"), ("tsan", "90")):
         section = re.search(r"(?ms)^  " + job + r":\n(.*?)(?=^  [\w-]+:|\Z)", ci)
         limits = re.findall(r"^    timeout-minutes: ([0-9]+)$", section[1], re.MULTILINE) if section else []
-        if limits != ["60"]:
+        if limits != [limit]:
             errors.append(f"SANITIZER_JOB_WATCHDOG {job}")
     # Exact commands deliberately disallow a second filter or a shell suffix
     # that could turn a failed test into a successful step.
@@ -1691,6 +1693,7 @@ def sanitizer_partition_errors(root: Path) -> list[str]:
         ("native-filter", ci.replace("--build-config Release\n", "--build-config Release -E alloc_failure\n")),
         ("missing-clang", ci.replace("{ name: Clang, compiler: clang++ }", "")),
         ("unbounded-job", ci.replace("    timeout-minutes: 60\n", "")),
+        ("unbounded-tsan-job", ci.replace("    timeout-minutes: 90\n", "")),
         ("unbuilt-offline-chain", ci.replace("dspark_offline_chain", "")),
         ("unbuilt-stereo-mix", ci.replace("dspark_stereo_mix", "")),
         ("unbounded-tsan-parallelism", ci.replace("-V --parallel 2 --timeout", "-V --parallel --timeout")),

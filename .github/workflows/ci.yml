@@ -622,8 +622,10 @@ jobs:
     name: ThreadSanitizer (Linux GCC)
     runs-on: ubuntu-latest
     # A watchdog, not a performance target. Keep failures observable even if a
-    # hosted runner slows down; never reduce stress iterations to meet it.
-    timeout-minutes: 60
+    # hosted runner slows down; never reduce stress iterations to meet it. The
+    # job takes 37 minutes on the faster hosted machines and has taken 58 on
+    # the slower ones.
+    timeout-minutes: 90
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:

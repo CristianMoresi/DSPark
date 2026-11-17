@@ -271,6 +271,10 @@ public:
             || output == nullptr || outputCapacity <= 0)
             return 0;
         const int64_t outputLength = std::min<int64_t>(outputLengthFor(inputLength), outputCapacity);
+        // A prepared ratio is positive, so this only states it: the zero fill
+        // of the tail below then spans a count that cannot be negative.
+        if (outputLength <= 0)
+            return 0;
         if (useTwoStage())
         {
             runTwoStage(input, inputLength, 0, outputLength, output);

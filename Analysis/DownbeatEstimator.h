@@ -9,7 +9,7 @@
  *
  * Given a signal and its beats (from Analysis/BeatTracker.h, a host's grid or
  * a tap), it names the beats that open a bar. It reads one value per beat for
- * each of five cues, asks of every candidate first beat how much of each cue
+ * each of six cues, asks of every candidate first beat how much of each cue
  * falls on the beats it would make first, and takes the candidate with the
  * most:
  *
@@ -17,14 +17,24 @@
  *   beat before it (a Jensen-Shannon divergence of the two, 30 Hz to 1.4 kHz
  *   at about 5 Hz of resolution). Chords and bass notes tend to change with
  *   the bar; the cue is the one of Davies and Plumbley (2006), read at a
- *   resolution that tells bass notes apart. It counts twice.
+ *   resolution that tells bass notes apart.
+ * - **Change between pairs of bars** - how far the two bars after a beat are
+ *   from the two before it, in pitch classes, in spectrum and in bass
+ *   spectrum: three cues. A candidate that splits the phrases where the music
+ *   does scores high on the three.
  * - **Low end at the beat** - the energy below 150 Hz from 30 ms before the
  *   beat to 120 ms after it, which a beat a little early or late still
  *   catches.
- * - **Change between pairs of bars** - how far the two bars after a beat are
- *   from the two before it, in pitch classes, in spectrum and in bass
- *   spectrum. A candidate that splits the phrases where the music does scores
- *   high on the three.
+ * - **Depth of the bass** - how low the spectrum below 300 Hz sits at the
+ *   beat: a kick drum or a root note pulls it down.
+ *
+ * The last two are the cues of a rhythm section, and they count in proportion
+ * to how much of one the music has, read from how flat the spectra of its
+ * beats are: in full where there are drums (the geometric mean of a beat's
+ * spectrum above 0.45 of its arithmetic mean), not at all in music of pitched
+ * lines alone (below 0.30), where a loud low note says nothing of the bar. On
+ * drums alone it is the other four that say nothing: the spectrum changes
+ * most at the loudest drum, and the low end is what marks the bar.
  *
  * Every cue is brought to zero mean and unit deviation over the beats, so
  * none has a scale to tune; a cue that barely moves (a click track, a held
@@ -33,30 +43,34 @@
  * length, when the caller does not give it, is 3 when the beats resemble each
  * other more three apart than two or four apart (in low end, spectral change
  * and loudness) and a first beat stands out more in bars of three than of
- * four, and 4 otherwise: duple and quadruple time both read as 4.
+ * four, and 4 otherwise: duple and quadruple time both read as 4. For this
+ * the low end counts in full whatever the music: a cue that falls on the
+ * wrong beat of the bar still tells its length.
  *
- * Measured on two annotated sets, each figure against a detector of the
+ * Measured on three annotated sets, each figure against a detector of the
  * spectral-difference kind given the same beats and bar length, as the mean
  * F-measure of the first beats within 70 ms. On 698 excerpts of dance music
- * (175 in three, 523 in four): with the annotated beats and bar length 0.853
- * against 0.747 (the right first beat in 85.2 % of the excerpts against
- * 74.6 %; in three 99.4 % against 98.9 %, in four 80.5 % against 66.5 %);
- * with the bar length estimated (right in 98.1 %) 0.844 against 0.739; with
- * BeatTracker's own beats (their F-measure 0.776) 0.625 against 0.567, and
- * 0.630 against 0.567 with the bar length estimated (right in 91.8 %). On 360
+ * (175 in three, 523 in four): with the annotated beats and bar length 0.872
+ * against 0.747 (the right first beat in 87.1 % of the excerpts against
+ * 74.6 %; in three 99.4 % against 98.9 %, in four 83.0 % against 66.5 %);
+ * with the bar length estimated (right in 98.0 %) 0.868 against 0.740; with
+ * BeatTracker's own beats (their F-measure 0.776) 0.628 against 0.567, and
+ * 0.630 against 0.567 with the bar length estimated (right in 91.7 %). On 360
  * excerpts of solo guitar, all in four, with no drums and no bass: 0.628
- * against 0.550 (62.8 % against 55.0 %); 0.618 against 0.552 with the bar
- * length estimated (right in 92.5 %); with BeatTracker's own beats (0.520)
- * 0.253 against 0.252, and 0.267 against 0.262. With the beats given, the
- * estimator is ahead or level in each of the twenty styles of the two sets.
- * With the library's own beats it is ahead in thirteen, level in one and
- * behind in six, by 0.036 at most: beats that sit on the off-beats or at
- * another metrical level leave no first beat to be right. The weights were
- * settled on both sets: the low end counted twice and a cue for how low the
- * bass sits led on the dance set and misled on the guitar, and are not used.
- * The confidence sorts the answers: with the annotated beats, 97.6 % and
- * 93.7 % are right where it reads above 0.75 (a half and a third of the
- * excerpts) and 48.1 % and 31.5 % where it reads below 0.25.
+ * against 0.550 (62.8 % against 55.0 %); 0.625 against 0.561 with the bar
+ * length estimated (right in 93.1 %); with BeatTracker's own beats (0.520)
+ * 0.258 against 0.252, and 0.272 against 0.266. On 243 takes of a drum kit
+ * alone, 240 of them in four, with the beats of each take's tempo: 0.770
+ * against 0.379 (77.0 % against 37.9 %); 0.759 against 0.385 with the bar
+ * length estimated (right in 95.9 %); with BeatTracker's own beats (0.760)
+ * 0.557 against 0.270, and 0.557 against 0.272. With the beats given, the
+ * estimator is ahead or level in each of the twenty-eight styles of five
+ * excerpts or more. With the library's own beats it is ahead in twenty-one,
+ * level in one and behind in six, by 0.028 at most: beats that sit on the
+ * off-beats or at another metrical level leave no first beat to be right. The
+ * confidence sorts the answers: with the annotated beats, 98.9 %, 95.4 % and
+ * 100 % are right in the three sets where it reads above 0.75, and 57.6 %,
+ * 34.3 % and 57.4 % where it reads below 0.25.
  *
  * Not real-time: estimate() allocates and runs on the calling thread, over
  * the whole signal at once. It shares no state between calls: any thread.
@@ -157,20 +171,28 @@ public:
         Readings r;
         if (!read(mono, sampleRate, beatSamples, r)) return result;
 
+        // How much the two low-end cues count towards the first beat: in full
+        // where the beats' spectra are as flat as a drum kit's, not at all
+        // where they are those of pitched lines alone.
+        const double rhythm = std::clamp((r.flatness - kTonalFlatness) / (kNoisyFlatness - kTonalFlatness), 0.0, 1.0);
+
         // The shares of bars of the caller's length, or of three or four:
         // three when the beats resemble each other more three apart than two
         // or four apart, and a first beat stands out more in bars of three.
+        // The bar length is read with the low end in full whatever the music:
+        // a cue that falls on the wrong beat of the bar still tells its length.
         std::array<double, kMaxBeatsPerBar> score{};
         int meter = beatsPerBar;
         if (meter != 0)
-            score = shares(r, static_cast<size_t>(meter));
+            score = shares(r, static_cast<size_t>(meter)).with(rhythm);
         else
         {
-            const std::array<double, kMaxBeatsPerBar> inThree = shares(r, 3), inFour = shares(r, 4);
+            const Shares inThree = shares(r, 3), inFour = shares(r, 4);
             const double alike = likeness(r, 3) - std::max(likeness(r, 2), likeness(r, 4));
-            const bool three = alike + kStandOutWeight * (standOut(inThree, 3) - standOut(inFour, 4)) > 0.0;
+            const double standsOut = standOut(inThree.with(1.0), 3) - standOut(inFour.with(1.0), 4);
+            const bool three = alike + kStandOutWeight * standsOut > 0.0;
             meter = three ? 3 : 4;
-            score = three ? inThree : inFour;
+            score = (three ? inThree : inFour).with(rhythm);
         }
         const size_t m = static_cast<size_t>(meter);
         if (beats < 2 * m + 1) return result;
@@ -198,6 +220,8 @@ private:
         std::vector<double> lowEnd;      ///< Log energy below 150 Hz around the beat.
         std::vector<double> loudness;    ///< Log energy of the beat, to the next one.
         std::vector<double> fineChange;  ///< Divergence of the beat's spectrum from the one before (0 at the first).
+        std::vector<double> bassDepth;   ///< How low the beat's bass sits: its centroid below 300 Hz, in Hz, negated.
+        double flatness = 0.0;           ///< Mean log flatness of the beats' spectra (0: noise; far below: pitches).
         std::vector<double> fine;        ///< Per beat, the mean magnitude spectrum to 1.4 kHz: beats x bins.
         std::vector<double> tone;        ///< Per beat, its twelve pitch classes: beats x 12.
         size_t bins = 0;                 ///< Bins of a spectrum in `fine`.
@@ -216,6 +240,17 @@ private:
     /// dB) and of the divergences and distances.
     static constexpr double kLogFloor = 0.05;
     static constexpr double kChangeFloor = 1e-3;
+    static constexpr double kDepthFloor = 1.0;       ///< The same for the depth of the bass, in Hz.
+    /// The two low-end cues count in full from this flatness of the beats'
+    /// spectra up, and not at all from the second one down: natural logs of
+    /// the ratio of a spectrum's geometric mean to its arithmetic mean (0.45
+    /// and 0.30). Drums and full mixes sit above the first, pitched lines
+    /// alone below the second.
+    static constexpr double kNoisyFlatness = -0.8;
+    static constexpr double kTonalFlatness = -1.2;
+    /// A beat whose spectrum sums to less than this share of the loudest
+    /// beat's is silent: it says nothing of how flat the music is.
+    static constexpr double kSilentShare = 1e-6;
     /// What the bar length takes of how much more a first beat stands out in
     /// bars of three than of four, next to how alike the beats are.
     static constexpr double kStandOutWeight = 0.25;
@@ -321,14 +356,35 @@ private:
             }
         }
 
-        // Per beat: its pitch classes and how far its spectrum is from the one before.
+        // Per beat: its pitch classes, how far its spectrum is from the one
+        // before, how low its bass sits and how flat its spectrum is.
         r.tone.assign(beats * 12, 0.0);
         r.fineChange.assign(beats, 0.0);
+        r.bassDepth.assign(beats, 0.0);
+        std::vector<double> level(beats, 0.0), flat(beats, 0.0);
         for (size_t k = 0; k < beats; ++k)
         {
             double* row = r.fine.data() + k * r.bins;
             const double count = static_cast<double>(frameTo[k] - frameFrom[k]);
             for (size_t b = 0; b < r.bins; ++b) row[b] /= count;
+            double weight = 1e-12, moment = 0.0;
+            for (size_t b = 1; b < r.bassBins; ++b)
+            {
+                weight += row[b];
+                moment += static_cast<double>(b) * row[b];
+            }
+            r.bassDepth[k] = -binHz * moment / weight;
+            if (r.bins > changeFrom)
+            {
+                double logs = 0.0;
+                for (size_t b = changeFrom; b < r.bins; ++b)
+                {
+                    level[k] += row[b];
+                    logs += std::log(1e-18 + row[b]);
+                }
+                const double counted = static_cast<double>(r.bins - changeFrom);
+                flat[k] = logs / counted - std::log(1e-18 + level[k] / counted);
+            }
             double* tone = r.tone.data() + k * 12;
             for (size_t b = 1; b < r.bins; ++b)
             {
@@ -338,6 +394,19 @@ private:
                 tone[static_cast<size_t>(((note % 12) + 12) % 12)] += row[b];
             }
             if (k > 0) r.fineChange[k] = divergence(row - r.bins, row, changeFrom, r.bins);
+        }
+        // How flat the spectra are, over the beats that sound.
+        {
+            const double loudest = *std::max_element(level.begin(), level.end());
+            double sum = 0.0;
+            size_t sounding = 0;
+            for (size_t k = 0; k < beats; ++k)
+                if (level[k] > kSilentShare * loudest)
+                {
+                    sum += flat[k];
+                    ++sounding;
+                }
+            r.flatness = sounding > 0 ? sum / static_cast<double>(sounding) : 0.0;
         }
         return true;
     }
@@ -386,15 +455,36 @@ private:
         }
     }
 
+    /// The cues' shares on each candidate first beat, in two sums: the cues
+    /// that count in any music and the two of the low end.
+    struct Shares
+    {
+        std::array<double, kMaxBeatsPerBar> always{};  ///< The beat-to-beat change and the three between pairs of bars.
+        std::array<double, kMaxBeatsPerBar> lowEnd{};  ///< The low end at the beat and the depth of the bass.
+
+        /// The two sums added up, the low end counted `low` times (0 to 1).
+        [[nodiscard]] std::array<double, kMaxBeatsPerBar> with(double low) const noexcept
+        {
+            std::array<double, kMaxBeatsPerBar> sum{};
+            for (size_t phase = 0; phase < sum.size(); ++phase) sum[phase] = always[phase] + low * lowEnd[phase];
+            return sum;
+        }
+    };
+
     /// Every cue's share on each candidate first beat of bars of `m` beats,
-    /// the cues added up: the beat-to-beat change twice, the low end once and
-    /// the three changes between pairs of bars once each.
-    [[nodiscard]] static std::array<double, kMaxBeatsPerBar> shares(const Readings& r, size_t m)
+    /// each cue counted once: the beat-to-beat change and the three changes
+    /// between pairs of bars in one sum, the low end and the depth of the
+    /// bass in the other. In music of pitched lines alone a loud low note
+    /// says nothing of where the bar starts, so the caller weighs the second
+    /// sum by how much of a rhythm section the music has.
+    [[nodiscard]] static Shares shares(const Readings& r, size_t m)
     {
         const size_t beats = r.lowEnd.size();
-        std::array<double, kMaxBeatsPerBar> score{};
-        addShare(r.fineChange, 1, beats, m, 2.0, kChangeFloor, score);
-        addShare(r.lowEnd, 1, beats, m, 1.0, kLogFloor, score);
+        Shares found;
+        std::array<double, kMaxBeatsPerBar>& score = found.always;
+        addShare(r.fineChange, 1, beats, m, 1.0, kChangeFloor, score);
+        addShare(r.lowEnd, 1, beats, m, 1.0, kLogFloor, found.lowEnd);
+        addShare(r.bassDepth, 1, beats, m, 1.0, kDepthFloor, found.lowEnd);
         const size_t span = 2 * m;
         if (beats >= 2 * span + 2)
         {
@@ -414,7 +504,7 @@ private:
             addShare(spectrum, span, beats - span + 1, m, 1.0, kChangeFloor, score);
             addShare(bass, span, beats - span + 1, m, 1.0, kChangeFloor, score);
         }
-        return score;
+        return found;
     }
 
     /// How far the best candidate first beat stands above the mean of the others.

@@ -11,32 +11,39 @@ All notable user-facing changes to DSPark are documented here.
   (`BeatTracker`'s, a host's grid or a tap). `estimate(mono, sampleRate,
   beatSamples, beatsPerBar = 0)` returns the bar length (the caller's, or 3
   or 4 as estimated), the first beat that opens a bar, all of them, and a
-  confidence. It reads five cues at every beat (how far the beat's spectrum
-  is from the one before, at about 5 Hz of resolution, counted twice; the
-  low end from 30 ms before the beat to 120 ms after it; and how far the two
-  bars after a beat are from the two before it, in pitch classes, in
-  spectrum and in bass spectrum), brings each to zero mean and unit
-  deviation over the beats, and takes the candidate first beat on which most
-  of them falls; the bar length is 3 when the beats resemble each other more
+  confidence. It reads six cues at every beat: how far the beat's spectrum
+  is from the one before, at about 5 Hz of resolution; how far the two bars
+  after a beat are from the two before it, in pitch classes, in spectrum and
+  in bass spectrum; the low end from 30 ms before the beat to 120 ms after
+  it; and how low the bass sits. Each is brought to zero mean and unit
+  deviation over the beats, and the candidate first beat on which most of
+  them falls is taken. The two cues of the low end count in proportion to
+  how flat the spectra of the beats are: in full where there are drums, not
+  at all in music of pitched lines alone, where a loud low note says nothing
+  of the bar. The bar length is 3 when the beats resemble each other more
   three apart than two or four apart and a first beat stands out more in
-  bars of three. Measured in one job on two annotated sets against a
-  detector of the spectral-difference kind (Davies and Plumbley, 2006) given
-  the same beats and bar length, as the mean F-measure of the first beats
-  within 70 ms. On 698 excerpts of dance music (175 in three, 523 in four):
-  with the annotated beats and bar length 0.853 against 0.747 (the right
-  first beat in 85.2 % of the excerpts against 74.6 %); with the bar length
-  estimated (right in 98.1 %) 0.844 against 0.739; with `BeatTracker`'s own
-  beats 0.625 against 0.567, and 0.630 against 0.567 with the bar length
-  estimated (right in 91.8 %). On 360 excerpts of solo guitar, all in four:
-  0.628 against 0.550 (62.8 % against 55.0 %); 0.618 against 0.552 with the
-  bar length estimated (right in 92.5 %); with `BeatTracker`'s own beats
-  0.253 against 0.252, and 0.267 against 0.262. With the beats given, the
-  estimator is ahead or level in each of the twenty styles of the two sets;
-  with the library's own beats it is ahead in thirteen, level in one and
-  behind in six, by 0.036 at most: beats on the off-beats or at another
-  metrical level leave no first beat to be right. The confidence sorts the
-  answers (97.6 % and 93.7 % right above 0.75, 48.1 % and 31.5 % below 0.25)
-  and reads near zero where nothing marks the bar.
+  bars of three. Measured in one job per set on three annotated sets against
+  a detector of the spectral-difference kind (Davies and Plumbley, 2006)
+  given the same beats and bar length, as the mean F-measure of the first
+  beats within 70 ms. On 698 excerpts of dance music (175 in three, 523 in
+  four): with the annotated beats and bar length 0.872 against 0.747 (the
+  right first beat in 87.1 % of the excerpts against 74.6 %); with the bar
+  length estimated (right in 98.0 %) 0.868 against 0.740; with
+  `BeatTracker`'s own beats 0.628 against 0.567, and 0.630 against 0.567
+  with the bar length estimated (right in 91.7 %). On 360 excerpts of solo
+  guitar, all in four: 0.628 against 0.550 (62.8 % against 55.0 %); 0.625
+  against 0.561 with the bar length estimated (right in 93.1 %); with
+  `BeatTracker`'s own beats 0.258 against 0.252, and 0.272 against 0.266. On
+  243 takes of a drum kit alone, 240 of them in four: 0.770 against 0.379
+  (77.0 % against 37.9 %); 0.759 against 0.385 with the bar length estimated
+  (right in 95.9 %); with `BeatTracker`'s own beats 0.557 against 0.270, and
+  0.557 against 0.272. With the beats given, the estimator is ahead or level
+  in each of the twenty-eight styles of five excerpts or more; with the
+  library's own beats it is ahead in twenty-one, level in one and behind in
+  six, by 0.028 at most: beats on the off-beats or at another metrical level
+  leave no first beat to be right. The confidence sorts the answers (98.9 %,
+  95.4 % and 100 % right above 0.75 in the three sets; 57.6 %, 34.3 % and
+  57.4 % below 0.25) and reads near zero where nothing marks the bar.
 - `LadderFilter::setSaturation(Saturation::Input)` (opt-in; `Feedback` and
   `Stages` are unchanged and bit-identical): a third saturation model, with
   linear stages and one saturator on the loop input, run in four sub-steps

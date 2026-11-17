@@ -2087,6 +2087,45 @@ void checkBarsAreFound()
         }
 }
 
+// A drum kit alone, in bars of four: a short, deep kick on the first beat, a
+// long tom on the third, a snare on the second and fourth and the same hat on
+// every beat. The tom is the largest thing in the spectrum, so the spectrum
+// changes most around the third beat; what marks the bar line is the low end.
+// The beats given start `pickup` beats before the first bar line.
+template <typename T>
+BarSong<T> drumSong(int bars, double bpm, int pickup)
+{
+    constexpr double kTwoPi = 6.283185307179586476925;
+    const double beatSeconds = 60.0 / bpm, lead = 0.25;
+    const int beatCount = pickup + bars * 4;
+    BarSong<T> song;
+    song.x.assign(static_cast<size_t>((lead + beatCount * beatSeconds + 0.5) * kFs), T(0));
+    for (int k = 0; k < beatCount; ++k)
+        song.beats.push_back(static_cast<int64_t>(std::llround((lead + k * beatSeconds) * kFs)));
+    uint32_t state = 12345u;
+    double below = 0.0;   // the noise under 300 Hz, taken out of the snare
+    const double pole = std::exp(-kTwoPi * 300.0 / kFs);
+    for (size_t i = 0; i < song.x.size(); ++i)
+    {
+        state = state * 1664525u + 1013904223u;
+        const double white = static_cast<double>(state >> 8) / 8388608.0 - 1.0;
+        below = (1.0 - pole) * white + pole * below;
+        const double t = static_cast<double>(i) / kFs - lead;
+        if (t < 0.0) continue;
+        const double beat = t / beatSeconds;
+        const int k = static_cast<int>(beat);
+        if (k >= beatCount) continue;
+        const double since = (beat - k) * beatSeconds;
+        const int inBar = (((k - pickup) % 4) + 4) % 4;
+        double v = 0.8 * std::exp(-since / 0.2) * white;                                              // the hat
+        if (inBar == 0) v += 0.5 * std::exp(-since / 0.08) * std::sin(kTwoPi * 45.0 * since);         // the kick
+        if (inBar == 2) v += 0.9 * std::exp(-since / 0.2) * std::sin(kTwoPi * 280.0 * since);         // the tom
+        if (inBar == 1 || inBar == 3) v += 0.8 * std::exp(-since / 0.12) * (white - below);           // the snare
+        song.x[i] = static_cast<T>(0.4 * v);
+    }
+    return song;
+}
+
 } // namespace
 
 // The estimator names the bar length (3 or 4) and the beat that opens the
@@ -2218,4 +2257,29 @@ DSPARK_TEST(Downbeat_estimator_is_unsure_where_nothing_marks_the_bar)
         EXPECT_TRUE(meter == 0 ? (found.beatsPerBar == 3 || found.beatsPerBar == 4) : found.beatsPerBar == meter);
         EXPECT_LT(static_cast<double>(found.confidence), 0.1);
     }
+}
+
+// Drums alone: the spectrum changes most where the loudest drum is, which is
+// not the bar line, and nothing changes from bar to bar. The low end and the
+// depth of the bass mark the first beat, and with spectra as flat as a drum
+// kit's they count in full: the bar is found from any beat it is entered at,
+// with the bar length given or left to the estimator.
+DSPARK_TEST(Downbeat_estimator_reads_drums_by_their_low_end)
+{
+    for (int pickup = 0; pickup < 4; ++pickup)
+    {
+        const BarSong<float> song = drumSong<float>(12, 120.0, pickup);
+        const auto given = DownbeatEstimator<float>::estimate(song.x, kFs, song.beats, 4);
+        const auto found = DownbeatEstimator<float>::estimate(song.x, kFs, song.beats);
+        std::cout << "  drums, " << pickup << " beats before the first bar: bar length given, first beat "
+                  << given.firstDownbeat << " (confidence " << static_cast<double>(given.confidence)
+                  << "); estimated " << found.beatsPerBar << ", first beat " << found.firstDownbeat << "\n";
+        EXPECT_EQ(given.beatsPerBar, 4);
+        EXPECT_EQ(given.firstDownbeat, pickup);
+        EXPECT_GT(static_cast<double>(given.confidence), 0.3);
+        EXPECT_EQ(found.beatsPerBar, 4);
+        EXPECT_EQ(found.firstDownbeat, pickup);
+    }
+    const BarSong<double> inDouble = drumSong<double>(12, 120.0, 2);
+    EXPECT_EQ(DownbeatEstimator<double>::estimate(inDouble.x, kFs, inDouble.beats).firstDownbeat, 2);
 }

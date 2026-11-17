@@ -1337,7 +1337,10 @@ void realFirst8(const T* in, T* out, size_t n) noexcept
  *
  * @param in  n / m spectra of m points.
  * @param out Receives n / 4m spectra of 4m points.
- * @param tw  (re, im) of w^i, w^2i, w^3i for i = 1 .. m/2 - 1.
+ * @param n   Points of each lane's transform.
+ * @param m   Points of the spectra that join.
+ * @param tw  (re, im) of w^i, w^2i, w^3i for i = 1 .. m/2 - 1, each value
+ *            once, or once per lane where Whole.
  */
 template <typename T, int W, bool Whole>
 void realRadix4(const T* in, T* out, size_t n, size_t m, const T* tw) noexcept
@@ -1667,6 +1670,7 @@ inline void loadSpectrumRows(const T* in, size_t i0, size_t n, typename Vec<T, W
  *
  * @param in   The lanes' packed spectra (n elements).
  * @param out  Receives N + 2 values.
+ * @param n    Points of each lane's transform.
  * @param tw   For every group of W bins and every lane j = 1 .. W - 1, the
  *             real and the imaginary parts of w^(ji) over the group's bins.
  * @param edge cos then sin of pi j (2r + 1) / W at [j W/2 + r].

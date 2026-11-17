@@ -1609,6 +1609,67 @@ inline void storeLaneBins(T* out, const typename Vec<T, W>::V* re, const typenam
     (storePair<T, W>(out + 2 * I * w, re[I], im[I]), ...);
 }
 
+/// Scalar offset, in the lanes' packed spectra, of the real part of the bin
+/// that position P of a vector holds within its group where the joining step
+/// works by halves (RealPlan::laneBin()).
+template <typename T, int W, size_t P>
+inline constexpr size_t kLaneBinOffset =
+    2 * RealPlan<T>::laneBin(static_cast<size_t>(W), P, true) * static_cast<size_t>(W);
+
+/// loadLaneBins() where the joining step works by halves, with half of the
+/// transposition done by the loads: re[a] and im[a] take the first half of
+/// the lanes of the bins at positions a and a + W/2, re[a + W/2] and
+/// im[a + W/2] the second half, so transposeHalves() leaves each lane's
+/// values along a vector with no shuffle across the halves. `first` is where
+/// the imaginary part of the first bin is read (zeros for bin 0).
+template <typename T, int W, size_t... A>
+inline void loadLaneBinsInHalves(const T* in, const T* first, typename Vec<T, W>::V* re,
+                                 typename Vec<T, W>::V* im, std::index_sequence<A...>) noexcept
+{
+    using O = Vec<T, W>;
+    constexpr size_t w = static_cast<size_t>(W), h = w / 2;
+    ((re[A] = O::loadHalves(in + kLaneBinOffset<T, W, A>, in + kLaneBinOffset<T, W, A + W / 2>),
+      re[A + h] = O::loadHalves(in + kLaneBinOffset<T, W, A> + h, in + kLaneBinOffset<T, W, A + W / 2> + h),
+      im[A] = O::loadHalves(A == 0 ? first : in + kLaneBinOffset<T, W, A> + w,
+                            in + kLaneBinOffset<T, W, A + W / 2> + w),
+      im[A + h] = O::loadHalves(A == 0 ? first + h : in + kLaneBinOffset<T, W, A> + w + h,
+                                in + kLaneBinOffset<T, W, A + W / 2> + w + h)), ...);
+}
+
+/// loadLaneBinsInHalves() the other way, after transposeHalves().
+template <typename T, int W, size_t... A>
+inline void storeLaneBinsInHalves(T* out, const typename Vec<T, W>::V* re, const typename Vec<T, W>::V* im,
+                                  std::index_sequence<A...>) noexcept
+{
+    using O = Vec<T, W>;
+    constexpr size_t w = static_cast<size_t>(W), h = w / 2;
+    ((O::storeHalves(out + kLaneBinOffset<T, W, A>, out + kLaneBinOffset<T, W, A + W / 2>, re[A]),
+      O::storeHalves(out + kLaneBinOffset<T, W, A> + h, out + kLaneBinOffset<T, W, A + W / 2> + h, re[A + h]),
+      O::storeHalves(out + kLaneBinOffset<T, W, A> + w, out + kLaneBinOffset<T, W, A + W / 2> + w, im[A]),
+      O::storeHalves(out + kLaneBinOffset<T, W, A> + w + h, out + kLaneBinOffset<T, W, A + W / 2> + w + h,
+                     im[A + h])), ...);
+}
+
+/// W rising bins of the interleaved spectrum from vectors that hold them in
+/// the order of RealPlan::laneBin(); storeFallingBins() writes them backwards.
+template <typename T, int W, bool Halves>
+inline void storeRisingBins(T* at, typename Vec<T, W>::V re, typename Vec<T, W>::V im) noexcept
+{
+    if constexpr (Halves)
+        Vec<T, W>::storeInterleave2InLane(at, re, im);
+    else
+        Vec<T, W>::storeInterleave2(at, re, im);
+}
+
+template <typename T, int W, bool Halves>
+inline void storeFallingBins(T* at, typename Vec<T, W>::V re, typename Vec<T, W>::V im) noexcept
+{
+    if constexpr (Halves)
+        Vec<T, W>::storeInterleave2ReversedInLane(at, re, im);
+    else
+        Vec<T, W>::storeInterleave2Reversed(at, re, im);
+}
+
 /// One lane's values times its factors (at tw: real parts, then imaginary
 /// parts), or times their conjugates.
 template <typename T, int W, bool Conjugate>
@@ -1642,16 +1703,21 @@ inline void turnLanes(typename Vec<T, W>::V* re, typename Vec<T, W>::V* im, cons
 
 /// The rising rows of bins i0 + r n and the falling rows (r + 1) n - i0 - t
 /// of the interleaved spectrum, r = 0 .. W/2 - 1, with the falling ones
-/// turned so that lane t holds the bin that pairs with i0 + t.
-template <typename T, int W, size_t... R>
+/// turned so that lane t holds the bin that pairs with i0 + t (or, by
+/// halves, both in the order of RealPlan::laneBin()).
+template <typename T, int W, bool Halves, size_t... R>
 inline void loadSpectrumRows(const T* in, size_t i0, size_t n, typename Vec<T, W>::V* dr,
                              typename Vec<T, W>::V* di, typename Vec<T, W>::V* mr,
                              typename Vec<T, W>::V* mi, std::index_sequence<R...>) noexcept
 {
     using O = Vec<T, W>;
     constexpr size_t w = static_cast<size_t>(W);
-    ((O::loadDeinterleave(in + 2 * (i0 + R * n), dr[R], di[R]),
-      O::loadDeinterleaveReversed(in + 2 * ((R + 1) * n - i0 - (w - 1)), mr[R], mi[R])), ...);
+    if constexpr (Halves)
+        ((O::loadDeinterleaveInLane(in + 2 * (i0 + R * n), dr[R], di[R]),
+          O::loadDeinterleaveReversedInLane(in + 2 * ((R + 1) * n - i0 - (w - 1)), mr[R], mi[R])), ...);
+    else
+        ((O::loadDeinterleave(in + 2 * (i0 + R * n), dr[R], di[R]),
+          O::loadDeinterleaveReversed(in + 2 * ((R + 1) * n - i0 - (w - 1)), mr[R], mi[R])), ...);
 }
 
 /**
@@ -1664,9 +1730,16 @@ inline void loadSpectrumRows(const T* in, size_t i0, size_t n, typename Vec<T, W
  * give X[i + r n] = A[r] and X[(r + 1) n - i] = conj(A[W - 1 - r]) for r <
  * W/2. W bins i go at a time: their 2W vectors are transposed, so that each
  * lane's values lie along a vector, and the results leave as W/2 runs of W
- * rising bins and W/2 runs of W falling ones. Bin 0 goes with the others (its
- * imaginary part taken as zero; what it writes twice, it writes equal), bin
- * n/2 on its own after them.
+ * rising bins and W/2 runs of W falling ones. By halves (vectors of 32 bytes,
+ * RealPlan::halves) the bins lie along a vector in the order of
+ * RealPlan::laneBin() and no shuffle crosses a 128-bit half: the loads take
+ * half of every bin's lanes into each half of a vector, which is half of the
+ * transposition, and the rows leave through stores that interleave within
+ * the halves. Both forms do the same arithmetic on every value and give the
+ * same bits. Bin 0 goes with the others (its imaginary part taken as zero;
+ * what it writes twice, it writes equal), bin n/2 on its own after them.
+ *
+ * @tparam Halves Work by halves; `tw` then follows RealPlan::laneBin().
  *
  * @param in   The lanes' packed spectra (n elements).
  * @param out  Receives N + 2 values.
@@ -1675,22 +1748,34 @@ inline void loadSpectrumRows(const T* in, size_t i0, size_t n, typename Vec<T, W
  *             real and the imaginary parts of w^(ji) over the group's bins.
  * @param edge cos then sin of pi j (2r + 1) / W at [j W/2 + r].
  */
-template <typename T, int W>
+template <typename T, int W, bool Halves>
 void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noexcept
 {
     using O = Vec<T, W>;
     using V = typename O::V;
     constexpr size_t w = static_cast<size_t>(W);
     constexpr size_t half = w / 2;
+    static_assert(!Halves || kInLaneDeinterleave<T, W>, "only vectors of 32 bytes have halves");
     T middle[W];
     O::store(middle, O::load(in + w));
     for (size_t i0 = 0; i0 < n / 2; i0 += w, in += 2 * w * w, tw += 2 * (w - 1) * w)
     {
         V re[W], im[W];
-        loadLaneBins<T, W>(in, re, im, std::make_index_sequence<w>());
-        if (i0 == 0) im[0] = O::set1(T(0));   // that element holds bin n/2
-        O::transpose(re);
-        O::transpose(im);
+        if constexpr (Halves)
+        {
+            // Bin 0 has no imaginary part: its slot holds bin n/2.
+            static constexpr T zeros[W] = {};
+            loadLaneBinsInHalves<T, W>(in, i0 == 0 ? zeros : in + w, re, im, std::make_index_sequence<half>());
+            O::transposeHalves(re);
+            O::transposeHalves(im);
+        }
+        else
+        {
+            loadLaneBins<T, W>(in, re, im, std::make_index_sequence<w>());
+            if (i0 == 0) im[0] = O::set1(T(0));   // that element holds bin n/2
+            O::transpose(re);
+            O::transpose(im);
+        }
         turnLanes<T, W, false>(re, im, tw, std::make_index_sequence<w - 1>());
         // Rising bins i + r n and falling bins (r + 1) n - i; the falling
         // ones go first, so that bin 0's doubles end as the rising values.
@@ -1698,8 +1783,8 @@ void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noe
         const auto falling = [&](size_t r) noexcept { return out + 2 * ((r + 1) * n - i0 - (w - 1)); };
         if constexpr (W == 2)
         {
-            O::storeInterleave2Reversed(falling(0), O::sub(re[0], re[1]), O::sub(im[1], im[0]));
-            O::storeInterleave2(rising(0), O::add(re[0], re[1]), O::add(im[0], im[1]));
+            storeFallingBins<T, W, Halves>(falling(0), O::sub(re[0], re[1]), O::sub(im[1], im[0]));
+            storeRisingBins<T, W, Halves>(rising(0), O::add(re[0], re[1]), O::add(im[0], im[1]));
         }
         else if constexpr (W == 4)
         {
@@ -1707,10 +1792,10 @@ void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noe
             const V u1r = O::sub(re[0], re[2]), u1i = O::sub(im[0], im[2]);
             const V u2r = O::add(re[1], re[3]), u2i = O::add(im[1], im[3]);
             const V u3r = O::sub(re[3], re[1]), u3i = O::sub(im[3], im[1]);
-            O::storeInterleave2Reversed(falling(0), O::add(u1r, u3i), O::sub(u3r, u1i));
-            O::storeInterleave2Reversed(falling(1), O::sub(u0r, u2r), O::sub(u2i, u0i));
-            O::storeInterleave2(rising(0), O::add(u0r, u2r), O::add(u0i, u2i));
-            O::storeInterleave2(rising(1), O::sub(u1r, u3i), O::add(u1i, u3r));
+            storeFallingBins<T, W, Halves>(falling(0), O::add(u1r, u3i), O::sub(u3r, u1i));
+            storeFallingBins<T, W, Halves>(falling(1), O::sub(u0r, u2r), O::sub(u2i, u0i));
+            storeRisingBins<T, W, Halves>(rising(0), O::add(u0r, u2r), O::add(u0i, u2i));
+            storeRisingBins<T, W, Halves>(rising(1), O::sub(u1r, u3i), O::add(u1i, u3r));
         }
         else
         {
@@ -1737,14 +1822,14 @@ void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noe
             const V m3 = O::sub(q1i, q3i), m4 = O::add(q1r, q3r);
             const V k1 = O::mul(h, O::add(m1, m2)), k2 = O::mul(h, O::sub(m3, m4));
             const V k3 = O::mul(nh, O::add(m3, m4)), k4 = O::mul(h, O::sub(m1, m2));
-            O::storeInterleave2Reversed(falling(0), O::add(v1r, k4), O::sub(k3, v1i));   // conj(A[7])
-            O::storeInterleave2Reversed(falling(1), O::add(u1r, u3i), O::sub(u3r, u1i)); // conj(A[6])
-            O::storeInterleave2Reversed(falling(2), O::sub(v0r, k1), O::sub(k2, v0i));   // conj(A[5])
-            O::storeInterleave2Reversed(falling(3), O::sub(u0r, u2r), O::sub(u2i, u0i)); // conj(A[4])
-            O::storeInterleave2(rising(0), O::add(u0r, u2r), O::add(u0i, u2i));           // A[0]
-            O::storeInterleave2(rising(1), O::add(v0r, k1), O::add(v0i, k2));             // A[1]
-            O::storeInterleave2(rising(2), O::sub(u1r, u3i), O::add(u1i, u3r));           // A[2]
-            O::storeInterleave2(rising(3), O::sub(v1r, k4), O::add(v1i, k3));             // A[3]
+            storeFallingBins<T, W, Halves>(falling(0), O::add(v1r, k4), O::sub(k3, v1i));   // conj(A[7])
+            storeFallingBins<T, W, Halves>(falling(1), O::add(u1r, u3i), O::sub(u3r, u1i)); // conj(A[6])
+            storeFallingBins<T, W, Halves>(falling(2), O::sub(v0r, k1), O::sub(k2, v0i));   // conj(A[5])
+            storeFallingBins<T, W, Halves>(falling(3), O::sub(u0r, u2r), O::sub(u2i, u0i)); // conj(A[4])
+            storeRisingBins<T, W, Halves>(rising(0), O::add(u0r, u2r), O::add(u0i, u2i));           // A[0]
+            storeRisingBins<T, W, Halves>(rising(1), O::add(v0r, k1), O::add(v0i, k2));             // A[1]
+            storeRisingBins<T, W, Halves>(rising(2), O::sub(u1r, u3i), O::add(u1i, u3r));           // A[2]
+            storeRisingBins<T, W, Halves>(rising(3), O::sub(v1r, k4), O::add(v1i, k3));             // A[3]
         }
     }
     // Bin n/2 of the lanes is real: X[n/2 + r n] = sum_j Y_j[n/2] exp(-pi i j (2r + 1) / W).
@@ -1771,14 +1856,17 @@ void realFinalize(const T* in, T* out, size_t n, const T* tw, const T* edge) noe
  * W-point transform that a_j = sum_r A[r] exp(2 pi i j r / W) undoes, and
  * Y_j[i] = conj(w^(ji)) a_j. The imaginary parts of bins 0 and N/2 are taken
  * as zero whatever they hold (a real signal has none).
+ *
+ * @tparam Halves Work by halves, as realFinalize() does.
  */
-template <typename T, int W>
+template <typename T, int W, bool Halves>
 void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noexcept
 {
     using O = Vec<T, W>;
     using V = typename O::V;
     constexpr size_t w = static_cast<size_t>(W);
     constexpr size_t half = w / 2;
+    static_assert(!Halves || kInLaneDeinterleave<T, W>, "only vectors of 32 bytes have halves");
     T* const first = out;
     for (size_t i0 = 0; i0 < n / 2; i0 += w, out += 2 * w * w, tw += 2 * (w - 1) * w)
     {
@@ -1795,7 +1883,7 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
             O::loadDeinterleaveReversed(in + 2 * (n - i0 - (w - 1)), mr[0], mi[0]);
         }
         else
-            loadSpectrumRows<T, W>(in, i0, n, dr, di, mr, mi, std::make_index_sequence<half>());
+            loadSpectrumRows<T, W, Halves>(in, i0, n, dr, di, mr, mi, std::make_index_sequence<half>());
         if (i0 == 0)
         {
             // Bins 0 and N/2 with their imaginary parts as zero, whatever
@@ -1874,9 +1962,18 @@ void realPrepare(const T* in, T* out, size_t n, const T* tw, const T* edge) noex
             im[7] = O::sub(p3i, t3i);
         }
         turnLanes<T, W, true>(re, im, tw, std::make_index_sequence<w - 1>());
-        O::transpose(re);
-        O::transpose(im);
-        storeLaneBins<T, W>(out, re, im, std::make_index_sequence<w>());
+        if constexpr (Halves)
+        {
+            O::transposeHalves(re);
+            O::transposeHalves(im);
+            storeLaneBinsInHalves<T, W>(out, re, im, std::make_index_sequence<half>());
+        }
+        else
+        {
+            O::transpose(re);
+            O::transpose(im);
+            storeLaneBins<T, W>(out, re, im, std::make_index_sequence<w>());
+        }
     }
     // Bin n/2 of the lanes: W Y_j[n/2] = 2 Re sum_r X[n/2 + r n] exp(pi i j (2r + 1) / W).
     // Rows r and W/2 - 1 - r have equal or opposite factors and are added
@@ -1925,7 +2022,17 @@ void realForwardAt(const RealPlan<T>& p, const T* time, T* freq, T* a, T* b) noe
         tw += RealPlan<T>::passValues(m, RealPlan<T>::repeatFor(m, p.lanes, p.wholeReach));
         std::swap(src, dst);
     }
-    realFinalize<T, W>(src, freq, n, p.turn, p.edge);
+    static_assert(kInLaneDeinterleave<T, W> == RealPlan<T>::halvesFor(0, static_cast<size_t>(W), 0),
+                  "RealPlan::halvesFor() names the vectors that have halves");
+    if constexpr (kInLaneDeinterleave<T, W>)
+    {
+        if (p.halves)
+        {
+            realFinalize<T, W, true>(src, freq, n, p.turn, p.edge);
+            return;
+        }
+    }
+    realFinalize<T, W, false>(src, freq, n, p.turn, p.edge);
 }
 
 /// One step of the inverse at W lanes: step 0 reads the spectrum into a,
@@ -1938,7 +2045,15 @@ void realInverseStepAt(const RealPlan<T>& p, size_t step, const T* freq, T* time
     const size_t n = p.n;
     if (step == 0)
     {
-        realPrepare<T, W>(freq, a, n, p.turn, p.edge);
+        if constexpr (kInLaneDeinterleave<T, W>)
+        {
+            if (p.halves)
+            {
+                realPrepare<T, W, true>(freq, a, n, p.turn, p.edge);
+                return;
+            }
+        }
+        realPrepare<T, W, false>(freq, a, n, p.turn, p.edge);
         return;
     }
     const size_t pass = step - 1;

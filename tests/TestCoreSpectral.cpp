@@ -1008,7 +1008,12 @@ static void checkLaneKernels(size_t lanes, double tolerance, Forward forward, In
         reference.forward(z.data());
 
         detail::fft::WorkBuffers<T> work(n);
-        const detail::fft::RealLaneTables<T> once(n, lanes, 0), mixed(n, lanes, 32), all(n, lanes, n);
+        // Twiddles kept once, as whole vectors up to 32 points, and as whole
+        // vectors everywhere; the first joins its lanes with whole vectors,
+        // the others by halves where the vectors have them. Same bits.
+        const detail::fft::RealLaneTables<T> once(n, lanes, 0, 0), mixed(n, lanes, 32, n), all(n, lanes, n, n);
+        EXPECT_TRUE(!once.plan().halves);
+        EXPECT_EQ(all.plan().halves, lanes * sizeof(T) == 32);
         std::vector<T> spec(n + 2, T(-7)), specMixed(n + 2, T(-7)), specAll(n + 2, T(-7));
         forward(once.plan(), x.data(), spec.data(), work.first(), work.second());
         forward(mixed.plan(), x.data(), specMixed.data(), work.first(), work.second());
@@ -1117,6 +1122,113 @@ DSPARK_TEST(FFT_vectors_transpose_their_lanes_and_subtract_a_product)
                                     simd::kVecNarrowWidth<float>>();
     checkTransposeAndNegatedProduct<simd::Vec<double, simd::kVecNarrowWidth<double>>, double,
                                     simd::kVecNarrowWidth<double>>();
+}
+
+// Along a vector of 32 bytes the step that joins the lanes holds the bins of
+// a group in the order that taking interleaved pairs apart leaves when no
+// value crosses the 128-bit halves (RealPlan::laneBin()), and its loads and
+// stores work by halves in that order: each one as written, on the
+// baseline's widest vectors where they have those operations (a build for
+// AVX; the dispatched copy's run through the kernel test above).
+template <typename O, typename T, int W>
+static void checkHalfWiseVectors()
+{
+    using Plan = detail::fft::RealPlan<T>;
+    const size_t w = static_cast<size_t>(W), h = w / 2;
+    T pairs[16] = {}, re[8] = {}, im[8] = {}, back[16] = {};
+    for (size_t k = 0; k < w; ++k)
+    {
+        pairs[2 * k] = static_cast<T>(10 * k + 1);
+        pairs[2 * k + 1] = static_cast<T>(10 * k + 2);
+    }
+    typename O::V r, m;
+    O::loadDeinterleaveInLane(pairs, r, m);
+    O::store(re, r);
+    O::store(im, m);
+    bool rising = true;
+    for (size_t p = 0; p < w; ++p)
+    {
+        const size_t bin = Plan::laneBin(w, p, true);
+        rising = rising && re[p] == pairs[2 * bin] && im[p] == pairs[2 * bin + 1];
+    }
+    EXPECT_TRUE(rising);
+    O::storeInterleave2InLane(back, r, m);
+    EXPECT_EQ(std::memcmp(back, pairs, 2 * w * sizeof(T)), 0);
+
+    O::loadDeinterleaveReversedInLane(pairs, r, m);
+    O::store(re, r);
+    O::store(im, m);
+    bool falling = true;
+    for (size_t p = 0; p < w; ++p)
+    {
+        const size_t bin = w - 1 - Plan::laneBin(w, p, true);
+        falling = falling && re[p] == pairs[2 * bin] && im[p] == pairs[2 * bin + 1];
+    }
+    EXPECT_TRUE(falling);
+    std::fill(back, back + 16, T(0));
+    O::storeInterleave2ReversedInLane(back, r, m);
+    EXPECT_EQ(std::memcmp(back, pairs, 2 * w * sizeof(T)), 0);
+
+    // Two runs of W/2 values make a vector, and a vector goes back to two.
+    T low[4] = {}, high[4] = {}, lowBack[4] = {}, highBack[4] = {};
+    for (size_t k = 0; k < h; ++k)
+    {
+        low[k] = static_cast<T>(k + 1);
+        high[k] = static_cast<T>(k + 51);
+    }
+    const typename O::V both = O::loadHalves(low, high);
+    O::store(re, both);
+    bool halves = true;
+    for (size_t k = 0; k < h; ++k) halves = halves && re[k] == low[k] && re[h + k] == high[k];
+    O::storeHalves(lowBack, highBack, both);
+    for (size_t k = 0; k < h; ++k) halves = halves && lowBack[k] == low[k] && highBack[k] == high[k];
+    EXPECT_TRUE(halves);
+
+    // Vector g + a of each group of W/2 receives lane a of the group's
+    // vectors in its first half and lane a + W/2 in its second.
+    T rows[8][8] = {};
+    typename O::V v[W];
+    for (size_t j = 0; j < w; ++j)
+    {
+        for (size_t k = 0; k < w; ++k) rows[j][k] = static_cast<T>(10 * j + k);
+        v[j] = O::load(rows[j]);
+    }
+    O::transposeHalves(v);
+    bool transposed = true;
+    for (size_t g = 0; g < w; g += h)
+        for (size_t a = 0; a < h; ++a)
+        {
+            O::store(re, v[g + a]);
+            for (size_t k = 0; k < h; ++k)
+                transposed = transposed && re[k] == rows[g + k][a] && re[h + k] == rows[g + k][a + h];
+        }
+    EXPECT_TRUE(transposed);
+}
+
+template <typename T>
+static void checkHalfWiseVectorsOf()
+{
+    constexpr int W = simd::kVecWidth<T>;
+    using O = simd::Vec<T, W>;
+    if constexpr (requires { &O::transposeHalves; })
+        checkHalfWiseVectors<O, T, W>();
+}
+
+DSPARK_TEST(FFT_vectors_of_32_bytes_keep_the_lane_join_within_their_halves)
+{
+    using F = detail::fft::RealPlan<float>;
+    using D = detail::fft::RealPlan<double>;
+    const size_t eight[8] = { 0, 1, 4, 5, 2, 3, 6, 7 }, four[4] = { 0, 2, 1, 3 };
+    bool order = true;
+    for (size_t p = 0; p < 8; ++p) order = order && F::laneBin(8, p, true) == eight[p] && F::laneBin(8, p, false) == p;
+    for (size_t p = 0; p < 4; ++p) order = order && D::laneBin(4, p, true) == four[p] && D::laneBin(4, p, false) == p;
+    EXPECT_TRUE(order);
+    // Only vectors of 32 bytes have halves, and only up to the reach.
+    EXPECT_TRUE(F::halvesFor(1024, 8, 1024) && D::halvesFor(1024, 4, 1024));
+    EXPECT_TRUE(!F::halvesFor(2048, 8, 1024) && !D::halvesFor(2048, 4, 1024));
+    EXPECT_TRUE(!F::halvesFor(1024, 4, 1024) && !D::halvesFor(1024, 2, 1024) && !D::halvesFor(1024, 8, 1024));
+    checkHalfWiseVectorsOf<float>();
+    checkHalfWiseVectorsOf<double>();
 }
 
 // A real signal has no imaginary part at DC or at Nyquist: the inverse takes

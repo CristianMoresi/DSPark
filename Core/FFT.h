@@ -62,10 +62,14 @@
  *   join four spectra into one of four times the points, whose two real
  *   bins take a few additions each), and one last step joins the W spectra,
  *   W bins at a time, into the interleaved spectrum: the only place where
- *   lanes mix. The inverse runs the same steps backwards and scales in its
- *   last pass. Every factor comes from the values of one eighth of a turn,
- *   so the factors of mirrored bins are equal or opposite to the last bit,
- *   and a unit impulse and a flat spectrum map to each other exactly.
+ *   lanes mix. At the AVX width that step works by halves of a vector where
+ *   that is faster (eight float lanes at every size, four double lanes up to
+ *   2048 samples): it then loads and stores half vectors and shuffles
+ *   nothing across the 128-bit halves, with the same bits either way. The
+ *   inverse runs the same steps backwards and scales in its last pass. Every
+ *   factor comes from the values of one eighth of a turn, so the factors of
+ *   mirrored bins are equal or opposite to the last bit, and a unit impulse
+ *   and a flat spectrum map to each other exactly.
  *   Transforms shorter than 16 double or 32 float samples, and builds
  *   without vectors, run a half-size complex FFT on the (even, odd) sample
  *   pairs and split its spectrum with a post-pass that takes bins k and
@@ -80,7 +84,7 @@
  * per real point at 64 / 1024 / 4096 / 65536 points, double and then float,
  * each row on one machine (the machines differ between rows). SSE2 (GCC):
  * 1.3 / 2.0 / 2.4 / 3.4 and 0.93 / 1.0 / 1.2 / 1.7. Built for AVX2 and FMA
- * (GCC): 1.2 / 1.3 / 2.4 / 3.8 and 1.1 / 0.75 / 1.0 / 1.7. NEON on an arm64
+ * (GCC): 1.2 / 1.2 / 2.3 / 3.8 and 1.1 / 0.65 / 0.95 / 1.6. NEON on an arm64
  * server core (GCC): 2.2 / 3.4 / 4.2 / 6.2 and 1.6 / 1.9 / 2.3 / 3.1.
  *
  * Threading: an instance keeps work buffers, so one instance serves one
@@ -218,6 +222,17 @@ inline constexpr size_t kRealWholeTwiddleReach = 256;
 inline constexpr size_t kRealWholeTwiddleReach = 0;
 #endif
 
+/// Longest real transforms by lanes (in samples) whose joining step, at
+/// vectors of 32 bytes, works by halves (RealPlan::halves): no shuffle then
+/// crosses the 128-bit halves, and the step loads and stores half vectors.
+/// Those shuffles have one port on the x64 cores that bound this step; the
+/// loads and stores are free while the transform works within the level-1
+/// data cache and are what the step waits for beyond it. Four double lanes
+/// load and store twice as often per value as eight float ones: they gain up
+/// to this size, the float lanes at every size measured.
+template <typename T>
+inline constexpr size_t kRealHalvesReach = sizeof(T) == sizeof(float) ? ~size_t{ 0 } : size_t{ 2048 };
+
 /// The two ping-pong buffers, [re | im] each: x is read, y is written.
 template <typename T>
 struct Buffers { T* xr; T* xi; T* yr; T* yi; };
@@ -246,6 +261,7 @@ struct RealPlan
     size_t n;               ///< Points of each lane's transform.
     size_t lanes;           ///< Lanes: the transform has n * lanes samples.
     bool first8;            ///< The first pass takes eight samples (log2 n odd), not four.
+    bool halves;            ///< The joining step works by halves, its tables in the order of laneBin().
     size_t wholeReach;      ///< Passes joining spectra of up to this many points hold each twiddle `lanes` times.
     const T* twiddles;      ///< The pass tables, by rising length of the spectra they join.
     const T* turn;          ///< The factors of the step that joins the lanes.
@@ -268,6 +284,27 @@ struct RealPlan
     [[nodiscard]] static constexpr size_t repeatFor(size_t m, size_t lanes, size_t wholeReach) noexcept
     {
         return m <= wholeReach ? lanes : 1;
+    }
+
+    /// Whether the joining step of a transform of `size` samples works by
+    /// halves: only vectors of 32 bytes have halves, and only up to `reach`
+    /// samples does it pay (kRealHalvesReach).
+    [[nodiscard]] static constexpr bool halvesFor(size_t size, size_t lanes, size_t reach) noexcept
+    {
+        return lanes * sizeof(T) == 32 && size <= reach;
+    }
+
+    /// The bin (counted from the first of its group) that position p of a
+    /// vector holds in the step that joins the lanes: p itself, or, where
+    /// the step works by halves, four runs of lanes / 4 bins in the order
+    /// (0, 2, 1, 3): what taking interleaved pairs apart gives when no value
+    /// leaves its 128-bit half. The tables of that step follow this order.
+    [[nodiscard]] static constexpr size_t laneBin(size_t lanes, size_t p, bool byHalves) noexcept
+    {
+        if (!byHalves) return p;
+        const size_t run = lanes / 4;
+        const size_t order[4] = { 0, 2, 1, 3 };
+        return run * order[p / run] + p % run;
     }
 
     /// Passes of a lane transform of n points, the first one included: one
@@ -913,9 +950,14 @@ public:
      * @param wholeReach Passes that join spectra of up to this many points
      *                   keep each twiddle `lanes` times, for kernels that
      *                   load it as a whole vector; the others keep it once.
+     * @param halvesReach Transforms of up to this many samples, at vectors
+     *                   of 32 bytes, join their lanes by halves
+     *                   (RealPlan::halves): the joining step's factors then
+     *                   follow RealPlan::laneBin().
      */
-    RealLaneTables(size_t size, size_t lanes, size_t wholeReach)
-        : n_(size / lanes), lanes_(lanes), wholeReach_(wholeReach), values_(valueCount(size, lanes, wholeReach))
+    RealLaneTables(size_t size, size_t lanes, size_t wholeReach, size_t halvesReach)
+        : n_(size / lanes), lanes_(lanes), wholeReach_(wholeReach),
+          halves_(RealPlan<T>::halvesFor(size, lanes, halvesReach)), values_(valueCount(size, lanes, wholeReach))
     {
         T* w = values_.data();
         double c = 0.0, s = 0.0;
@@ -933,14 +975,15 @@ public:
                 }
         }
         // The joining step: exp(-2 pi i j k / size) for the lanes j >= 1,
-        // the bins k of a group along a vector.
+        // the bins k of a group along a vector, in the order the kernels
+        // hold them (RealPlan::laneBin()).
         turn_ = static_cast<size_t>(w - values_.data());
         for (size_t first = 0; first < n_ / 2; first += lanes_)
             for (size_t j = 1; j < lanes_; ++j)
             {
                 for (size_t t = 0; t < lanes_; ++t)
                 {
-                    unit(j * (first + t), size, c, s);
+                    unit(j * (first + RealPlan<T>::laneBin(lanes_, t, halves_)), size, c, s);
                     w[t] = static_cast<T>(c);
                     w[lanes_ + t] = static_cast<T>(0.0 - s);
                 }
@@ -975,7 +1018,7 @@ public:
 
     [[nodiscard]] RealPlan<T> plan() const noexcept
     {
-        return { n_, lanes_, firstLength(n_) == 8, wholeReach_, values_.data(), values_.data() + turn_,
+        return { n_, lanes_, firstLength(n_) == 8, halves_, wholeReach_, values_.data(), values_.data() + turn_,
                  values_.data() + edge_, T(1) / static_cast<T>(n_ * lanes_) };
     }
 
@@ -1023,6 +1066,7 @@ private:
     size_t n_ = 0;        ///< Points per lane.
     size_t lanes_ = 0;
     size_t wholeReach_ = 0;
+    bool halves_ = false; ///< The joining step works by halves.
     size_t turn_ = 0;     ///< Where the joining step's factors start.
     size_t edge_ = 0;     ///< Where the middle bin's start.
     std::vector<T> values_;
@@ -1170,9 +1214,11 @@ public:
             return;
         }
         laneWork_ = detail::fft::WorkBuffers<T>(realSize_);
-        lanes_ = detail::fft::RealLaneTables<T>(realSize_, lanes, detail::fft::plan::kRealWholeTwiddleReach);
+        constexpr size_t halvesReach = detail::fft::plan::kRealHalvesReach<T>;
+        lanes_ = detail::fft::RealLaneTables<T>(realSize_, lanes, detail::fft::plan::kRealWholeTwiddleReach,
+                                                halvesReach);
         if (const size_t other = dispatchedLanes(realSize_); other != lanes)
-            wideLanes_ = detail::fft::RealLaneTables<T>(realSize_, other, 0);
+            wideLanes_ = detail::fft::RealLaneTables<T>(realSize_, other, 0, halvesReach);
     }
 
     /** @brief Returns the number of real input samples (N). */

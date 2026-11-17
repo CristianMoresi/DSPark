@@ -461,6 +461,62 @@ struct Vec<float, 8>
         v[6] = _mm256_permute2f128_ps(b2, b6, 0x31);
         v[7] = _mm256_permute2f128_ps(b3, b7, 0x31);
     }
+    /// Transposes v[0 .. 3] and v[4 .. 7] within each 128-bit half: v[g + a]
+    /// receives lanes a and a + 4 of the four vectors of its group, the
+    /// first in its low half and the second in its high half. No shuffle
+    /// crosses the halves; storeHalves() and loadHalves() move the halves
+    /// to and from where a full transposition would put them.
+    static void transposeHalves(V* v) noexcept
+    {
+        // Written out, as transpose() is: every compiler then keeps the
+        // vectors in registers.
+        const V a0 = _mm256_unpacklo_ps(v[0], v[1]), b0 = _mm256_unpacklo_ps(v[2], v[3]);
+        const V c0 = _mm256_unpackhi_ps(v[0], v[1]), d0 = _mm256_unpackhi_ps(v[2], v[3]);
+        const V a1 = _mm256_unpacklo_ps(v[4], v[5]), b1 = _mm256_unpacklo_ps(v[6], v[7]);
+        const V c1 = _mm256_unpackhi_ps(v[4], v[5]), d1 = _mm256_unpackhi_ps(v[6], v[7]);
+        v[0] = _mm256_shuffle_ps(a0, b0, 0x44);
+        v[1] = _mm256_shuffle_ps(a0, b0, 0xEE);
+        v[2] = _mm256_shuffle_ps(c0, d0, 0x44);
+        v[3] = _mm256_shuffle_ps(c0, d0, 0xEE);
+        v[4] = _mm256_shuffle_ps(a1, b1, 0x44);
+        v[5] = _mm256_shuffle_ps(a1, b1, 0xEE);
+        v[6] = _mm256_shuffle_ps(c1, d1, 0x44);
+        v[7] = _mm256_shuffle_ps(c1, d1, 0xEE);
+    }
+    /// A vector from two runs of four values: its low and its high half.
+    static V loadHalves(const float* low, const float* high) noexcept
+    {
+        return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_loadu_ps(low)), _mm_loadu_ps(high), 1);
+    }
+    static void storeHalves(float* low, float* high, V v) noexcept
+    {
+        _mm_storeu_ps(low, _mm256_castps256_ps128(v));
+        _mm_storeu_ps(high, _mm256_extractf128_ps(v, 1));
+    }
+    /// loadDeinterleaveInLane() of eight pairs taken backwards: lane l
+    /// holds pair 7 - b, b the pair that lane holds in the forward order
+    /// (0, 1, 4, 5, 2, 3, 6, 7). The halves are loaded where they go.
+    static void loadDeinterleaveReversedInLane(const float* p, V& re, V& im) noexcept
+    {
+        const V x = loadHalves(p + 12, p + 8), y = loadHalves(p + 4, p);
+        re = _mm256_shuffle_ps(x, y, _MM_SHUFFLE(0, 2, 0, 2));
+        im = _mm256_shuffle_ps(x, y, _MM_SHUFFLE(1, 3, 1, 3));
+    }
+    /// storeInterleave2() of lanes in the order (0, 1, 4, 5, 2, 3, 6, 7):
+    /// each half then interleaves into one run of the output.
+    static void storeInterleave2InLane(float* p, V re, V im) noexcept
+    {
+        _mm256_storeu_ps(p,     _mm256_unpacklo_ps(re, im));
+        _mm256_storeu_ps(p + 8, _mm256_unpackhi_ps(re, im));
+    }
+    /// storeInterleave2InLane() with the pairs written backwards.
+    static void storeInterleave2ReversedInLane(float* p, V re, V im) noexcept
+    {
+        const V lo = _mm256_permute_ps(_mm256_unpacklo_ps(re, im), _MM_SHUFFLE(1, 0, 3, 2));
+        const V hi = _mm256_permute_ps(_mm256_unpackhi_ps(re, im), _MM_SHUFFLE(1, 0, 3, 2));
+        storeHalves(p + 4, p, hi);
+        storeHalves(p + 12, p + 8, lo);
+    }
     /// loadDeinterleave() without crossing the 128-bit halves: the lanes come
     /// out in the order (0, 1, 4, 5, 2, 3, 6, 7).
     static void loadDeinterleaveInLane(const float* p, V& re, V& im) noexcept
@@ -583,6 +639,41 @@ struct Vec<double, 4>
         v[1] = _mm256_permute2f128_pd(b, d, 0x20);
         v[2] = _mm256_permute2f128_pd(a, c, 0x31);
         v[3] = _mm256_permute2f128_pd(b, d, 0x31);
+    }
+    /// transposeHalves(), loadHalves() and storeHalves() as in
+    /// Vec<float, 8>, with groups of two vectors and halves of two values.
+    static void transposeHalves(V* v) noexcept
+    {
+        const V a = _mm256_unpacklo_pd(v[0], v[1]), b = _mm256_unpackhi_pd(v[0], v[1]);
+        const V c = _mm256_unpacklo_pd(v[2], v[3]), d = _mm256_unpackhi_pd(v[2], v[3]);
+        v[0] = a;
+        v[1] = b;
+        v[2] = c;
+        v[3] = d;
+    }
+    static V loadHalves(const double* low, const double* high) noexcept
+    {
+        return _mm256_insertf128_pd(_mm256_castpd128_pd256(_mm_loadu_pd(low)), _mm_loadu_pd(high), 1);
+    }
+    static void storeHalves(double* low, double* high, V v) noexcept
+    {
+        _mm_storeu_pd(low, _mm256_castpd256_pd128(v));
+        _mm_storeu_pd(high, _mm256_extractf128_pd(v, 1));
+    }
+    /// loadDeinterleaveInLane() of four pairs taken backwards: lane l holds
+    /// pair 3 - b, b the pair that lane holds in the forward order (0, 2,
+    /// 1, 3).
+    static void loadDeinterleaveReversedInLane(const double* p, V& re, V& im) noexcept
+    {
+        const V x = loadHalves(p + 6, p + 4), y = loadHalves(p + 2, p);
+        re = _mm256_unpacklo_pd(x, y);
+        im = _mm256_unpackhi_pd(x, y);
+    }
+    /// storeInterleave2InLane() with the pairs written backwards.
+    static void storeInterleave2ReversedInLane(double* p, V re, V im) noexcept
+    {
+        storeHalves(p + 2, p, _mm256_unpackhi_pd(re, im));
+        storeHalves(p + 6, p + 4, _mm256_unpacklo_pd(re, im));
     }
     /// loadDeinterleave() without crossing the 128-bit halves: the lanes come
     /// out in the order (0, 2, 1, 3).

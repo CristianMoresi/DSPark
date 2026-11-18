@@ -134,7 +134,8 @@ template <FloatType T> class OfflineTempoAnalyzer final
                     frame.referenceSample = featureReference(features, i);
                     return frame;
                 },
-                options.minimumBpm, options.maximumBpm, 25, job);
+                options.minimumBpm, options.maximumBpm,
+                static_cast<double>(BeatTracker<T>::defaultTightness()), job);
             candidate.report_.tempoBpm = static_cast<double>(tracked.tempoBpm);
             candidate.report_.secondaryTempoBpm = static_cast<double>(tracked.secondaryTempoBpm);
             candidate.report_.confidence = static_cast<double>(tracked.confidence);
@@ -249,7 +250,8 @@ template <FloatType T> class OfflineTempoAnalyzer final
                     frame.registers = frames[begin + i].registers;
                     frame.referenceSample = featureReference(features, begin + i);
                     return frame;
-                }, candidate.options_.minimumBpm, candidate.options_.maximumBpm, 25, job, &workspace);
+                }, candidate.options_.minimumBpm, candidate.options_.maximumBpm,
+                static_cast<double>(BeatTracker<T>::defaultTightness()), job, &workspace);
             ++candidate.report_.localWindows;
             const auto grid = local.beats();
             if (local.confidence >= candidate.options_.minimumConfidence && grid.size() >= 2)

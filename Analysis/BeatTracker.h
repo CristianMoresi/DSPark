@@ -26,63 +26,100 @@
  * what one k times too short costs.
  *
  * The target period is a single number while the METRICAL LEVEL is being
- * decided, and a per-frame number once it has been. One global period is the
- * right model for the first question because it is the stable one, and the
- * wrong model for laying a grid on music whose tempo moves, because the
- * interval cost would then measure the distance from the average rather than
- * from the tempo being played. The per-frame period comes from sweeping the
- * causal path's own resonator bank over the envelope twice, once each way, and
- * combining: one direction carries the filter's memory as a lag, the other
- * carries the mirror image of that lag, and the two together are centred on
- * the frame they describe. That is only possible offline, and it is why the
- * offline path can follow a tempo the causal path can only chase. Measured on
- * a 100-to-140 BPM ramp, it takes the worst local tempo error from 40.2% to
- * 0.18% and the grid F-measure from 0.725 to 0.994.
+ * decided: one global period is the right model for that question because it
+ * is the stable one. The grid is then laid in TWO PASSES, because holding a
+ * grid and following a tempo ask opposite things of alpha. A recursion loose
+ * enough to follow a tempo that moves is loose enough to take a beat off the
+ * grid onto a louder note beside it and bring it back at the next one -- the
+ * anticipated sixteenth of a samba, the swung eighth of a shuffle -- and one
+ * tight enough to refuse that loses a tempo that leaves its period. So a
+ * first, loose pass only follows. Its intervals say what period the music
+ * keeps overall and what period it moves at around each beat, and the second
+ * pass is held, at the tightness asked for, to the overall period wherever
+ * the two agree, and follows the local one where they part. How far apart
+ * they have to be depends on how well the intervals around the beat agree
+ * with one another: spread out, a period a few hundredths off the overall
+ * one is the overall one read badly, and the grid is held up to a twelfth
+ * of the period away; all alike, it is a tempo of its own, and the grid
+ * follows it from a fiftieth. An interval of the held pass costs at most a
+ * fixed number of beats' worth of onset strength, so that a change of phase
+ * the music made -- a bar of another length, an edit -- is taken at once
+ * instead of being slid into over the beats around it. Where the tempo
+ * swings faster than a period can be read over a few beats, the held grid
+ * ends up carrying less than half of what the loose one carries, and the
+ * loose grid is the one delivered. On a 100-to-140 BPM ramp the worst local
+ * tempo error is 1.0% and every beat is found; on a tempo swinging by 15%
+ * every sixteen beats or every nine, every beat is found.
  *
- * Two further stages sit between the recursion and the returned grid, and both
- * exist because of where the recursion is weak rather than because they sound
- * like a good idea. The recursion has to guess the phase of its first links
- * before it has accumulated any evidence, so its earliest beats can sit a
- * frame or two off a transient that is plainly visible: the grid is therefore
- * snapped to nearby envelope peaks, within a window too narrow to reach an
- * off-beat, and then continued off both ends for as long as the envelope keeps
- * supporting it. Together they take the grid F-measure on clean clicks from
- * 0.9315 to 1.0000 and the worst beat error from 29.1 ms to 5.4 ms.
+ * A tempo that changes at once is taken at the beat it changes on. The
+ * period around the change is read on the side that is steady, and a second
+ * tempo too far from the first for the loose pass to reach is looked for
+ * between the two. Clicks that go from one tempo to another between 90 and
+ * 140 BPM, by a twentieth or by two fifths, once or back and forth, with a
+ * third of them or more at each tempo, are all beats, and none is further
+ * from its click than on a steady train (7.6 ms against 7.7). A second
+ * tempo kept for a quarter of the signal or less is not followed. See
+ * layGrid().
+ *
+ * MEASURED against annotated beats, as the mean F-measure at +/-70 ms, on
+ * three collections: 698 excerpts of dance music, 243 takes of a drum kit
+ * alone and 360 of a guitar alone. One loose pass with its beats moved to
+ * the nearest envelope peak, which is what this path did before / the two
+ * passes / a reference tracker of the same family (a dynamic program over
+ * an onset function), run in the same job: against the annotation as it is,
+ * 0.776 / 0.830 / 0.784, 0.760 / 0.805 / 0.763 and 0.520 / 0.559 / 0.608;
+ * against its best reading (as annotated, twice or half as fast, on the
+ * off-beats, in threes), which takes the choice of metrical level out of
+ * the number, 0.838 / 0.919 / 0.891, 0.860 / 0.925 / 0.917 and 0.668 /
+ * 0.786 / 0.775. The share of the grid's intervals within an eighth of
+ * their median went from 0.88, 0.92 and 0.78 to 0.998, 0.997 and 0.995.
+ * What is left behind the reference is the level chosen for the guitar
+ * alone: the annotated tempo in 53% of the pieces against 61%, and half of
+ * it in 14% against 5%.
+ *
+ * The grid is no longer moved onto envelope peaks afterwards. The recursion
+ * already places each beat on the frame where its running total is largest,
+ * and a beat moved to the largest peak within an eighth of a period, twice
+ * over, lands on the note beside the beat as readily as on the beat. Two
+ * things that step used to cover are handled where they arise. A chain is
+ * free to start at any frame, where it used to open with an interval from
+ * the first frames of the signal to its first note (see runDp()). And the
+ * two ends of the grid are continued for as long as the envelope supports a
+ * beat, down to a quarter of what a beat of the grid carries: excerpts fade
+ * and endings thin out, and at a half the grid stopped 1.6 beats short of
+ * the annotated ones per piece of dance music, against 0.6 now.
  *
  * DENSE MIXES. On a loud modern master the onset envelope is mostly strums,
  * hats and syllables, because they own most of its quarter-tone bands, while
- * the kick that states the beat lights a handful of bands below 200 Hz. Two
- * things keep the answer on the beat there. The metrical level is decided on a
- * REGISTER-BALANCED envelope - the front end's flux split into four registers
- * (below 200 Hz, to 800 Hz, to 3.2 kHz, above), each conditioned on its own
- * and weighted by its own periodicity - so the kick counts as much as the
- * hats. And the grid is chosen among three readings - the moving-period grid
- * above, a steady-period grid, and a steady grid held four times tighter - by
- * how much of that balanced envelope each explains, the moving one only when
- * it explains half as much again: a steady groove under a syncopated guitar
- * otherwise drew the moving grid onto the off-accents. Measured on 46
+ * the kick that states the beat lights a handful of bands below 200 Hz. The
+ * metrical level is therefore decided on a REGISTER-BALANCED envelope - the
+ * front end's flux split into four registers (below 200 Hz, to 800 Hz, to
+ * 3.2 kHz, above), each conditioned on its own and weighted by its own
+ * periodicity - so the kick counts as much as the hats. Measured on 46
  * synthetic pop masters from 92 to 150 BPM (kick on every beat, snare on two
  * and four, strummed 3-3-2 guitar, syncopated bass, syllabic vocal,
- * saturation and limiting), the delivered level is right on all 46 against
- * 35 before, and tempoBpm agrees with the grid's median interval within its
- * frame quantisation (0.55%) against up to 17.7% before. Correlation lags that
- * are only bumps of its noise floor are no longer candidates at all.
+ * saturation and limiting), the delivered level is right on all 46, and
+ * tempoBpm agrees with the grid's median interval within its frame
+ * quantisation (0.55%). Correlation lags that are only bumps of the
+ * correlation's noise floor are not candidates at all, and neither is a lag
+ * on the shoulder of a taller peak of the same reading (see
+ * kNeighbourPeakFloor).
  *
- * TIGHTNESS. The default is 25, chosen by measurement on this implementation
- * rather than inherited. The published values disagree with each other by most
- * of an order of magnitude -- the paper names 400 as its default (Figure 5
- * caption) and hard-codes it (beat2.m line 56, beatdyn.m line 56), its own
- * best score on its own tuning set is at alpha = 680 (section 4.2), and 100
- * is also in common use. All use the
- * natural logarithm and the same cost, so the numbers are comparable and the
- * disagreement is real rather than a change of units -- but none of them
- * decides anything here. Measured on material where the term is actually live
- * -- which excludes isochronous clicks, where it multiplies a quantity that is
- * identically zero -- no case in the bed prefers a value above the default and
- * three prefer it to 100: a +/-15% rubato at 120 BPM costs 43% of the grid at
- * 400, 0.8% at 100 and nothing at the default. See setTightness() for the
- * sweep, for the case-by-case ranking that picks the number, and for why a
- * steady-tempo bed cannot measure this parameter at all.
+ * TIGHTNESS. The default is 400, the value the method's paper names, and it
+ * means something narrower here than there: it is the tightness of the held
+ * pass, where the music keeps its period. The first pass runs at 25, and
+ * where the tempo moves the delivered grid is laid at 25 as well. Measured
+ * on the three collections above, against the best reading of the
+ * annotation: from 0.859, 0.869 and 0.690 at 25 to 0.919, 0.925 and 0.786 at
+ * 400, level with it at 800 and lower again at 1600 (0.912, 0.923, 0.784).
+ * On a bed of clicks where the interval cost is live -- a tempo swinging by
+ * 15% every sixteen beats and every nine, and a bar whose loudest note sits
+ * a sixteenth before a beat that carries nothing -- the default finds every
+ * beat of all three, and so does a grid four times tighter: where the tempo
+ * moves the grid is not held, whatever it is held with elsewhere. With the
+ * term deleted the third loses a quarter of its beats, and the one loose
+ * pass with its beats moved to the nearest peak, which this path was
+ * before, lost a fifth of them. See setTightness().
  *
  * CAUSAL (processBlock()). A bank of one-pole complex resonators over the same
  * envelope -- baseline-removed the same way, by a trailing mean rather than a
@@ -405,8 +442,8 @@ public:
         for (auto* values : {&bankPeriod_, &bankCosCoef_, &bankSinCoef_, &bankDecay_,
                              &bankPrior_, &zRe_, &zIm_, &zMass_, &bankCoherence_,
                              &bankLevelRatio_, &env_, &envBal_, &local_, &cumScore_,
-                             &acf_, &scratchA_, &kernel_, &localPeriod_, &sweepA_,
-                             &sweepB_, &candScore_, &candExplains_, &beatScore_,
+                             &acf_, &scratchA_, &kernel_, &localPeriod_,
+                             &localTightness_, &candScore_, &candExplains_, &beatScore_,
                              &beatScratch_, &beatAhead_, &beatLogLag_, &beatWeightTable_,
                              &combRing_, &combSum_, &combTime_, &combSpec_, &combAcf_,
                              &combDelta_, &combNext_, &combStep_, &combPrior_, &combKernel_,
@@ -527,82 +564,54 @@ public:
      * @brief Sets the dynamic-programming tightness (Ellis alpha).
      *
      * Weight of the interval-consistency term against the onset evidence:
-     * larger holds the grid closer to the estimated period, smaller lets it
-     * follow the envelope. Offline path only -- the causal path has no
-     * transition cost to weigh. Non-finite values are ignored; values are
-     * clamped to a positive floor because a tightness of zero removes the
-     * term the recursion is built on and leaves the grid free to place a beat
-     * at every envelope peak.
+     * larger holds the grid closer to its period, smaller lets it follow the
+     * envelope. Offline path only -- the causal path has no transition cost
+     * to weigh. Non-finite values are ignored; values are clamped to a
+     * positive floor because a tightness of zero removes the term the
+     * recursion is built on and leaves the grid free to place a beat at every
+     * envelope peak.
      *
-     * Default 25, and the number is measured rather than inherited.
+     * WHAT IT HOLDS. The grid is laid in two passes (see layGrid()). The
+     * first follows the tempo, at the lesser of this value and 25. The second
+     * is held at this value to the period the first one kept, wherever the
+     * first one kept it, and follows at the first pass's value where it did
+     * not. So the number is the tightness of the passages at a steady tempo,
+     * and a value of 25 or less lays both passes alike: one loose grid.
+     *
+     * Default 400, the value the method's paper names as its default.
+     *
+     * MEASURED on annotated music -- 698 excerpts of dance music, 243 takes
+     * of a drum kit alone, 360 of a guitar alone -- as the mean F-measure at
+     * +/-70 ms against the best reading of the annotation (as annotated,
+     * twice or half as fast, on the off-beats, in threes):
+     *
+     *   alpha       25     100    200    400    800   1600
+     *   dance     0.859  0.898  0.912  0.919  0.919  0.912
+     *   drums     0.869  0.906  0.920  0.925  0.926  0.923
+     *   guitar    0.690  0.752  0.773  0.786  0.787  0.784
+     *
+     * and against the annotation as it is, 0.789, 0.819, 0.828, 0.830, 0.832
+     * and 0.826; 0.768, 0.794, 0.803, 0.805, 0.805 and 0.802; 0.525, 0.542,
+     * 0.553, 0.559, 0.557 and 0.558. Below the default the grid leaves the
+     * beat for the notes beside it: at 25 the share of its intervals within
+     * an eighth of their median is 0.955, 0.955 and 0.893, against 0.998,
+     * 0.997 and 0.995 at 400. The default sits where the three rows level
+     * off, and the paper's value is on that level; 800 is level with it and
+     * 1600 is lower on all three.
+     *
+     * And on clicks, where the truth is exact, F at +/-70 ms: a tempo
+     * swinging by 15% every sixteen beats and every nine, and a bar whose
+     * loudest note is a sixteenth before a beat that carries nothing, read
+     * 1.000, 1.000 and 1.000 at the default, and at 1600 as well: the grid
+     * is held only where the tempo holds. With the term deleted (0.001) the
+     * third reads 0.765.
      *
      * A CAUTION ON MEASURING IT. On isochronous clicks this parameter does
-     * nothing at all: the optimal interval is exactly the target period, so
-     * the cost it weighs is identically zero, and the grid is BIT-IDENTICAL
-     * from alpha = 0.001 -- which deletes the term outright -- to alpha =
-     * 4000. Any sweep run only on steady material measures nothing and will
-     * report a spread of zero whatever the code does. The term is live only
-     * where the played interval departs from the target by more than the
-     * grid-snap window, an eighth of a period.
-     *
-     * MEASURED, on a bed that does exercise it: expressive timing (rubato at
-     * +/-8, +/-10 and +/-15%, ritardando, accelerando), material with onsets
-     * off the beat and beats carrying no onset (dropouts, syncopation,
-     * straight eighths, swing), and a noise bed under heavy jitter. Reported
-     * at the WORST case of that bed, F-measure at +/-70 ms:
-     *
-     *   alpha    0.001    10     25     50    100    200    400   1000   4000
-     *   worst F  0.685  0.760  0.820  0.820  0.820  0.609  0.564  0.520  0.544
-     *   mean  F  0.938  0.978  0.984  0.982  0.978  0.944  0.913  0.881  0.881
-     *
-     * The WORST-case row has a plateau from 25 to 100, and its two edges are
-     * real failures, one on each side: below it the grid follows spurious
-     * peaks (a sparse pattern with the kick off the beat drops from 0.820 to
-     * 0.760, and with the term deleted the same case is 0.760 and the metrical
-     * level is wrong twice); above it expressive timing collapses (a +/-15%
-     * rubato at 120 BPM scores 1.0000 at alpha = 25 and at 50, 0.9919 at 100
-     * and 0.5645 at 400 -- at 400 the tracker loses 43% of that grid).
-     *
-     * That plateau is one statistic, and it is not a tie. Compared case by
-     * case, alpha = 25 is equal to alpha = 100 on 12 of the 15 cases, better
-     * on three -- +/-15% rubato at 120 BPM 1.0000 against 0.9919, +/-15%
-     * rubato at 90 BPM 1.0000 against 0.9574, the syncopated pattern at 110
-     * BPM 1.0000 against 0.9649 -- and worse on none. 25 likewise loses to 50
-     * on no case and beats it on one. The mean row printed above says the same
-     * thing in one number, and the ranking, not the plateau, is what picks the
-     * default: the bed contains no case that prefers a larger value.
-     *
-     * The default is therefore the BOTTOM of the plateau, decided by that
-     * per-case comparison. The same order holds OFF this bed, on the sparse
-     * and noisy material a larger value might be expected to protect: over a
-     * second bed of 16 cases -- noise swept to 0.50 rms at two tempi, and
-     * beats carrying no onset at all, with and without noise -- alpha = 25 is
-     * better than 100 on six, worse on one and level on nine. The six are
-     * large (F 0.8113 against 0.2885 at 0.45 rms, 0.9346 against 0.6226 at
-     * 0.40) and the one is small (0.9720 against 0.9811 at 0.30 rms). A
-     * tighter grid does not rescue thin evidence: it holds the grid to a
-     * period that thin evidence was too weak to have set correctly in the
-     * first place.
-     *
-     * It is NOT the 400 the original paper names as its default (Figure 5
-     * caption) and hard-codes in its reference implementation. Against the
-     * default, 400 loses on six of the fifteen cases -- the four expressive
-     * ones, the syncopated pattern and the jittered bed -- ties on the other
-     * nine and wins on none, the largest single loss being 0.4355 of F. The
-     * published values also disagree with each other by most of an order of
-     * magnitude: the same paper's best score on its own tuning set is at
-     * alpha = 680, and the reference implementation above shipped 400 through
-     * its 0.3 series and 100 from 0.4.0 on. All of them use the natural
-     * logarithm and the same cost, so the numbers are directly comparable and
-     * the disagreement is real rather than a change of units. None of those
-     * numbers is a reason here; the sweep above is.
-     *
-     * Callers whose material has a genuinely elastic tempo should lower it
-     * further. Raising it is not recommended and was not left as advice: on
-     * the two beds above, 30 of the 31 cases are flat or worse when it is
-     * raised to 100, and the single case that improves does so by 0.009 of F.
-     * A caller that raises it anyway should measure the effect on its own
-     * material rather than trust the direction.
+     * next to nothing: every interval is the target period, so the cost it
+     * weighs is zero, and the grids at alpha = 0.001 -- which deletes the
+     * term outright -- and at alpha = 4000 name the same beats within two
+     * analysis frames of each other. A sweep run only on steady clicks
+     * measures nothing and will report no spread whatever the code does.
      */
     void setTightness(T alpha) noexcept
     {
@@ -615,6 +624,12 @@ public:
     [[nodiscard]] T getTightness() const noexcept
     {
         return static_cast<T>(tightness_.load(std::memory_order_relaxed));
+    }
+
+    /** @brief The tightness in force until setTightness() is called. */
+    [[nodiscard]] static constexpr T defaultTightness() noexcept
+    {
+        return static_cast<T>(kDefaultTightness);
     }
 
     // -- Offline -------------------------------------------------------------
@@ -949,59 +964,10 @@ private:
 
         // The metrical level is decided against one period for the whole
         // signal, which is the stable model, and only then is the grid laid
-        // down against a period that is allowed to move.
-        // A period that moves is only worth estimating where there is a pulse
-        // to estimate it from. When the winner does not clear the fundamental
-        // floor -- the caller restricted the range past the real pulse -- a
-        // per-frame estimate over that range is tracking noise, and it drags
-        // the delivered grid with it: measured at 96 BPM on 160 BPM material
-        // searched over 60 to 100, where the answer a listener would give is
-        // the 80 BPM the correlation points at.
-        //
-        // Both grids are built - one against the moving period, one against
-        // the steady one - and the one that explains the envelope better is
-        // delivered. A per-frame period is the right model for a tempo that
-        // moves, and the wrong one for a steady tempo under a syncopated
-        // part: there the resonator sweep is drawn, bar by bar, towards the
-        // syncopation's own period, and the grid it drives falls off the beat
-        // and onto the off-accents. Measured on a limited pop master at 120
-        // BPM over a dotted-eighth guitar, the moving-period grid put 18 of 74
-        // intervals at three quarters or five quarters of a beat; the steady
-        // grid has none, and explains more of the envelope, so it is the one
-        // delivered. On a tempo ramp the steady grid drifts off the beats and
-        // the moving one wins by the same measure.
+        // down: held to the period the music keeps, following where it leaves
+        // it (see layGrid()).
         WorkVector<int64_t> win(detail::AccountedAllocator<int64_t>{&allocationAccount_});
-        localPeriod_.clear();
-        WorkVector<int64_t> moving(detail::AccountedAllocator<int64_t>{&allocationAccount_});
-        bool haveMoving = false;
-        if (coherence(tau1) >= kMinFundamentalCoherence)
-        {
-            computeLocalPeriods(tau1);
-            haveMoving = buildGrid(tau1, moving) && moving.size() >= 2;
-        }
-        localPeriod_.clear();
-        bool haveSteady = buildGrid(tau1, win) && win.size() >= 2;
-        // A third reading: the steady period held kStrictTightnessFactor times
-        // more tightly. The tightness in force is tuned for rubato, where it
-        // must let an interval stretch; under a steady beat with a strong
-        // syncopated part the same slack lets single intervals jump onto the
-        // off-accents. Whichever grid explains the envelope best is kept, so
-        // rubato keeps its loose grid and a steady groove gets a steady one.
-        {
-            WorkVector<int64_t> strict(detail::AccountedAllocator<int64_t>{&allocationAccount_});
-            alphaScale_ = kStrictTightnessFactor;
-            const bool haveStrict = buildGrid(tau1, strict) && strict.size() >= 2;
-            alphaScale_ = 1.0;
-            if (haveStrict && (!haveSteady || gridCoherence(strict) > gridCoherence(win)))
-            {
-                win.swap(strict);
-                haveSteady = true;
-            }
-        }
-        if (haveMoving && (!haveSteady
-                           || gridCoherence(moving) > kMovingGridMargin * gridCoherence(win)))
-            win.swap(moving);
-        else if (!haveSteady)
+        if (!layGrid(tau1, win))
         {
             resetState();
             return out;
@@ -1200,7 +1166,7 @@ private:
 
     /// Dynamic-programming tightness. See setTightness() for what the number
     /// is, where it comes from and why it is a default rather than a constant.
-    static constexpr double kDefaultTightness = 25.0;
+    static constexpr double kDefaultTightness = 400.0;
     static constexpr double kMinTightness = 1e-3;
 
     /// Least share of the onset mass a candidate must carry in phase before
@@ -1237,17 +1203,122 @@ private:
     /// that is ranked as a tempo candidate (see pickCandidates()).
     static constexpr double kCandidatePeakFloor = 0.25;
 
-    /// Half-width, in bank bins, of the band the per-frame period may move in
-    /// around the global one (see computeLocalPeriods()).
-    /// Tightness multiplier of the strict steady-period grid analyze() also
-    /// tries (see there).
-    static constexpr double kStrictTightnessFactor = 4.0;
+    /// The same floor against a neighbour: a candidate within
+    /// kNeighbourOctaves of one that correlates more is ranked only if it
+    /// correlates this much of it (see pickCandidates()). The distance stops
+    /// short of the nearest metrical relation, four thirds of a period at
+    /// 0.42 of an octave. A floor and not "the tallest wins": a tempo that
+    /// swings spreads its correlation over a run of peaks of similar height,
+    /// the tallest at the two ends of the swing, and the ranking has to keep
+    /// the middle ones to choose from (with the tallest alone, a tempo
+    /// swinging by 15% lost a sixth of its grid and a 100-to-140 BPM ramp a
+    /// quarter of its local tempo).
+    static constexpr double kNeighbourPeakFloor = 0.6;
+    static constexpr double kNeighbourOctaves = 0.35;
 
-    /// How much more of the envelope the moving-period grid must explain
-    /// before it is preferred to a steady one (see analyze()).
-    static constexpr double kMovingGridMargin = 1.5;
+    /// Tightness of the first pass of layGrid(), the one that only has to
+    /// follow the tempo: the value at which a grid keeps up with a tempo that
+    /// swings by 15% within nine beats. A caller that asks for less gets what
+    /// it asks for in both passes.
+    static constexpr double kFollowTightness = 25.0;
 
-    static constexpr int kLocalPeriodSpan = kBinsPerOctave / 6;
+    /// Beats either side over which the period the loose grid moves at is
+    /// read (see holdToGrid()): the mean of the central half of nine
+    /// intervals, so that a beat taken off the grid and the one that brings
+    /// it back do not count.
+    static constexpr int kPeriodReachBeats = 4;
+
+    /// Share of the spread of the intervals around a beat that the intervals
+    /// on one side of it alone have to stay under for the period to be read
+    /// on that side (see holdToGrid()): a change of tempo made at once, where
+    /// the nine intervals are two tempi and their central mean a period that
+    /// none of them has. A tempo that moves evenly stays above it: on a
+    /// steady ramp one side spreads 0.54 of what the whole does, and at the
+    /// steepest point of a tempo that swings over sixteen beats, 0.47.
+    static constexpr double kStepSpreadShare = 1.0 / 3.0;
+
+    /// How far the loose grid may move from its own overall period, in log
+    /// period, before the delivered grid stops being held to that period and
+    /// follows instead: at this distance it is half held, at half of it
+    /// almost wholly (0.94), at twice it almost not (0.06). This is the
+    /// distance where the intervals of the loose grid are spread out; where
+    /// they agree with one another it is shorter (kHoldSpreads).
+    static constexpr double kHoldWidth = 0.08;
+
+    /// The hold distance in spreads of the intervals the local period was
+    /// read from (their mean distance from it, in log period), and the
+    /// distance where they do not spread at all. A period read off intervals
+    /// that sit a twentieth either side of it may be the overall one read
+    /// badly; the same period read off intervals that all agree is a tempo
+    /// of its own, however near the overall one, and a grid held away from
+    /// it sits beside every beat where the tempo changes (16 ms beside the
+    /// click at a change from 120 to 110 BPM).
+    static constexpr double kHoldSpreads = 4.0;
+    static constexpr double kSteadyHoldWidth = 0.02;
+
+    /// Furthest the periods read off the loose grid may sit from the period
+    /// the candidates gave and from one another, in octaves: a third keeps
+    /// them short of the next reading (four thirds and three quarters of the
+    /// period are 0.42 of an octave away).
+    static constexpr double kHoldReachOctaves = 1.0 / 3.0;
+
+    /// How far the period the loose grid keeps may sit from the period it was
+    /// given, in octaves, before the loose pass is laid again around its own
+    /// (see layGrid()).
+    static constexpr double kRecentreOctaves = 0.03;
+
+    /// A second tempo in the same signal (see layGrid()): a ranked candidate
+    /// this many octaves from the period decided. Nearer than the first, the
+    /// loose pass follows both tempi from either of them; further than the
+    /// second, the two do not fit within kHoldReachOctaves of one period
+    /// between them.
+    static constexpr double kSecondTempoNear = 0.25;
+    static constexpr double kSecondTempoFar = 2.0 * kHoldReachOctaves;
+
+    /// What a ranked candidate has to correlate, of what the period decided
+    /// does, to be looked at as a second tempo. Low, because a tempo kept
+    /// for a third of the signal correlates well under the other, and being
+    /// looked at decides nothing by itself: at 0.6, sixteen clicks at one
+    /// tempo among thirty-two at another were not looked at (F 0.78 to 0.80
+    /// at 15 ms).
+    static constexpr double kSecondTempoPeakFloor = 0.3;
+
+    /// What makes the loose grid laid between two tempi the grid that is
+    /// read (see layGrid()): this share of its intervals at each of the two
+    /// periods, within kHoldWidth and in runs of this many or more (twice
+    /// kPeriodReachBeats: what a local period is read over), and each of its
+    /// beats carrying this much more than a beat of the grid laid at the
+    /// period decided. That grid follows one tempo and slides over the
+    /// other, where one beat in three or four of its own finds a beat of the
+    /// music under it.
+    ///
+    /// The runs are what tells a change of tempo from a rhythm that crosses
+    /// the beat. On 1301 pieces of music at one tempo, a second tempo is
+    /// looked at in 1169. Counted without runs, a third of the intervals at
+    /// each was enough to take the grid between the two in four pieces --
+    /// three beats laid over four of a tango, a ride cymbal in threes --
+    /// and each was the worse for it. In runs, no piece has a quarter at
+    /// each (the most is 0.23 and 0.23) and none is taken. On clicks,
+    /// sixteen at one tempo among thirty-two at another are followed (0.34
+    /// of the intervals); twelve among thirty-six are not (0.23).
+    static constexpr double kSecondTempoShare = 0.25;
+    static constexpr size_t kSecondTempoRun = 8;
+    static constexpr double kSecondTempoGain = 1.15;
+
+    /// Most an interval may cost while the held grid is laid, in beats of
+    /// the loose grid (the mean of what they carry). An interval that breaks
+    /// the period is either a beat taken off the grid, which this prices out,
+    /// or a change of phase the music made, which has to be taken once the
+    /// beats after it confirm it. Without a cap the grid slides into a
+    /// half-beat change over eight intervals instead.
+    static constexpr double kIntervalCapBeats = 8.0;
+
+    /// Share of what the loose grid carries that the held grid has to carry
+    /// to be the one delivered. On music a held grid carries less than the
+    /// loose one because it leaves the notes off the beat alone, and is the
+    /// better grid for it at every share measured; under half, the tempo is
+    /// one the held grid did not follow.
+    static constexpr double kHeldShare = 0.5;
 
     /// Shortest signal analyze() will fit a tempo to, in beats at the slowest
     /// searched tempo.
@@ -1269,17 +1340,25 @@ private:
     static constexpr double kSearchLowFactor = 0.5;
     static constexpr double kSearchHighFactor = 2.0;
 
-    /// How far a beat may be moved onto a nearby envelope peak, and how far
-    /// the grid extension may look for the next one, as a fraction of the beat
-    /// period. An eighth of a period cannot reach an off-beat at any swing
-    /// ratio -- the nearest one is a third of a period away -- so the step can
-    /// correct a misplacement but never change which pulse a beat is on.
-    static constexpr double kSnapFraction = 0.125;
+    /// How far either side of the next expected beat the grid extension
+    /// looks for it, as a fraction of the beat period.
+    static constexpr double kExtendFraction = 0.125;
 
-    /// Grid trimming: a leading or trailing beat carrying less than this
-    /// fraction of the grid's mean onset strength is an artefact of where the
-    /// recursion had to start and stop, not a beat anyone played.
-    static constexpr double kTrimFraction = 0.5;
+    /// The ends of the grid: a leading or trailing beat carrying less than
+    /// this fraction of the grid's mean onset strength is not a beat anyone
+    /// played, and the grid is continued past its ends only onto beats that
+    /// carry as much. A quarter: excerpts fade and endings thin out, and at
+    /// a half the grid stopped 1.6 beats short of the annotated beats per
+    /// piece on a collection of dance music; at a quarter, 0.6.
+    static constexpr double kSupportFraction = 0.25;
+
+    /// The same floor for a beat in the first frames of the signal. A signal
+    /// that is already sounding at its first sample shows the envelope an
+    /// onset there that is the edge of the file and not a note; a beat on it
+    /// has to carry what a beat carries. The frames are those whose analysis
+    /// window reaches back past the first sample.
+    static constexpr double kEdgeSupportFraction = 0.5;
+    static constexpr double kEdgeSeconds = 0.06;
 
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
                   "audio-thread stores must not lock");
@@ -2489,6 +2568,33 @@ private:
             candidates_.resize(w);
         }
 
+        // Within one reading the correlation is the judge. Candidates closer
+        // than the nearest metrical relation (kNeighbourOctaves) are the same
+        // reading at two tunings, and the ranking below is not built to tell
+        // those apart: it weighs a period against its own multiples, and a
+        // lag beside the period, whose multiples fall between the repeats,
+        // is weighed against nothing and ranks high for it. One that
+        // correlates less than kNeighbourPeakFloor of another within that
+        // distance is a shoulder of the other's peak, and is not ranked.
+        {
+            const WorkVector<int> all(candidates_.begin(), candidates_.end(),
+                                      candidates_.get_allocator());
+            size_t w = 0;
+            for (size_t i = 0; i < all.size(); ++i)
+            {
+                bool shoulder = false;
+                for (size_t j = 0; j < all.size() && !shoulder; ++j)
+                    shoulder = j != i
+                            && std::abs(std::log2(static_cast<double>(all[i])
+                                                  / static_cast<double>(all[j])))
+                                   < kNeighbourOctaves
+                            && kNeighbourPeakFloor * acf_[static_cast<size_t>(all[j])]
+                                   > acf_[static_cast<size_t>(all[i])];
+                if (!shoulder) candidates_[w++] = all[i];
+            }
+            candidates_.resize(w);
+        }
+
         // Rank by the octave discriminator, not by correlation height. Two
         // scores per candidate, for the two questions of scoreAt(): the
         // adjudicated one decides the level, the explanatory one is what the
@@ -2766,116 +2872,347 @@ private:
     }
 
     /**
-     * @brief Per-frame beat period, for music whose tempo moves.
+     * @brief Lays the delivered grid at the period already decided, in the
+     *        caller's timeline.
      *
-     * The same resonator bank the causal path runs, swept over the envelope
-     * once forward and once backward and combined in the log-period domain.
-     * One direction alone carries its own memory as a lag -- a forward sweep
-     * reports where the tempo HAS been -- and running the identical filter the
-     * other way produces the mirror-image lag, so the two together are
-     * symmetric in time and centred on the frame being described. That is only
-     * possible offline, and it is the whole reason the offline path can follow
-     * a tempo the causal path can only chase.
+     * Two passes of the recursion, because holding a grid and following a
+     * tempo ask opposite things of the interval cost. A cost light enough to
+     * follow a tempo that moves is light enough to take a beat off the grid
+     * onto a louder note next to it and bring it back at the following one:
+     * the anticipated sixteenth of a samba, the swung eighth of a shuffle.
+     * A cost heavy enough to refuse that holds the grid to one period, and
+     * loses a tempo that leaves it.
      *
-     * The sweep is confined to a sixth of an octave (about 12%) either side
-     * of the period the global analysis settled on: the metrical level has
-     * already been decided by then, and a local estimate free to move further
-     * is drawn, bar by bar, to the period of a syncopated part - a
-     * dotted-eighth guitar pulled it to three quarters of the beat. A 100 to
-     * 140 BPM ramp still tracks to within 1.03% at this width.
+     * The first pass is loose (kFollowTightness) and only has to follow. From
+     * its intervals come the period the music keeps overall and the period
+     * it moves at around each beat (holdToGrid()), and the second pass is
+     * held, at the tightness asked for, to the overall period wherever the
+     * two agree, and follows the local one where they part. An interval of
+     * the held pass never costs more than kIntervalCapBeats beats of the
+     * loose grid, so that a change of phase the music made is still taken.
+     *
+     * The loose pass does not reach every tempo from the period it is laid
+     * around, and the period decided may be one of two tempi the signal
+     * keeps: from 96 BPM the pass does not reach 126, and slides over that
+     * part of the signal, three beats to four of the music. So where the
+     * ranking kept a second period that could be a second tempo
+     * (secondTempo()), the loose pass is also laid around the period between
+     * the two, and that grid is the one read if it is at the two tempi: a
+     * share of its intervals in runs at each, its beats carrying more than
+     * those of the first grid (kSecondTempoShare, kSecondTempoRun,
+     * kSecondTempoGain).
+     *
+     * The held grid is the one delivered unless it carries less than
+     * kHeldShare of what the loose grid carries: a tempo that swings faster
+     * than its period can be read over a few beats looks steady to the first
+     * pass's statistics and is not, and there the loose grid is the grid.
+     *
+     * Where the period has no pulse of its own under it -- the caller
+     * restricted the range past the real one -- there is nothing to follow,
+     * and one pass at the tightness asked for lays the grid.
+     *
+     * @return false if the signal is too short for the period.
      */
-    void computeLocalPeriods(double globalTau)
+    bool layGrid(double tau, WorkVector<int64_t>& gridOut)
     {
-        const int n = static_cast<int>(env_.size());
-        localPeriod_.assign(static_cast<size_t>(n), globalTau);
-        if (n < 8 || bankSize_ < 2) return;
+        gridOut.clear();
+        localPeriod_.clear();
+        localTightness_.clear();
+        intervalCap_ = 0.0;
+        alphaScale_ = 1.0;
 
-        // Confined twice over: to kLocalPeriodSpan either side of the period
-        // the global analysis settled on, AND to the range the caller asked to
-        // be searched. The first keeps a syncopated part from moving the grid
-        // off the beat; the second is the caller's contract, and a local
-        // estimate that escaped it would deliver a tempo outside the range
-        // that was asked for -- measured at 110 BPM on 160 BPM material
-        // searched over 60 to 100 before this clamp existed.
-        int aLo = 0, aHi = 0;
-        unpackRange(activeRange_.load(std::memory_order_relaxed), aLo, aHi);
-        aLo = std::clamp(aLo, 0, bankSize_ - 1);
-        aHi = std::clamp(aHi, aLo, bankSize_ - 1);
-
-        const int gi = periodToIndex(globalTau);
-        int lo = std::clamp(gi - kLocalPeriodSpan, aLo, aHi);
-        int hi = std::clamp(gi + kLocalPeriodSpan, aLo, aHi);
-        if (hi < lo) std::swap(lo, hi);
-        if (hi <= lo) return;
-
-        sweepA_.assign(static_cast<size_t>(n), globalTau);
-        sweepB_.assign(static_cast<size_t>(n), globalTau);
-        sweepPeriods(lo, hi, false, sweepA_);
-        sweepPeriods(lo, hi, true, sweepB_);
-
-        for (int i = 0; i < n; ++i)
+        WorkVector<int> grid(detail::AccountedAllocator<int>{&allocationAccount_});
+        bool have = false;
+        if (coherence(tau) >= kMinFundamentalCoherence)
         {
-            if ((i & 255) == 0) checkOfflineWork();
-            const double a = sweepA_[static_cast<size_t>(i)];
-            const double b = sweepB_[static_cast<size_t>(i)];
-            localPeriod_[static_cast<size_t>(i)] =
-                (a > 0.0 && b > 0.0) ? std::sqrt(a * b) : globalTau;
-        }
+            WorkVector<int> loose(detail::AccountedAllocator<int>{&allocationAccount_});
+            const double asked = tightness_.load(std::memory_order_relaxed);
+            alphaScale_ = std::min(1.0, kFollowTightness / asked);
+            const bool followed = runDp(tau, loose, true) && loose.size() >= 4;
+            alphaScale_ = 1.0;
+            if (followed)
+            {
+                // A signal at two tempi, the second out of the loose pass's
+                // reach from the first. Laid around the period between them
+                // the loose grid follows both.
+                double given = tau;
+                if (const double second = secondTempo(tau); second > 0.0)
+                {
+                    const double between = std::sqrt(tau * second);
+                    WorkVector<int> both(detail::AccountedAllocator<int>{&allocationAccount_});
+                    alphaScale_ = std::min(1.0, kFollowTightness / asked);
+                    const bool laid = runDp(between, both, true) && both.size() >= 4;
+                    alphaScale_ = 1.0;
 
-        // Smooth over a couple of beats: a per-frame winner steps by whole
-        // bank bins, and a target period that steps is a target period the
-        // interval cost can be made to chase.
-        const int half = std::max(1, static_cast<int>(std::lround(globalTau)));
-        scratchA_.assign(static_cast<size_t>(n) + 1, 0.0);
-        for (int i = 0; i < n; ++i)
-            scratchA_[static_cast<size_t>(i) + 1] = scratchA_[static_cast<size_t>(i)]
-                + std::log(localPeriod_[static_cast<size_t>(i)]);
-        for (int i = 0; i < n; ++i)
-        {
-            if ((i & 255) == 0) checkOfflineWork();
-            const int a = std::max(0, i - half);
-            const int b = std::min(n, i + half + 1);
-            const double m = (scratchA_[static_cast<size_t>(b)]
-                              - scratchA_[static_cast<size_t>(a)])
-                           / static_cast<double>(b - a);
-            localPeriod_[static_cast<size_t>(i)] = std::exp(m);
+                    // Taken if it is a grid at the two tempi: that share of
+                    // its intervals in runs at each of the two periods, and
+                    // each of its beats carrying that much more than a beat
+                    // of the first grid, both on the score it was laid on. A
+                    // grid that settled on one period, the second or one
+                    // between the two, or that goes from one to the other
+                    // every few beats, follows another reading of the tempo,
+                    // and which reading is the beat was decided before this.
+                    bool taken = false;
+                    if (laid)
+                        taken = shareInRuns(both, tau) >= kSecondTempoShare
+                             && shareInRuns(both, second) >= kSecondTempoShare
+                             && carriedBy(both) * static_cast<double>(loose.size())
+                                    > kSecondTempoGain * carriedBy(loose)
+                                          * static_cast<double>(both.size());
+                    if (taken)
+                    {
+                        loose.swap(both);
+                        given = between;
+                    }
+                    else
+                        buildLocalScore(tau);   // back on the score the first chain was laid on
+                }
+
+                double overall = overallPeriod(loose, given);
+                if (std::abs(std::log2(overall / given)) > kRecentreOctaves)
+                {
+                    // The loose grid moves at another period than the one it
+                    // was given: laid again around its own, it no longer pays
+                    // for the distance at the far end of a tempo that swings.
+                    WorkVector<int> again(detail::AccountedAllocator<int>{&allocationAccount_});
+                    alphaScale_ = std::min(1.0, kFollowTightness / asked);
+                    const bool laid = runDp(overall, again, true) && again.size() >= 4;
+                    alphaScale_ = 1.0;
+                    if (laid)
+                    {
+                        loose.swap(again);
+                        overall = overallPeriod(loose, overall);
+                    }
+                    else
+                        buildLocalScore(given);   // back on the score the first chain was laid on
+                }
+                intervalCap_ = kIntervalCapBeats * carriedBy(loose) / static_cast<double>(loose.size());
+                holdToGrid(loose, overall);
+                have = runDp(overall, grid) && grid.size() >= 2;
+                localPeriod_.clear();
+                localTightness_.clear();
+                intervalCap_ = 0.0;
+
+                // Both grids on the score the held one was laid on, the loose
+                // one continued past its ends the way the held one was.
+                extendGrid(loose);
+                if (!have || carriedBy(grid) < kHeldShare * carriedBy(loose))
+                {
+                    grid.swap(loose);
+                    have = grid.size() >= 2;
+                }
+            }
         }
+        if (!have) have = runDp(tau, grid) && grid.size() >= 2;
+        if (!have) return false;
+
+        gridOut.reserve(grid.size());
+        for (const int f : grid)
+            gridOut.push_back(beatSample(f));
+        return true;
     }
 
-    /** @brief One resonator sweep over the envelope, in either direction,
-     *  writing the winning period per frame. Uses the causal path's own bank
-     *  state, which analyze() owns for the duration of the call. */
-    void sweepPeriods(int lo, int hi, bool reverse, WorkVector<double>& out)
+    /** @brief Onset strength a grid's beats carry, on the score in force. */
+    [[nodiscard]] double carriedBy(const WorkVector<int>& beatFrames) const noexcept
+    {
+        double sum = 0.0;
+        for (const int f : beatFrames) sum += local_[static_cast<size_t>(f)];
+        return sum;
+    }
+
+    /** @brief Mean of the central half of a set of intervals: the loose grid
+     *  takes beats off the period in pairs, a short interval and the long
+     *  one that brings it back, and the central half leaves both out, while
+     *  a mean of what remains resolves the period well below the frame the
+     *  intervals are counted in. Sorts @p intervals. */
+    [[nodiscard]] static double centralMean(WorkVector<double>& intervals)
+    {
+        std::sort(intervals.begin(), intervals.end());
+        const size_t q = intervals.size() / 4;
+        double sum = 0.0;
+        for (size_t j = q; j < intervals.size() - q; ++j) sum += intervals[j];
+        return sum / static_cast<double>(intervals.size() - 2 * q);
+    }
+
+    /** @brief The period a grid keeps overall, within kHoldReachOctaves of
+     *  @p around so that it cannot settle on another reading. */
+    [[nodiscard]] double overallPeriod(const WorkVector<int>& beats, double around) const
+    {
+        WorkVector<double> intervals(detail::AccountedAllocator<double>{&allocationAccount_});
+        intervals.reserve(beats.size());
+        for (size_t k = 1; k < beats.size(); ++k)
+            intervals.push_back(static_cast<double>(beats[k] - beats[k - 1]));
+        const double reach = std::exp2(kHoldReachOctaves);
+        return std::clamp(centralMean(intervals), around / reach, around * reach);
+    }
+
+    /** @brief Share of a grid's intervals that sit within kHoldWidth, in log
+     *  period, of @p period in runs of kSecondTempoRun or more. */
+    [[nodiscard]] static double shareInRuns(const WorkVector<int>& beats, double period) noexcept
+    {
+        size_t inRuns = 0, run = 0;
+        for (size_t k = 1; k < beats.size(); ++k)
+        {
+            if (std::abs(std::log(static_cast<double>(beats[k] - beats[k - 1]) / period))
+                <= kHoldWidth)
+            {
+                ++run;
+                continue;
+            }
+            if (run >= kSecondTempoRun) inRuns += run;
+            run = 0;
+        }
+        if (run >= kSecondTempoRun) inRuns += run;
+        return static_cast<double>(inRuns) / static_cast<double>(beats.size() - 1);
+    }
+
+    /**
+     * @brief The period of a second tempo the signal may keep beside
+     *        @p tau; 0 if the ranking kept none.
+     *
+     * A second tempo is a ranked candidate between kSecondTempoNear and
+     * kSecondTempoFar octaves from @p tau that correlates at least
+     * kSecondTempoPeakFloor of what @p tau does; of several, the one that
+     * correlates most.
+     */
+    [[nodiscard]] double secondTempo(double tau) const noexcept
+    {
+        const auto own = static_cast<size_t>(std::llround(tau));
+        if (own >= acf_.size() || !(acf_[own] > 0.0)) return 0.0;
+        double most = 0.0, second = 0.0;
+        for (const int lag : candidates_)
+        {
+            const double octaves = std::abs(std::log2(static_cast<double>(lag) / tau));
+            if (octaves < kSecondTempoNear || octaves > kSecondTempoFar) continue;
+            const double v = acf_[static_cast<size_t>(lag)];
+            if (v >= kSecondTempoPeakFloor * acf_[own] && v > most)
+            {
+                most = v;
+                second = static_cast<double>(lag);
+            }
+        }
+        return second;
+    }
+
+    /**
+     * @brief Reads off the loose grid what the held grid is held to: fills
+     *        the per-frame target period and tightness.
+     *
+     * The period the loose grid moves at around each beat is the central
+     * mean of the intervals within kPeriodReachBeats beats, kept within
+     * kHoldReachOctaves of the overall one -- of the overall one and not of
+     * the period the candidates gave, which need not sit in the middle of a
+     * tempo that moves.
+     *
+     * Where the tempo changes at once those intervals are two tempi, and
+     * their central mean is a period that none of them has and that can be
+     * the overall one itself: held to it, the grid rounds the change off and
+     * sits beside the beats either side of it (20 and 65 ms late on clicks
+     * that go from 120 to 100 BPM). There the intervals on one side of the
+     * beat spread far less than all of them do (kStepSpreadShare), and the
+     * period is read on that side.
+     *
+     * A frame is judged as the end of an interval, so its period is the one
+     * read half a period before it. With `away` the log of that period over
+     * the overall one, the grid is held by 1 / (1 + (away / width)^4): the
+     * target is the overall period moved towards the local one by what is
+     * not held, and the tightness the one asked for where held, that of the
+     * loose pass where not.
+     *
+     * The width is kHoldSpreads times the spread of the intervals the period
+     * was read from, between kSteadyHoldWidth and kHoldWidth. Where the
+     * loose grid's intervals are spread out, a local period a few hundredths
+     * off the overall one is the overall one read badly, and the grid is
+     * held. Where they all agree it is a tempo of its own, and a grid held
+     * away from it, even by half, sits beside the beat wherever the tempo
+     * changes.
+     */
+    void holdToGrid(const WorkVector<int>& beats, double overall)
     {
         const int n = static_cast<int>(env_.size());
-        std::fill(zRe_.begin(), zRe_.end(), 0.0);
-        std::fill(zIm_.begin(), zIm_.end(), 0.0);
-        std::fill(zMass_.begin(), zMass_.end(), 0.0);
+        const size_t count = beats.size() - 1;
+        const double reach = std::exp2(kHoldReachOctaves);
+        const detail::AccountedAllocator<double> doubles(&allocationAccount_);
 
-        for (int k = 0; k < n; ++k)
+        WorkVector<double> window(doubles);
+        window.reserve(static_cast<size_t>(2 * kPeriodReachBeats + 1));
+        const auto interval = [&beats](size_t k) {
+            return static_cast<double>(beats[k + 1] - beats[k]);
+        };
+
+        // The period a run of intervals keeps, and how far they sit from it.
+        const auto read = [&window, &interval](size_t first, size_t last,
+                                               double& period, double& spread) {
+            window.clear();
+            for (size_t j = first; j <= last; ++j) window.push_back(interval(j));
+            period = centralMean(window);
+            spread = 0.0;
+            for (const double x : window) spread += std::abs(std::log(x / period));
+            spread /= static_cast<double>(window.size());
+        };
+
+        // The local period of each interval, at the interval's centre, as
+        // the log of its distance from the overall one.
+        WorkVector<double> away(count, 0.0, doubles), centre(count, 0.0, doubles),
+            width(count, kHoldWidth, doubles);
+        const size_t each = static_cast<size_t>(kPeriodReachBeats);
+        for (size_t k = 0; k < count; ++k)
         {
-            if ((k & 255) == 0) checkOfflineWork();
-            const int i = reverse ? (n - 1 - k) : k;
-            const double o = env_[static_cast<size_t>(i)];
+            const size_t first = (k > each ? k - each : 0);
+            const size_t last = std::min(count - 1, k + each);
+            double period = 0.0, spread = 0.0;
+            read(first, last, period, spread);
 
-            int best = -1;
-            double bestValue = 0.0;
-            for (int b = lo; b <= hi; ++b)
+            // One side alone, where it is whole and far the steadier.
+            double steadiest = kStepSpreadShare * spread, readSpread = spread;
+            if (k >= each && last > k)
             {
-                const size_t u = static_cast<size_t>(b);
-                const double re = zRe_[u], im = zIm_[u];
-                zRe_[u] = bankCosCoef_[u] * re - bankSinCoef_[u] * im + o;
-                zIm_[u] = bankCosCoef_[u] * im + bankSinCoef_[u] * re;
-                zMass_[u] = bankDecay_[u] * zMass_[u] + o;
-                const double mass = zMass_[u];
-                const double c = (mass > kMassFloor)
-                    ? std::sqrt(zRe_[u] * zRe_[u] + zIm_[u] * zIm_[u]) / mass : 0.0;
-                bankCoherence_[u] = c;
-                const double s = bankPrior_[u] * c;
-                if (s > bestValue) { bestValue = s; best = b; }
+                double sidePeriod = 0.0, sideSpread = 0.0;
+                read(k - each, k, sidePeriod, sideSpread);
+                if (sideSpread < steadiest)
+                {
+                    steadiest = readSpread = sideSpread;
+                    period = sidePeriod;
+                }
             }
-            out[static_cast<size_t>(i)] = (best >= 0)
-                ? bankPeriod_[static_cast<size_t>(best)] : 0.0;
+            if (k + each < count && first < k)
+            {
+                double sidePeriod = 0.0, sideSpread = 0.0;
+                read(k, k + each, sidePeriod, sideSpread);
+                if (sideSpread < steadiest)
+                {
+                    steadiest = readSpread = sideSpread;
+                    period = sidePeriod;
+                }
+            }
+            width[k] = std::clamp(kHoldSpreads * readSpread, kSteadyHoldWidth, kHoldWidth);
+            away[k] = std::log(std::clamp(period, overall / reach, overall * reach) / overall);
+            centre[k] = 0.5 * static_cast<double>(beats[k] + beats[k + 1]);
+        }
+
+        const double asked = tightness_.load(std::memory_order_relaxed);
+        const double follow = std::min(asked, kFollowTightness);
+        localPeriod_.assign(static_cast<size_t>(n), overall);
+        localTightness_.assign(static_cast<size_t>(n), asked);
+        size_t k = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            if ((i & 255) == 0) checkOfflineWork();
+            const double at = static_cast<double>(i) - 0.5 * overall;
+            while (k + 2 < count && centre[k + 1] <= at) ++k;
+            double a = away[k], w = width[k];
+            if (at >= centre[count - 1]) { a = away[count - 1]; w = width[count - 1]; }
+            else if (at > centre[k] && k + 1 < count)
+            {
+                const double span = centre[k + 1] - centre[k];
+                const double share = span > 0.0 ? std::clamp((at - centre[k]) / span, 0.0, 1.0) : 0.0;
+                a += share * (away[k + 1] - a);
+                w += share * (width[k + 1] - w);
+            }
+            const double r = a / w;
+            const double held = 1.0 / (1.0 + r * r * r * r);
+            localPeriod_[static_cast<size_t>(i)] = overall * std::exp((1.0 - held) * a);
+            localTightness_[static_cast<size_t>(i)] = follow + held * (asked - follow);
         }
     }
 
@@ -2889,48 +3226,34 @@ private:
                           0.0, 1.0);
     }
 
-    /** @brief Nearest bank index to a period in frames. */
-    [[nodiscard]] int periodToIndex(double periodFrames) const noexcept
-    {
-        if (!(periodFrames > 0.0) || bankSize_ < 1) return 0;
-        const double x = std::log2(periodFrames / bankPeriod_[0])
-                       * static_cast<double>(kBinsPerOctave);
-        return std::clamp(static_cast<int>(std::lround(x)), 0, bankSize_ - 1);
-    }
-
-    /** @brief Realises a candidate period as a beat grid in the caller's
-     *  timeline. The metrical level is already settled by then -- it is
-     *  decided by the ranking in pickCandidates(), on the whole envelope,
-     *  before any grid exists. */
-    bool buildGrid(double periodFrames, WorkVector<int64_t>& gridOut)
-    {
-        gridOut.clear();
-        WorkVector<int> beatFrames(detail::AccountedAllocator<int>{&allocationAccount_});
-        if (!runDp(periodFrames, beatFrames) || beatFrames.size() < 2) return false;
-        gridOut.reserve(beatFrames.size());
-        for (const int f : beatFrames)
-            gridOut.push_back(beatSample(f));
-        return true;
-    }
-
     /**
-     * @brief The dynamic program of the file header, plus backtrace, trim,
-     *        grid extension and sub-frame refinement.
+     * @brief The dynamic program of the file header, plus backtrace, the
+     *        trimming of the two ends and their continuation.
+     * @param chainOnly Stops after the trimming: the chain of the recursion
+     *        itself, for reading its intervals.
      * @return false if the signal is too short for the period asked for.
      *
-     * The target period is a single number for the whole signal unless
-     * localPeriod_ has been filled, in which case each frame is judged against
-     * the period estimated where it sits. One global period is the right model
-     * for deciding WHICH metrical level a signal is on, because it is the
-     * stable one; it is the wrong model for laying the grid down on music
-     * whose tempo moves, because the interval cost then measures the distance
-     * from the average rather than from the tempo being played.
+     * The target period and the tightness are single numbers for the whole
+     * signal unless localPeriod_ and localTightness_ have been filled (see
+     * holdToGrid()), in which case each frame is judged against its own. An
+     * interval costs at most intervalCap_ when that is set.
+     *
+     * A beat need not have one before it. Every frame further than half a
+     * period into the signal has candidates for a previous beat, and a chain
+     * forced to take one starts every grid with an interval that is whatever
+     * the distance from the first frames to the first note happens to be;
+     * a tight grid then pays for that interval by placing its first real beat
+     * late (28 ms at 90 BPM, measured on clicks after half a second of
+     * silence). So where every previous beat would leave the running total
+     * below zero the chain starts afresh: a total that low is the opening of
+     * the signal, since afterwards it holds everything the grid has gathered.
      */
-    bool runDp(double periodFrames, WorkVector<int>& beatFrames)
+    bool runDp(double periodFrames, WorkVector<int>& beatFrames, bool chainOnly = false)
     {
         beatFrames.clear();
         const int n = static_cast<int>(env_.size());
         const bool varying = (localPeriod_.size() == env_.size());
+        const bool weighted = varying && (localTightness_.size() == env_.size());
         const int lo = std::max(1, static_cast<int>(std::lround(kSearchLowFactor
                                                                 * periodFrames)));
         const int hi = std::max(lo + 1, static_cast<int>(std::lround(kSearchHighFactor
@@ -2940,6 +3263,7 @@ private:
         buildLocalScore(periodFrames);
 
         const double alpha = tightness_.load(std::memory_order_relaxed) * alphaScale_;
+        const double cap = intervalCap_;
         cumScore_.assign(static_cast<size_t>(n), 0.0);
         backlink_.assign(static_cast<size_t>(n), -1);
 
@@ -2948,6 +3272,7 @@ private:
             if ((i & 255) == 0) checkOfflineWork();
             const double target = varying ? localPeriod_[static_cast<size_t>(i)]
                                           : periodFrames;
+            const double weight = weighted ? localTightness_[static_cast<size_t>(i)] : alpha;
             const int dLo = varying
                 ? std::max(1, static_cast<int>(std::lround(kSearchLowFactor * target)))
                 : lo;
@@ -2963,9 +3288,12 @@ private:
             {
                 const int j = i - d;
                 const double lr = std::log(static_cast<double>(d) / target);
-                const double s = cumScore_[static_cast<size_t>(j)] - alpha * lr * lr;
+                double cost = weight * lr * lr;
+                if (cap > 0.0 && cost > cap) cost = cap;
+                const double s = cumScore_[static_cast<size_t>(j)] - cost;
                 if (bestJ < 0 || s > best) { best = s; bestJ = j; }
             }
+            if (bestJ >= 0 && best < 0.0) { best = 0.0; bestJ = -1; }
             cumScore_[static_cast<size_t>(i)] = local_[static_cast<size_t>(i)]
                                               + ((bestJ >= 0) ? best : 0.0);
             backlink_[static_cast<size_t>(i)] = bestJ;
@@ -2985,67 +3313,31 @@ private:
 
         trimBeats(beatFrames);
         if (beatFrames.size() < 2) return false;
+        if (chainOnly) return true;
 
-        snapBeats(beatFrames, periodFrames);
         extendGrid(beatFrames);
-        snapBeats(beatFrames, periodFrames);
         return beatFrames.size() >= 2;
     }
 
-    /**
-     * @brief Moves each beat to the nearest peak of the envelope, within a
-     *        bounded window.
-     *
-     * The recursion places beats on frames; the frames are 5 ms apart and a
-     * beat is not. It also has to guess the phase of its first few links
-     * before it has accumulated any evidence to guess with, so the beats at
-     * the start of the chain can sit a full frame or two off a transient that
-     * is plainly visible in the envelope. Both are repaired by the same step,
-     * and it is bounded to an eighth of a period so that it can correct a
-     * misplacement without ever being able to drag a beat onto its neighbour
-     * or onto an off-beat: at any swing ratio the nearest off-beat is at least
-     * a third of a period away.
-     */
-    void snapBeats(WorkVector<int>& beatFrames, double periodFrames) const
+    /** @brief Frames at the head of the signal whose analysis window reaches
+     *  back past its first sample (see kEdgeSupportFraction). */
+    [[nodiscard]] int edgeFrames() const noexcept
     {
-        const int n = static_cast<int>(env_.size());
-        const int win = std::max(1, static_cast<int>(std::lround(periodFrames
-                                                                 * kSnapFraction)));
-        int previous = -1;
-        for (size_t k = 0; k < beatFrames.size(); ++k)
-        {
-            const int f = beatFrames[k];
-            int best = f;
-            double bestValue = local_[static_cast<size_t>(f)];
-            const int lo = std::max(previous + 1, f - win);
-            const int hi = std::min(n - 1, f + win);
-            for (int i = lo; i <= hi; ++i)
-            {
-                if (local_[static_cast<size_t>(i)] > bestValue)
-                {
-                    bestValue = local_[static_cast<size_t>(i)];
-                    best = i;
-                }
-            }
-            beatFrames[k] = best;
-            previous = best;
-        }
+        return static_cast<int>(std::ceil(kEdgeSeconds * frameRate_));
     }
 
     /**
      * @brief Continues the grid off both ends of what the recursion returned,
      *        as far as the envelope keeps supporting it.
      *
-     * The recursion needs history before its interval cost means anything, so
-     * the beats at the very start of a signal are the ones it places worst,
-     * and trimming then removes them -- along with any real beat that was
-     * among them. Offline there is no reason to accept that: the period is
-     * known once the middle of the signal has been tracked, so the two ends
-     * are stepped out at that period and each candidate is kept only if the
-     * envelope carries as much onset strength there as the beats already in
-     * the grid do. Silence past the end of the music therefore ends the
-     * extension immediately, and a real beat before the recursion had warmed
-     * up is recovered.
+     * The recursion ends where its running total is largest, and a beat a
+     * little off the period it is held to can cost it more than the beat
+     * carries. So the two ends are stepped out at the grid's own interval,
+     * and each candidate is kept if the envelope carries, within
+     * kExtendFraction of a period of where it is expected, the share of a
+     * beat that keeps a beat at the ends of the grid (see kSupportFraction).
+     * Silence past the end of the music ends the extension at once, and so
+     * does a note held through where a beat would be.
      */
     void extendGrid(WorkVector<int>& beatFrames) const
     {
@@ -3063,17 +3355,24 @@ private:
         double mean = 0.0;
         for (const int f : beatFrames) mean += local_[static_cast<size_t>(f)];
         mean /= static_cast<double>(beatFrames.size());
-        const double floorValue = kTrimFraction * mean;
-        const int win = std::max(1, static_cast<int>(std::lround(step * kSnapFraction)));
+        const double floorValue = kSupportFraction * mean;
+        const double edgeFloor = kEdgeSupportFraction * mean;
+        const int edge = edgeFrames();
+        const int win = std::max(1, static_cast<int>(std::lround(step * kExtendFraction)));
 
-        WorkVector<int> front(detail::AccountedAllocator<int>{&allocationAccount_});
-        for (int guess = beatFrames.front() - step; guess - win >= 0; guess -= step)
-        {
+        const auto supported = [&](int guess, double least) {
             int best = -1;
-            double bestValue = floorValue;
+            double bestValue = least;
             for (int i = std::max(0, guess - win); i <= std::min(n - 1, guess + win); ++i)
                 if (local_[static_cast<size_t>(i)] > bestValue)
                 { bestValue = local_[static_cast<size_t>(i)]; best = i; }
+            return best;
+        };
+
+        WorkVector<int> front(detail::AccountedAllocator<int>{&allocationAccount_});
+        for (int guess = beatFrames.front() - step; guess >= 0; guess -= step)
+        {
+            const int best = supported(guess, guess - win <= edge ? edgeFloor : floorValue);
             if (best < 0) break;
             front.push_back(best);
             guess = best;
@@ -3081,13 +3380,9 @@ private:
         std::reverse(front.begin(), front.end());
 
         WorkVector<int> back(detail::AccountedAllocator<int>{&allocationAccount_});
-        for (int guess = beatFrames.back() + step; guess + win <= n - 1; guess += step)
+        for (int guess = beatFrames.back() + step; guess <= n - 1; guess += step)
         {
-            int best = -1;
-            double bestValue = floorValue;
-            for (int i = std::max(0, guess - win); i <= std::min(n - 1, guess + win); ++i)
-                if (local_[static_cast<size_t>(i)] > bestValue)
-                { bestValue = local_[static_cast<size_t>(i)]; best = i; }
+            const int best = supported(guess, floorValue);
             if (best < 0) break;
             back.push_back(best);
             guess = best;
@@ -3137,9 +3432,11 @@ private:
         }
     }
 
-    /** @brief Drops leading and trailing beats the envelope does not support.
-     *  The recursion must start and stop somewhere and it will place a beat
-     *  in silence rather than leave the chain open; those are the two ends. */
+    /** @brief Drops leading and trailing beats the envelope does not support
+     *  (see kSupportFraction and, for the first frames of the signal,
+     *  kEdgeSupportFraction). The recursion carries a beat through a passage
+     *  with nothing on it rather than leave the chain open, and at the two
+     *  ends of the music those beats are nobody's. */
     void trimBeats(WorkVector<int>& beatFrames) const
     {
         if (beatFrames.size() < 3) return;
@@ -3147,11 +3444,14 @@ private:
         double mean = 0.0;
         for (const int f : beatFrames) mean += local_[static_cast<size_t>(f)];
         mean /= static_cast<double>(beatFrames.size());
-        const double floorValue = kTrimFraction * mean;
+        const double floorValue = kSupportFraction * mean;
+        const double edgeFloor = kEdgeSupportFraction * mean;
+        const int edge = edgeFrames();
 
         size_t first = 0;
         while (first + 2 < beatFrames.size()
-               && local_[static_cast<size_t>(beatFrames[first])] < floorValue)
+               && local_[static_cast<size_t>(beatFrames[first])]
+                      < (beatFrames[first] <= edge ? edgeFloor : floorValue))
             ++first;
 
         size_t last = beatFrames.size() - 1;
@@ -3204,40 +3504,6 @@ private:
         if (!(den < 0.0)) return std::max<int64_t>(0, base);   // not a peak: nothing to interpolate
         const double d = std::clamp(0.5 * (a - c) / den, -0.5, 0.5);
         return std::max<int64_t>(0, base + static_cast<int64_t>(std::llround(d * static_cast<double>(hop_))));
-    }
-
-    /**
-     * @brief How much of the conditioned envelope a (possibly non-uniform)
-     *        grid explains: the in-phase share of onset mass, with the phase
-     *        of each frame read off the grid itself (0 on a beat, advancing
-     *        linearly to 1 at the next). The uniform-period coherence() is the
-     *        special case of an isochronous grid; frames outside the grid's
-     *        span do not count.
-     */
-    [[nodiscard]] double gridCoherence(const WorkVector<int64_t>& beats) const noexcept
-    {
-        if (beats.size() < 2) return 0.0;
-        // Judged on the register-balanced envelope when there is one, for the
-        // reason the metrical level is: on a dense mix the plain envelope is
-        // mostly strums and syllables, and a grid that chases them "explains"
-        // it better than the grid on the kick does.
-        const WorkVector<double>& e = (envBal_.size() == env_.size()) ? envBal_ : env_;
-        double re = 0.0, mass = 0.0;
-        size_t k = 0;
-        for (size_t i = 0; i < e.size(); ++i)
-        {
-            const int64_t r = envRef_[i];
-            if (r < beats.front()) continue;
-            while (k + 1 < beats.size() && beats[k + 1] <= r) ++k;
-            if (k + 1 >= beats.size()) break;
-            const double span = static_cast<double>(beats[k + 1] - beats[k]);
-            if (!(span > 0.0)) continue;
-            const double phase = static_cast<double>(r - beats[k]) / span;
-            const double o = e[i];
-            re += o * std::cos(2.0 * pi<double> * phase);
-            mass += o;
-        }
-        return (mass > kMassFloor) ? re / mass : 0.0;
     }
 
     /**
@@ -3482,8 +3748,10 @@ private:
     std::array<WorkVector<double>, kRegisters> envReg_;   ///< Per-register envelopes (offline).
     WorkVector<double> envBal_;   ///< Register-balanced envelope: decides the metrical level.
     double alphaScale_ = 1.0;      ///< Tightness multiplier for the grid being built.
+    double intervalCap_ = 0.0;     ///< Most an interval may cost in the grid being built (0: no cap).
     WorkVector<double> local_, cumScore_, acf_, scratchA_, kernel_;
-    WorkVector<double> localPeriod_, sweepA_, sweepB_;
+    WorkVector<double> localPeriod_;      ///< Target period per frame, while a held grid is laid.
+    WorkVector<double> localTightness_;   ///< Tightness per frame, alongside it.
     WorkVector<int> backlink_;
     WorkVector<int> candidates_;
     WorkVector<double> candScore_, candExplains_;

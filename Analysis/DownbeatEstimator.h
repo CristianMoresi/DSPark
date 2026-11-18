@@ -54,19 +54,19 @@
  * against 0.747 (the right first beat in 87.1 % of the excerpts against
  * 74.6 %; in three 99.4 % against 98.9 %, in four 83.0 % against 66.5 %);
  * with the bar length estimated (right in 98.0 %) 0.868 against 0.740; with
- * BeatTracker's own beats (their F-measure 0.776) 0.628 against 0.567, and
- * 0.630 against 0.567 with the bar length estimated (right in 91.7 %). On 360
+ * BeatTracker's own beats (their F-measure 0.830) 0.677 against 0.602, and
+ * 0.677 against 0.602 with the bar length estimated (right in 93.0 %). On 360
  * excerpts of solo guitar, all in four, with no drums and no bass: 0.628
  * against 0.550 (62.8 % against 55.0 %); 0.625 against 0.561 with the bar
- * length estimated (right in 93.1 %); with BeatTracker's own beats (0.520)
- * 0.258 against 0.252, and 0.272 against 0.266. On 243 takes of a drum kit
+ * length estimated (right in 93.1 %); with BeatTracker's own beats (0.559)
+ * 0.296 against 0.253, and 0.294 against 0.258. On 243 takes of a drum kit
  * alone, 240 of them in four, with the beats of each take's tempo: 0.770
  * against 0.379 (77.0 % against 37.9 %); 0.759 against 0.385 with the bar
- * length estimated (right in 95.9 %); with BeatTracker's own beats (0.760)
- * 0.557 against 0.270, and 0.557 against 0.272. With the beats given, the
+ * length estimated (right in 95.9 %); with BeatTracker's own beats (0.805)
+ * 0.596 against 0.286, and 0.597 against 0.285. With the beats given, the
  * estimator is ahead or level in each of the twenty-eight styles of five
  * excerpts or more. With the library's own beats it is ahead in twenty-one,
- * level in one and behind in six, by 0.028 at most: beats that sit on the
+ * level in one and behind in six, by 0.025 at most: beats that sit on the
  * off-beats or at another metrical level leave no first beat to be right. The
  * confidence sorts the answers: with the annotated beats, 98.9 %, 95.4 % and
  * 100 % are right in the three sets where it reads above 0.75, and 57.6 %,

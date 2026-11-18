@@ -749,6 +749,160 @@ DSPARK_TEST(Beat_tempo_survives_isolated_half_beat_phase_changes)
     EXPECT_LT(worst, 0.0025);
 }
 
+// The loudest note of the bar a sixteenth before a beat that carries nothing
+// (sparsePattern()). A grid loose enough to follow a tempo takes that beat
+// off the grid onto the note and loses it, and its neighbours with it at the
+// faster tempi; held to the period the pattern keeps, the grid stays on the
+// beat. Every beat of every tempo is asked for, the silent ones included.
+DSPARK_TEST(Beat_grid_stays_on_the_beat_beside_a_louder_note)
+{
+    double worstF = 1.0, worstAt = 0.0;
+    for (const double bpm : { 80.0, 96.0, 110.0, 126.0, 140.0 })
+    {
+        const Corpus c = sparsePattern(bpm, 20.0);
+        const auto r = analyzeCorpus(c);
+        const auto s = scoreBeats(c.beats, r.beatSamples, 70.0);
+        std::cout << "  loud note beside the beat at " << bpm << " BPM: tempo "
+                  << static_cast<double>(r.tempoBpm) << ", F=" << s.f << ", "
+                  << r.beatSamples.size() << " beats for " << c.beats.size() << "\n";
+        EXPECT_TRUE(classify(static_cast<double>(r.tempoBpm), bpm) == Level::Correct);
+        if (s.f < worstF) { worstF = s.f; worstAt = bpm; }
+    }
+    std::cout << "  worst case: F=" << worstF << " at " << worstAt << " BPM\n";
+    EXPECT_GT(worstF, 0.9999);
+}
+
+// One change of phase by half a beat, and nothing else: a bar of another
+// length, an edit. The grid has to take it in one interval -- half a period
+// or one and a half -- and be on the clicks before it and after it. Sliding
+// into it over the beats around it, or bridging it with a beat on nothing,
+// both miss clicks at 15 ms.
+DSPARK_TEST(Beat_grid_takes_a_change_of_phase_in_one_interval)
+{
+    for (const double bpm : { 85.0, 100.0, 120.0 })
+        for (const double direction : { -1.0, 1.0 })
+        {
+            Corpus c;
+            c.bpm = bpm;
+            const double period = 60.0 * kFs / bpm;
+            c.x.assign(static_cast<size_t>(56.0 * period), 0.0f);
+            for (int k = 0; k < 52; ++k)
+            {
+                const double phase = k >= 20 ? direction * 0.5 : 0.0;
+                const int64_t at = static_cast<int64_t>(std::llround(
+                    kLeadSeconds * kFs + (static_cast<double>(k) + phase) * period));
+                addClick(c.x, at, kFs);
+                c.beats.push_back(at);
+            }
+            const auto r = analyzeCorpus(c);
+            int offThePeriod = 0;
+            double broken = 0.0;
+            for (size_t k = 1; k < r.beatSamples.size(); ++k)
+            {
+                const double interval =
+                    static_cast<double>(r.beatSamples[k] - r.beatSamples[k - 1]) / period;
+                if (std::abs(interval - 1.0) > 0.05) { ++offThePeriod; broken = interval; }
+            }
+            const double f = scoreBeats(c.beats, r.beatSamples, 15.0).f;
+            std::cout << "  half a beat " << (direction < 0.0 ? "early" : "late") << " at " << bpm
+                      << " BPM: " << r.beatSamples.size() << " beats for " << c.beats.size()
+                      << ", F=" << f << " at 15 ms, " << offThePeriod
+                      << " interval off the period (" << broken << "), tempo "
+                      << static_cast<double>(r.tempoBpm) << "\n";
+            EXPECT_GT(f, 0.9999);
+            EXPECT_EQ(offThePeriod, 1);
+            EXPECT_NEAR(broken, 1.0 + direction * 0.5, 0.05);
+            EXPECT_NEAR(static_cast<double>(r.tempoBpm), bpm, bpm * 0.0025);
+        }
+}
+
+// A tempo that changes at once, between two clicks, by a twentieth and by two
+// fifths, once and back again, in halves and with a third of the clicks at
+// the second tempo: every click is a beat and no beat is further from its
+// click than a beat of a steady train is. Three
+// things the held grid needs for it. The period around the change is read on
+// the side that is steady: nine intervals of two tempi average to a period
+// that none of them has, and a grid held to it sat 20 and 65 ms beside the
+// clicks either side of a change from 120 to 100 BPM. A tempo that is steady
+// is followed however near the overall one it sits: held to the overall one,
+// the click at a change from 120 to 110 BPM had its beat 16 ms away. And a
+// second tempo out of the first pass's reach is looked for between the two:
+// from 96 BPM the pass does not reach 126, and the grid slid over that half
+// of the clicks, three beats to four.
+DSPARK_TEST(Beat_grid_takes_a_change_of_tempo_at_the_click_it_is_made)
+{
+    struct Run { double bpm; int clicks; };
+    const std::vector<std::vector<Run>> shapes = {
+        { { 120.0, 24 }, { 100.0, 24 } }, { { 100.0, 24 }, { 120.0, 24 } },
+        { { 120.0, 24 }, { 110.0, 24 } }, { { 114.0, 24 }, { 120.0, 24 } },
+        { { 96.0, 24 }, { 126.0, 24 } }, { { 126.0, 24 }, { 96.0, 24 } },
+        { { 90.0, 24 }, { 120.0, 24 } }, { { 100.0, 24 }, { 140.0, 24 } },
+        { { 120.0, 16 }, { 100.0, 16 }, { 120.0, 16 } },
+        { { 126.0, 12 }, { 96.0, 12 }, { 126.0, 12 }, { 96.0, 12 } },
+        { { 96.0, 32 }, { 126.0, 16 } }, { { 126.0, 16 }, { 96.0, 32 } },
+        { { 96.0, 16 }, { 126.0, 16 }, { 96.0, 16 } } };
+    double worstOverall = 0.0;
+    for (const auto& shape : shapes)
+    {
+        Corpus c;
+        c.bpm = shape.front().bpm;
+        double length = (kLeadSeconds + 2.0) * kFs;
+        for (const Run& run : shape) length += run.clicks * 60.0 * kFs / run.bpm;
+        c.x.assign(static_cast<size_t>(length), 0.0f);
+        double at = kLeadSeconds * kFs;
+        std::cout << "  change of tempo,";
+        for (const Run& run : shape)
+        {
+            std::cout << ' ' << run.clicks << " at " << run.bpm;
+            for (int k = 0; k < run.clicks; ++k)
+            {
+                const int64_t sample = static_cast<int64_t>(std::llround(at));
+                addClick(c.x, sample, kFs);
+                c.beats.push_back(sample);
+                at += 60.0 * kFs / run.bpm;
+            }
+        }
+        const auto r = analyzeCorpus(c);
+        double worst = 0.0;
+        for (const int64_t beat : r.beatSamples)
+        {
+            double nearest = 1e18;
+            for (const int64_t click : c.beats)
+                nearest = std::min(nearest, std::abs(static_cast<double>(beat - click)));
+            worst = std::max(worst, 1000.0 * nearest / kFs);
+        }
+        worstOverall = std::max(worstOverall, worst);
+        const double f = scoreBeats(c.beats, r.beatSamples, 15.0).f;
+        std::cout << " BPM: " << r.beatSamples.size() << " beats for " << c.beats.size() << ", F=" << f
+                  << " at 15 ms, furthest beat " << worst << " ms from a click\n";
+        EXPECT_EQ(r.beatSamples.size(), c.beats.size());
+        EXPECT_GT(f, 0.9999);
+        EXPECT_LT(worst, 10.0);
+    }
+    std::cout << "  change of tempo worst case: " << worstOverall << " ms from a click (bound 10)\n";
+}
+
+// The last four clicks fade to a twentieth. A beat at the end of the grid
+// stays while it carries a quarter of what a beat of the grid carries; at a
+// half, the two quietest of these were dropped. Nothing is named past them.
+DSPARK_TEST(Beat_grid_reaches_the_beats_that_fade_at_its_end)
+{
+    Corpus c = clickTrain(120.0, 20.0);
+    std::fill(c.x.begin(), c.x.end(), 0.0f);
+    const float tail[4] = { 0.3f, 0.2f, 0.1f, 0.05f };
+    for (size_t k = 0; k < c.beats.size(); ++k)
+    {
+        const size_t fromEnd = c.beats.size() - 1 - k;
+        addClick(c.x, c.beats[k], kFs, fromEnd < 4 ? tail[3 - fromEnd] : 1.0f, 7u);
+    }
+    const auto r = analyzeCorpus(c);
+    const auto s = scoreBeats(c.beats, r.beatSamples, 70.0);
+    std::cout << "  clicks fading to 0.05 over the last four: " << r.beatSamples.size() << " beats for "
+              << c.beats.size() << ", F=" << s.f << "\n";
+    EXPECT_EQ(r.beatSamples.size(), c.beats.size());
+    EXPECT_GT(s.f, 0.9999);
+}
+
 // Swung eighths. The quarter-note grid must be recovered within 15 ms, and
 // the tracker must not lock onto the swung off-beat -- which is why the
 // metrical level is asserted as well as the timing.
@@ -876,73 +1030,91 @@ DSPARK_TEST(Beat_secondary_hypothesis_names_and_discounts)
 // Tightness
 // ---------------------------------------------------------------------------
 
-// The tightness sweep, on a bed that can actually show tightness -- and the
-// proof that it can, which comes first. On isochronous clicks the optimal
-// interval equals the target period exactly, so the transition cost is
-// identically zero and the parameter multiplies nothing: a sweep run there
-// reports a spread of zero whatever the code does, and the run that proves it
-// is the one with the mechanism DELETED. This case asserts both directions:
-// the bed moves when the mechanism is deleted, the old bed does not, and the
-// shipped default beats the paper's 400 at the worst point of the bed.
+// The tightness, on a bed that can actually show it -- and the proof that it
+// can, which comes first. On isochronous clicks every interval is the target
+// period, so the cost the tightness weighs is zero and the parameter decides
+// nothing but which of two neighbouring frames a beat is counted on: a sweep
+// run there reports no spread whatever the code does, and the run that
+// proves it is the one with the mechanism DELETED. This case asserts both
+// directions: the bed moves when the mechanism is deleted, the steady bed
+// does not move by more than the frames the grid is counted in, and nothing
+// on the bed beats the shipped default: without the term the pattern with
+// its loudest note off the beat is lost, and four times the default gains
+// nothing.
+//
+// The default is held where the tempo holds and follows where it moves (see
+// BeatTracker::layGrid()), which is why one number can win both the swinging
+// tempo and the pattern with its loudest note off the beat: the first used to
+// need a loose grid and the second a tight one. It is also why a tighter
+// value no longer loses the swinging tempo: where the tempo moves the grid is
+// not held, whatever it is held with elsewhere.
 DSPARK_TEST(Beat_tightness_measured_where_the_interval_term_is_live)
 {
     constexpr double kFloorAlpha = 1e-3;   // below the clamp: the term is gone
 
     // (a) capability. The bed is disqualified unless deleting the mechanism
-    // changes the grid; the steady bed is shown failing that test.
+    // changes the grid; the steady bed is shown not to be one: the same
+    // beats, none of them further than two analysis frames from where the
+    // other extreme of the parameter puts it.
     const Corpus rub = rubatoTrain(120.0, 0.15, 8.0, 20.0);
     const Corpus clean = clickTrain(120.0, 20.0);
     const auto rubFloor = analyzeCorpus(rub, kFloorAlpha);
     const auto rubTight = analyzeCorpus(rub, 4000.0);
     const auto cleanFloor = analyzeCorpus(clean, kFloorAlpha);
     const auto cleanTight = analyzeCorpus(clean, 4000.0);
+    int64_t cleanApart = 0;
+    for (size_t k = 0; k < std::min(cleanFloor.beatSamples.size(), cleanTight.beatSamples.size()); ++k)
+        cleanApart = std::max<int64_t>(cleanApart,
+                                       std::abs(cleanFloor.beatSamples[k] - cleanTight.beatSamples[k]));
+    BeatTracker<float> framed;
+    framed.prepare(AudioSpec{ kFs, 512, 1 });
+    const int64_t twoFrames = static_cast<int64_t>(std::llround(2.0 * kFs / framed.getFrameRate()));
     std::cout << "  capability control: rubato grids at alpha 0.001 vs 4000 "
               << (rubFloor.beatSamples == rubTight.beatSamples ? "IDENTICAL" : "differ")
-              << "; clean clicks "
-              << (cleanFloor.beatSamples == cleanTight.beatSamples ? "IDENTICAL" : "differ")
-              << "\n";
+              << "; clean clicks at most " << cleanApart << " samples apart (two frames are "
+              << twoFrames << ")\n";
     EXPECT_TRUE(rubFloor.beatSamples != rubTight.beatSamples);
-    EXPECT_TRUE(cleanFloor.beatSamples == cleanTight.beatSamples);
+    EXPECT_EQ(cleanFloor.beatSamples.size(), cleanTight.beatSamples.size());
+    EXPECT_TRUE(cleanApart <= twoFrames);
+    EXPECT_GT(scoreBeats(clean.beats, cleanTight.beatSamples, 15.0).f, 0.9999);
+    EXPECT_GT(scoreBeats(clean.beats, cleanFloor.beatSamples, 15.0).f, 0.9999);
 
     // (b) the sweep, reported at its worst case with the case named.
     const Corpus sparse = sparsePattern(96.0, 20.0);
-    double worstDefault = 1.0, worstPaper = 1.0, worstFloor = 1.0;
+    const double tighter = 4.0 * static_cast<double>(framed.getTightness());
+    double worstDefault = 1.0, worstTighter = 1.0, worstFloor = 1.0;
     for (const auto& c : { rub, sparse, clean })
     {
         const double fDefault = scoreBeats(c.beats, analyzeCorpus(c).beatSamples, 70.0).f;
-        const double fPaper = scoreBeats(c.beats, analyzeCorpus(c, 400.0).beatSamples, 70.0).f;
+        const double fTighter = scoreBeats(c.beats, analyzeCorpus(c, tighter).beatSamples, 70.0).f;
         const double fFloor = scoreBeats(c.beats,
                                          analyzeCorpus(c, kFloorAlpha).beatSamples, 70.0).f;
         std::cout << "    " << c.bpm << " BPM case: F at the default "
-                  << fDefault << ", at alpha=400 " << fPaper << ", with the term deleted "
+                  << fDefault << ", four times tighter " << fTighter << ", with the term deleted "
                   << fFloor << "\n";
         worstDefault = std::min(worstDefault, fDefault);
-        worstPaper = std::min(worstPaper, fPaper);
+        worstTighter = std::min(worstTighter, fTighter);
         worstFloor = std::min(worstFloor, fFloor);
     }
-    std::cout << "  worst over the bed: default " << worstDefault << ", alpha=400 "
-              << worstPaper << ", term deleted " << worstFloor << "\n";
-    EXPECT_GT(worstDefault, 0.79);
-    EXPECT_LT(worstPaper, worstDefault);      // the paper's default is worse here
-    EXPECT_LT(worstFloor, worstDefault);      // and so is having no term at all
+    std::cout << "  worst over the bed: default " << worstDefault << ", four times tighter "
+              << worstTighter << ", term deleted " << worstFloor << "\n";
+    EXPECT_GT(worstDefault, 0.95);
+    EXPECT_TRUE(worstTighter <= worstDefault);   // a grid four times tighter gains nothing here
+    EXPECT_LT(worstFloor, worstDefault);         // and having no term at all loses
 
-    // (c) direction tripwire. The default is the bottom of the worst-case
-    // plateau rather than the top, and what put it there is a per-case
-    // ranking: over the wider sweep the header quotes, no case prefers a
-    // tighter grid and three prefer this one. This bed is four cases wide and
-    // does NOT separate the two values -- every case here ties -- so what
-    // follows is a guard, not the demonstration: if any future change makes
-    // the default worse than a grid four times tighter on material this
-    // ordinary, the reason the default sits where it does has gone.
+    // (c) direction tripwire, case by case: nothing on this bed prefers a
+    // grid four times tighter, nor the loose value the first pass runs at.
     const Corpus rub90 = rubatoTrain(90.0, 0.15, 6.0, 30.0);
     for (const auto& c : { rub, sparse, clean, rub90 })
     {
         const double fDefault = scoreBeats(c.beats, analyzeCorpus(c).beatSamples, 70.0).f;
         const double fTighter = scoreBeats(c.beats,
-                                           analyzeCorpus(c, 100.0).beatSamples, 70.0).f;
+                                           analyzeCorpus(c, tighter).beatSamples, 70.0).f;
+        const double fLoose = scoreBeats(c.beats, analyzeCorpus(c, 25.0).beatSamples, 70.0).f;
         std::cout << "    " << c.bpm << " BPM case: F at the default " << fDefault
-                  << ", four times tighter " << fTighter << "\n";
+                  << ", four times tighter " << fTighter << ", at the loose value " << fLoose << "\n";
         EXPECT_TRUE(fDefault >= fTighter - 1e-9);
+        EXPECT_TRUE(fDefault >= fLoose - 1e-9);
     }
 }
 
@@ -1435,7 +1607,7 @@ DSPARK_TEST(Beat_tempo_range_is_honoured_and_rejects_nonsense)
     EXPECT_NEAR(static_cast<double>(still.tempoBpm), 160.0, 1.0);
 
     bt.setTightness(std::numeric_limits<float>::quiet_NaN());
-    EXPECT_NEAR(static_cast<double>(bt.getTightness()), 25.0, 1e-3);
+    EXPECT_NEAR(static_cast<double>(bt.getTightness()), 400.0, 1e-3);
 }
 
 // Degenerate and hostile input must return an empty answer rather than a

@@ -29,18 +29,18 @@ All notable user-facing changes to DSPark are documented here.
   four): with the annotated beats and bar length 0.872 against 0.747 (the
   right first beat in 87.1 % of the excerpts against 74.6 %); with the bar
   length estimated (right in 98.0 %) 0.868 against 0.740; with
-  `BeatTracker`'s own beats 0.628 against 0.567, and 0.630 against 0.567
-  with the bar length estimated (right in 91.7 %). On 360 excerpts of solo
+  `BeatTracker`'s own beats 0.677 against 0.602, and 0.677 against 0.602
+  with the bar length estimated (right in 93.0 %). On 360 excerpts of solo
   guitar, all in four: 0.628 against 0.550 (62.8 % against 55.0 %); 0.625
   against 0.561 with the bar length estimated (right in 93.1 %); with
-  `BeatTracker`'s own beats 0.258 against 0.252, and 0.272 against 0.266. On
+  `BeatTracker`'s own beats 0.296 against 0.253, and 0.294 against 0.258. On
   243 takes of a drum kit alone, 240 of them in four: 0.770 against 0.379
   (77.0 % against 37.9 %); 0.759 against 0.385 with the bar length estimated
-  (right in 95.9 %); with `BeatTracker`'s own beats 0.557 against 0.270, and
-  0.557 against 0.272. With the beats given, the estimator is ahead or level
+  (right in 95.9 %); with `BeatTracker`'s own beats 0.596 against 0.286, and
+  0.597 against 0.285. With the beats given, the estimator is ahead or level
   in each of the twenty-eight styles of five excerpts or more; with the
   library's own beats it is ahead in twenty-one, level in one and behind in
-  six, by 0.028 at most: beats on the off-beats or at another metrical level
+  six, by 0.025 at most: beats on the off-beats or at another metrical level
   leave no first beat to be right. The confidence sorts the answers (98.9 %,
   95.4 % and 100 % right above 0.75 in the three sets; 57.6 %, 34.3 % and
   57.4 % below 0.25) and reads near zero where nothing marks the bar.
@@ -483,6 +483,63 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `BeatTracker::analyze()` and the offline session, and `OfflineTempoAnalyzer`
+  with them: the beat grid is laid in two passes, and the default tightness
+  is 400 (was 25). A recursion loose enough to follow a tempo that moves is
+  loose enough to take a beat off the grid onto a louder note beside it and
+  bring it back at the next one (the anticipated sixteenth of a samba, the
+  swung eighth of a shuffle), and that is what the single loose pass did. Now
+  a first pass at 25 only follows; its intervals give the period the music
+  keeps overall and the period it moves at around each beat; and the second
+  pass is held at the tightness asked for to the overall period wherever the
+  two agree, and follows the local one where they part: from a twelfth of
+  the period away where the intervals around the beat are spread out, from a
+  fiftieth where they all agree, which is a tempo of its own. Where the
+  tempo changes at once, the period is read on the side that is steady; and
+  a second tempo too far from the first for the loose pass to reach is
+  looked for between the two, and taken where the grid laid there has a
+  quarter of its intervals at each, in runs of eight or more. An interval of
+  the held pass costs at most eight beats' worth of onset strength, so a
+  change of phase by half a beat is taken in one interval where a tight grid
+  would slide into it over eight; where the tempo swings faster than its
+  period can be read, the held grid carries less than half of what the loose
+  one does and the loose one is delivered. The beats are no longer moved to the
+  largest envelope peak within an eighth of a period, which put them on the
+  note beside the beat as readily as on the beat; a chain may start at any
+  frame, where it used to open with an interval from the head of the signal
+  to its first note; and the two ends of the grid are kept down to a quarter
+  of what a beat carries (was a half), a half in the first frames of the
+  signal. Among the candidates of the period, one within 0.35 of an octave of
+  another that correlates more is ranked only if it correlates 0.6 of it: a
+  lag on the shoulder of a peak used to outrank the peak. `setTightness()`
+  keeps its meaning for values up to 25 (one loose grid); above, it is the
+  tightness of the passages at a steady tempo. `defaultTightness()` is new.
+  Measured against annotated beats, as the mean F-measure at 70 ms, on 698
+  excerpts of dance music, 243 takes of a drum kit alone and 360 of a guitar
+  alone, before / now / a reference tracker of the same family (a dynamic
+  program over an onset function) run in the same job. Against the
+  annotation as it is: 0.776 / 0.830 / 0.784, 0.760 / 0.805 / 0.763 and
+  0.520 / 0.559 / 0.608. Against its best reading (as annotated, twice or
+  half as fast, on the off-beats, in threes): 0.838 / 0.919 / 0.891, 0.860 /
+  0.925 / 0.917 and 0.668 / 0.786 / 0.775. Beats named that are right: 0.873
+  / 0.935 / 0.889, 0.896 / 0.955 / 0.930 and 0.801 / 0.874 / 0.843; annotated
+  beats found: 0.825 / 0.921 / 0.904, 0.847 / 0.918 / 0.915 and 0.612 / 0.762
+  / 0.755. Intervals within an eighth of the grid's median: 0.878 / 0.998,
+  0.919 / 0.997 and 0.776 / 0.995 (reference 0.952, 0.966, 0.917). Behind
+  the reference: the annotation as it is on the guitar alone, where the
+  grid is at the annotated tempo in 53 % of the pieces against 61 %, and at
+  half of it in 14 % against 5 %. On clicks: a bar whose loudest note is a
+  sixteenth before a beat that carries nothing, at 80 to 140 BPM, 0.75 to
+  0.93 before and 1.000 now at every tempo; one change of phase by half a
+  beat, taken in one interval with every click on a beat (it was bridged
+  with a beat on nothing, 0.98 to 0.99 at 15 ms); clicks fading to a
+  twentieth over the last four, all four named (two before); a tempo that
+  changes at once, between 90 and 140 BPM, by a twentieth or by two fifths,
+  once or back and forth, with a third of the clicks or more at each tempo,
+  every click a beat within 7.6 ms (7.7 on a steady train), where six of the
+  thirteen cases tried read 0.67 to 0.86 at 15 ms before; a tempo
+  swinging by 15 % every sixteen beats and every nine, and ramps between 100
+  and 140 BPM, as before.
 - `FFTReal` from 16 double or 32 float samples on, in builds with vectors: a
   new engine, faster on every machine measured, with output that changes at
   rounding level. The samples are taken as W sequences of N/W points, one in

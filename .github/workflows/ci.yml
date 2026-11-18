@@ -565,7 +565,9 @@ jobs:
   sanitizers:
     name: ASan + UBSan + float-cast-overflow (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A watchdog, not a performance target. The GCC job takes 46 minutes on
+    # the faster hosted machines and has taken 58 on the slower ones.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -607,7 +609,7 @@ jobs:
           # Catch the circuit regression before starting the lengthy suite.
           # The unfiltered CTest run below remains mandatory after this passes.
           ./build-san/tests/dspark_tests --prefix TubePreamp_
-          ctest --test-dir build-san --output-on-failure --test-output-size-failed 0
+          ctest --test-dir build-san --output-on-failure --test-output-size-failed 0 --timeout 3600
 
   # ---------------------------------------------------------------------------
   # ThreadSanitizer (Linux GCC) - data-race detection for the lock-free code

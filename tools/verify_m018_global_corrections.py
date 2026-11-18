@@ -1606,9 +1606,10 @@ def allocation_thread_errors(root: Path, overrides: dict[str, str] | None = None
 
 def sanitizer_workflow_errors(ci: str, cmake: str) -> list[str]:
     errors: list[str] = []
-    # The ThreadSanitizer job runs the ordinary suite instrumented: 37 minutes
-    # on the faster hosted machines, 58 on the slower ones.
-    for job, limit in (("tests", "60"), ("sanitizers", "60"), ("tsan", "90")):
+    # The sanitizer jobs run the ordinary suite instrumented. ThreadSanitizer:
+    # 37 minutes on the faster hosted machines, 58 on the slower ones.
+    # AddressSanitizer with GCC: 46 and 58.
+    for job, limit in (("tests", "60"), ("sanitizers", "90"), ("tsan", "90")):
         section = re.search(r"(?ms)^  " + job + r":\n(.*?)(?=^  [\w-]+:|\Z)", ci)
         limits = re.findall(r"^    timeout-minutes: ([0-9]+)$", section[1], re.MULTILINE) if section else []
         if limits != [limit]:
@@ -1617,7 +1618,7 @@ def sanitizer_workflow_errors(ci: str, cmake: str) -> list[str]:
     # that could turn a failed test into a successful step.
     commands = re.findall(r"^\s*(?:run:\s*)?(ctest [^\n]+)", ci, re.MULTILINE)
     expected = {
-        "build-san": "ctest --test-dir build-san --output-on-failure --test-output-size-failed 0",
+        "build-san": "ctest --test-dir build-san --output-on-failure --test-output-size-failed 0 --timeout 3600",
         "build-tsan": "ctest --test-dir build-tsan -V --parallel 2 --timeout 5400 -E '^alloc_failure$'",
     }
     for directory, command in expected.items():

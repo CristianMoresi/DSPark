@@ -1607,6 +1607,15 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Synthesizer` with oversampling, built with one recent compiler: every event
+  landed early, by 32 samples at 2x and 17 at 4x, and where it landed depended
+  on where the block began. The two lines that place the content against the
+  decimation delay (the delay rounded up to whole samples, and what the
+  rounding added) were evaluated wrong by that compiler's optimizer (MSVC
+  19.52.37029 for x64, at /O1 and /O2; the same two lines alone in a file give
+  -63 where 0 is right); they are now written with the remainder, which it
+  evaluates right. Builds with every other compiler tested, and with that one
+  without optimization, were not affected.
 - Offline transient analysis, the offline sinc stages, the offline clippers
   and StereoGenerator charged their FFTs from a fixed estimate (fewer than 4N
   scalars for a real transform of size N), which the faster transforms of

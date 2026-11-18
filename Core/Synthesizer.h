@@ -1113,8 +1113,17 @@ private:
         invPeriod_ = 1.0 / static_cast<double>(periodHi_);
         const int delay = (factor_ == 2) ? os2_.getDecimationDelay()
                         : (factor_ == 4 ? os4_.getDecimationDelay() : 0);
-        const int latency = (delay + factor_ - 1) / factor_;
-        shift_ = latency * factor_ - delay;
+        // The latency is the delay rounded up to whole base samples, and the
+        // content starts later by what the rounding added. Written with the
+        // remainder on purpose. The other way round (latency = (delay +
+        // factor - 1) / factor, then latency * factor - delay) is the same
+        // number, and one optimizer in use evaluates its second line short
+        // by about the latency (MSVC 19.52.37029 for x64, at /O1 and /O2:
+        // -63 where 1 is right at 2x, -65 for 3 at 4x), which put every
+        // event 64 or 68 high-rate samples early.
+        const int over = delay % factor_;
+        const int latency = delay / factor_ + (over != 0 ? 1 : 0);
+        shift_ = (over != 0) ? factor_ - over : 0;
         latency_.store(latency, std::memory_order_relaxed);
         smoothAlpha_ = 1.0 - std::exp(-static_cast<double>(kControlPeriod) / (0.010 * baseRate_));
         stealFade_ = std::max(1, static_cast<int>(std::lround(0.003 * internalRate_)));

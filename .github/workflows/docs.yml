@@ -27,7 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Doxygen
-        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18
+        run: |
+          # A download the mirror drops is tried again, three times in all.
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18; then break; fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
       - name: Check the closed public-text policy and correction contract
         run: |
           python3 tools/check_public_text.py

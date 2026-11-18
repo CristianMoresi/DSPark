@@ -54,7 +54,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install documentation tools
-        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18
+        run: |
+          # A download the mirror drops is tried again, three times in all.
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18; then break; fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
       - name: Check the closed public-text policy and correction contract
         run: |
           python3 tools/check_public_text.py
@@ -307,7 +313,7 @@ jobs:
 
       - name: X11 WebView editor smoke (Linux)
         if: matrix.name == 'Linux GCC x64'
-        timeout-minutes: 15
+        timeout-minutes: 25
         shell: bash
         run: |
           # The runner's Azure mirror stalled before the editor test began.
@@ -317,8 +323,24 @@ jobs:
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
           sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q
-          sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" install -y -q xvfb libwebkit2gtk-4.1-0 \
-            || sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" install -y -q xvfb libwebkit2gtk-4.0-37
+          # The older runtime is the fallback only where the release does not
+          # carry the newer one. A download the mirror drops is not that: it
+          # is tried again on a fresh index, three times in all, because the
+          # release that carries the newer runtime does not carry the older
+          # one and falling back to it there can only fail.
+          webkit=libwebkit2gtk-4.1-0
+          apt-cache show "$webkit" > /dev/null 2>&1 || webkit=libwebkit2gtk-4.0-37
+          installed=no
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" install -y -q xvfb "$webkit"; then
+              installed=yes
+              break
+            fi
+            echo "package install attempt $attempt failed"
+            sleep 20
+            sudo timeout --kill-after=10s 120s apt-get "${apt_options[@]}" update -q || true
+          done
+          [[ "$installed" == yes ]]
           g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/x11_editor_smoke.cpp \
             -o x11_editor_smoke -ldl
           # No GPU/DRI on CI runners: keep WebKit on the software paths.
@@ -397,7 +419,12 @@ jobs:
             Windows) PV_PAT="*Windows*"; CV_PAT="*windows*" ;;
             macOS)   PV_PAT="*macOS*";   CV_PAT="*macos*" ;;
             *)       PV_PAT="*Linux*";   CV_PAT="*ubuntu*"
-                     sudo apt-get update -q && sudo apt-get install -y -q xvfb ;;
+                     # A download the mirror drops is tried again, three times in all.
+                     for attempt in 1 2 3; do
+                       if sudo apt-get update -q && sudo apt-get install -y -q xvfb; then break; fi
+                       if [ "$attempt" = 3 ]; then exit 1; fi
+                       sleep 20
+                     done ;;
           esac
           # Validator versions are PINNED so a third-party release cannot turn
           # this gate red on its own. clap-validator's "0.4.1" (2026-07-22) is a

@@ -95,6 +95,7 @@ public:
 
         updateEnvelopeCoeffs();
         coefSmoothCoeff_ = static_cast<T>(1.0 - std::exp(-1.0 / (sampleRate_ * 0.001)));
+        autoFall_ = std::pow(10.0, -kAutoRefFallDb / (20.0 * sampleRate_));
 
         reset();
 
@@ -121,6 +122,7 @@ public:
         T thresh = threshold_.load(std::memory_order_relaxed);
         T maxRed = maxReduction_.load(std::memory_order_relaxed);
         auto mode = detectionMode_.load(std::memory_order_relaxed);
+        relative_ = autoThreshold_.load(std::memory_order_relaxed);
 
         constexpr int kCoefRefreshInterval = 16;
         const T coefSmooth = coefSmoothCoeff_;
@@ -150,6 +152,7 @@ public:
             derivShift_[ch].fill(T(0));
         }
         envelope_ = T(0);
+        autoRef_ = kAutoRefFloor;
         refreshCounter_ = 0;
         gainReduction_.store(T(0), std::memory_order_relaxed);
     }
@@ -202,6 +205,23 @@ public:
         threshold_.store(db, std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Counts the threshold from the level of the whole input.
+     *
+     * A reference follows the largest sample of the input, all of its band:
+     * it rises at once and falls 1 dB per second, and the threshold is added
+     * to it. The de-esser then acts on how loud the sibilance is against the
+     * voice that carries it, the same at any input level: a threshold of
+     * -20 dB reduces a band that comes within 20 dB of the voice's recent
+     * peaks. Off by default: the threshold is in dBFS.
+     *
+     * State key "autoThreshold" (absent = off).
+     */
+    void setAutoThreshold(bool on) noexcept { autoThreshold_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the threshold counts from the level of the input (see setAutoThreshold()). */
+    [[nodiscard]] bool isAutoThreshold() const noexcept { return autoThreshold_.load(std::memory_order_relaxed); }
+
     /** @brief Sets the maximum gain reduction in dB (sign is ignored). Non-finite values are ignored. */
     void setReduction(T db) noexcept
     {
@@ -250,6 +270,7 @@ public:
         w.write("attack", static_cast<float>(attackMs_.load(std::memory_order_relaxed)));
         w.write("release", static_cast<float>(releaseMs_.load(std::memory_order_relaxed)));
         w.write("detection", static_cast<int32_t>(detectionMode_.load(std::memory_order_relaxed)));
+        w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -267,6 +288,7 @@ public:
         setAttack(static_cast<T>(r.read("attack", 0.5f)));
         setRelease(static_cast<T>(r.read("release", 20.0f)));
         setDetectionMode(static_cast<DetectionMode>(r.read("detection", 0)));
+        setAutoThreshold(r.read("autoThreshold", false));
         return true;
     }
 
@@ -278,12 +300,14 @@ private:
         for (int i = 0; i < numSamples; ++i)
         {
             T maxLevel = T(0);
+            T maxInput = T(0);
 
             // 1. Stereo-linked detection
             for (int ch = 0; ch < numCh; ++ch)
             {
                 T dataIn = buffer.getChannel(ch)[i];
                 if (!std::isfinite(dataIn)) dataIn = T(0); // would latch in the detector
+                maxInput = std::max(maxInput, std::abs(dataIn));
                 T level = T(0);
 
                 if constexpr (IsDerivative)
@@ -313,7 +337,15 @@ private:
 
             // 3. Compute GR
             T envDb = gainToDecibels(envelope_ + T(1e-30));
-            T overDb = envDb - thresh;
+            T threshNow = thresh;
+            if (relative_)
+            {
+                // The threshold counts from a reference that follows the
+                // whole input: up at once, down 1 dB per second.
+                autoRef_ = std::max({ static_cast<double>(maxInput), autoRef_ * autoFall_, kAutoRefFloor });
+                threshNow = thresh + gainToDecibels(static_cast<T>(autoRef_));
+            }
+            T overDb = envDb - threshNow;
             T grDb = (overDb > T(0)) ? -std::min(overDb, maxRed) : T(0);
 
             if (-grDb > blockMaxGr) blockMaxGr = -grDb;
@@ -421,6 +453,14 @@ private:
 
     Biquad<T, 1> detector_[kMaxChannels]{};
     Biquad<T, 1> reduction_[kMaxChannels]{};
+
+    // Automatic threshold (setAutoThreshold()).
+    static constexpr double kAutoRefFallDb = 1.0;  ///< dB per second its reference falls.
+    static constexpr double kAutoRefFloor = 1e-5;  ///< The reference never goes under -100 dBFS.
+    std::atomic<bool> autoThreshold_ { false };    ///< The threshold counts from the level of the input.
+    bool relative_ = false;                        ///< Its value for the block (audio thread).
+    double autoRef_ = kAutoRefFloor;               ///< The reference (linear).
+    double autoFall_ = 1.0;                        ///< Its fall per sample (a factor).
 
     T envelope_{T(0)}; // Stereo-linked envelope
     T smoothedGrDb_[kMaxChannels]{};

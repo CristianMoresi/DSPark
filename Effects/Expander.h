@@ -269,6 +269,27 @@ public:
     /** @brief Returns the lookahead in milliseconds. */
     [[nodiscard]] T getLookahead() const noexcept { return lookaheadMs_.load(std::memory_order_relaxed); }
 
+    /**
+     * @brief Counts the threshold from the key's own recent level.
+     *
+     * A reference follows the detected level: it rises at once and falls
+     * 1 dB per second, and the threshold is added to it. The expander then
+     * acts the same at any input level: a threshold of -40 dB closes on what
+     * lies more than 40 dB under the programme's recent peaks. While the key
+     * is under the closing threshold the reference falls a quarter as fast,
+     * so a pause lowers the threshold by 1 dB every four seconds: far enough
+     * into a long one the floor opens the expander again (the range bounds
+     * what that lets through), and a stray peak that left the programme
+     * under the threshold is forgotten at that pace. Off by default: the
+     * threshold is in dBFS.
+     *
+     * State key "autoThreshold" (absent = off).
+     */
+    void setAutoThreshold(bool on) noexcept { autoThreshold_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the threshold counts from the key's recent level (see setAutoThreshold()). */
+    [[nodiscard]] bool isAutoThreshold() const noexcept { return autoThreshold_.load(std::memory_order_relaxed); }
+
     /** @brief Latency in samples (the lookahead), correct right after setLookahead(). */
     [[nodiscard]] int getLatency() const noexcept
     {
@@ -303,6 +324,8 @@ public:
         gateGain_ = rangeLinear_.load(std::memory_order_relaxed);
         envelope_ = T(0);
         holdCounter_ = 0;
+        autoRefDb_ = -100.0;
+        thresholdNow_ = threshold_.load(std::memory_order_relaxed);
         publishMeters();
 
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
@@ -328,6 +351,7 @@ public:
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
         w.write("scHpfFreq", static_cast<float>(scHpfFreqHz_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
+        w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -346,6 +370,7 @@ public:
         setSidechainHPF(r.read("scHpf", false),
                         static_cast<double>(r.read("scHpfFreq", 80.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
+        setAutoThreshold(r.read("autoThreshold", false));
         return true;
     }
 
@@ -364,6 +389,8 @@ protected:
         cachedScHpfCoeff_   = scHpfCoeff_.load(std::memory_order_relaxed);
         cachedScHpfA0_      = scHpfA0_.load(std::memory_order_relaxed);
         cachedLookahead_    = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
+        cachedAutoThreshold_ = autoThreshold_.load(std::memory_order_relaxed);
+        autoRefFall_ = kAutoRefFallDb / sampleRate_;
     }
 
     /** Lookahead in samples for a ms value (shared by cacheParams() and getLatency()). */
@@ -440,6 +467,19 @@ protected:
             // 3. Gain Calculation (Converting envelope to dB only once)
             T levelDb = gainToDecibels(envelope_ + T(1e-9));
 
+            // The automatic threshold counts from a reference that follows
+            // the level: up at once, down slowly, and a quarter as fast
+            // while the level is under the closing threshold.
+            thresholdNow_ = cachedThreshold_;
+            if (cachedAutoThreshold_)
+            {
+                const double closing = autoRefDb_ + static_cast<double>(cachedThreshold_ - cachedHysteresis_);
+                const double fall = (static_cast<double>(levelDb) < closing) ? autoRefFall_ * kAutoRefQuiet
+                                                                             : autoRefFall_;
+                autoRefDb_ = std::max(static_cast<double>(levelDb), autoRefDb_ - fall);
+                thresholdNow_ = cachedThreshold_ + static_cast<T>(autoRefDb_);
+            }
+
             updateStateMachine(levelDb);
             T gain = computeGain(levelDb);
 
@@ -476,8 +516,8 @@ protected:
 
     void updateStateMachine(T levelDb) noexcept
     {
-        T openThresh  = cachedThreshold_;
-        T closeThresh = cachedThreshold_ - cachedHysteresis_;
+        T openThresh  = thresholdNow_;
+        T closeThresh = thresholdNow_ - cachedHysteresis_;
 
         switch (state_)
         {
@@ -510,7 +550,7 @@ protected:
         }
         else
         {
-            T underDb = cachedThreshold_ - levelDb;
+            T underDb = thresholdNow_ - levelDb;
             // Downward-expander law: the transfer slope below threshold is the
             // ratio R (out = thr + R*(in - thr)), so the attenuation applied is
             // underDb*(R-1). As R -> inf this approaches full closure, i.e. the
@@ -603,6 +643,15 @@ protected:
     T cachedScHpfA0_ = T(0.9975);
     int cachedHoldSamples_ = 0;
     bool cachedScHpfEnabled_ = false;
+
+    // Automatic threshold (setAutoThreshold()).
+    static constexpr double kAutoRefFallDb = 1.0;  ///< dB per second its reference falls.
+    static constexpr double kAutoRefQuiet = 0.25;  ///< Share of that fall while the key is under the closing threshold.
+    std::atomic<bool> autoThreshold_ { false };    ///< The threshold counts from the key's recent level.
+    bool cachedAutoThreshold_ = false;
+    double autoRefDb_ = -100.0;                    ///< The reference (dB).
+    double autoRefFall_ = 0.0;                     ///< Its fall per sample (dB).
+    T thresholdNow_ = T(-40);                      ///< Threshold of the frame (dB).
 
     State state_ = State::Closed;
     T gateGain_ = T(0);

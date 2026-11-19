@@ -273,6 +273,31 @@ public:
     }
 
     /**
+     * @brief Counts the threshold from the key's own recent level.
+     *
+     * A reference follows the detected level: it rises at once and falls
+     * 1 dB per second, and the thresholds are counted from it. The gate then
+     * acts the same at any input level: a threshold of -40 dB closes on what
+     * lies more than 40 dB under the programme's recent peaks. While the key
+     * is under the closing threshold the reference falls a quarter as fast,
+     * so a pause lowers the threshold by 1 dB every four seconds: far enough
+     * into a long one the floor opens the gate again (the range bounds what
+     * that lets through), and a stray peak that left the programme under
+     * the threshold is forgotten at that pace. Off by default: the threshold
+     * is in dBFS.
+     *
+     * State key "autoThreshold" (absent = off).
+     */
+    void setAutoThreshold(bool on) noexcept
+    {
+        autoThreshold_.store(on, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Whether the threshold counts from the key's recent level (see setAutoThreshold()). */
+    [[nodiscard]] bool isAutoThreshold() const noexcept { return autoThreshold_.load(std::memory_order_relaxed); }
+
+    /**
      * @brief Sets the hysteresis amount (gap between open and close thresholds).
      * @param dB Hysteresis in decibels (floored to 0). Non-finite values are ignored.
      */
@@ -425,6 +450,7 @@ public:
         gateGain_ = cachedRangeLinear_;
         envelopeState_ = T(0);
         holdCounter_ = 0;
+        autoRef_ = kAutoRefFloor;
         scHpfState_.fill(T(0));
         scHpfPrev_.fill(T(0));
         for (int ch = 0; ch < kMaxChannels; ++ch)
@@ -459,6 +485,7 @@ public:
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
         w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
+        w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -479,6 +506,7 @@ public:
         setSidechainHPF(r.read("scHpf", false),
                         static_cast<double>(r.read("scHpfFreq", 80.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
+        setAutoThreshold(r.read("autoThreshold", false));
         return true;
     }
 
@@ -504,6 +532,11 @@ protected:
         cachedGateMode_ = gateMode_.load(std::memory_order_relaxed);
         cachedAdaptiveHold_ = adaptiveHold_.load(std::memory_order_relaxed);
         cachedScHpfEnabled_ = scHpfEnabled_.load(std::memory_order_relaxed);
+        cachedAutoThreshold_ = autoThreshold_.load(std::memory_order_relaxed);
+        // The reference of the automatic threshold falls by a factor per
+        // sample (1 dB per second; a quarter of that while the key is quiet).
+        autoFall_ = std::pow(10.0, -kAutoRefFallDb / (20.0 * sampleRate_));
+        autoFallQuiet_ = std::pow(10.0, -kAutoRefFallDb * kAutoRefQuiet / (20.0 * sampleRate_));
 
         // Compute thresholds in LINEAR domain to eliminate log10 in hot path
         T thDb = threshold_.load(std::memory_order_relaxed);
@@ -574,8 +607,21 @@ protected:
 
     void updateStateMachine(T envelopeLinear) noexcept
     {
-        bool above = envelopeLinear > cachedThresholdLinear_;
-        bool below = envelopeLinear < cachedCloseThresholdLinear_;
+        T openAt = cachedThresholdLinear_;
+        T closeAt = cachedCloseThresholdLinear_;
+        if (cachedAutoThreshold_)
+        {
+            // The thresholds count from a reference that follows the level:
+            // up at once, down slowly, and a quarter as fast while the level
+            // is under the closing threshold.
+            const double level = static_cast<double>(envelopeLinear);
+            const bool quiet = level < static_cast<double>(closeAt) * autoRef_;
+            autoRef_ = std::max({ level, autoRef_ * (quiet ? autoFallQuiet_ : autoFall_), kAutoRefFloor });
+            openAt *= static_cast<T>(autoRef_);
+            closeAt *= static_cast<T>(autoRef_);
+        }
+        bool above = envelopeLinear > openAt;
+        bool below = envelopeLinear < closeAt;
 
         if (cachedDuck_)
             std::swap(above, below);
@@ -753,6 +799,16 @@ protected:
     T attackCoeff_ = T(0);
     T releaseCoeff_ = T(0);
     int holdSamples_ = 0;
+
+    // Automatic threshold (setAutoThreshold()).
+    static constexpr double kAutoRefFallDb = 1.0;  ///< dB per second its reference falls.
+    static constexpr double kAutoRefQuiet = 0.25;  ///< Share of that fall while the key is under the closing threshold.
+    static constexpr double kAutoRefFloor = 1e-5;  ///< The reference never goes under -100 dBFS.
+    std::atomic<bool> autoThreshold_ { false };    ///< The thresholds count from the key's recent level.
+    bool cachedAutoThreshold_ = false;
+    double autoRef_ = kAutoRefFloor;               ///< The reference (linear).
+    double autoFall_ = 1.0;                        ///< Its fall per sample (a factor).
+    double autoFallQuiet_ = 1.0;                   ///< The same while the key is quiet.
 
     // Fast Envelope Follower State
     T envelopeState_ = T(0);

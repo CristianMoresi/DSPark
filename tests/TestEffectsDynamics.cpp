@@ -3728,6 +3728,257 @@ DSPARK_TEST(DynamicEQ_mixed_engine_is_block_independent_and_recovers)
     }
 }
 
+namespace {
+
+std::unique_ptr<DynamicEQ<float>> dynEqLinear(int channels, const DynamicEQ<float>::BandConfig& band)
+{
+    auto d = std::make_unique<DynamicEQ<float>>();
+    d->setLinearPhase(true);
+    d->prepare(AudioSpec{ 48000.0, 512, channels });
+    d->setNumBands(1);
+    d->setBand(0, band);
+    return d;
+}
+
+struct DynEqTone { double gainDb = 0.0, phaseDeg = 0.0; };
+
+// The gain and the phase a processed tone has, over its last `span` samples, against its input
+// `latency` samples earlier.
+DynEqTone dynEqToneAgainst(const Vec& y, const Vec& x, double hz, int latency, int span)
+{
+    const int n = static_cast<int>(y.size());
+    std::complex<double> out(0.0, 0.0), in(0.0, 0.0);
+    for (int i = n - span; i < n; ++i)
+    {
+        const std::complex<double> turn = std::polar(1.0, -2.0 * kPiD * hz * i / 48000.0);
+        out += static_cast<double>(y[static_cast<size_t>(i)]) * turn;
+        in += static_cast<double>(x[static_cast<size_t>(i - latency)]) * turn;
+    }
+    DynEqTone t;
+    t.gainDb = 20.0 * std::log10(std::abs(out) / std::abs(in));
+    t.phaseDeg = std::arg(out / in) * 180.0 / kPiD;
+    return t;
+}
+
+} // namespace
+
+// New mode: linear phase. With no band acting it is the signal, late by half
+// the kernel plus one partition, to the bit.
+DSPARK_TEST(DynamicEQ_linear_phase_is_the_signal_late_when_no_band_acts)
+{
+    auto d = dynEqLinear(2, dynEqCut(1000.0f, 2.0f, -20.0f, 4.0f, 12.0f));
+    d->setBand(1, dynEqCut(5000.0f, 1.0f, -20.0f, 4.0f, 12.0f));
+    EXPECT_EQ(d->getLatency(), 2560);
+    EXPECT_EQ(d->getLinearPhaseKernelLength(), 4096);
+
+    const int n = 24000;
+    Vec s = makeSine(1000.0, 0.01, 48000.0, n);
+    uint32_t seed = 9u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        s[static_cast<size_t>(i)] += 0.004f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f);
+    }
+    std::vector<Vec> x { s, s };
+    processInBlocks(x, 480, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    bool late = true, quiet = true;
+    for (int i = 0; i + 2560 < n; ++i)
+        late = late && x[0][static_cast<size_t>(i + 2560)] == s[static_cast<size_t>(i)]
+                    && x[1][static_cast<size_t>(i + 2560)] == s[static_cast<size_t>(i)];
+    for (int i = 0; i < 2560; ++i) quiet = quiet && x[0][static_cast<size_t>(i)] == 0.0f;
+    EXPECT_TRUE(late);
+    EXPECT_TRUE(quiet);
+
+    // A longer kernel, and what it costs in latency: half of it plus an eighth.
+    auto longer = std::make_unique<DynamicEQ<float>>();
+    longer->setLinearPhase(true);
+    longer->setLinearPhaseKernelLength(8000);       // goes up to 8192
+    longer->prepare(AudioSpec{ 48000.0, 512, 2 });
+    EXPECT_EQ(longer->getLinearPhaseKernelLength(), 8192);
+    EXPECT_EQ(longer->getLatency(), 5120);
+    longer->setLinearPhase(false);
+    longer->prepare(AudioSpec{ 48000.0, 512, 2 });
+    EXPECT_EQ(longer->getLatency(), 0);
+}
+
+// The band sits on the gain it is asked, as in the other engines, and turns no
+// phase: 200 Hz below the centre of a 6 dB cut the mixed engine is 19 degrees
+// off the input and this one is on it.
+DSPARK_TEST(DynamicEQ_linear_phase_band_sits_on_its_gain_and_turns_no_phase)
+{
+    const int n = 48000;
+    auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 2.0f, 12.0f);
+    auto held = [&](DynamicEQ<float>& eq, double probeHz, double keyAmplitude) {
+        const Vec in = makeSine(probeHz, 0.01, 48000.0, n);
+        std::vector<Vec> probe { in };
+        std::vector<Vec> key { makeSine(1000.0, keyAmplitude, 48000.0, n) };
+        dynEqRun(eq, probe, key);
+        return dynEqToneAgainst(probe[0], in, probeHz, eq.getLatency(), 9600);
+    };
+
+    {
+        auto d = dynEqLinear(1, c);
+        const DynEqTone centre = held(*d, 1000.0, 0.0398107);           // 12 dB over at 2:1
+        EXPECT_NEAR(centre.gainDb, -6.0, 0.2);
+        EXPECT_NEAR(centre.phaseDeg, 0.0, 0.3);
+    }
+    {
+        auto d = dynEqLinear(1, c);
+        const DynEqTone below = held(*d, 800.0, 0.0398107);
+        const float hz[1] = { 800.0f };
+        float drawn[1] = {};
+        d->getBandMagnitude(0, -6.0f, hz, drawn, 1);
+        EXPECT_NEAR(below.gainDb, -3.30, 0.25);                         // the nominal bell at half the range
+        EXPECT_NEAR(below.gainDb, toDb(drawn[0]), 0.2);
+        EXPECT_NEAR(below.phaseDeg, 0.0, 0.5);
+
+        auto mixed = dynEqMake(true, 1, c);
+        const DynEqTone turned = held(*mixed, 800.0, 0.0398107);
+        EXPECT_GT(std::abs(turned.phaseDeg), 10.0);
+    }
+    {
+        auto d = dynEqLinear(1, c);
+        EXPECT_NEAR(held(*d, 1000.0, 0.5).gainDb, -12.0, 0.3);          // the end of the range
+    }
+    {
+        c.gain = 4.0f;
+        auto d = dynEqLinear(1, c);
+        EXPECT_NEAR(held(*d, 1000.0, 0.0001).gainDb, 4.0, 0.2);         // at rest
+        auto e = dynEqLinear(1, c);
+        EXPECT_NEAR(held(*e, 1000.0, 0.0398107).gainDb, -2.0, 0.3);
+    }
+}
+
+// The gain is held back to meet the audio it was computed from: a key that
+// starts at one sample bites the output that many samples plus the latency
+// later, and with lookahead that much sooner, at no cost in latency.
+DSPARK_TEST(DynamicEQ_linear_phase_keeps_time_with_its_detector)
+{
+    const int n = 24000, starts = 8000;
+    auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 100.0f, 12.0f);
+    auto level = [](const Vec& y, int from) {
+        return toDb(rmsOf(y.data() + from, 96) * std::sqrt(2.0) / 0.01);
+    };
+    for (float lookaheadMs : { 0.0f, 5.0f })
+    {
+        auto d = dynEqLinear(1, c);
+        d->setLookahead(lookaheadMs);
+        EXPECT_EQ(d->getLatency(), 2560);
+        std::vector<Vec> probe { makeSine(1000.0, 0.01, 48000.0, n) };
+        std::vector<Vec> key { makeSine(1000.0, 0.5, 48000.0, n) };
+        std::fill(key[0].begin(), key[0].begin() + starts, 0.0f);
+        dynEqRun(*d, probe, key);
+        const int bites = starts + 2560 - static_cast<int>(lookaheadMs * 48.0f);
+        EXPECT_NEAR(level(probe[0], bites - 400), 0.0, 0.3);            // not yet
+        EXPECT_NEAR(level(probe[0], bites + 720), -12.0, 0.5);          // 15 ms in: the whole cut
+        if (lookaheadMs > 0.0f) EXPECT_LT(level(probe[0], starts + 2560 - 96), -9.0);
+    }
+}
+
+// The mode keeps the guarantees of the others (block independence, recovery
+// from a sample that is not a number), its placements, and its state.
+DSPARK_TEST(DynamicEQ_linear_phase_blocks_placements_and_state)
+{
+    using DE = DynamicEQ<float>;
+    const int n = 48000;
+    Vec a(static_cast<size_t>(n));
+    uint32_t seed = 5u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double t = i / 48000.0;
+        const double env = 0.15 + 0.6 * std::exp(-std::fmod(t, 0.25) * 18.0);
+        a[static_cast<size_t>(i)] = static_cast<float>(env * (0.5 * std::sin(2.0 * kPiD * 1730.3 * t)
+                                  + 0.1 * (static_cast<double>(seed) / 4294967296.0 - 0.5)));
+    }
+    auto make = [] {
+        auto c = dynEqCut(1700.0f, 2.0f, -30.0f, 4.0f, 12.0f);
+        c.gain = 2.0f;
+        auto d = dynEqLinear(2, c);
+        auto second = dynEqCut(6000.0f, 1.0f, -45.0f, 3.0f, 9.0f);
+        second.placement = DE::Placement::Mid;
+        second.timing = DE::Timing::Program;
+        second.aboveBoost = true;
+        d->setBand(1, second);
+        return d;
+    };
+    auto run = [&](int block) {
+        auto d = make();
+        std::vector<Vec> x { a, a };
+        for (int i = 0; i < n; ++i) x[1][static_cast<size_t>(i)] *= 0.7f;
+        processInBlocks(x, block, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        return x;
+    };
+    const auto ref = run(512);
+    EXPECT_GT(rmsOf(ref[0].data() + 24000, 24000), 0.01);
+    for (int block : { 7, 100 })
+    {
+        const auto x = run(block);
+        double md = 0;
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < n; ++i)
+                md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(c)][static_cast<size_t>(i)])
+                                           - ref[static_cast<size_t>(c)][static_cast<size_t>(i)]));
+        EXPECT_LT(md, 1e-5);
+    }
+
+    {
+        auto d = make(), twin = make();
+        std::vector<Vec> x { a, a }, y { a, a };
+        x[0][10000] = std::numeric_limits<float>::quiet_NaN();
+        processInBlocks(x, 256, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+        EXPECT_TRUE(std::isnan(x[0][10000 + 2560]));                    // it comes out late, like the rest
+        EXPECT_TRUE(allFinite(x[0].data() + 10000 + 2561, n - 12561));
+        EXPECT_TRUE(allFinite(x[1].data(), n));
+        double md = 0;
+        for (int i = n - 4800; i < n; ++i)
+            md = std::max(md, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+        EXPECT_LT(md, 1e-4);
+    }
+
+    // A band on the middle: the middle takes the cut, the sides are the sides, late.
+    {
+        auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 100.0f, 12.0f);
+        c.placement = DE::Placement::Mid;
+        auto d = dynEqLinear(2, c);
+        const Vec probe = makeSine(1000.0, 0.02, 48000.0, n), other = makeSine(1000.0, 0.01, 48000.0, n);
+        const Vec loud = makeSine(1000.0, 0.5, 48000.0, n);
+        Vec left(static_cast<size_t>(n)), right(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            left[static_cast<size_t>(i)] = probe[static_cast<size_t>(i)] + other[static_cast<size_t>(i)];
+            right[static_cast<size_t>(i)] = probe[static_cast<size_t>(i)] - other[static_cast<size_t>(i)];
+        }
+        std::vector<Vec> x { left, right }, key { loud, loud };
+        dynEqRun(*d, x, key);
+        Vec middle(static_cast<size_t>(n)), sides(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            middle[static_cast<size_t>(i)] = 0.5f * (x[0][static_cast<size_t>(i)] + x[1][static_cast<size_t>(i)]);
+            sides[static_cast<size_t>(i)] = 0.5f * (x[0][static_cast<size_t>(i)] - x[1][static_cast<size_t>(i)]);
+        }
+        EXPECT_NEAR(toDb(toneAmplitude(middle.data() + n - 9600, 9600, 1000.0, 48000.0) / 0.02), -12.0, 0.3);
+        EXPECT_NEAR(toDb(toneAmplitude(sides.data() + n - 9600, 9600, 1000.0, 48000.0) / 0.01), 0.0, 0.01);
+    }
+
+    // The state carries the mode and its kernel.
+    {
+        auto d = std::make_unique<DE>();
+        d->setLinearPhase(true);
+        d->setLinearPhaseKernelLength(8192);
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        d->setNumBands(1);
+        const auto blob = d->getState();
+        auto e = std::make_unique<DE>();
+        EXPECT_TRUE(e->setState(blob.data(), blob.size()));
+        EXPECT_TRUE(e->isLinearPhase());
+        e->prepare(AudioSpec{ 48000.0, 512, 2 });
+        EXPECT_EQ(e->getLatency(), 5120);
+        EXPECT_TRUE(e->getState() == blob);
+    }
+}
+
 // ============================================================================
 // DeEsser
 // ============================================================================

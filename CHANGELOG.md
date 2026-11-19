@@ -105,6 +105,48 @@ All notable user-facing changes to DSPark are documented here.
   `processBlock()`, which sees both channels of a frame.
   `getMagnitudeForFrequencyArray()` takes the place to draw (the stereo
   bands and the ones placed there). The state carries `place` per band.
+- `DynamicEQ::setMixedBands(true)` (off by default): a band is the signal
+  and one fixed filter per side, the end of its range, and what moves is how
+  much of the filter is heard, with the weight taken from the gain in
+  amplitude so that the centre of a bell (the plateau of a shelf) sits on
+  the gain asked for at every sample. No recursion has its coefficients
+  moved and nothing is designed while the gain moves. The default engine
+  designs the band again every 16 samples, which is a gain that moves in
+  steps: a steady 6 kHz tone under a band that a key opens and closes 25
+  times a second (attack 5 ms, release 20 ms) grows lines 3 kHz away at
+  -65.6 dBc, and mixed they are at -103.9 (with 20 and 100 ms: -69.2 and
+  -119.6; with 1 and 5 ms, where the gain itself is that fast: -63.2 and
+  -79.6). The cost is the same (eight bands on a stereo block: 410 to 438 ns
+  per frame against 418 to 456 on three compilers). Two fixed curves cannot
+  be the nominal band at every depth, so the end is chosen for the band to
+  be exactly the bell or shelf of its Q half way through the range in
+  decibels, fitted to the analog curve up to Nyquist; a 12 dB cut of Q 1 is
+  1.63 octaves wide at half its depth when it is 3 dB deep, 1.39 (nominal)
+  at 6 dB and 1.00 at 12, and a boost the other way round (1.18, 1.39,
+  1.90). A band that rests at 0 dB and is not acting returns its input bit
+  for bit.
+- `DynamicEQ` bands, in either engine: `BandConfig::gain`, the gain the band
+  rests at (the dynamic part moves from there); `knee`, a soft knee around
+  the threshold in dB, or `kAutomaticKnee` for one that grows with the
+  width of the band and with the root of its range (7.2 dB for a bell of
+  Q 1 and 12 dB of range); `placement` (`Stereo`, `Left`, `Right`, `Mid`,
+  `Side`): where the band acts and what part of the sidechain it listens
+  to; `timing = Program`: the band listens through a filter 1.5 times
+  narrower and three followers of the level replace the attack and release
+  fields, timed from the band's own frequency and width (a fast one, a slow
+  one that follows it, and a last one over the larger of the two), so a
+  short event is let go at the fast rate and a held one at the slow rate (a
+  band at 1 kHz, Q 2, gives back 90 % of a 6 dB cut 25 ms after a 15 ms
+  event, 136 ms after one of 60 ms and 360 ms after 2 s; with manual times
+  of 5 and 50 ms, 230 ms in every case); and `relativeThreshold`: the
+  threshold counts from the band's own recent level (a reference that rises
+  at once and falls 2 dB per second) instead of from full scale, so the band
+  acts the same on a quiet take and on a loud one, and when the band is
+  moved to another zone a second reference listens there for half a second
+  and takes over. `getBandMagnitude()` gives an interface the curve of a
+  band at any gain of its dynamic part, as the engine in use plays it. The
+  state carries `mixed`, and `gain`, `knee`, `place`, `timing` and
+  `relative` per band; older states load as before.
 - `BiquadCascade<T, MaxSections, MaxChannels>` (new,
   `Core/BiquadCascade.h`): second-order sections in series, run up to four
   at a time inside one loop over the samples, in direct form I with the node

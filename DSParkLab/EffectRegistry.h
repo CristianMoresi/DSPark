@@ -145,6 +145,12 @@ inline EffectSlot makeEqualizer()
         std::snprintf(nm, sizeof(nm), "Band %d Order", b + 1);
         s.addSlider(nm, 1, 16, 1, "");
     }
+    // Band N Place (27..30): the channels the band acts on.
+    for (int b = 0; b < 4; ++b) {
+        char nm[32];
+        std::snprintf(nm, sizeof(nm), "Band %d Place", b + 1);
+        s.addChoice(nm, {"Stereo","Left","Right","Mid","Side"}, 0);
+    }
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {
@@ -159,6 +165,13 @@ inline EffectSlot makeEqualizer()
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, toType, toSlope, toOrder](int i, float v) {
         if (i == 22) { p->setAnalogResponse(v > 0.5f); return; }
+        if (i >= 27 && i <= 30)
+        {
+            auto cfg = p->getBandConfig(i - 27);
+            cfg.placement = static_cast<EQ::Placement>(std::clamp(static_cast<int>(v), 0, 4));
+            p->setBand(i - 27, cfg);
+            return;
+        }
         if (i >= 23 && i <= 26)
         {
             auto cfg = p->getBandConfig(i - 23);

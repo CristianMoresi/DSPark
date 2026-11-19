@@ -7390,3 +7390,94 @@ DSPARK_TEST(Delta_listen_is_the_complement_of_the_output)
         EXPECT_LT(check(plain, delta, a->getLatency()), 1e-5);
     }
 }
+
+// ============================================================================
+// The dominant link of a stereo pair (Compressor, DynamicEQ)
+// ============================================================================
+
+namespace
+{
+// A 1 kHz tone with a gain per channel, through a processor for a second,
+// in blocks of 256; returns what read() gives at the end.
+template <class P, class Read>
+double pairReading(P& p, float gainL, float gainR, Read read)
+{
+    constexpr int kBlock = 256;
+    std::vector<float> l(kBlock), r(kBlock);
+    long n = 0;
+    for (int b = 0; b < 48000 / kBlock; ++b)
+    {
+        for (int i = 0; i < kBlock; ++i, ++n)
+        {
+            const float x = 0.5f * static_cast<float>(std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(n) / 48000.0));
+            l[static_cast<size_t>(i)] = gainL * x;
+            r[static_cast<size_t>(i)] = gainR * x;
+        }
+        float* ch[2] = { l.data(), r.data() };
+        p.processBlock(AudioBufferView<float>(ch, 2, kBlock));
+    }
+    return read(p);
+}
+} // namespace
+
+DSPARK_TEST(Compressor_dominant_link_reads_a_source_wherever_it_is_panned)
+{
+    // An equal-power pan: centred, the tone is 0.707 of itself in each
+    // channel; panned hard, all of it in one. The loudest link reads the hard
+    // pan 3 dB hotter (2.25 dB more reduction at 4:1); the dominant link reads
+    // the same source the same anywhere. Both paths: passes and per sample.
+    constexpr float kCentre = 0.70710678f;
+    using C = Compressor<float>;
+    for (const auto precision : { C::Precision::Standard, C::Precision::High })
+    {
+        double spread[2] = {};
+        for (const auto link : { C::LinkMode::Loudest, C::LinkMode::Dominant })
+        {
+            double gr[2] = {};
+            for (int pan = 0; pan < 2; ++pan)
+            {
+                auto c = std::make_unique<C>();
+                c->setThreshold(-30.0f); c->setRatio(4.0f); c->setKnee(0.0f);
+                c->setAttack(2.0f); c->setRelease(60.0f);
+                c->setDetector(C::DetectorType::Rms);
+                c->setPrecision(precision);
+                c->setLinkMode(link);
+                c->prepare(spec(48000.0, 256, 2));
+                gr[pan] = pairReading(*c, pan == 0 ? kCentre : 1.0f, pan == 0 ? kCentre : 0.0f,
+                                      [](C& x) { return static_cast<double>(x.getGainReductionDb()); });
+            }
+            EXPECT_LT(gr[0], -5.0);   // it compresses
+            spread[link == C::LinkMode::Dominant ? 1 : 0] = std::abs(gr[0] - gr[1]);
+        }
+        EXPECT_GT(spread[0], 1.5);    // loudest: the hard pan reads hotter
+        EXPECT_LT(spread[1], 0.3);    // dominant: the same anywhere
+    }
+}
+
+DSPARK_TEST(DynamicEQ_dominant_link_reads_a_source_wherever_it_is_panned)
+{
+    constexpr float kCentre = 0.70710678f;
+    using D = DynamicEQ<float>;
+    double spread[2] = {};
+    for (const auto link : { D::LinkMode::Loudest, D::LinkMode::Dominant })
+    {
+        double gain[2] = {};
+        for (int pan = 0; pan < 2; ++pan)
+        {
+            auto d = std::make_unique<D>();
+            D::BandConfig band;
+            band.frequency = 1000.0f; band.q = 1.0f; band.threshold = -30.0f;
+            band.aboveRatio = 4.0f; band.aboveRangeDb = 24.0f;
+            band.aboveAttackMs = 5.0f; band.aboveReleaseMs = 60.0f;
+            d->setBand(0, band);
+            d->setLinkMode(link);
+            d->prepare(spec(48000.0, 256, 2));
+            gain[pan] = pairReading(*d, pan == 0 ? kCentre : 1.0f, pan == 0 ? kCentre : 0.0f,
+                                    [](D& x) { return static_cast<double>(x.getBandGainDb(0)); });
+        }
+        EXPECT_LT(gain[0], -5.0);
+        spread[link == D::LinkMode::Dominant ? 1 : 0] = std::abs(gain[0] - gain[1]);
+    }
+    EXPECT_GT(spread[0], 1.5);
+    EXPECT_LT(spread[1], 0.3);
+}

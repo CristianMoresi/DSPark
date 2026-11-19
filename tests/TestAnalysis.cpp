@@ -4458,3 +4458,41 @@ DSPARK_TEST(PhaseCorrelation_dominant_level_and_auditory_spectrum)
     for (int b = 1; b < 72; ++b) if (out[static_cast<size_t>(b)] > out[static_cast<size_t>(top)]) top = b;
     EXPECT_NEAR(bands.getCentre(top), 1000.0, 120.0);
 }
+
+DSPARK_TEST(SpectrumAnalyzer_asymmetric_window_reads_the_level_and_follows_sooner)
+{
+    // Calibrated like the others (a bin-exact sine of 0.5 reads -6.02 dB),
+    // and a tone that has just started reads closer to its level than under
+    // a Hann window: the weight sits on the recent samples.
+    using SA = SpectrumAnalyzer<float>;
+    const double w = 2.0 * 3.141592653589793 * 100.0 / 2048.0;
+    {
+        SA sa;
+        sa.prepare(48000.0, 2048, SA::WindowType::AsymmetricHann);
+        sa.setSmoothing(0.0f);
+        EXPECT_TRUE(sa.getWindowType() == SA::WindowType::AsymmetricHann);
+        std::vector<float> x(2048);
+        double ph = 0.0;
+        for (int b = 0; b < 4; ++b)
+        {
+            for (auto& s : x) { s = 0.5f * static_cast<float>(std::sin(ph)); ph += w; }
+            sa.pushSamples(x.data(), 2048);
+        }
+        EXPECT_NEAR(sa.getMagnitudesDb()[100], -6.02f, 0.2f);
+    }
+    float onset[2] = {};
+    for (int asym = 0; asym < 2; ++asym)
+    {
+        SA sa;
+        sa.prepare(48000.0, 2048, asym ? SA::WindowType::AsymmetricHann : SA::WindowType::Hann);
+        sa.setSmoothing(0.0f);
+        std::vector<float> silence(4096, 0.0f);
+        sa.pushSamples(silence.data(), 4096);
+        std::vector<float> x(1024);
+        double ph = 0.0;
+        for (auto& s : x) { s = 0.5f * static_cast<float>(std::sin(ph)); ph += w; }
+        sa.pushSamples(x.data(), 1024);   // the analysis ends 1024 samples into the tone
+        onset[asym] = sa.getMagnitudesDb()[100];
+    }
+    EXPECT_GT(onset[1], onset[0] + 2.5f);
+}

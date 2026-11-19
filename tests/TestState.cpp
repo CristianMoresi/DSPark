@@ -76,6 +76,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         c.setMode(Compressor<float>::Mode::Upward);
         c.setCharacter(Compressor<float>::Character::FET);
         c.setCharacterColor(0.65f);
+        c.setLinkMode(Compressor<float>::LinkMode::Dominant);
         c.setCleanBallistics(Compressor<float>::CleanBallistics::Decoupled);
         c.setAutoMakeup(Compressor<float>::AutoMakeupMode::Analytic);
         c.setPrecision(Compressor<float>::Precision::High);
@@ -158,6 +159,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         c.setMode(Clipper<float>::Mode::Soft); c.setCeiling(-0.5f);
         c.setInputGain(3.0f); c.setStages(3); c.setMix(0.65f);
         c.setSlewLimit(0.4f); c.setOversampling(4);
+        c.setOversamplingMode(Clipper<float>::OversamplingMode::MinimumPhase);
     })));
     EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
         c.setRate(1.8f); c.setDepthMs(5.0f); c.setVoices(3);
@@ -204,6 +206,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     })));
     EXPECT_TRUE((roundTrip<FilterEngine<float>>([](auto& f) {
         f.setLowPass(2200.0f, 0.9f, 24);
+        f.setStructure(FilterEngine<float>::Structure::Ladder);
     })));
 }
 
@@ -268,6 +271,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         d.setBand(0, b);
         b.frequency = 240.0f; b.belowRatio = 1.8f;
         d.setBand(1, b);
+        d.setLinkMode(DynamicEQ<float>::LinkMode::Dominant);
     })));
 }
 
@@ -283,10 +287,12 @@ DSPARK_TEST(State_roundtrip_new_effects)
         t.setElectronics(TM::Electronics::Circuit); t.setAlignment(1.5f, -2.0f);
         t.setFormulation(TM::Formulation::HighOutput); t.setTrackFormat(TM::TrackFormat::Full);
         t.setCalibrationLevel(6.0f); t.setMonitor(TM::Monitor::Sync);
+        t.setOversamplingMode(TM::OversamplingMode::MinimumPhase);
     })));
     EXPECT_TRUE((roundTrip<TubePreamp<float>>([](auto& t) {
         t.setDrive(8.0f); t.setTreble(0.7f); t.setBass(0.4f);
         t.setStages(2);
+        t.setOversamplingMode(TubePreamp<float>::OversamplingMode::MinimumPhase);
     })));
     EXPECT_TRUE((roundTrip<TransformerModel<float>>([](auto& t) {
         t.setDrive(4.0f); t.setCoreSize(0.7f);

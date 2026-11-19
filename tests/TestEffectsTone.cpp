@@ -5899,3 +5899,172 @@ DSPARK_TEST(LoFi_fold_keeps_its_level_and_the_grains_drop_the_pitch)
     EXPECT_TRUE(b.getState() == blob);
     EXPECT_EQ(LoFi<float>::getLatency(), 0);
 }
+
+// ============================================================================
+// Oversampled effects with minimum-phase filters: the dry copy crosses them
+// ============================================================================
+
+namespace
+{
+// A tone in blocks of 256 through an effect; returns the left channel.
+template <class P>
+std::vector<float> toneThrough(P& p, double freq, float amp, int length)
+{
+    constexpr int kBlock = 256;
+    std::vector<float> outL(static_cast<size_t>(length));
+    std::vector<float> l(kBlock), r(kBlock);
+    for (int off = 0; off < length; off += kBlock)
+    {
+        const int n = std::min(kBlock, length - off);
+        for (int i = 0; i < n; ++i)
+        {
+            const float x = amp * static_cast<float>(std::sin(2.0 * std::numbers::pi * freq * (off + i) / 48000.0));
+            l[static_cast<size_t>(i)] = x;
+            r[static_cast<size_t>(i)] = x;
+        }
+        float* ch[2] = { l.data(), r.data() };
+        p.processBlock(AudioBufferView<float>(ch, 2, n));
+        std::copy_n(l.data(), n, outL.data() + off);
+    }
+    return outL;
+}
+
+// The same tone through a bare round trip of an engine, late by `delay`.
+std::vector<float> roundTripThrough(Oversampling<float>& os, double freq, float amp, int length, int delay)
+{
+    constexpr int kBlock = 256;
+    std::vector<float> out(static_cast<size_t>(length), 0.0f);
+    std::vector<float> l(kBlock), r(kBlock);
+    for (int off = 0; off < length; off += kBlock)
+    {
+        const int n = std::min(kBlock, length - off);
+        for (int i = 0; i < n; ++i)
+        {
+            const float x = amp * static_cast<float>(std::sin(2.0 * std::numbers::pi * freq * (off + i) / 48000.0));
+            l[static_cast<size_t>(i)] = x;
+            r[static_cast<size_t>(i)] = x;
+        }
+        float* ch[2] = { l.data(), r.data() };
+        AudioBufferView<float> view(ch, 2, n);
+        [[maybe_unused]] const auto high = os.upsample(view);
+        os.downsample(view);
+        for (int i = 0; i < n; ++i)
+            if (off + i + delay < length) out[static_cast<size_t>(off + i + delay)] = l[static_cast<size_t>(i)];
+    }
+    return out;
+}
+
+double worstDifference(const std::vector<float>& a, const std::vector<float>& b, int from)
+{
+    double worst = 0.0;
+    for (size_t i = static_cast<size_t>(from); i < a.size(); ++i)
+        worst = std::max(worst, std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    return worst;
+}
+} // namespace
+
+DSPARK_TEST(Clipper_minimum_phase_oversampling_mixes_in_phase)
+{
+    // Below the ceiling the hard clip does nothing, so the wet signal is the
+    // oversampler's round trip; behind minimum-phase filters the dry copy
+    // crosses the same filters, so all dry and all wet agree at 18 kHz,
+    // where the filters' delay is fractional (against the rounded delay they
+    // differ by a large share of the tone).
+    using C = Clipper<float>;
+    int latency[2] = {};
+    for (const auto mode : { C::OversamplingMode::LinearPhase, C::OversamplingMode::MinimumPhase })
+    {
+        std::vector<float> out[2];
+        for (int wet = 0; wet < 2; ++wet)
+        {
+            auto c = std::make_unique<C>();
+            c->setMode(C::Mode::Hard);
+            c->setCeiling(0.0f);
+            c->setMix(wet ? 1.0f : 0.0f);
+            c->setOversampling(2);
+            c->setOversamplingMode(mode);
+            c->prepare(spec(48000.0, 256, 2));
+            EXPECT_TRUE(c->getOversamplingMode() == mode);
+            latency[mode == C::OversamplingMode::MinimumPhase ? 1 : 0] = c->getLatency();
+            out[wet] = toneThrough(*c, 18000.0, 0.25f, 9600);
+        }
+        if (mode == C::OversamplingMode::MinimumPhase)
+        {
+            EXPECT_LT(worstDifference(out[0], out[1], 2400), 1e-5);
+        }
+    }
+    EXPECT_LT(latency[1], latency[0]);
+}
+
+DSPARK_TEST(TubePreamp_and_TapeMachine_dry_path_crosses_minimum_phase_filters)
+{
+    // With the mix at zero the output is the dry copy: the oversampler's
+    // round trip of the input, late by the rest of the effect's latency.
+    {
+        using P = TubePreamp<float>;
+        auto p = std::make_unique<P>();
+        p->setMix(0.0f);
+        p->setOversamplingMode(P::OversamplingMode::MinimumPhase);
+        p->prepare(spec(48000.0, 256, 2));
+        auto linear = std::make_unique<P>();
+        linear->prepare(spec(48000.0, 256, 2));
+        EXPECT_LT(p->getLatency(), linear->getLatency());
+
+        Oversampling<float> os(2, Oversampling<float>::Quality::High, Oversampling<float>::Mode::PolyphaseIir,
+                               Oversampling<float>::Depth::Preset);
+        os.prepare(spec(48000.0, 256, 2));
+        const auto got = toneThrough(*p, 15000.0, 0.2f, 9600);
+        const auto want = roundTripThrough(os, 15000.0, 0.2f, 9600, p->getLatency() - os.getLatency());
+        EXPECT_LT(worstDifference(got, want, 2400), 1e-6);
+    }
+    {
+        using P = TapeMachine<float>;
+        auto p = std::make_unique<P>();
+        p->setMix(0.0f);
+        p->setOversamplingMode(P::OversamplingMode::MinimumPhase);
+        p->prepare(spec(48000.0, 256, 2));
+        auto linear = std::make_unique<P>();
+        linear->prepare(spec(48000.0, 256, 2));
+        EXPECT_LT(p->getLatency(), linear->getLatency());
+
+        Oversampling<float> os(4, Oversampling<float>::Quality::High, Oversampling<float>::Mode::PolyphaseIir);
+        os.prepare(spec(48000.0, 256, 2));
+        const auto got = toneThrough(*p, 15000.0, 0.2f, 9600);
+        const auto want = roundTripThrough(os, 15000.0, 0.2f, 9600, p->getLatency() - os.getLatency());
+        EXPECT_LT(worstDifference(got, want, 2400), 1e-6);
+    }
+}
+
+DSPARK_TEST(FilterEngine_ladder_structure_matches_the_direct_form)
+{
+    // The same response at rest and through a glide (the two ramp in their
+    // own coefficient spaces, so the glide agrees closely, not to the bit).
+    using F = FilterEngine<float>;
+    std::vector<float> out[2];
+    for (int ladder = 0; ladder < 2; ++ladder)
+    {
+        F f;
+        f.setLowPass(900.0f, 3.0f, 24);
+        if (ladder) f.setStructure(F::Structure::Ladder);
+        f.prepare(spec(48000.0, 256, 2));
+        EXPECT_TRUE(f.getStructure() == (ladder ? F::Structure::Ladder : F::Structure::DirectForm));
+        std::vector<float> noise(48000);
+        uint32_t seed = 12345u;
+        for (auto& v : noise) { seed = seed * 1664525u + 1013904223u; v = static_cast<float>(seed >> 8) / 8388608.0f - 1.0f; v *= 0.3f; }
+        out[ladder] = noise;
+        for (int off = 0; off < 48000; off += 256)
+        {
+            if (off == 23808) f.setFrequency(6000.0f);   // a glide in the second half
+            float* ch[1] = { out[ladder].data() + off };
+            f.processBlock(AudioBufferView<float>(ch, 1, std::min(256, 48000 - off)));
+        }
+    }
+    double peak = 0.0;
+    for (float v : out[0]) peak = std::max(peak, std::abs(static_cast<double>(v)));
+    EXPECT_LT(worstDifference(out[0], out[1], 0) / peak, 2e-2);
+    // At rest, before the glide: rounding apart.
+    double rest = 0.0;
+    for (size_t i = 0; i < 23808; ++i)
+        rest = std::max(rest, std::abs(static_cast<double>(out[0][i]) - static_cast<double>(out[1][i])));
+    EXPECT_LT(rest / peak, 1e-4);
+}

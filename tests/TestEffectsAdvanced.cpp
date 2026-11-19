@@ -8330,3 +8330,19 @@ DSPARK_TEST(SpectralDenoiser_options_delta_and_filter_mode)
     for (float x : f.first) finite = finite && std::isfinite(x);
     EXPECT_TRUE(finite);
 }
+
+DSPARK_TEST(PitchShifter_default_frame_follows_the_rate)
+{
+    // The frame of every engine is the power of two nearest 43 ms: the same
+    // analysis span at any rate (the published 2048 at 44.1 and 48 kHz).
+    using PS = PitchShifter<float>;
+    struct Expected { double rate; int frame; };
+    for (const Expected& e : { Expected { 44100.0, 2048 }, Expected { 48000.0, 2048 },
+                               Expected { 96000.0, 4096 }, Expected { 192000.0, 8192 } })
+    {
+        auto ps = std::make_unique<PS>();
+        ps->setQuality(PS::Quality::Standard);
+        ps->prepare(spec(e.rate, 512, 2));
+        EXPECT_EQ(ps->getLatency(), 2 * e.frame);
+    }
+}

@@ -647,3 +647,39 @@ DSPARK_TEST(Panner_survives_nonfinite_input)
     EXPECT_TRUE(finite);
     EXPECT_GT(energy, 1e-3);
 }
+
+DSPARK_TEST(StereoWidth_bass_mono_switch_is_click_free)
+{
+    // A 60 Hz side signal. The switch used to step the side by its low end
+    // (switching off) or by the filter's stale memory (switching back on);
+    // it fades now, with the filter running.
+    StereoWidth<float> w;
+    w.prepare(48000.0);
+    constexpr int kBlock = 256;
+    std::vector<float> l(kBlock), r(kBlock);
+    long n = 0;
+    float last = 0.0f;
+    double steady = 0.0, worst = 0.0;
+    for (int b = 0; b < 48000 * 2 / kBlock; ++b)
+    {
+        if (b == 60) w.setBassMono(true, 120.0);
+        if (b == 120) w.setBassMono(false);
+        if (b == 250) w.setBassMono(true, 120.0);
+        for (int i = 0; i < kBlock; ++i, ++n)
+        {
+            const float x = 0.5f * static_cast<float>(std::sin(2.0 * 3.14159265358979323846 * 60.0 * static_cast<double>(n) / 48000.0));
+            l[static_cast<size_t>(i)] = x;
+            r[static_cast<size_t>(i)] = -x;
+        }
+        w.process(l.data(), r.data(), kBlock);
+        for (int i = 0; i < kBlock; ++i)
+        {
+            const double step = std::abs(static_cast<double>(l[static_cast<size_t>(i)]) - last);
+            last = l[static_cast<size_t>(i)];
+            if (b > 2 && b < 58) steady = std::max(steady, step);
+            if (b >= 58) worst = std::max(worst, step);
+        }
+    }
+    EXPECT_GT(steady, 0.003);
+    EXPECT_LT(worst, 1.3 * steady);
+}

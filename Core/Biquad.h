@@ -644,6 +644,28 @@ struct alignas(32) BiquadCoeffs
         return c;
     }
 
+    // -- Transparent set with the same poles ------------------------------------
+
+    /**
+     * @brief The set with these poles whose numerator equals its denominator.
+     *
+     * Its transfer function is 1 at every frequency, with the poles (and the
+     * memory of a filter running on them) still there. A filter whose state
+     * is signal, such as BiquadCascade's direct form, can be moved to this set
+     * to leave the path and back to return to it, and what it adds to its
+     * input fades at the rate of its own poles instead of stopping with a
+     * click. A bell at 0 dB already is this set.
+     *
+     * @return {1, a1, a2} over {1, a1, a2}.
+     */
+    [[nodiscard]] BiquadCoeffs bypassed() const noexcept
+    {
+        BiquadCoeffs c;
+        c.b0 = 1.0; c.b1 = a1; c.b2 = a2;
+        c.a1 = a1;  c.a2 = a2;
+        return c;
+    }
+
     // -- Frequency response analysis -------------------------------------------
 
     /**

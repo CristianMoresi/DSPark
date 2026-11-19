@@ -7,6 +7,7 @@
 #include "../Core/Biquad.h"
 #include "../Core/BiquadCascade.h"
 #include "../Core/FilterDesign.h"
+#include "../Core/FirBank.h"
 #include "../Core/NormalizedLadder.h"
 #include "../Core/StateVariableFilter.h"
 #include "../Core/LadderFilter.h"
@@ -4107,4 +4108,163 @@ DSPARK_TEST(FilterDesign_cascades_as_biquads_follow_their_prototypes)
     EXPECT_GT(plain(FilterDesign::highCut(16000.0, 96.0), 48000.0), 60.0);
     EXPECT_GT(plain(FilterDesign::bell(14000.0, 4.0, -18.0, 8), 48000.0), 6.0);
     EXPECT_GT(plain(FilterDesign::ellipticHighCut(18000.0), 48000.0), 100.0);
+}
+
+// ============================================================================
+// FirBank
+// ============================================================================
+
+namespace {
+
+// Pushes signals through a bank in runs of a given length (cut again at every hop) and collects what
+// every kernel gives for every line: out[kernel * lines + line].
+void firBankRun(FirBank<double>& bank, const std::vector<std::vector<double>>& in,
+                std::vector<std::vector<double>>& out, int runLength)
+{
+    const int lines = bank.getNumInputs(), kernels = bank.getNumKernels();
+    const int total = static_cast<int>(in[0].size());
+    out.assign(static_cast<size_t>(kernels * lines), std::vector<double>(static_cast<size_t>(total), 0.0));
+    std::vector<const double*> ptr(static_cast<size_t>(lines));
+    int done = 0;
+    while (done < total)
+    {
+        const int n = std::min({ total - done, runLength, bank.room() });
+        for (int k = 0; k < kernels; ++k)
+            for (int i = 0; i < lines; ++i)
+                std::copy_n(bank.tap(k, i), n, out[static_cast<size_t>(k * lines + i)].begin() + done);
+        for (int i = 0; i < lines; ++i) ptr[static_cast<size_t>(i)] = in[static_cast<size_t>(i)].data() + done;
+        bank.push(ptr.data(), n);
+        done += n;
+    }
+}
+
+std::vector<double> firBankNoise(int n, uint32_t seed)
+{
+    std::vector<double> v(static_cast<size_t>(n));
+    for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = static_cast<double>(seed >> 8) / 8388608.0 - 1.0; }
+    return v;
+}
+
+// Direct convolution of x with h, `late` samples late.
+std::vector<double> firBankDirect(const std::vector<double>& x, const std::vector<double>& h, int late)
+{
+    std::vector<double> y(x.size(), 0.0);
+    for (size_t n = 0; n < x.size(); ++n)
+    {
+        double sum = 0.0;
+        for (size_t k = 0; k < h.size(); ++k)
+        {
+            const std::ptrdiff_t at = static_cast<std::ptrdiff_t>(n) - late - static_cast<std::ptrdiff_t>(k);
+            if (at >= 0) sum += h[k] * x[static_cast<size_t>(at)];
+        }
+        y[n] = sum;
+    }
+    return y;
+}
+
+double firBankWorst(const std::vector<double>& a, const std::vector<double>& b)
+{
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::abs(a[i] - b[i]));
+    return worst;
+}
+
+} // namespace
+
+// New: a bank of long kernels over shared input lines. Each kernel gives, for
+// each line that hears it, the convolution of that line with it, one
+// partition late; a line it does not hear gives silence; and the result does
+// not depend on how the stream is cut.
+DSPARK_TEST(FirBank_is_the_convolution_of_each_line_one_partition_late)
+{
+    FirBank<double> bank;
+    bank.prepare(600, 100, 2, 3);                   // 100 goes up to 128, 600 taps to 640
+    EXPECT_EQ(bank.getPartition(), 128);
+    EXPECT_EQ(bank.getLatency(), 128);
+    EXPECT_EQ(bank.getKernelLength(), 640);
+    EXPECT_EQ(bank.room(), 128);
+
+    std::vector<double> first = firBankNoise(640, 3u), second = firBankNoise(640, 9u);
+    for (size_t i = 0; i < 640; ++i)
+    {
+        first[i] *= std::exp(-static_cast<double>(i) / 150.0);
+        second[i] *= 0.5 * std::exp(-static_cast<double>(i) / 60.0);
+    }
+    bank.setKernel(0, first.data(), 0b11u);
+    bank.setKernel(1, second.data(), 0b10u);
+    bank.reset();                                   // they land with no fade
+    EXPECT_TRUE(bank.isKernelActive(0));
+    EXPECT_TRUE(!bank.isKernelActive(2));
+
+    const std::vector<std::vector<double>> in { firBankNoise(4000, 21u), firBankNoise(4000, 22u) };
+    std::vector<std::vector<double>> out, other;
+    firBankRun(bank, in, out, 4000);
+    EXPECT_LT(firBankWorst(out[0], firBankDirect(in[0], first, 128)), 1e-10);     // kernel 0, line 0
+    EXPECT_LT(firBankWorst(out[1], firBankDirect(in[1], first, 128)), 1e-10);     // kernel 0, line 1
+    EXPECT_LT(firBankWorst(out[3], firBankDirect(in[1], second, 128)), 1e-10);    // kernel 1, line 1
+    EXPECT_EQ(firBankWorst(out[2], std::vector<double>(4000, 0.0)), 0.0);         // kernel 1 does not hear line 0
+    EXPECT_EQ(firBankWorst(out[4], std::vector<double>(4000, 0.0)), 0.0);         // kernel 2 is not there
+    EXPECT_TRUE(bank.isKernelSilent(2));
+    EXPECT_TRUE(!bank.isKernelSilent(0));
+
+    for (int runLength : { 1, 37, 300 })
+    {
+        bank.reset();
+        firBankRun(bank, in, other, runLength);
+        for (size_t i = 0; i < out.size(); ++i) EXPECT_EQ(firBankWorst(other[i], out[i]), 0.0);
+    }
+}
+
+// A kernel that replaces another comes in over one partition, as a straight
+// crossfade of what the two give; one that is removed goes the same way, and
+// then costs nothing.
+DSPARK_TEST(FirBank_kernel_changes_crossfade_over_one_partition)
+{
+    FirBank<double> bank;
+    bank.prepare(256, 64, 1, 1);
+    std::vector<double> one(256, 0.0), half(256, 0.0);
+    one[0] = 1.0;
+    half[0] = 0.5;
+    bank.setKernel(0, one.data(), 1u);
+    bank.reset();
+
+    const std::vector<std::vector<double>> in { std::vector<double>(64 * 8, 1.0) };
+    std::vector<std::vector<double>> out;
+    std::vector<double> y;
+    std::vector<const double*> ptr(1);
+    const auto run = [&](int hops) {
+        for (int h = 0; h < hops; ++h)
+        {
+            const double* wet = bank.tap(0, 0);
+            y.insert(y.end(), wet, wet + 64);
+            ptr[0] = in[0].data();
+            bank.push(ptr.data(), 64);
+        }
+    };
+    run(2);                         // hop 0: silence (one partition late); hop 1: the signal
+    bank.setKernel(0, half.data(), 1u);
+    run(3);                         // hop 2 was computed with the first kernel; hop 3 is the crossfade
+    bank.removeKernel(0);
+    EXPECT_TRUE(!bank.isKernelActive(0));
+    run(3);
+
+    for (int j = 0; j < 64; ++j)
+    {
+        const double ramp = static_cast<double>(j + 1) / 64.0;
+        EXPECT_NEAR(y[static_cast<size_t>(j)], 0.0, 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(64 + j)], 1.0, 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(128 + j)], 1.0, 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(192 + j)], 1.0 - 0.5 * ramp, 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(256 + j)], 0.5, 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(320 + j)], 0.5, 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(384 + j)], 0.5 * (1.0 - ramp), 1e-12);
+        EXPECT_NEAR(y[static_cast<size_t>(448 + j)], 0.0, 1e-12);
+    }
+    EXPECT_TRUE(bank.isKernelSilent(0));
+
+    // Out of range: ignored, and silence.
+    bank.setKernel(5, one.data(), 1u);
+    bank.removeKernel(-1);
+    EXPECT_TRUE(bank.isKernelSilent(5));
+    EXPECT_TRUE(!bank.isKernelActive(5));
 }

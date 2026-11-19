@@ -3228,6 +3228,506 @@ DSPARK_TEST(DynamicEQ_non_finite_sample_does_not_latch)
     }
 }
 
+namespace {
+
+// Runs a DynamicEQ over audio with its own key, in blocks.
+void dynEqRun(DynamicEQ<float>& eq, std::vector<Vec>& audio, std::vector<Vec>& key, int block = 512)
+{
+    const int n = static_cast<int>(audio[0].size());
+    std::vector<float*> a(audio.size()), k(key.size());
+    for (int off = 0; off < n; off += block)
+    {
+        const int m = std::min(block, n - off);
+        for (size_t c = 0; c < audio.size(); ++c) a[c] = audio[c].data() + off;
+        for (size_t c = 0; c < key.size(); ++c) k[c] = key[c].data() + off;
+        AudioBufferView<float> va(a.data(), static_cast<int>(a.size()), m);
+        AudioBufferView<float> vk(k.data(), static_cast<int>(k.size()), m);
+        eq.processBlock(va, vk);
+    }
+}
+
+std::unique_ptr<DynamicEQ<float>> dynEqMake(bool mixed, int channels, const DynamicEQ<float>::BandConfig& band)
+{
+    auto d = std::make_unique<DynamicEQ<float>>();
+    d->setMixedBands(mixed);
+    d->prepare(AudioSpec{ 48000.0, 512, channels });
+    d->setNumBands(1);
+    d->setBand(0, band);
+    return d;
+}
+
+// The gain (dB) a one-band DynamicEQ gives a quiet probe at the centre of its
+// band while a key tone of the same frequency holds its level.
+double dynEqHeldGainDb(bool mixed, const DynamicEQ<float>::BandConfig& band, double keyAmplitude)
+{
+    auto d = dynEqMake(mixed, 1, band);
+    const int n = 48000;
+    const double hz = static_cast<double>(band.frequency);
+    std::vector<Vec> probe { makeSine(hz, 0.01, 48000.0, n) };
+    std::vector<Vec> key { makeSine(hz, keyAmplitude, 48000.0, n) };
+    dynEqRun(*d, probe, key);
+    return toDb(toneAmplitude(probe[0].data() + n - 9600, 9600, hz, 48000.0) / 0.01);
+}
+
+DynamicEQ<float>::BandConfig dynEqCut(float hz, float q, float threshold, float ratio, float range)
+{
+    DynamicEQ<float>::BandConfig c;
+    c.frequency = hz; c.q = q; c.threshold = threshold;
+    c.aboveRatio = ratio; c.aboveRangeDb = range;
+    c.aboveAttackMs = 1.0f; c.aboveReleaseMs = 50.0f;
+    return c;
+}
+
+// Milliseconds a band takes, once its key stops, to give back all but 10 % of
+// a 6 dB cut. The key lasts keyMs.
+double dynEqReleaseMs(const DynamicEQ<float>::BandConfig& band, double keyMs)
+{
+    auto d = dynEqMake(false, 1, band);
+    const int on = static_cast<int>(keyMs * 48.0), tail = 48000;
+    std::vector<Vec> audio { Vec(static_cast<size_t>(on + tail), 0.0f) };
+    std::vector<Vec> key { makeSine(static_cast<double>(band.frequency), 0.0251189, 48000.0, on + tail) };
+    std::fill(key[0].begin() + on, key[0].end(), 0.0f);
+    std::vector<float*> a(1), k(1);
+    double deepest = 0.0;
+    for (int off = 0; off < on + tail; off += 64)
+    {
+        const int m = std::min(64, on + tail - off);
+        a[0] = audio[0].data() + off;
+        k[0] = key[0].data() + off;
+        AudioBufferView<float> va(a.data(), 1, m), vk(k.data(), 1, m);
+        d->processBlock(va, vk);
+        const double gain = static_cast<double>(d->getBandGainDb(0));
+        deepest = std::min(deepest, gain);
+        if (off >= on && gain > -0.6) return deepest < -5.0 ? (off + m - on) / 48.0 : -1.0;
+    }
+    return 1e9;
+}
+
+} // namespace
+
+// Improvement: a band made of fixed filters mixed by the gain sits exactly on
+// the gain the ballistics ask for, at rest, half way and at the end of its
+// range, and so does the default engine with the gain at rest that is new.
+DSPARK_TEST(DynamicEQ_band_sits_on_the_gain_it_is_asked_in_both_engines)
+{
+    for (bool mixed : { false, true })
+    {
+        // 12 dB over the threshold at 2:1 is 6 dB of cut; far over it, the range.
+        auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 2.0f, 12.0f);
+        EXPECT_NEAR(dynEqHeldGainDb(mixed, c, 0.0398107), -6.0, 0.1);
+        EXPECT_NEAR(dynEqHeldGainDb(mixed, c, 0.5), -12.0, 0.1);
+        EXPECT_NEAR(dynEqHeldGainDb(mixed, c, 0.0001), 0.0, 0.02);
+
+        // A band that rests at +4 dB: there with no key, and 6 dB below it with one.
+        c.gain = 4.0f;
+        EXPECT_NEAR(dynEqHeldGainDb(mixed, c, 0.0001), 4.0, 0.1);
+        EXPECT_NEAR(dynEqHeldGainDb(mixed, c, 0.0398107), -2.0, 0.1);
+
+        // A boost, and a low shelf heard well below its corner.
+        auto lift = dynEqCut(3000.0f, 1.0f, -40.0f, 4.0f, 9.0f);
+        lift.aboveBoost = true;
+        EXPECT_NEAR(dynEqHeldGainDb(mixed, lift, 0.5), 9.0, 0.1);
+        auto shelf = dynEqCut(2000.0f, 1.0f, -40.0f, 2.0f, 12.0f);
+        shelf.shape = DynamicEQ<float>::BandShape::LowShelf;
+        auto held = dynEqMake(mixed, 1, shelf);         // probe and key at 100 Hz, under a shelf at 2 kHz
+        const int n = 48000;
+        std::vector<Vec> probe { makeSine(100.0, 0.01, 48000.0, n) };
+        std::vector<Vec> key { makeSine(100.0, 0.0398107, 48000.0, n) };
+        dynEqRun(*held, probe, key);
+        EXPECT_NEAR(toDb(toneAmplitude(probe[0].data() + n - 9600, 9600, 100.0, 48000.0) / 0.01), -6.0, 0.15);
+    }
+}
+
+// Improvement: a mixed band that rests at 0 dB and is not asked to act returns
+// its input bit for bit, with its filters running.
+DSPARK_TEST(DynamicEQ_mixed_band_at_rest_returns_its_input)
+{
+    auto d = dynEqMake(true, 2, dynEqCut(1000.0f, 2.0f, -20.0f, 4.0f, 12.0f));
+    d->setBand(1, dynEqCut(5000.0f, 1.0f, -20.0f, 4.0f, 12.0f));
+    const int n = 24000;
+    Vec s = makeSine(1000.0, 0.01, 48000.0, n);
+    uint32_t seed = 9u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        s[static_cast<size_t>(i)] += 0.004f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f);
+    }
+    std::vector<Vec> x { s, s };
+    processInBlocks(x, 480, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    EXPECT_TRUE(std::memcmp(x[0].data(), s.data(), sizeof(float) * static_cast<size_t>(n)) == 0);
+    EXPECT_TRUE(std::memcmp(x[1].data(), s.data(), sizeof(float) * static_cast<size_t>(n)) == 0);
+    EXPECT_NEAR(static_cast<double>(d->getBandGainDb(0)), 0.0, 1e-9);
+}
+
+// Defect of the default engine that the mixed one does not have: the band is
+// designed again every 16 samples, so its gain moves in steps and a steady
+// tone under a moving band grows lines 3 kHz away (48000 / 16). A 6 kHz tone
+// under a band that a key opens and closes 25 times a second: the default
+// engine leaves them 50 dB under the tone or so; mixed, they are not there.
+DSPARK_TEST(DynamicEQ_mixed_band_moves_without_steps)
+{
+    auto c = dynEqCut(6000.0f, 1.0f, -30.0f, 4.0f, 12.0f);
+    c.aboveAttackMs = 5.0f; c.aboveReleaseMs = 20.0f;
+    const int n = 96000;
+    auto lines = [&](bool mixed) {
+        auto d = dynEqMake(mixed, 1, c);
+        std::vector<Vec> tone { makeSine(6000.0, 0.25, 48000.0, n) };
+        std::vector<Vec> key { makeSine(6000.0, 0.5, 48000.0, n) };
+        for (int i = 0; i < n; ++i)
+            if ((i / 960) % 2 == 1) key[0][static_cast<size_t>(i)] = 0.0f;      // 20 ms on, 20 ms off
+        dynEqRun(*d, tone, key);
+        const float* y = tone[0].data() + 48000;                               // one second, 25 periods
+        const double carrier = toneAmplitude(y, 48000, 6000.0, 48000.0);
+        const double worst = std::max({ toneAmplitude(y, 48000, 8975.0, 48000.0),
+                                        toneAmplitude(y, 48000, 3025.0, 48000.0),
+                                        toneAmplitude(y, 48000, 9025.0, 48000.0),
+                                        toneAmplitude(y, 48000, 2975.0, 48000.0) });
+        return toDb(worst / carrier);
+    };
+    const double stepped = lines(false), mixed = lines(true);
+    EXPECT_LT(mixed, -80.0);
+    EXPECT_LT(mixed, stepped - 20.0);
+}
+
+// New: a knee around the threshold, given or automatic. With the level on the
+// threshold a knee of W dB at ratio R gives (1 - 1/R) W / 8 dB; the automatic
+// knee is 3 dB per (1 + octaves of width) at a range of 12 dB and grows with
+// the root of the range.
+DSPARK_TEST(DynamicEQ_knee_bends_the_curve_around_the_threshold)
+{
+    using DE = DynamicEQ<float>;
+    auto c = dynEqCut(1000.0f, 1.0f, -30.0f, 4.0f, 12.0f);
+    const double onThreshold = 0.0316228, sixOver = 0.0630957;
+
+    EXPECT_NEAR(dynEqHeldGainDb(false, c, onThreshold), 0.0, 0.06);        // a corner: nothing yet
+    c.knee = 12.0f;
+    EXPECT_NEAR(dynEqHeldGainDb(false, c, onThreshold), -1.125, 0.08);
+    EXPECT_NEAR(dynEqHeldGainDb(true, c, onThreshold), -1.125, 0.08);
+    EXPECT_NEAR(dynEqHeldGainDb(false, c, sixOver), -4.5, 0.1);            // where the knee ends
+
+    c.knee = DE::kAutomaticKnee;
+    const double narrow = dynEqHeldGainDb(false, c, onThreshold);          // Q 1: 7.16 dB of knee
+    EXPECT_NEAR(narrow, -0.671, 0.08);
+    c.aboveRangeDb = 24.0f;
+    const double far = dynEqHeldGainDb(false, c, onThreshold);             // 10.13 dB
+    EXPECT_NEAR(far, -0.950, 0.08);
+    c.aboveRangeDb = 12.0f; c.q = 0.5f;
+    const double wide = dynEqHeldGainDb(false, c, onThreshold);            // 10.63 dB
+    EXPECT_NEAR(wide, -0.997, 0.08);
+    EXPECT_LT(far, narrow - 0.15);
+    EXPECT_LT(wide, narrow - 0.15);
+}
+
+// New: program timing. A held tone lands on the static curve, and the band
+// gives back a 6 dB cut several times sooner after a short event (the fast
+// follower: about 20 ms) than after a held one (the slow one: about 330 ms).
+DSPARK_TEST(DynamicEQ_program_timing_lets_go_of_short_events_sooner)
+{
+    using DE = DynamicEQ<float>;
+    auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 4.0f, 12.0f);
+    c.timing = DE::Timing::Program;
+    c.aboveAttackMs = 500.0f; c.aboveReleaseMs = 5000.0f;                  // not used
+    EXPECT_NEAR(dynEqHeldGainDb(false, c, 0.0251189), -6.0, 0.1);          // 8 dB over at 4:1
+    EXPECT_NEAR(dynEqHeldGainDb(true, c, 0.0251189), -6.0, 0.1);
+
+    const double afterShort = dynEqReleaseMs(c, 15.0), afterLong = dynEqReleaseMs(c, 2000.0);
+    EXPECT_GT(afterShort, 5.0);
+    EXPECT_LT(afterShort, 60.0);
+    EXPECT_GT(afterLong, 200.0);
+    EXPECT_LT(afterLong, 600.0);
+    EXPECT_GT(afterLong, 4.0 * afterShort);
+
+    // The times come from the band: an octave and a half lower and twice as
+    // narrow, the fast follower is six times slower.
+    c.frequency = 350.0f; c.q = 4.0f;
+    const double lowShort = dynEqReleaseMs(c, 60.0);
+    EXPECT_GT(lowShort, 1.5 * afterShort);
+}
+
+// New: a threshold that counts from the band's own recent level. The band acts
+// the same 40 dB lower, lets a quieter passage through, comes back to it as
+// its reference falls (2 dB per second), and when it is moved to a quieter
+// zone a second reference takes over after half a second instead of the band
+// waiting for the first to fall.
+DSPARK_TEST(DynamicEQ_relative_threshold_follows_the_level_of_the_band)
+{
+    auto c = dynEqCut(1000.0f, 2.0f, -6.0f, 4.0f, 12.0f);
+    c.relativeThreshold = true;
+    EXPECT_NEAR(dynEqHeldGainDb(false, c, 0.5), -4.5, 0.15);               // 6 dB over at 4:1
+    EXPECT_NEAR(dynEqHeldGainDb(false, c, 0.005), -4.5, 0.15);
+    EXPECT_NEAR(dynEqHeldGainDb(true, c, 0.005), -4.5, 0.15);
+
+    auto d = dynEqMake(false, 1, c);
+    auto play = [&](double hz, double amplitude, double seconds) {
+        const int n = static_cast<int>(seconds * 48000.0);
+        std::vector<Vec> audio { Vec(static_cast<size_t>(n), 0.0f) };
+        std::vector<Vec> key { makeSine(hz, amplitude, 48000.0, n) };
+        dynEqRun(*d, audio, key, 480);
+        return static_cast<double>(d->getBandGainDb(0));
+    };
+    EXPECT_NEAR(play(1000.0, 0.5, 1.0), -4.5, 0.15);
+    EXPECT_NEAR(play(1000.0, 0.158114, 0.5), 0.0, 0.2);                    // 10 dB quieter: under the threshold
+    EXPECT_NEAR(play(1000.0, 0.158114, 6.0), -4.5, 0.3);                   // the reference has come down to it
+
+    // Moved to 8 kHz, where the key is 20 dB quieter than the reference.
+    c.frequency = 8000.0f;
+    d->setBand(0, c);
+    EXPECT_NEAR(play(8000.0, 0.0158114, 0.4), 0.0, 0.3);                   // the second reference still listens
+    EXPECT_NEAR(play(8000.0, 0.0158114, 0.4), -4.5, 0.4);                  // and has taken over
+}
+
+// New: a band acts on, and listens to, the left, the right, the middle or the
+// sides of the pair, in both engines.
+DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
+{
+    using DE = DynamicEQ<float>;
+    const int n = 48000;
+    const Vec probe = makeSine(1000.0, 0.02, 48000.0, n), other = makeSine(1000.0, 0.01, 48000.0, n);
+    const Vec loud = makeSine(1000.0, 0.5, 48000.0, n), silent(static_cast<size_t>(n), 0.0f);
+    auto gainOf = [&](const Vec& y, double reference) {
+        return toDb(toneAmplitude(y.data() + n - 9600, 9600, 1000.0, 48000.0) / reference);
+    };
+    auto farFrom = [&](const Vec& y, const Vec& x) {
+        double worst = 0.0;
+        for (int i = 0; i < n; ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(y[static_cast<size_t>(i)]) - x[static_cast<size_t>(i)]));
+        return worst;
+    };
+
+    for (bool mixed : { false, true })
+    {
+        auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 100.0f, 12.0f);
+
+        // The key is on the left only.
+        c.placement = DE::Placement::Left;
+        {
+            auto d = dynEqMake(mixed, 2, c);
+            std::vector<Vec> x { probe, probe }, key { loud, silent };
+            dynEqRun(*d, x, key);
+            EXPECT_NEAR(gainOf(x[0], 0.02), -12.0, 0.2);
+            EXPECT_EQ(farFrom(x[1], probe), 0.0);
+        }
+        c.placement = DE::Placement::Right;
+        {
+            auto d = dynEqMake(mixed, 2, c);
+            std::vector<Vec> x { probe, probe }, key { loud, silent };
+            dynEqRun(*d, x, key);
+            EXPECT_EQ(farFrom(x[0], probe), 0.0);
+            EXPECT_LT(farFrom(x[1], probe), 1e-6);                          // it hears silence
+        }
+
+        // The audio: `probe` in the middle and `other` on the sides. The key is all middle.
+        Vec left(static_cast<size_t>(n)), right(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            left[static_cast<size_t>(i)] = probe[static_cast<size_t>(i)] + other[static_cast<size_t>(i)];
+            right[static_cast<size_t>(i)] = probe[static_cast<size_t>(i)] - other[static_cast<size_t>(i)];
+        }
+        c.placement = DE::Placement::Mid;
+        {
+            auto d = dynEqMake(mixed, 2, c);
+            std::vector<Vec> x { left, right }, key { loud, loud };
+            dynEqRun(*d, x, key);
+            Vec middle(static_cast<size_t>(n)), sides(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i)
+            {
+                middle[static_cast<size_t>(i)] = 0.5f * (x[0][static_cast<size_t>(i)] + x[1][static_cast<size_t>(i)]);
+                sides[static_cast<size_t>(i)] = 0.5f * (x[0][static_cast<size_t>(i)] - x[1][static_cast<size_t>(i)]);
+            }
+            EXPECT_NEAR(gainOf(middle, 0.02), -12.0, 0.2);
+            EXPECT_NEAR(gainOf(sides, 0.01), 0.0, 0.01);
+        }
+        c.placement = DE::Placement::Side;
+        {
+            auto d = dynEqMake(mixed, 2, c);
+            std::vector<Vec> x { left, right }, key { loud, loud };         // no sides in the key: nothing to do
+            dynEqRun(*d, x, key);
+            EXPECT_LT(farFrom(x[0], left), 1e-6);
+            EXPECT_LT(farFrom(x[1], right), 1e-6);
+            std::vector<Vec> y { left, right }, sideKey { loud, silent };   // half of it is sides
+            auto e = dynEqMake(mixed, 2, c);
+            dynEqRun(*e, y, sideKey);
+            Vec middle(static_cast<size_t>(n)), sides(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i)
+            {
+                middle[static_cast<size_t>(i)] = 0.5f * (y[0][static_cast<size_t>(i)] + y[1][static_cast<size_t>(i)]);
+                sides[static_cast<size_t>(i)] = 0.5f * (y[0][static_cast<size_t>(i)] - y[1][static_cast<size_t>(i)]);
+            }
+            EXPECT_NEAR(gainOf(sides, 0.01), -12.0, 0.2);
+            EXPECT_NEAR(gainOf(middle, 0.02), 0.0, 0.01);
+        }
+
+        // One channel: the left and the middle are it; it has no right and no sides.
+        for (auto place : { DE::Placement::Left, DE::Placement::Mid, DE::Placement::Right, DE::Placement::Side })
+        {
+            c.placement = place;
+            auto d = dynEqMake(mixed, 1, c);
+            std::vector<Vec> x { probe }, key { loud };
+            dynEqRun(*d, x, key);
+            const bool acts = place == DE::Placement::Left || place == DE::Placement::Mid;
+            EXPECT_NEAR(gainOf(x[0], 0.02), acts ? -12.0 : 0.0, acts ? 0.2 : 0.001);
+        }
+    }
+}
+
+// Design of the mixed band: two fixed curves cannot be the nominal band at
+// every depth, so the end of a side is chosen for the band to be exactly the
+// bell of its Q half way through the range (in decibels). At a quarter of the
+// range a cut is then wider than nominal, and at the end of it narrower.
+DSPARK_TEST(DynamicEQ_mixed_band_is_the_nominal_bell_half_way)
+{
+    auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 4.0f, 12.0f);
+    auto mixed = dynEqMake(true, 1, c), plain = dynEqMake(false, 1, c);
+    const float hz[7] = { 250.0f, 500.0f, 800.0f, 1000.0f, 1250.0f, 2000.0f, 4000.0f };
+    float a[7] = {}, b[7] = {};
+    mixed->getBandMagnitude(0, -6.0f, hz, a, 7);
+    plain->getBandMagnitude(0, -6.0f, hz, b, 7);
+    for (int i = 0; i < 7; ++i) EXPECT_NEAR(toDb(a[i]), toDb(b[i]), 0.08);
+
+    mixed->getBandMagnitude(0, -3.0f, hz, a, 7);
+    plain->getBandMagnitude(0, -3.0f, hz, b, 7);
+    EXPECT_NEAR(toDb(a[3]), -3.0, 0.05);
+    EXPECT_NEAR(toDb(a[2]), -1.90, 0.1);            // nominal: -1.66 at 800 Hz
+    EXPECT_LT(toDb(a[2]), toDb(b[2]) - 0.1);
+
+    mixed->getBandMagnitude(0, -12.0f, hz, a, 7);
+    plain->getBandMagnitude(0, -12.0f, hz, b, 7);
+    EXPECT_NEAR(toDb(a[3]), -12.0, 0.05);
+    EXPECT_NEAR(toDb(a[2]), -4.77, 0.15);           // nominal: -6.55
+    EXPECT_GT(toDb(a[2]), toDb(b[2]) + 0.3);
+
+    // A boost mirrors it: narrower than nominal near the rest.
+    c.aboveBoost = true;
+    mixed->setBand(0, c);
+    plain->setBand(0, c);
+    mixed->getBandMagnitude(0, 6.0f, hz, a, 7);
+    plain->getBandMagnitude(0, 6.0f, hz, b, 7);
+    for (int i = 0; i < 7; ++i) EXPECT_NEAR(toDb(a[i]), toDb(b[i]), 0.08);
+    mixed->getBandMagnitude(0, 3.0f, hz, a, 7);
+    plain->getBandMagnitude(0, 3.0f, hz, b, 7);
+    EXPECT_LT(toDb(a[2]), toDb(b[2]) - 0.1);
+}
+
+// New fields: kept by the state, and guarded on the way in like the rest.
+DSPARK_TEST(DynamicEQ_new_band_fields_are_kept_and_guarded)
+{
+    using DE = DynamicEQ<float>;
+    auto c = dynEqCut(700.0f, 1.5f, -25.0f, 3.0f, 9.0f);
+    c.gain = 3.0f; c.knee = 6.0f; c.placement = DE::Placement::Side;
+    c.timing = DE::Timing::Program; c.relativeThreshold = true;
+
+    auto a = dynEqMake(true, 2, c);
+    const auto blob = a->getState();
+    auto b = std::make_unique<DE>();
+    b->prepare(AudioSpec{ 48000.0, 512, 2 });
+    EXPECT_TRUE(b->setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b->isMixedBands());
+    EXPECT_TRUE(b->getState() == blob);
+
+    // What is not a value keeps the band's own; what is out of range is brought in.
+    auto wild = c;
+    wild.gain = std::numeric_limits<float>::quiet_NaN();
+    wild.knee = std::numeric_limits<float>::infinity();
+    wild.placement = static_cast<DE::Placement>(9);
+    wild.timing = static_cast<DE::Timing>(-3);
+    a->setBand(0, wild);
+    EXPECT_TRUE(a->getState() == blob);
+
+    auto far = c, held = c;
+    far.gain = 90.0f; far.knee = 300.0f;
+    held.gain = 24.0f; held.knee = 40.0f;
+    auto e = dynEqMake(true, 2, far), f = dynEqMake(true, 2, held);
+    EXPECT_TRUE(e->getState() == f->getState());
+    far.knee = -7.0f; held.knee = DE::kAutomaticKnee;
+    e->setBand(0, far); f->setBand(0, held);
+    EXPECT_TRUE(e->getState() == f->getState());
+
+    // The curve an interface draws is the gain the audio gets, in both engines.
+    for (bool mixed : { false, true })
+    {
+        auto band = dynEqCut(1000.0f, 2.0f, -40.0f, 2.0f, 12.0f);
+        band.gain = 4.0f;
+        auto d = dynEqMake(mixed, 1, band);
+        const float hz[3] = { 1000.0f, 100.0f, 1400.0f };
+        float drawn[3] = {};
+        d->getBandMagnitude(0, -6.0f, hz, drawn, 3);
+        EXPECT_NEAR(toDb(drawn[0]), -2.0, 0.05);
+        EXPECT_NEAR(toDb(drawn[1]), 0.0, 0.1);
+        auto played = dynEqMake(mixed, 1, band);
+        const int n = 48000;
+        std::vector<Vec> probe { makeSine(1400.0, 0.01, 48000.0, n) };
+        std::vector<Vec> key { makeSine(1000.0, 0.0398107, 48000.0, n) };
+        dynEqRun(*played, probe, key);
+        EXPECT_NEAR(toDb(toneAmplitude(probe[0].data() + n - 9600, 9600, 1400.0, 48000.0) / 0.01), toDb(drawn[2]), 0.1);
+    }
+}
+
+// The mixed engine keeps what the default one guarantees: the output does not
+// depend on how the host cuts the stream, and a sample that is not a number
+// neither stays in a filter nor in a follower.
+DSPARK_TEST(DynamicEQ_mixed_engine_is_block_independent_and_recovers)
+{
+    using DE = DynamicEQ<float>;
+    const int n = 48000;
+    Vec a(static_cast<size_t>(n));
+    uint32_t seed = 5u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double t = i / 48000.0;
+        const double env = 0.15 + 0.6 * std::exp(-std::fmod(t, 0.25) * 18.0);
+        a[static_cast<size_t>(i)] = static_cast<float>(env * (0.5 * std::sin(2.0 * kPiD * 1730.3 * t)
+                                  + 0.1 * (static_cast<double>(seed) / 4294967296.0 - 0.5)));
+    }
+    auto make = [] {
+        auto c = dynEqCut(1700.0f, 2.0f, -30.0f, 4.0f, 12.0f);
+        c.gain = 2.0f;
+        auto d = dynEqMake(true, 2, c);
+        auto second = dynEqCut(6000.0f, 1.0f, -45.0f, 3.0f, 9.0f);
+        second.placement = DE::Placement::Mid;
+        second.timing = DE::Timing::Program;
+        second.aboveBoost = true;
+        d->setBand(1, second);
+        return d;
+    };
+    auto run = [&](int block) {
+        auto d = make();
+        std::vector<Vec> x { a, a };
+        for (int i = 0; i < n; ++i) x[1][static_cast<size_t>(i)] *= 0.7f;
+        processInBlocks(x, block, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        return x;
+    };
+    const auto ref = run(512);
+    for (int block : { 7, 33, 100 })
+    {
+        const auto x = run(block);
+        double md = 0;
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < n; ++i)
+                md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(c)][static_cast<size_t>(i)])
+                                           - ref[static_cast<size_t>(c)][static_cast<size_t>(i)]));
+        EXPECT_LT(md, 1e-6);
+    }
+
+    auto d = make(), twin = make();
+    std::vector<Vec> x { a, a }, y { a, a };
+    x[0][10000] = std::numeric_limits<float>::quiet_NaN();
+    x[1][10000] = std::numeric_limits<float>::infinity();
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) { d->processBlock(v); });
+    processInBlocks(y, 256, [&](AudioBufferView<float> v) { twin->processBlock(v); });
+    EXPECT_TRUE(std::isnan(x[0][10000]));
+    EXPECT_TRUE(std::isinf(x[1][10000]));
+    for (int c = 0; c < 2; ++c)
+    {
+        EXPECT_TRUE(allFinite(x[static_cast<size_t>(c)].data() + 10001, n - 10001));
+        double md = 0;
+        for (int i = n - 4800; i < n; ++i)
+            md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(c)][static_cast<size_t>(i)])
+                                       - y[static_cast<size_t>(c)][static_cast<size_t>(i)]));
+        EXPECT_LT(md, 1e-4);
+    }
+}
+
 // ============================================================================
 // DeEsser
 // ============================================================================

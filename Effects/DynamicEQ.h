@@ -153,6 +153,8 @@ public:
         isPrepared_.store(false, std::memory_order_relaxed); // basic guarantee
         spec_ = spec;
         sampleRate_ = spec.sampleRate;
+        if (oversamplingAutomatic_)
+            oversamplingFactor_ = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate, 4);
 
         if (oversamplingFactor_ > 1)
         {
@@ -309,8 +311,35 @@ public:
     {
         oversamplingFactor_ = std::clamp(factor, 1, 4);
         if (oversamplingFactor_ == 3) oversamplingFactor_ = 4;
+        oversamplingAutomatic_ = false;
         isPrepared_.store(false, std::memory_order_relaxed); // Forces user to call prepare()
     }
+
+    /**
+     * @brief Lets the host rate choose the factor (setup threads only: like
+     *  setOversampling() it un-prepares the processor until the next prepare()).
+     *
+     * With it on, every prepare() takes the smallest factor that brings
+     * the gain stage to an internal rate of at least 88.2 kHz: 2x at 44.1 and 48 kHz and
+     * none from 88.2 kHz up. The
+     * nonlinearity then runs at about the same rate whatever the session
+     * rate, and a high-rate session stops paying for a factor it does not
+     * need. Off by default; an explicit setOversampling() turns it off.
+     *
+     * @param on True to choose the factor from the rate.
+     */
+    void setAutomaticOversampling(bool on) noexcept
+    {
+        if (on == oversamplingAutomatic_) return;
+        oversamplingAutomatic_ = on;
+        isPrepared_.store(false, std::memory_order_relaxed);
+    }
+
+    /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
+    [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return oversamplingAutomatic_; }
+
+    /** @brief Active oversampling factor (1 = off), as the last prepare() or setter left it. */
+    [[nodiscard]] int getOversamplingFactor() const noexcept { return oversamplingFactor_; }
 
     /** @brief Sets the lookahead (0..10 ms). Applied immediately (may click);
      *         non-finite values are ignored. */
@@ -916,6 +945,8 @@ private:
     std::array<std::atomic<T>, MaxBands> meterGainDb_ {};
 
     int oversamplingFactor_ = 1;
+    bool oversamplingAutomatic_ = false;               ///< The factor follows the host rate.
+    static constexpr double kAutomaticInternalRate = 88200.0; ///< Rate the automatic factor reaches.
     std::unique_ptr<Oversampling<T>> oversampler_;     // audio path
     std::unique_ptr<Oversampling<T>> oversamplerSc_;   // sidechain path
 

@@ -147,6 +147,8 @@ public:
         mixMaxStep_ = static_cast<T>(1.0 / std::max(1.0, sampleRate_ * 0.02));
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
+        if (osAutomatic_)
+            osFactor_ = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate);
 
         // The hysteresis core runs at the active oversampling factor (4x
         // default) so the quarter-internal-rate AC bias carrier and its
@@ -335,11 +337,36 @@ public:
     void setOversampling(int factor)
     {
         if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
-        if (factor == osFactor_) return;
+        if (factor == osFactor_ && !osAutomatic_) return;
+        osAutomatic_ = false;
         osFactor_ = factor;
         if (prepared_.load(std::memory_order_relaxed))
             prepare(spec_);
     }
+
+    /**
+     * @brief Lets the host rate choose the factor (SETUP THREAD ONLY, as
+     *  setOversampling()).
+     *
+     * With it on, every prepare() takes the smallest factor that brings the
+     * core to an internal rate of at least 176.4 kHz: 4x at 44.1 and 48 kHz
+     * (the default factor), 2x at 88.2 and 96 kHz, none from 176.4 kHz up. The
+     * bias carrier and the hysteresis then run at the same rate whatever the
+     * session rate, and a high-rate session stops paying for a factor it does
+     * not need. Off by default; an explicit setOversampling() turns it off.
+     *
+     * @param on True to choose the factor from the rate.
+     */
+    void setAutomaticOversampling(bool on)
+    {
+        if (on == osAutomatic_) return;
+        osAutomatic_ = on;
+        if (on && prepared_.load(std::memory_order_relaxed))
+            prepare(spec_);
+    }
+
+    /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
+    [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return osAutomatic_; }
 
     /** @brief Active oversampling factor (1 = off, 4 = default). */
     [[nodiscard]] int getOversamplingFactor() const noexcept { return osFactor_; }
@@ -448,6 +475,7 @@ public:
         w.write("noise", static_cast<float>(noiseDb_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("oversampling", osFactor_);
+        w.write("oversamplingAuto", osAutomatic_);
         return w.blob();
     }
 
@@ -467,6 +495,7 @@ public:
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         // Default 4 = the historical fixed factor (older blobs restore 4x).
         setOversampling(r.read("oversampling", 4));
+        setAutomaticOversampling(r.read("oversamplingAuto", false));
         return true;
     }
 
@@ -1077,6 +1106,8 @@ private:
     int latency_ = 0;
     int drySize_ = 1;
     int osFactor_ = 4;               ///< Oversampling factor (setup thread; 1 = off, 4 default).
+    bool osAutomatic_ = false;       ///< The factor follows the host rate (setAutomaticOversampling()).
+    static constexpr double kAutomaticInternalRate = 176400.0; ///< Rate the automatic factor reaches.
 
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<Hysteresis<T>> hysteresis_;   ///< +carrier instances (push-pull pair A).

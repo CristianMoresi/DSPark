@@ -230,7 +230,9 @@ public:
     void prepare(const AudioSpec& spec)
     {
         spec_ = spec;
-        if (oversampler_)
+        if (oversamplingAutomatic_)
+            applyOversampling(Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate));
+        else if (oversampler_)
             oversampler_->prepare(spec);
     }
 
@@ -242,7 +244,37 @@ public:
     void setOversampling(int factor)
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0);
+        oversamplingAutomatic_ = false;
+        applyOversampling(factor);
+    }
 
+    /**
+     * @brief Lets the host rate choose the factor (allocates: not from the
+     *  audio thread).
+     *
+     * With it on, every prepare() takes the smallest factor that brings
+     * the table to an internal rate of at least 88.2 kHz: 2x at 44.1 and 48 kHz and
+     * none from 88.2 kHz up. The
+     * nonlinearity then runs at about the same rate whatever the session
+     * rate, and a high-rate session stops paying for a factor it does not
+     * need. Off by default; an explicit setOversampling() turns it off.
+     *
+     * @param on True to choose the factor from the rate.
+     */
+    void setAutomaticOversampling(bool on)
+    {
+        if (on == oversamplingAutomatic_) return;
+        oversamplingAutomatic_ = on;
+        if (on && spec_.sampleRate > 0)
+            applyOversampling(Oversampling<T>::factorForRate(spec_.sampleRate, kAutomaticInternalRate));
+    }
+
+    /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
+    [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return oversamplingAutomatic_; }
+
+private:
+    void applyOversampling(int factor)
+    {
         if (factor > 1)
         {
             oversampler_ = std::make_unique<Oversampling<T>>(factor);
@@ -260,6 +292,7 @@ public:
         }
     }
 
+public:
     [[nodiscard]] int getOversamplingFactor() const noexcept { return oversamplingFactor_; }
 
     /**
@@ -426,6 +459,8 @@ private:
     AudioSpec spec_ {};
     std::unique_ptr<Oversampling<T>> oversampler_;
     int oversamplingFactor_ = 1;
+    bool oversamplingAutomatic_ = false;   ///< The factor follows the host rate.
+    static constexpr double kAutomaticInternalRate = 88200.0; ///< Rate the automatic factor reaches.
 };
 
 } // namespace dspark

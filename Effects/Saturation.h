@@ -1641,6 +1641,15 @@ public:
     {
         if (!spec.isValid()) return;
         spec_ = spec;
+        if (oversamplingAutomatic_)
+        {
+            const int automatic = Oversampling<SampleType>::factorForRate(spec.sampleRate, kAutomaticInternalRate);
+            if (automatic != oversamplingFactor_)
+            {
+                oversamplingFactor_ = automatic;
+                oversampler_.reset();   // rebuilt below for the new factor
+            }
+        }
         for (auto& algo : pool_)
             if (algo) algo->prepare(spec);
 
@@ -2144,6 +2153,40 @@ public:
     void setOversampling(int factor)
     {
         if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
+        oversamplingAutomatic_ = false;
+        applyOversampling(factor);
+    }
+
+    /**
+     * @brief Lets the host rate choose the factor (NOT real-time safe, as
+     *  setOversampling()).
+     *
+     * With it on, every prepare() takes the smallest factor that brings the
+     * curves to an internal rate of at least 88.2 kHz: 2x at 44.1 and 48 kHz
+     * (the default factor) and none from 88.2 kHz up. The nonlinearity then
+     * runs at about the same rate whatever the session rate, and a high-rate
+     * session stops paying for a factor it does not need. Off by default; an
+     * explicit setOversampling() turns it off.
+     *
+     * @param on True to choose the factor from the rate.
+     */
+    void setAutomaticOversampling(bool on)
+    {
+        if (on == oversamplingAutomatic_) return;
+        oversamplingAutomatic_ = on;
+        if (on && spec_.sampleRate > 0)
+        {
+            const int automatic = Oversampling<SampleType>::factorForRate(spec_.sampleRate, kAutomaticInternalRate);
+            if (automatic != oversamplingFactor_) applyOversampling(automatic);
+        }
+    }
+
+    /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
+    [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return oversamplingAutomatic_; }
+
+private:
+    void applyOversampling(int factor)
+    {
         oversamplingFactor_ = factor;
         if (factor > 1)
         {
@@ -2173,6 +2216,8 @@ public:
             reset();
         }
     }
+
+public:
 
     // -- Thread-Safe Getters (GUI / Metering) --------------------------------
 
@@ -2239,6 +2284,7 @@ public:
         w.write("adaptiveBlend", adaptiveBlend_.load(std::memory_order_relaxed));
         w.write("slewSens", static_cast<float>(slewSensitivity_.load(std::memory_order_relaxed)));
         w.write("oversampling", oversamplingFactor_);
+        w.write("oversamplingAuto", oversamplingAutomatic_);
         return w.blob();
     }
 
@@ -2268,6 +2314,7 @@ public:
         setAdaptiveBlend(r.read("adaptiveBlend", false));
         setSlewSensitivity(static_cast<SampleType>(r.read("slewSens", 0.0f)));
         setOversampling(r.read("oversampling", 1));
+        setAutomaticOversampling(r.read("oversamplingAuto", false));
         return true;
     }
 
@@ -2804,6 +2851,8 @@ protected:
 
     std::unique_ptr<Oversampling<SampleType>> oversampler_;
     int oversamplingFactor_ = 2;   ///< 2x by default: the curves alias at 1x (see setOversampling()).
+    bool oversamplingAutomatic_ = false;   ///< The factor follows the host rate (setAutomaticOversampling()).
+    static constexpr double kAutomaticInternalRate = 88200.0; ///< Rate the automatic factor reaches.
 
     std::atomic<SampleType> gainReductionDb_ { SampleType(0) };
 

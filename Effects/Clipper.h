@@ -123,7 +123,12 @@ public:
         spec_ = spec;
         mixer_.prepare(spec);
 
-        const int osFactor = osFactor_.load(std::memory_order_relaxed);
+        int osFactor = osFactor_.load(std::memory_order_relaxed);
+        if (osAutomatic_.load(std::memory_order_relaxed))
+        {
+            osFactor = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate);
+            osFactor_.store(osFactor, std::memory_order_relaxed);
+        }
 
         if (osFactor > 1) {
             // At 16x the antialiased curves leave less than the High
@@ -323,7 +328,26 @@ public:
     {
         factor = std::bit_ceil(static_cast<unsigned int>(std::max(1, factor)));
         osFactor_.store(std::min(factor, 16), std::memory_order_relaxed);
+        osAutomatic_.store(false, std::memory_order_relaxed);
     }
+
+    /**
+     * @brief Lets the host rate choose the factor (applied by the next prepare(), as
+     *  setOversampling()).
+     *
+     * With it on, every prepare() takes the smallest factor that brings
+     * the clipper to an internal rate of at least 88.2 kHz: 2x at 44.1 and 48 kHz and
+     * none from 88.2 kHz up. The
+     * nonlinearity then runs at about the same rate whatever the session
+     * rate, and a high-rate session stops paying for a factor it does not
+     * need. Off by default; an explicit setOversampling() turns it off.
+     *
+     * @param on True to choose the factor from the rate.
+     */
+    void setAutomaticOversampling(bool on) noexcept { osAutomatic_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
+    [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return osAutomatic_.load(std::memory_order_relaxed); }
 
     [[nodiscard]] Mode getMode() const noexcept { return mode_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getCeiling() const noexcept { return ceilingDb_.load(std::memory_order_relaxed); }
@@ -371,6 +395,7 @@ public:
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("slewLimit", static_cast<float>(slewLimitMs_.load(std::memory_order_relaxed)));
         w.write("oversampling", osFactor_.load(std::memory_order_relaxed));
+        w.write("oversamplingAuto", osAutomatic_.load(std::memory_order_relaxed));
         w.write("antialias", antialias_.load(std::memory_order_relaxed));
         return w.blob();
     }
@@ -388,6 +413,7 @@ public:
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setSlewLimit(static_cast<T>(r.read("slewLimit", 0.0f)));
         setOversampling(r.read("oversampling", 1));
+        setAutomaticOversampling(r.read("oversamplingAuto", false));
         setAntialiasing(r.read("antialias", false));
         return true;
     }
@@ -764,6 +790,8 @@ protected:
     std::atomic<T> mix_ { T(1) };
     std::atomic<T> slewLimitMs_ { T(0) };
     std::atomic<int> osFactor_ { 1 }; // Default to 1 (off)
+    std::atomic<bool> osAutomatic_ { false }; ///< The factor follows the host rate.
+    static constexpr double kAutomaticInternalRate = 88200.0; ///< Rate the automatic factor reaches.
 
     // History states per channel
     T slewPrev_[kMaxChannels] {};

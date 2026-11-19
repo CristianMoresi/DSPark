@@ -325,8 +325,8 @@ inline EffectSlot makeCompressor()
     s.addChoice("Auto Makeup", {"Off","Static","Adaptive","Analytic"}, 0);
     s.addSlider("Mix", 0, 1, 1, "");
     // Detector order MUST match dspark::Compressor::DetectorType enum.
-    // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4
-    s.addChoice("Detector", {"Peak","RMS","TruePeak","SplitPolarity","Hilbert"}, 0);
+    // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4, Hybrid=5
+    s.addChoice("Detector", {"Peak","RMS","TruePeak","SplitPolarity","Hilbert","Hybrid"}, 0);
     // Character order MUST match dspark::Compressor::Character enum.
     // Enum: Clean=0, Opto=1, FET=2, Varimu=3
     s.addChoice("Character", {"Clean","Opto","FET","Varimu"}, 0);
@@ -349,6 +349,13 @@ inline EffectSlot makeCompressor()
     // The control signal worked out between the samples (index 19). Order
     // MUST match dspark::Compressor::Precision (Standard=0, High=1).
     s.addChoice("Precision", {"Standard","High"}, 0);
+    // Timing that follows the programme (indices 20 to 23): release after a
+    // sustained reduction, attack by the distance to the target, both by the
+    // spectral balance of the key, and the emphasis of the attack.
+    s.addSlider("Program Release", 0, 1, 0, "");
+    s.addSlider("Adaptive Attack", 0, 1, 0, "");
+    s.addSlider("Spectral Timing", 0, 1, 0, "");
+    s.addSlider("Attack Emphasis", -1, 1, 0, "");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -374,6 +381,10 @@ inline EffectSlot makeCompressor()
             case 17: p->setRange(v); break;
             case 18: p->setSoftRange(v > 0.5f); break;
             case 19: p->setPrecision(static_cast<dspark::Compressor<float>::Precision>(static_cast<int>(v))); break;
+            case 20: p->setProgramRelease(v); break;
+            case 21: p->setAdaptiveAttack(v); break;
+            case 22: p->setSpectralTiming(v); break;
+            case 23: p->setAttackEmphasis(v); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

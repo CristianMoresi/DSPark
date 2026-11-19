@@ -374,10 +374,10 @@ public:
 
         // The numerator over the poles carried from the prototype.
         double normal[5][6];
-        double cost = 0.0, far = 0.0;
+        double cost = 0.0, gap = 0.0;
         if (nN > 0)
         {
-            pass(shape, x, p, false, normal, cost, far);
+            pass(shape, x, p, false, normal, cost, gap);
             if (!advance(shape, false, 1e-12, normal, p)) return bilinear(section, fs, section.poleFrequency());
             clampNumerator(shape, x, p);
         }
@@ -386,27 +386,27 @@ public:
         double best[5] = {};
         std::copy(p, p + 5, best);
         double bestCost = 0.0;
-        pass(shape, x, p, true, nullptr, bestCost, far);
+        pass(shape, x, p, true, nullptr, bestCost, gap);
 
         // The rest: numerator and denominator together. Each pass measures
         // the section it has and prepares the step to the next.
-        for (int i = 0; i < kFitSteps && far > kClose; ++i)
+        for (int i = 0; i < kFitSteps && gap > kClose; ++i)
         {
-            pass(shape, x, p, true, normal, cost, far);
+            pass(shape, x, p, true, normal, cost, gap);
             if (i > 0)
             {
                 if (!(cost < bestCost)) break;
                 const bool settled = bestCost - cost < kSettled * bestCost;
                 std::copy(p, p + 5, best);
                 bestCost = cost;
-                if (settled || !(far > kClose)) break;
+                if (settled || !(gap > kClose)) break;
             }
             if (!advance(shape, true, 1e-6, normal, p)) break;
             if (!positive(p[nN], nD > 1 ? p[nN + 1] : 0.0, x.tMax)) break;
             clampNumerator(shape, x, p);
             if (i + 1 == kFitSteps)
             {
-                pass(shape, x, p, true, nullptr, cost, far);
+                pass(shape, x, p, true, nullptr, cost, gap);
                 if (cost < bestCost) std::copy(p, p + 5, best);
             }
         }

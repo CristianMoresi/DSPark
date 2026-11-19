@@ -117,7 +117,7 @@
  *   left.
  * - **Transparent modulation.** Two mechanisms share the work of smearing
  *   the tail's remaining resonances. Each line's length wanders with its
- *   own smooth random LFO (Lexicon style), updated at control rate with a
+ *   own smooth random LFO, updated at control rate with a
  *   per-sample linear ramp and read through a first-order allpass
  *   interpolator, so there is no cumulative HF loss. Its fractional delay
  *   covers [0.1, 1.1): where the read index steps, the two configurations
@@ -159,6 +159,17 @@
  *   spring per side, with the same decay calibration and loudness (within
  *   0.5 dB), at about 55% of the CPU.
  *
+ * Around the tank, all off by default (each one is described at its setter):
+ * a parametric equalizer of the decay time (setDecayBand()), freeze
+ * (setFreeze()), ducking and a relative gate driven by the dry signal
+ * (setDucking(), setGate()), distance (setDistance()), thickness
+ * (setThickness()), pre-delay and gate hold at a tempo (setTempo(),
+ * setPreDelayNote(), setGateHoldNote()), input width and a width law that
+ * keeps the power (setInputWidth(), setWidthLaw()), a parametric equalizer of
+ * the wet signal (setPostEqBand()), modulation by random segments
+ * (setModulationStyle()), line lengths in a geometric series
+ * (setSpaceLayout()) and an octave-up shimmer (setShimmer()).
+ *
  * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
  * lock-free atomic publications, safe from any thread; topology changes
@@ -178,12 +189,13 @@
  * - Schlecht & Habets (2017, 2019): FDN mixing matrices, echo density, modulation
  * - Valimaki, Parker & Abel (2010, JAES): parametric spring reverberation
  * - Dattorro (1997, JAES): plate topology, allpass-interpolated modulation
- * - Griesinger / Lexicon 480L: random modulation
+ * - Griesinger: random modulation of reverberators
  * - Valimaki et al. (2012, IEEE): "50 Years of Artificial Reverberation"
  * - Abel & Huang (2006): normalized echo density
  *
  * Dependencies: DryWetMixer.h, DspMath.h, Biquad.h, AudioSpec.h,
- *               AudioBuffer.h, DenormalGuard.h, StateBlob.h, SimdOps.h.
+ *               AudioBuffer.h, DenormalGuard.h, StateBlob.h, SimdOps.h,
+ *               KeyEqualizer.h, TailShaper.h.
  *
  * @code
  *   dspark::AlgorithmicReverb<float> reverb;
@@ -207,6 +219,8 @@
 #include "../Core/Biquad.h"
 #include "../Core/StateBlob.h"
 #include "../Core/SimdOps.h"
+#include "../Core/KeyEqualizer.h"
+#include "../Core/TailShaper.h"
 
 #include <algorithm>
 #include <array>
@@ -214,6 +228,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -249,6 +264,36 @@ public:
         Eco     ///< Reduced 8-line engine, about 3x cheaper. For constrained targets.
     };
 
+    /** @brief Shape of a band of the decay equalizer (setDecayBand()). */
+    enum class DecayShape { Off, Bell, LowShelf, HighShelf };
+
+    /** @brief One band of the decay equalizer. */
+    struct DecayBand
+    {
+        DecayShape shape = DecayShape::Off;
+        T frequency = T(1000);   ///< Centre or corner, 20 Hz to 20 kHz.
+        T q = T(0.7071);         ///< Width of a bell, 0.1 to 10 (the shelves ignore it).
+        T multiplier = T(1);     ///< Decay time in the band against the rest, 0.1 to 4.
+    };
+
+    /** @brief A note value for the tempo-synced times. */
+    enum class NoteValue { Off, Whole, Half, Quarter, Eighth, Sixteenth, ThirtySecond };
+
+    /** @brief The feel of a note value. */
+    enum class NoteFeel { Straight, Dotted, Triplet };
+
+    /** @brief How the output width acts (setWidthLaw()). */
+    enum class WidthLaw { Side, PowerKept };
+
+    /** @brief How the lines' lengths wander (setModulationStyle()). */
+    enum class ModulationStyle { Smooth, Segments };
+
+    /** @brief How the line lengths are laid out (setSpaceLayout()). */
+    enum class SpaceLayout { Prime, Geometric };
+
+    static constexpr int kDecayBands = 6;   ///< Bands of the decay equalizer.
+    static constexpr int kPostBands = KeyEqualizer<T, 2>::kBands;   ///< Bands of the wet equalizer.
+
     ~AlgorithmicReverb() = default; // non-virtual: leaf class (no virtual dispatch)
 
     // -- Lifecycle --------------------------------------------------------------
@@ -272,10 +317,21 @@ public:
         mixSpec.numChannels = std::max(spec.numChannels, 2);
         mixer_.prepare(mixSpec);
         const double sr = spec.sampleRate;
+        tail_.prepare(sr);
+        refreshGateHold();
+        postEq_.prepare(sr);
+        {
+            int size = 1;
+            while (size < static_cast<int>(2.0 * kShimmerMaxMs * 0.001 * sr) + 8) size <<= 1;
+            shimBuf_.assign(static_cast<size_t>(size), T(0));
+            shimMask_ = size - 1;
+        }
+        thickUp_ = std::exp(-1.0 / (0.020 * sr));
+        thickDown_ = std::exp(-1.0 / (0.004 * sr));
 
         // Re-derive the sample counts stored at set-time: after a re-prepare
         // at a different rate they would keep the OLD rate's sample count.
-        preDelaySamples_.store(msToSamples(preDelayMs_.load(std::memory_order_relaxed)),
+        preDelaySamples_.store(msToSamples(static_cast<T>(effectivePreDelayMs())),
                                std::memory_order_relaxed);
         erToLateSamples_.store(msToSamples(erToLateMs_.load(std::memory_order_relaxed)),
                                std::memory_order_relaxed);
@@ -402,6 +458,17 @@ public:
             }
         }
 
+        // The wet signal's equalizer.
+        if (postEq_.sync())
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* d = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i) d[i] = postEq_.processSample(d[i], ch);
+            }
+            postEq_.advance(nS);
+        }
+
         mixer_.mixWet(buffer, mix_.load(std::memory_order_relaxed));
     }
 
@@ -425,6 +492,12 @@ public:
         if (!std::isfinite(input)) input = T(0);
         T outL = T(0), outR = T(0);
         processChunk(&input, &input, &outL, &outR, 1);
+        if (postEq_.sync())
+        {
+            outL = postEq_.processSample(outL, 0);
+            outR = postEq_.processSample(outR, 1);
+            postEq_.advance(1);
+        }
         return { outL, outR };
     }
 
@@ -457,6 +530,21 @@ public:
         jotY1_.fill(T(0));
         bassX1_.fill(T(0));
         bassY1_.fill(T(0));
+        for (auto& z : dqZ1_) z.fill(T(0));
+        for (auto& z : dqZ2_) z.fill(T(0));
+        std::fill(shimBuf_.begin(), shimBuf_.end(), T(0));
+        shimW_ = 0;
+        shimPhase_ = { 0.0, 0.5 };
+        shimLen_ = { 0.045, 0.045 };
+        shimRng_ = 0x51ED27u;
+        lastLateMono_ = T(0);
+        thickEnv_ = 0.0;
+        distLp_ = { T(0), T(0) };
+        distMix_ = distance_.load(std::memory_order_relaxed) > T(0) ? T(1) : T(0);
+        tail_.reset();
+        postEq_.reset();
+        freezeNow_ = freeze_.load(std::memory_order_relaxed) ? T(1) : T(0);
+        applyFreezeCoeffs();
 
         const double sr = spec_.sampleRate > 0 ? spec_.sampleRate : 48000.0;
         const T rate = modRate_.load(std::memory_order_relaxed);
@@ -469,6 +557,7 @@ public:
                 rotC_[i] = T(1);
                 rotS_[i] = T(0);
             }
+            seg_[i].prepare(lfoSeed(i) ^ 0x9E3779B9u);
             lenCur_[i] = static_cast<T>(lenTarget_[i]);
             loopAPCur_[i] = static_cast<T>(loopAPLen_[i]);
             pos_[i] = static_cast<double>(std::max(lenCur_[i], T(kMinReadPos)));
@@ -603,14 +692,14 @@ public:
         paramsDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Pre-delay before the early reflections, in ms (0 - 200). */
+    /** @brief Pre-delay before the early reflections, in ms (0 - 500); a
+     *  note value set by setPreDelayNote() takes its place. */
     void setPreDelay(T ms) noexcept
     {
         if (!std::isfinite(ms)) return;
         T clamped = std::clamp(ms, T(0), T(kMaxPreDelayMs));
         preDelayMs_.store(clamped, std::memory_order_relaxed);
-        if (spec_.sampleRate > 0)
-            preDelaySamples_.store(msToSamples(clamped), std::memory_order_relaxed);
+        refreshPreDelay();
     }
 
     /**
@@ -814,6 +903,220 @@ public:
     }
 
     // =========================================================================
+    // Level 3: Around the tank (all off by default)
+    // =========================================================================
+
+    /**
+     * @brief One band of the decay equalizer: the decay time in a band of
+     *        frequencies, as a multiple of what the other controls give there.
+     *
+     * Each line carries the band as a filter in its loop, whose gain is
+     * -60 x (round trip / T60) x (1 / multiplier - 1) dB at the band (T60 is
+     * the decay there without the band): a bell at its centre, a low shelf at
+     * DC, a high shelf at Nyquist. Where bands that lengthen the decay would
+     * lift a loop's gain over 0.9995 at some frequency, their boosts are
+     * scaled down together until it does not. A multiplier of 1 or the shape
+     * Off takes the band out of the loop.
+     *
+     * @param index Band, 0 to kDecayBands - 1 (others are ignored).
+     * @param band  The settings (non-finite fields are ignored).
+     */
+    void setDecayBand(int index, const DecayBand& band) noexcept
+    {
+        if (index < 0 || index >= kDecayBands) return;
+        auto& d = decayBands_[static_cast<size_t>(index)];
+        d.shape.store(std::clamp(static_cast<int>(band.shape), 0, 3), std::memory_order_relaxed);
+        if (std::isfinite(band.frequency)) d.frequency.store(std::clamp(band.frequency, T(20), T(20000)), std::memory_order_relaxed);
+        if (std::isfinite(band.q)) d.q.store(std::clamp(band.q, T(0.1), T(10)), std::memory_order_relaxed);
+        if (std::isfinite(band.multiplier)) d.multiplier.store(std::clamp(band.multiplier, T(0.1), T(4)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return The settings of a band of the decay equalizer (an Off band out of range). */
+    [[nodiscard]] DecayBand getDecayBand(int index) const noexcept
+    {
+        DecayBand b;
+        if (index < 0 || index >= kDecayBands) return b;
+        const auto& d = decayBands_[static_cast<size_t>(index)];
+        b.shape = static_cast<DecayShape>(d.shape.load(std::memory_order_relaxed));
+        b.frequency = d.frequency.load(std::memory_order_relaxed);
+        b.q = d.q.load(std::memory_order_relaxed);
+        b.multiplier = d.multiplier.load(std::memory_order_relaxed);
+        return b;
+    }
+
+    /**
+     * @brief Freezes the tail: the input to the tank and the early field fade
+     *        out over about 20 ms while every loop's absorption and decay band
+     *        fade to unity, so the tail holds with its highs. Off fades back.
+     */
+    void setFreeze(bool on) noexcept { freeze_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the tail is frozen (as set). */
+    [[nodiscard]] bool isFrozen() const noexcept { return freeze_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Ducks the wet signal while the dry one plays (see TailShaper):
+     *        by up to `dB` (0 to 48; 0, the default, is off), in proportion to
+     *        the dry level against its own recent peak.
+     */
+    void setDucking(T dB) noexcept { tail_.setDucking(dB); }
+
+    /**
+     * @brief Gate on the wet signal (see TailShaper): it closes once the dry
+     *        signal has stayed `thresholdDb` under its recent peak (-80 to 0;
+     *        below -80, the default, the gate is off) for the hold time.
+     */
+    void setGate(T thresholdDb) noexcept { tail_.setGate(thresholdDb); }
+
+    /** @brief Hold of the gate, 0 to 4000 ms (default 100); a note value set by setGateHoldNote() takes its place. */
+    void setGateHold(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        gateHoldMs_.store(std::clamp(ms, T(0), T(4000)), std::memory_order_relaxed);
+        refreshGateHold();
+    }
+
+    /** @brief Release of the gate, 5 to 4000 ms (default 150). */
+    void setGateRelease(T ms) noexcept { tail_.setGateRelease(ms); }
+
+    /**
+     * @brief Distance of the source, 0 to 1 (0, the default, is off): one
+     *        control that moves the balance from the early reflections (down
+     *        to half) to the tail (up by half), shortens the pre-delay (to a
+     *        fifth at 1), adds input diffusion (with its square, up to 0.25)
+     *        and darkens the wet signal with a one-pole low-pass from 18 kHz
+     *        down (to 2.25 kHz at 1, further with a darker HF decay).
+     *        Non-finite values are ignored.
+     */
+    void setDistance(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        distance_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Thickness, 0 to 1 (0, the default, is off): a compressor on the
+     *        tank's input (ratio 1 + 3 x amount over -30 dBFS with a 24 dB
+     *        knee; its level rises over 20 ms and falls over 4 ms), its gain
+     *        compensated at -18 dBFS: quiet passages feed the tail as much as
+     *        loud ones. Non-finite values are ignored.
+     */
+    void setThickness(T amount) noexcept
+    {
+        if (std::isfinite(amount)) thickness_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Soft saturation after the thickness compressor (off by default). */
+    void setThicknessSaturation(bool on) noexcept { thickSat_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Tempo for the note values, 20 to 400 BPM (default 120). */
+    void setTempo(T bpm) noexcept
+    {
+        if (!std::isfinite(bpm)) return;
+        tempo_.store(std::clamp(bpm, T(20), T(400)), std::memory_order_relaxed);
+        refreshPreDelay();
+        refreshGateHold();
+    }
+
+    /** @brief Pre-delay as a note value at the tempo (Off, the default, uses setPreDelay()); up to 500 ms. */
+    void setPreDelayNote(NoteValue note, NoteFeel feel = NoteFeel::Straight) noexcept
+    {
+        preNote_.store(std::clamp(static_cast<int>(note), 0, 6), std::memory_order_relaxed);
+        preFeel_.store(std::clamp(static_cast<int>(feel), 0, 2), std::memory_order_relaxed);
+        refreshPreDelay();
+    }
+
+    /** @brief Gate hold as a note value at the tempo (Off, the default, uses setGateHold()); up to 4 s. */
+    void setGateHoldNote(NoteValue note, NoteFeel feel = NoteFeel::Straight) noexcept
+    {
+        gateNote_.store(std::clamp(static_cast<int>(note), 0, 6), std::memory_order_relaxed);
+        gateFeel_.store(std::clamp(static_cast<int>(feel), 0, 2), std::memory_order_relaxed);
+        refreshGateHold();
+    }
+
+    /**
+     * @brief Width of the input, 0 to 1 (1, the default, is the input as it
+     *        is): the side of the input is scaled before the tank, so a wide
+     *        source excites the room from nearer the centre.
+     */
+    void setInputWidth(T width) noexcept
+    {
+        if (std::isfinite(width)) inputWidth_.store(std::clamp(width, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief How setWidth() acts on the tail: Side (the default) scales the
+     *        side; PowerKept also raises the middle as the side falls
+     *        (sqrt(2 - width^2)), so the tail's power stays the same from 0 to
+     *        1.41.
+     */
+    void setWidthLaw(WidthLaw law) noexcept
+    {
+        widthLaw_.store(std::clamp(static_cast<int>(law), 0, 1), std::memory_order_relaxed);
+    }
+
+    /** @brief One band of the wet signal's equalizer (KeyEqualizer bands; 20 ms ramps). */
+    void setPostEqBand(int index, const typename KeyEqualizer<T, 2>::Band& band) noexcept { postEq_.setBand(index, band); }
+    /** @return The settings of a band of the wet signal's equalizer. */
+    [[nodiscard]] typename KeyEqualizer<T, 2>::Band getPostEqBand(int index) const noexcept { return postEq_.getBand(index); }
+
+    /**
+     * @brief How the line lengths wander: Smooth (the default) is the smooth
+     *        random modulation of every line; Segments moves every other line
+     *        in straight segments toward random positions at random speeds
+     *        (each segment 0.5 to 1.5 cycles of the line's rate), with the
+     *        depth held under 2 % of the line's length.
+     */
+    void setModulationStyle(ModulationStyle style) noexcept
+    {
+        modStyle_.store(std::clamp(static_cast<int>(style), 0, 1), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief How the line lengths are laid out: Prime (the default) takes the
+     *        tuned base lengths; Geometric spaces them evenly in log over the
+     *        same range (about 6.6 per octave, the lines of the two sides
+     *        interleaved half a step apart), then to the nearest prime. The
+     *        lengths glide to the new layout.
+     */
+    void setSpaceLayout(SpaceLayout layout) noexcept
+    {
+        layout_.store(std::clamp(static_cast<int>(layout), 0, 1), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Octave-up shimmer, 0 to 1 (0, the default, is off): the tail is
+     *        pitched up an octave by two read heads with windows of random
+     *        length (30 to 60 ms) and a raised-cosine crossfade, and fed back
+     *        into the tank. Non-finite values are ignored.
+     */
+    void setShimmer(T amount) noexcept
+    {
+        if (std::isfinite(amount)) shimmer_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] T getDucking() const noexcept { return tail_.getDucking(); }
+    [[nodiscard]] T getGate() const noexcept { return tail_.getGate(); }
+    [[nodiscard]] T getGateHold() const noexcept { return gateHoldMs_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getGateRelease() const noexcept { return tail_.getGateRelease(); }
+    [[nodiscard]] T getDistance() const noexcept { return distance_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getThickness() const noexcept { return thickness_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool isThicknessSaturated() const noexcept { return thickSat_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getTempo() const noexcept { return tempo_.load(std::memory_order_relaxed); }
+    [[nodiscard]] NoteValue getPreDelayNote() const noexcept { return static_cast<NoteValue>(preNote_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] NoteValue getGateHoldNote() const noexcept { return static_cast<NoteValue>(gateNote_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] T getInputWidth() const noexcept { return inputWidth_.load(std::memory_order_relaxed); }
+    [[nodiscard]] WidthLaw getWidthLaw() const noexcept { return static_cast<WidthLaw>(widthLaw_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] ModulationStyle getModulationStyle() const noexcept { return static_cast<ModulationStyle>(modStyle_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] SpaceLayout getSpaceLayout() const noexcept { return static_cast<SpaceLayout>(layout_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] T getShimmer() const noexcept { return shimmer_.load(std::memory_order_relaxed); }
+
+    /** @return The pre-delay in use, in ms (the note value's time when one is set). */
+    [[nodiscard]] T getEffectivePreDelay() const noexcept { return static_cast<T>(effectivePreDelayMs()); }
+
+    // =========================================================================
     // Getters
     // =========================================================================
 
@@ -862,6 +1165,34 @@ public:
         w.write("lateDb", static_cast<float>(getLateLevel()));
         w.write("toneLowCut", static_cast<float>(toneLowCutHz_.load(std::memory_order_relaxed)));
         w.write("toneHighCut", static_cast<float>(toneHighCutHz_.load(std::memory_order_relaxed)));
+        char key[24];
+        for (int b = 0; b < kDecayBands; ++b)
+        {
+            const DecayBand band = getDecayBand(b);
+            std::snprintf(key, sizeof(key), "db%d.shape", b); w.write(key, static_cast<int32_t>(band.shape));
+            std::snprintf(key, sizeof(key), "db%d.freq", b);  w.write(key, static_cast<float>(band.frequency));
+            std::snprintf(key, sizeof(key), "db%d.q", b);     w.write(key, static_cast<float>(band.q));
+            std::snprintf(key, sizeof(key), "db%d.mult", b);  w.write(key, static_cast<float>(band.multiplier));
+        }
+        w.write("freeze", isFrozen());
+        w.write("ducking", static_cast<float>(getDucking()));
+        w.write("gate", static_cast<float>(getGate()));
+        w.write("gateHold", static_cast<float>(getGateHold()));
+        w.write("gateRelease", static_cast<float>(getGateRelease()));
+        w.write("distance", static_cast<float>(getDistance()));
+        w.write("thickness", static_cast<float>(getThickness()));
+        w.write("thickSat", isThicknessSaturated());
+        w.write("tempo", static_cast<float>(getTempo()));
+        w.write("preNote", preNote_.load(std::memory_order_relaxed));
+        w.write("preFeel", preFeel_.load(std::memory_order_relaxed));
+        w.write("gateNote", gateNote_.load(std::memory_order_relaxed));
+        w.write("gateFeel", gateFeel_.load(std::memory_order_relaxed));
+        w.write("inWidth", static_cast<float>(getInputWidth()));
+        w.write("widthLaw", widthLaw_.load(std::memory_order_relaxed));
+        w.write("modStyle", modStyle_.load(std::memory_order_relaxed));
+        w.write("layout", layout_.load(std::memory_order_relaxed));
+        w.write("shimmer", static_cast<float>(getShimmer()));
+        postEq_.writeState(w, "post");
         return w.blob();
     }
 
@@ -893,6 +1224,33 @@ public:
         // the blob's source instance.
         setToneLowCut(static_cast<T>(r.read("toneLowCut", -1.0f)));
         setToneHighCut(static_cast<T>(r.read("toneHighCut", -1.0f)));
+        char key[24];
+        for (int b = 0; b < kDecayBands; ++b)
+        {
+            DecayBand band;
+            std::snprintf(key, sizeof(key), "db%d.shape", b); band.shape = static_cast<DecayShape>(r.read(key, 0));
+            std::snprintf(key, sizeof(key), "db%d.freq", b);  band.frequency = static_cast<T>(r.read(key, 1000.0f));
+            std::snprintf(key, sizeof(key), "db%d.q", b);     band.q = static_cast<T>(r.read(key, 0.7071f));
+            std::snprintf(key, sizeof(key), "db%d.mult", b);  band.multiplier = static_cast<T>(r.read(key, 1.0f));
+            setDecayBand(b, band);
+        }
+        setFreeze(r.read("freeze", false));
+        setDucking(static_cast<T>(r.read("ducking", 0.0f)));
+        setGate(static_cast<T>(r.read("gate", -200.0f)));
+        setGateHold(static_cast<T>(r.read("gateHold", 100.0f)));
+        setGateRelease(static_cast<T>(r.read("gateRelease", 150.0f)));
+        setDistance(static_cast<T>(r.read("distance", 0.0f)));
+        setThickness(static_cast<T>(r.read("thickness", 0.0f)));
+        setThicknessSaturation(r.read("thickSat", false));
+        setTempo(static_cast<T>(r.read("tempo", 120.0f)));
+        setPreDelayNote(static_cast<NoteValue>(r.read("preNote", 0)), static_cast<NoteFeel>(r.read("preFeel", 0)));
+        setGateHoldNote(static_cast<NoteValue>(r.read("gateNote", 0)), static_cast<NoteFeel>(r.read("gateFeel", 0)));
+        setInputWidth(static_cast<T>(r.read("inWidth", 1.0f)));
+        setWidthLaw(static_cast<WidthLaw>(r.read("widthLaw", 0)));
+        setModulationStyle(static_cast<ModulationStyle>(r.read("modStyle", 0)));
+        setSpaceLayout(static_cast<SpaceLayout>(r.read("layout", 0)));
+        setShimmer(static_cast<T>(r.read("shimmer", 0.0f)));
+        postEq_.readState(r, "post");
         return true;
     }
 
@@ -915,7 +1273,11 @@ protected:
     static constexpr int kCtrl       = 16;  ///< modulation control period (samples)
     static constexpr int kChunk      = 64;  ///< sparse-FIR processing chunk (samples)
 
-    static constexpr double kMaxPreDelayMs = 200.0;
+    static constexpr double kMaxPreDelayMs = 500.0;
+    static constexpr double kShimmerMinMs = 30.0;    ///< Shortest window of the shimmer's heads.
+    static constexpr double kShimmerMaxMs = 60.0;    ///< Longest window of the shimmer's heads.
+    static constexpr T      kShimmerFeed = T(0.08);  ///< Share of the shimmer fed back at full amount.
+    static constexpr double kMaxDecayLoopGain = 0.9995;   ///< Highest loop gain the decay bands may reach.
     static constexpr double kMaxErToLateMs = 200.0;
     static constexpr double kMaxErMs       = 170.0;
     static constexpr double kMaxInjectMs   = 8.0;
@@ -1156,6 +1518,47 @@ protected:
         }
     };
 
+    /**
+     * @brief Modulation by segments: a straight move toward a random
+     *        position (in [-1, 1]) at a random speed (each segment 0.5 to 1.5
+     *        cycles of the rate), then the next.
+     */
+    struct SegmentLfo
+    {
+        double pos = 0.0, target = 0.0, step = 0.0;
+        uint32_t state = 1;
+
+        void prepare(uint32_t seed) noexcept
+        {
+            state = seed ? seed : 1;
+            pos = target = step = 0.0;
+        }
+
+        double next(int stride, double rateHz, double sr) noexcept
+        {
+            if (step == 0.0)
+            {
+                target = 2.0 * random() - 1.0;
+                const double seconds = (0.5 + random()) / std::max(rateHz, 0.01);
+                step = std::abs(target - pos) / std::max(1.0, seconds * sr);
+                if (step == 0.0) step = 1e-9;
+            }
+            const double move = step * static_cast<double>(stride);
+            if (std::abs(target - pos) <= move) { pos = target; step = 0.0; }
+            else pos += target > pos ? move : -move;
+            return pos;
+        }
+
+    private:
+        double random() noexcept
+        {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            return static_cast<double>(state) / 4294967296.0;
+        }
+    };
+
     static constexpr T lfoRateFactor(int i) noexcept
     {
         return T(0.71) + T(0.063) * static_cast<T>(i);
@@ -1369,8 +1772,51 @@ protected:
         T earlyLevel = T(1);
         T lateLevel  = T(1);
         T width      = T(1);
+        T inputWidth = T(1);
+        T thickness  = T(0);
+        bool thickSat = false;
+        bool powerKept = false;
+        bool segments = false;
+        T shimmer    = T(0);
+        T distance   = T(0);
     };
     CachedParams cachedParams_ {};
+
+    // Around the tank (settings).
+    struct PublishedDecayBand
+    {
+        std::atomic<int> shape { 0 };
+        std::atomic<T> frequency { T(1000) };
+        std::atomic<T> q { T(0.7071) };
+        std::atomic<T> multiplier { T(1) };
+    };
+    std::array<PublishedDecayBand, kDecayBands> decayBands_;
+    std::atomic<bool> freeze_ { false }, thickSat_ { false };
+    std::atomic<T> distance_ { T(0) }, thickness_ { T(0) }, tempo_ { T(120) }, inputWidth_ { T(1) };
+    std::atomic<T> shimmer_ { T(0) }, gateHoldMs_ { T(100) };
+    std::atomic<int> preNote_ { 0 }, preFeel_ { 0 }, gateNote_ { 0 }, gateFeel_ { 0 };
+    std::atomic<int> widthLaw_ { 0 }, modStyle_ { 0 }, layout_ { 0 };
+    TailShaper<T> tail_;
+    KeyEqualizer<T, 2> postEq_;
+
+    // ... and their state (audio thread).
+    std::array<std::array<T, kMaxLines>, 3> jotBase_ {}, bassBase_ {};
+    std::array<std::array<std::array<T, kMaxLines>, kDecayBands>, 5> dqBase_ {};
+    std::array<std::array<T, kMaxLines>, kDecayBands> dqB0_ {}, dqB1_ {}, dqB2_ {}, dqA1_ {}, dqA2_ {};
+    std::array<std::array<T, kMaxLines>, kDecayBands> dqZ1_ {}, dqZ2_ {};
+    std::array<int, kDecayBands> dqList_ {};
+    int dqCount_ = 0;
+    T freezeNow_ = T(0);
+    double thickEnv_ = 0.0, thickUp_ = 0.0, thickDown_ = 0.0;
+    std::array<T, 2> distLp_ {};
+    T distCoeff_ = T(1), distMix_ = T(0);
+    std::array<SegmentLfo, kMaxLines> seg_ {};
+    std::vector<T> shimBuf_;
+    int shimMask_ = 0, shimW_ = 0;
+    std::array<double, 2> shimPhase_ { 0.0, 0.5 };
+    std::array<double, 2> shimLen_ { 0.045, 0.045 };
+    uint32_t shimRng_ = 0x51ED27u;
+    T lastLateMono_ = T(0);
 
     // =========================================================================
     // Audio-thread control
@@ -1423,8 +1869,9 @@ protected:
     /// Puts every gliding parameter (levels, width, diffusion, tone) at its target.
     void snapGlides() noexcept
     {
-        earlyCur_ = earlyLevel_.load(std::memory_order_relaxed);
-        lateCur_  = lateLevel_.load(std::memory_order_relaxed);
+        const T d = distance_.load(std::memory_order_relaxed);
+        earlyCur_ = earlyLevel_.load(std::memory_order_relaxed) * (d > T(0) ? T(1) - T(0.5) * d : T(1));
+        lateCur_  = lateLevel_.load(std::memory_order_relaxed) * (d > T(0) ? T(1) + T(0.5) * d : T(1));
         widthCur_ = width_.load(std::memory_order_relaxed);
         inAPCoeff_ = inAPCoeffTarget_;
         loopAPCoeff_ = loopAPCoeffTarget_;
@@ -1538,6 +1985,23 @@ protected:
         cachedParams_.earlyLevel = earlyLevel_.load(std::memory_order_relaxed);
         cachedParams_.lateLevel  = lateLevel_.load(std::memory_order_relaxed);
         cachedParams_.width      = width_.load(std::memory_order_relaxed);
+        cachedParams_.inputWidth = inputWidth_.load(std::memory_order_relaxed);
+        cachedParams_.thickness  = thickness_.load(std::memory_order_relaxed);
+        cachedParams_.thickSat   = thickSat_.load(std::memory_order_relaxed);
+        cachedParams_.powerKept  = widthLaw_.load(std::memory_order_relaxed) == 1;
+        cachedParams_.segments   = modStyle_.load(std::memory_order_relaxed) == 1;
+        cachedParams_.shimmer    = shimmer_.load(std::memory_order_relaxed);
+        cachedParams_.distance   = distance_.load(std::memory_order_relaxed);
+        const T d = cachedParams_.distance;
+        if (d > T(0))
+        {
+            // Distance: from the early field to the tail, a shorter gap.
+            cachedParams_.earlyLevel *= T(1) - T(0.5) * d;
+            cachedParams_.lateLevel  *= T(1) + T(0.5) * d;
+            cachedParams_.preDelaySamples = static_cast<int>(static_cast<T>(cachedParams_.preDelaySamples)
+                                                             * (T(1) - T(0.8) * d));
+        }
+        tail_.sync();
     }
 
     /**
@@ -1560,11 +2024,18 @@ protected:
                 rotC_[k] = static_cast<T>(std::cos(static_cast<double>(theta)));
                 rotS_[k] = static_cast<T>(std::sin(static_cast<double>(theta)));
             }
+        const bool segments = cachedParams_.segments;
+        const double sr = spec_.sampleRate;
+        const double rate = static_cast<double>(modRate_.load(std::memory_order_relaxed));
         for (int i = 0; i < n; ++i)
         {
             const T diff = static_cast<T>(lenTarget_[i]) - lenCur_[i];
             lenCur_[i] += std::clamp(diff * glideCoeff_, -maxGlideStep_, maxGlideStep_);
-            const T m = lfo_[i].nextStride(kCtrl) * modDepthSamples_;
+            // Segments: every other line, its depth held under 2 % of its length.
+            const T m = segments
+                ? ((i & 1) ? T(0) : static_cast<T>(seg_[i].next(kCtrl, rate * static_cast<double>(lfoRateFactor(i)), sr))
+                                        * std::min(modDepthSamples_, T(0.02) * lenCur_[i]))
+                : lfo_[i].nextStride(kCtrl) * modDepthSamples_;
             const double target = std::clamp(static_cast<double>(lenCur_[i]) + static_cast<double>(m),
                                              static_cast<double>(kMinReadPos),
                                              static_cast<double>(maxReadPos_));
@@ -1633,7 +2104,7 @@ protected:
      *        shelves, in-loop allpass, safety limiter, injection, write.
      */
     template <int N>
-    void runFdn(T& lateL, T& lateR, int injLag, T loopAPCoeff) noexcept
+    void runFdn(T& lateL, T& lateR, int injLag, T loopAPCoeff, T inGain, T extra) noexcept
     {
         constexpr int W = std::min(simd::kVecWidth<T>, N);
         using O = simd::Vec<T, W>;
@@ -1688,6 +2159,7 @@ protected:
             O::store(bassY1_.data() + i, b);
             O::store(r.data() + i, b);
         }
+        if (dqCount_ > 0) applyDecayBands<N, W, O>(r.data());
 
         // Orthogonal L/R output sums, taken after the absorption: even the
         // first pass through a line leaves attenuated by that line's own
@@ -1773,9 +2245,38 @@ protected:
                 const T over = std::abs(x) - kSoftLimit;
                 x = std::copysign(kSoftLimit + over / (T(1) + over), x);
             }
-            lines_.write(i, x + injGain_[i] * ring_[(i >> 1) & 1].at(injLag + injTap_[i]));
+            lines_.write(i, x + injGain_[i] * (inGain * ring_[(i >> 1) & 1].at(injLag + injTap_[i]) + extra));
         }
         lines_.advance();
+    }
+
+    /**
+     * @brief The decay bands in the loop, one TDF-II biquad per line and band
+     *        (the per-line arithmetic runs across the lines in SIMD).
+     */
+    template <int N, int W, typename O>
+    void applyDecayBands(T* r) noexcept
+    {
+        using V = typename O::V;
+        for (int k = 0; k < dqCount_; ++k)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(k)]);
+            T* z1 = dqZ1_[b].data();
+            T* z2 = dqZ2_[b].data();
+            const T* b0 = dqB0_[b].data();
+            const T* b1 = dqB1_[b].data();
+            const T* b2 = dqB2_[b].data();
+            const T* a1 = dqA1_[b].data();
+            const T* a2 = dqA2_[b].data();
+            for (int i = 0; i < N; i += W)
+            {
+                const V x = O::load(r + i);
+                const V y = O::madd(O::load(b0 + i), x, O::load(z1 + i));
+                O::store(z1 + i, O::sub(O::madd(O::load(b1 + i), x, O::load(z2 + i)), O::mul(O::load(a1 + i), y)));
+                O::store(z2 + i, O::sub(O::mul(O::load(b2 + i), x), O::mul(O::load(a2 + i), y)));
+                O::store(r + i, y);
+            }
+        }
     }
 
     /**
@@ -1882,6 +2383,7 @@ protected:
             O::store(bassY1_.data() + g, b);
             O::store(x.data() + g, b);
         }
+        if (dqCount_ > 0) applyDecayBands<Springs, W, O>(x.data());
         for (int s = 0; s < Springs; ++s)
         {
             T v = x[s];
@@ -1952,6 +2454,42 @@ protected:
         const T rampStep = T(1) / static_cast<T>(count);
         fresh_ = false;
 
+        // Freeze: the absorption fades to unity and the input out.
+        const T freeze0 = freezeNow_;
+        freezeNow_ = glideTo(freezeNow_, freeze_.load(std::memory_order_relaxed) ? T(1) : T(0), gc);
+        if (freezeNow_ != freeze0) applyFreezeCoeffs();
+        const bool freezing = freezeNow_ != T(0) || freeze0 != T(0);
+        const T in0 = T(1) - freeze0, in1 = T(1) - freezeNow_;
+
+        // Input width: the side of the input before the tank.
+        alignas(64) T narrowL[kChunk];
+        alignas(64) T narrowR[kChunk];
+        if (cachedParams_.inputWidth != T(1))
+        {
+            const T w = cachedParams_.inputWidth;
+            for (int n = 0; n < count; ++n)
+            {
+                const T mid = (inL[n] + inR[n]) * T(0.5), side = (inL[n] - inR[n]) * T(0.5) * w;
+                narrowL[n] = mid + side;
+                narrowR[n] = mid - side;
+            }
+            inL = narrowL;
+            inR = narrowR;
+        }
+
+        // Distance: the low-pass on the wet signal, crossfaded in and out.
+        {
+            const T d = cachedParams_.distance;
+            distMix_ = glideTo(distMix_, d > T(0) ? T(1) : T(0), gc);
+            if (d > T(0))
+            {
+                const double hd = static_cast<double>(highDecayMult_.load(std::memory_order_relaxed));
+                const double darkness = static_cast<double>(d) * (1.25 - 0.5 * hd);
+                const double fc = std::min(18000.0 * std::exp2(-3.0 * darkness), 0.45 * spec_.sampleRate);
+                distCoeff_ = static_cast<T>(1.0 - std::exp(-6.283185307179586 * fc / spec_.sampleRate));
+            }
+        }
+
         // --- Pre-delay, then the allpass diffusers of the late-field feed ---
         alignas(64) T raw[2][kChunk];
         for (int c = 0; c < 2; ++c)
@@ -1961,6 +2499,37 @@ protected:
             for (int n = 0; n < count; ++n) pre.push(in[n]);
             std::fill(raw[c], raw[c] + count, T(0));
             addTap(raw[c], pre, pd + 1 + last, T(1), count);
+        }
+
+        // Thickness: a compressor on the tank's input, both sides linked.
+        if (cachedParams_.thickness > T(0))
+        {
+            const double ratio = 1.0 + 3.0 * static_cast<double>(cachedParams_.thickness);
+            const double slope = 1.0 / ratio - 1.0;
+            constexpr double kThreshold = -30.0, kKnee = 24.0;
+            const double makeup = -slope * 12.0;   // -18 dBFS sits on the knee's top
+            const bool saturate = cachedParams_.thickSat;
+            for (int n = 0; n < count; ++n)
+            {
+                const double level = std::max(static_cast<double>(raw[0][n]) * raw[0][n],
+                                              static_cast<double>(raw[1][n]) * raw[1][n]);
+                thickEnv_ = level + (level > thickEnv_ ? thickUp_ : thickDown_) * (thickEnv_ - level);
+                const double over = 10.0 * std::log10(thickEnv_ + 1e-30) - kThreshold;
+                const double gr = over <= -0.5 * kKnee ? 0.0
+                                : over >= 0.5 * kKnee ? slope * over
+                                : slope * (over + 0.5 * kKnee) * (over + 0.5 * kKnee) / (2.0 * kKnee);
+                const T g = static_cast<T>(std::pow(10.0, (gr + makeup) / 20.0));
+                for (int c = 0; c < 2; ++c)
+                {
+                    T x = raw[c][n] * g;
+                    if (saturate) x = std::tanh(T(1.5) * x) * T(1.0 / 1.5);
+                    raw[c][n] = x;
+                }
+            }
+        }
+
+        for (int c = 0; c < 2; ++c)
+        {
             Line& ring = ring_[static_cast<std::size_t>(c)];
             auto& aps = inAP_[static_cast<std::size_t>(c)];
             for (int n = 0; n < count; ++n)
@@ -2048,29 +2617,112 @@ protected:
 
             // --- Late field ---
             T lateL = T(0), lateR = T(0);
+            const T a = static_cast<T>(n + 1) * rampStep;
+            const T inGain = freezing ? in0 + (in1 - in0) * a : T(1);
             if (spring_)
             {
-                const T rawN[2] = { raw[0][n], raw[1][n] };
+                const T rawN[2] = { raw[0][n] * inGain, raw[1][n] * inGain };
                 if (eco_) runSprings<kEcoSprings, kEcoSpringStages>(lateL, lateR, rawN);
                 else      runSprings<kSprings, kSpringStages>(lateL, lateR, rawN);
             }
-            const T a = static_cast<T>(n + 1) * rampStep;
             if (!spring_)
             {
                 const T loopG = loopAP0 + (loopAPCoeff_ - loopAP0) * a;
-                if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n, loopG);
-                else      runFdn<kMaxLines>(lateL, lateR, gap + last - n, loopG);
+                const T extra = cachedParams_.shimmer > T(0) ? shimmerStep(lastLateMono_) * cachedParams_.shimmer * kShimmerFeed : T(0);
+                if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
+                else      runFdn<kMaxLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
+                lastLateMono_ = (lateL + lateR) * T(0.5);
             }
 
-            const auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n],
-                                              early0 + (earlyCur_ - early0) * a,
-                                              late0 + (lateCur_ - late0) * a,
-                                              width0 + (widthCur_ - width0) * a,
-                                              toneHP0 + (toneHPMix_ - toneHP0) * a,
-                                              toneLP0 + (toneLPMix_ - toneLP0) * a,
-                                              outAP0 + (outAPCoeff_ - outAP0) * a);
+            const T earlyNow = early0 + (earlyCur_ - early0) * a;
+            auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n],
+                                        freezing ? earlyNow * inGain : earlyNow,
+                                        late0 + (lateCur_ - late0) * a,
+                                        width0 + (widthCur_ - width0) * a,
+                                        toneHP0 + (toneHPMix_ - toneHP0) * a,
+                                        toneLP0 + (toneLPMix_ - toneLP0) * a,
+                                        outAP0 + (outAPCoeff_ - outAP0) * a);
+            if (tail_.isActive())
+            {
+                const T g = tail_.next(std::max(std::abs(inL[n]), std::abs(inR[n])));
+                yl *= g;
+                yr *= g;
+            }
             outL[n] = yl;
             outR[n] = yr;
+        }
+    }
+
+    /**
+     * @brief One sample of the octave-up shimmer: two read heads, half a
+     *        window apart, sweep the recent input at twice its speed, each
+     *        under a raised-cosine window; a head draws its next window length
+     *        (30 to 60 ms) as it wraps.
+     */
+    T shimmerStep(T input) noexcept
+    {
+        shimBuf_[static_cast<std::size_t>(shimW_)] = input;
+        const double sr = spec_.sampleRate;
+        T sum = T(0), weight = T(0);
+        for (int h = 0; h < 2; ++h)
+        {
+            const auto hh = static_cast<std::size_t>(h);
+            const double ph = shimPhase_[hh];
+            const double len = shimLen_[hh] * sr;
+            // The delay falls by one sample per sample: the head reads at
+            // twice the speed of the writing, an octave up.
+            const double delay = 1.0 + len * (1.0 - ph);
+            const int di = static_cast<int>(delay);
+            const T f = static_cast<T>(delay - di);
+            const T s0 = shimBuf_[static_cast<std::size_t>((shimW_ - di) & shimMask_)];
+            const T s1 = shimBuf_[static_cast<std::size_t>((shimW_ - di - 1) & shimMask_)];
+            const T w = static_cast<T>(0.5 - 0.5 * std::cos(6.283185307179586 * ph));
+            sum += w * (s0 + f * (s1 - s0));
+            weight += w;
+            shimPhase_[hh] += 1.0 / std::max(1.0, len);
+            if (shimPhase_[hh] >= 1.0)
+            {
+                shimPhase_[hh] -= 1.0;
+                shimLen_[hh] = drawShimmerLength();
+            }
+        }
+        shimW_ = (shimW_ + 1) & shimMask_;
+        // The windows of heads of different lengths do not sum to one: the
+        // sum is normalized, and attenuated where both heads are near a wrap.
+        return weight > T(0.25) ? sum / weight : sum * T(4);
+    }
+
+    double drawShimmerLength() noexcept
+    {
+        shimRng_ ^= shimRng_ << 13;
+        shimRng_ ^= shimRng_ >> 17;
+        shimRng_ ^= shimRng_ << 5;
+        const double u = static_cast<double>(shimRng_) / 4294967296.0;
+        return 0.001 * (kShimmerMinMs + (kShimmerMaxMs - kShimmerMinMs) * u);
+    }
+
+    /** @brief The absorption and decay bands in use: the designed ones moved toward unity by the freeze. */
+    void applyFreezeCoeffs() noexcept
+    {
+        const T f = freezeNow_, k = T(1) - f;
+        for (int i = 0; i < kMaxLines; ++i)
+        {
+            const auto l = static_cast<std::size_t>(i);
+            jotB0_[l] = jotBase_[0][l] + (T(1) - jotBase_[0][l]) * f;
+            jotB1_[l] = jotBase_[1][l] * k;
+            jotA1_[l] = jotBase_[2][l] * k;
+            bassB0_[l] = bassBase_[0][l] + (T(1) - bassBase_[0][l]) * f;
+            bassB1_[l] = bassBase_[1][l] * k;
+            bassA1_[l] = bassBase_[2][l] * k;
+            for (int q = 0; q < dqCount_; ++q)
+            {
+                const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+                dqB0_[b][l] = dqBase_[0][b][l] + (T(1) - dqBase_[0][b][l]) * f;
+                dqB1_[b][l] = dqBase_[1][b][l] * k;
+                dqB2_[b][l] = dqBase_[2][b][l] * k;
+                dqA1_[b][l] = dqBase_[3][b][l] * k;
+                dqA2_[b][l] = dqBase_[4][b][l] * k;
+            }
         }
     }
 
@@ -2110,10 +2762,11 @@ protected:
             // kCoherenceHz), which reproduces the interaural coherence of a
             // measured concert hall seat: about 0.97 at 125 Hz, 0.65 at
             // 250 Hz, under 0.1 from 500 Hz up.
-            const T mid  = (lateL + lateR) * T(0.5);
+            T mid  = (lateL + lateR) * T(0.5);
             T side = (lateL - lateR) * T(0.5);
             const double hp = coherenceFilter_.processSampleCore(static_cast<double>(side), 0);
             side = static_cast<T>(hp * static_cast<double>(width));
+            if (cachedParams_.powerKept) mid *= std::sqrt(std::max(T(0), T(2) - width * width));
             lateL = mid + side;
             lateR = mid - side;
         }
@@ -2122,6 +2775,13 @@ protected:
                      earlyR * earlyLevel + lateR };
         for (int c = 0; c < 2; ++c)
             out[c] = subsonicFilter_.processSample(out[c], c);
+        if (distMix_ > T(0))
+            for (int c = 0; c < 2; ++c)
+            {
+                T& z = distLp_[static_cast<std::size_t>(c)];
+                z += distCoeff_ * (out[c] - z);
+                out[c] += distMix_ * (z - out[c]);
+            }
         // Tone EQ, crossfaded in and out when it is switched (a settled
         // filter's share is exactly 1 or 0).
         if (toneHPActive_)
@@ -2166,13 +2826,19 @@ protected:
         const double sr = spec_.sampleRate;
         const double sz = static_cast<double>(sizeFactor());
         const auto ms = [sr](double v) { return std::max(1, static_cast<int>(v * sr / 1000.0)); };
+        const bool geometric = layout_.load(std::memory_order_relaxed) == 1;
 
         for (int i = 0; i < kMaxLines; ++i)
         {
             // Eco picks every other base delay, so its 16 lines still span
             // the full range (even mode density).
             const int src = eco_ ? std::min(i * (kMaxLines / kEcoLines) + 1, kMaxLines - 1) : i;
-            lenTarget_[i] = nearestPrime(ms(kBaseDelaysMs_[src] * sz));
+            // Geometric layout: the same range, even in log.
+            const double baseMs = geometric
+                ? kBaseDelaysMs_[0] * std::pow(kBaseDelaysMs_[kMaxLines - 1] / kBaseDelaysMs_[0],
+                                               static_cast<double>(src) / (kMaxLines - 1))
+                : kBaseDelaysMs_[src];
+            lenTarget_[i] = nearestPrime(ms(baseMs * sz));
             // The in-loop allpasses scale with the room like the lines, so
             // their group-delay ripple stays a small, size-independent share
             // of each loop: no frequency lingers longer in a small room.
@@ -2202,8 +2868,11 @@ protected:
         const double diff = static_cast<double>(diffusion_.load(std::memory_order_relaxed));
         // Targets: the running coefficients glide to them chunk by chunk
         // (processChunk), and snap with reset().
+        const double dist = static_cast<double>(distance_.load(std::memory_order_relaxed));
         for (int st = 0; st < kInStages; ++st)
-            inAPCoeffTarget_[static_cast<std::size_t>(st)] = static_cast<T>(kInDiffCoeffs_[st] * diff);
+            inAPCoeffTarget_[static_cast<std::size_t>(st)] = dist > 0.0
+                ? static_cast<T>(std::min(0.8, kInDiffCoeffs_[st] * diff + 0.25 * dist * dist))
+                : static_cast<T>(kInDiffCoeffs_[st] * diff);
         loopAPCoeffTarget_ = static_cast<T>(0.075 + 0.175 * diff);
         outAPCoeffTarget_ = static_cast<T>(0.6 * diff);
 
@@ -2302,6 +2971,160 @@ protected:
             }
         }
         meanLoopSec_ = loopSum / std::max(1, nLines_) / sr;
+        for (int i = 0; i < kMaxLines; ++i)
+        {
+            const auto l = static_cast<std::size_t>(i);
+            jotBase_[0][l] = jotB0_[l]; jotBase_[1][l] = jotB1_[l]; jotBase_[2][l] = jotA1_[l];
+            bassBase_[0][l] = bassB0_[l]; bassBase_[1][l] = bassB1_[l]; bassBase_[2][l] = bassA1_[l];
+        }
+        designDecayBands(decay, t60H, t60B, Kh, Kb);
+        applyFreezeCoeffs();
+    }
+
+    /** |H(e^jw)| of ((1 + a) + (a - 1) z^-1) / ((1 + b) + (b - 1) z^-1). */
+    [[nodiscard]] static double shelfGain(double a, double b, double w) noexcept
+    {
+        const double c = std::cos(w), sn = std::sin(w);
+        const double nr = (1.0 + a) + (a - 1.0) * c, ni = -(a - 1.0) * sn;
+        const double dr = (1.0 + b) + (b - 1.0) * c, di = -(b - 1.0) * sn;
+        return std::sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+    }
+
+    /** |H(e^jw)| of a biquad. */
+    [[nodiscard]] static double biquadGain(const BiquadCoeffs& q, double w) noexcept
+    {
+        const double c1 = std::cos(w), s1 = std::sin(w), c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
+        const double nr = q.b0 + q.b1 * c1 + q.b2 * c2, ni = -(q.b1 * s1 + q.b2 * s2);
+        const double dr = 1.0 + q.a1 * c1 + q.a2 * c2, di = -(q.a1 * s1 + q.a2 * s2);
+        return std::sqrt((nr * nr + ni * ni) / std::max(1e-300, dr * dr + di * di));
+    }
+
+    /**
+     * @brief Designs the decay bands per line (audio thread at the drain, or
+     *        prepare()): each band's gain from the line's own loop gain there,
+     *        and the boosts scaled down together where they would lift the
+     *        loop over kMaxDecayLoopGain.
+     */
+    void designDecayBands(double decay, double t60H, double t60B, double Kh, double Kb) noexcept
+    {
+        const double sr = spec_.sampleRate;
+        dqCount_ = 0;
+        std::array<DecayBand, kDecayBands> bands {};
+        for (int k = 0; k < kDecayBands; ++k)
+        {
+            const DecayBand b = getDecayBand(k);
+            if (b.shape == DecayShape::Off || std::abs(static_cast<double>(b.multiplier) - 1.0) < 1e-3) continue;
+            bands[static_cast<std::size_t>(dqCount_)] = b;
+            dqList_[static_cast<std::size_t>(dqCount_++)] = k;
+        }
+        if (dqCount_ == 0) return;
+
+        constexpr int kGrid = 32;
+        std::array<double, kGrid> grid {};
+        for (int g = 0; g < kGrid; ++g)
+            grid[static_cast<std::size_t>(g)] = 2.0 * 3.14159265358979323846
+                * 20.0 * std::pow(0.45 * sr / 20.0, static_cast<double>(g) / (kGrid - 1)) / sr;
+        for (int i = 0; i < kMaxLines; ++i)
+        {
+            const double M = spring_
+                ? static_cast<double>(lenTarget_[i]) + springStages_ * springK_
+                      * (1.0 - static_cast<double>(springA_)) / (1.0 + static_cast<double>(springA_))
+                : static_cast<double>(lenTarget_[i] + loopAPLen_[i]);
+            const double gM = std::pow(0.001, M / (decay * sr));
+            const double gH = std::min(std::pow(0.001, M / (t60H * sr)), gM);
+            const double gB = std::min(std::pow(0.001, M / (t60B * sr)), 0.9995);
+            const double rh = std::sqrt(gM / gH), rb = std::sqrt(gB / gM);
+            const auto loopGain = [&](double w) { return gH * shelfGain(Kh * rh, Kh / rh, w) * shelfGain(Kb * rb, Kb / rb, w); };
+
+            std::array<double, kDecayBands> gains {};
+            for (int k = 0; k < dqCount_; ++k)
+            {
+                const DecayBand& b = bands[static_cast<std::size_t>(k)];
+                const double ref = b.shape == DecayShape::LowShelf ? gB
+                                 : b.shape == DecayShape::HighShelf ? gH
+                                 : loopGain(2.0 * 3.14159265358979323846 * static_cast<double>(b.frequency) / sr);
+                gains[static_cast<std::size_t>(k)] = 20.0 * std::log10(std::clamp(ref, 1e-6, 0.999999))
+                                                   * (1.0 / static_cast<double>(b.multiplier) - 1.0);
+            }
+            std::array<BiquadCoeffs, kDecayBands> coeffs {};
+            const auto design = [&](double boostScale) {
+                for (int k = 0; k < dqCount_; ++k)
+                {
+                    const DecayBand& b = bands[static_cast<std::size_t>(k)];
+                    double g = gains[static_cast<std::size_t>(k)];
+                    if (g > 0.0) g *= boostScale;
+                    const double f = std::min(static_cast<double>(b.frequency), 0.45 * sr);
+                    coeffs[static_cast<std::size_t>(k)] =
+                          b.shape == DecayShape::LowShelf ? BiquadCoeffs::makeLowShelf(sr, f, g)
+                        : b.shape == DecayShape::HighShelf ? BiquadCoeffs::makeHighShelf(sr, f, g)
+                        : BiquadCoeffs::makePeak(sr, f, static_cast<double>(b.q), g);
+                }
+            };
+            const auto peakLoop = [&]() {
+                double top = 0.0;
+                for (double w : grid)
+                {
+                    double v = loopGain(w);
+                    for (int k = 0; k < dqCount_; ++k) v *= biquadGain(coeffs[static_cast<std::size_t>(k)], w);
+                    top = std::max(top, v);
+                }
+                return top;
+            };
+            design(1.0);
+            if (peakLoop() > kMaxDecayLoopGain)
+            {
+                double lo = 0.0, hi = 1.0;
+                for (int it = 0; it < 12; ++it)
+                {
+                    const double mid = 0.5 * (lo + hi);
+                    design(mid);
+                    (peakLoop() > kMaxDecayLoopGain ? hi : lo) = mid;
+                }
+                design(lo);
+            }
+            for (int k = 0; k < dqCount_; ++k)
+            {
+                const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(k)]);
+                const auto l = static_cast<std::size_t>(i);
+                const BiquadCoeffs& c = coeffs[static_cast<std::size_t>(k)];
+                dqBase_[0][b][l] = static_cast<T>(c.b0);
+                dqBase_[1][b][l] = static_cast<T>(c.b1);
+                dqBase_[2][b][l] = static_cast<T>(c.b2);
+                dqBase_[3][b][l] = static_cast<T>(c.a1);
+                dqBase_[4][b][l] = static_cast<T>(c.a2);
+            }
+        }
+    }
+
+    /** @brief The pre-delay in ms: the note value's time at the tempo, or the one set. */
+    [[nodiscard]] double effectivePreDelayMs() const noexcept
+    {
+        const int note = preNote_.load(std::memory_order_relaxed);
+        if (note == 0) return static_cast<double>(preDelayMs_.load(std::memory_order_relaxed));
+        return std::min(noteMs(note, preFeel_.load(std::memory_order_relaxed)), kMaxPreDelayMs);
+    }
+
+    void refreshPreDelay() noexcept
+    {
+        if (spec_.sampleRate > 0)
+            preDelaySamples_.store(msToSamples(static_cast<T>(effectivePreDelayMs())), std::memory_order_relaxed);
+    }
+
+    void refreshGateHold() noexcept
+    {
+        const int note = gateNote_.load(std::memory_order_relaxed);
+        const double ms = note == 0 ? static_cast<double>(gateHoldMs_.load(std::memory_order_relaxed))
+                                    : std::min(noteMs(note, gateFeel_.load(std::memory_order_relaxed)), 4000.0);
+        tail_.setGateHold(static_cast<T>(ms));
+    }
+
+    /** @brief A note value's time at the tempo, in ms. */
+    [[nodiscard]] double noteMs(int note, int feel) const noexcept
+    {
+        static constexpr double kBeats[7] = { 0.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.125 };
+        const double beat = 60000.0 / static_cast<double>(tempo_.load(std::memory_order_relaxed));
+        const double factor = feel == 1 ? 1.5 : feel == 2 ? 2.0 / 3.0 : 1.0;
+        return beat * kBeats[static_cast<std::size_t>(std::clamp(note, 0, 6))] * factor;
     }
 
     /**

@@ -4553,3 +4553,256 @@ DSPARK_TEST(Equalizer_band_placement_state_and_curves)
     eq.getMagnitudeForFrequencyArray(hz, level, 1);
     EXPECT_NEAR(20.0 * std::log10(level[0]), 5.0, 0.05);
 }
+
+// ============================================================================
+// Equalizer: the natural-phase mode
+// ============================================================================
+
+namespace {
+
+// The response of an equalizer at one frequency, with its latency taken out.
+std::complex<double> eqPlayedAt(const std::vector<double>& h, double hz, double fs, int latency)
+{
+    const double w = 2.0 * 3.14159265358979323846 * hz / fs;
+    std::complex<double> sum(0.0, 0.0);
+    for (size_t n = 0; n < h.size(); ++n)
+        sum += h[n] * std::polar(1.0, -w * (static_cast<double>(n) - latency));
+    return sum;
+}
+
+// The response of an analog prototype at one frequency.
+std::complex<double> eqAnalogAt(const AnalogCascade& proto, double hz)
+{
+    const double w = 2.0 * 3.14159265358979323846 * hz;
+    std::complex<double> h(1.0, 0.0);
+    for (int i = 0; i < proto.count; ++i)
+    {
+        const AnalogSection& s = proto.sections[static_cast<size_t>(i)];
+        h *= std::complex<double>(s.b0 - s.b2 * w * w, s.b1 * w) / std::complex<double>(s.a0 - s.a2 * w * w, s.a1 * w);
+    }
+    return h;
+}
+
+struct EqDistance { double level = 0.0, phase = 0.0; };
+
+// Worst distance in level (dB) and in phase (degrees), from 200 Hz to 20 kHz, between one band as an
+// equalizer plays it in a mode and its analog prototype. Nothing is compared below -60 dB.
+EqDistance eqDistance(const AnalogCascade& proto, const AnalogEq::BandConfig& cfg, AnalogEq::FilterMode mode,
+                      double fs = 48000.0)
+{
+    AnalogEq eq;
+    eq.setAnalogResponse(true);
+    eq.setFilterMode(mode);
+    eq.setBand(0, cfg);
+    eq.prepare({ fs, 256, 1 });
+    const std::vector<double> h = eqImpulse(eq);
+    const int latency = eq.getLatency();
+    EqDistance worst;
+    for (double hz = 200.0; hz <= 20000.0; hz *= 1.03)
+    {
+        const std::complex<double> want = eqAnalogAt(proto, hz), got = eqPlayedAt(h, hz, fs, latency);
+        if (std::abs(want) < 1e-3) continue;
+        worst.level = std::max(worst.level, std::abs(20.0 * std::log10(std::abs(got) / std::abs(want))));
+        worst.phase = std::max(worst.phase, std::abs(std::arg(got / want)) * 180.0 / 3.14159265358979323846);
+    }
+    return worst;
+}
+
+} // namespace
+
+// New mode: with no band at work the natural-phase mode is the signal, 32
+// samples late, to the bit, in double and in float.
+DSPARK_TEST(Equalizer_natural_phase_at_rest_is_the_signal_late_to_the_bit)
+{
+    using Type = AnalogEq::BandType;
+    AnalogEq eq;
+    eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 1.0));
+    eq.setBand(1, eqBand(Type::HighShelf, 8000.0, 0.0, 0.7071));
+    eq.prepare({ 48000.0, 256, 2 });
+    EXPECT_EQ(eq.getLatency(), 32);
+
+    const EqStereo x = eqStereoNoise(8192, 11u);
+    EqStereo y = x;
+    eqRunStereo(eq, y, 200);
+    bool late = true, quiet = true;
+    for (size_t i = 0; i + 32 < x.l.size(); ++i)
+        late = late && y.l[i + 32] == x.l[i] && y.r[i + 32] == x.r[i];
+    for (size_t i = 0; i < 32; ++i) quiet = quiet && y.l[i] == 0.0 && y.r[i] == 0.0;
+    EXPECT_TRUE(late);
+    EXPECT_TRUE(quiet);
+
+    eq.setFilterMode(AnalogEq::FilterMode::MinimumPhase);
+    EXPECT_EQ(eq.getLatency(), 0);
+
+    Equalizer<float> single;
+    single.setFilterMode(Equalizer<float>::FilterMode::NaturalPhase);
+    single.setBand(0, 3000.0f, 0.0f, 1.0f);
+    single.prepare({ 44100.0, 128, 1 });
+    std::vector<float> in(4096), out;
+    uint32_t seed = 7u;
+    for (auto& v : in) { seed = seed * 1664525u + 1013904223u; v = static_cast<float>(seed >> 8) / 8388608.0f - 1.0f; }
+    out = in;
+    for (int off = 0; off < 4096; off += 100)
+    {
+        float* ch[1] = { out.data() + off };
+        single.processBlock(AudioBufferView<float>(ch, 1, std::min(100, 4096 - off)));
+    }
+    bool same = true;
+    for (size_t i = 0; i + 32 < in.size(); ++i) same = same && out[i + 32] == in[i];
+    EXPECT_TRUE(same);
+    EXPECT_EQ(single.getLatency(), 32);
+}
+
+// The mode keeps the guarantees of the others: the output does not depend on
+// how the host cuts the stream, and a change of a band is faded in (a 15 kHz
+// tone under a shelf that jumps 6 dB leaves nothing 60 dB under it at 3 kHz).
+DSPARK_TEST(Equalizer_natural_phase_does_not_depend_on_the_blocks_and_fades_a_change)
+{
+    using Type = AnalogEq::BandType;
+    auto make = [](AnalogEq& eq) {
+        eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+        eq.setBand(0, eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071));
+        eq.setBand(1, eqPlaced(eqBand(Type::Peak, 14000.0, -6.0, 2.0), AnalogEq::Placement::Mid));
+        eq.setBand(2, eqBand(Type::LowPass, 17000.0, 0.0, 0.7071, 18.0));
+        eq.prepare({ 48000.0, 512, 2 });
+    };
+    const EqStereo x = eqStereoNoise(24000, 5u);
+    AnalogEq first;
+    make(first);
+    EqStereo reference = x;
+    eqRunStereo(first, reference, 512);
+    for (int block : { 37, 64, 480 })
+    {
+        AnalogEq eq;
+        make(eq);
+        EqStereo y = x;
+        eqRunStereo(eq, y, block);
+        EXPECT_LT(eqWorstDiff(y.l, reference.l), 1e-12);
+        EXPECT_LT(eqWorstDiff(y.r, reference.r), 1e-12);
+    }
+
+    AnalogEq eq;
+    eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    eq.setBand(0, eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071));
+    eq.prepare({ 48000.0, 256, 1 });
+    const int n = 48000;
+    std::vector<double> tone(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) tone[static_cast<size_t>(i)] = 0.25 * std::sin(2.0 * 3.14159265358979323846 * 15000.0 * i / 48000.0);
+    std::vector<double> head(tone.begin(), tone.begin() + 24064), tail(tone.begin() + 24064, tone.end());
+    eqRun(eq, head);
+    eq.setBand(0, eqBand(Type::HighShelf, 10000.0, 3.0, 0.7071));
+    eqRun(eq, tail);
+    std::vector<double> y = head;
+    y.insert(y.end(), tail.begin(), tail.end());
+    // What the change leaves at 3 kHz, over 8192 samples around it (Hann), against the tone.
+    double re = 0.0, im = 0.0, carrierRe = 0.0, carrierIm = 0.0;
+    for (int i = 0; i < 8192; ++i)
+    {
+        const double window = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * i / 8192.0);
+        const double v = y[static_cast<size_t>(24064 - 4096 + i)] * window;
+        const double a = 2.0 * 3.14159265358979323846 * 3000.0 * i / 48000.0, b = 2.0 * 3.14159265358979323846 * 15000.0 * i / 48000.0;
+        re += v * std::cos(a); im += v * std::sin(a);
+        carrierRe += v * std::cos(b); carrierIm += v * std::sin(b);
+    }
+    const double splash = 10.0 * std::log10((re * re + im * im) / (carrierRe * carrierRe + carrierIm * carrierIm));
+    EXPECT_LT(splash, -60.0);
+}
+
+// With placed bands the correction is a matrix between the two channels: a
+// band on the left leaves the right channel alone (the signal, late, to the
+// bit) and gives the left what a one-channel equalizer gives; a band on the
+// middle gives the middle that, and leaves the sides alone.
+DSPARK_TEST(Equalizer_natural_phase_with_placed_bands_is_one_matrix)
+{
+    using Type = AnalogEq::BandType;
+    using Place = AnalogEq::Placement;
+    const AnalogEq::BandConfig band = eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071);
+    const EqStereo x = eqStereoNoise(8192, 23u);
+    const size_t n = x.l.size();
+
+    AnalogEq one;
+    one.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    one.setBand(0, band);
+    one.prepare({ 48000.0, 256, 1 });
+    std::vector<double> alone = x.l;
+    eqRun(one, alone);
+
+    AnalogEq left;
+    left.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    left.setBand(0, eqPlaced(band, Place::Left));
+    left.prepare({ 48000.0, 256, 2 });
+    EqStereo y = x;
+    eqRunStereo(left, y);
+    EXPECT_LT(eqWorstDiff(y.l, alone), 1e-12);
+    bool late = true;
+    for (size_t i = 0; i + 32 < n; ++i) late = late && y.r[i + 32] == x.r[i];
+    EXPECT_TRUE(late);
+
+    std::vector<double> middle(n), sides(n);
+    for (size_t i = 0; i < n; ++i) { middle[i] = 0.5 * (x.l[i] + x.r[i]); sides[i] = 0.5 * (x.l[i] - x.r[i]); }
+    one.reset();
+    std::vector<double> middleAlone = middle;
+    eqRun(one, middleAlone);
+
+    AnalogEq mid;
+    mid.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    mid.setBand(0, eqPlaced(band, Place::Mid));
+    mid.prepare({ 48000.0, 256, 2 });
+    EqStereo z = x;
+    eqRunStereo(mid, z);
+    double worstMiddle = 0.0, worstSides = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        worstMiddle = std::max(worstMiddle, std::abs(0.5 * (z.l[i] + z.r[i]) - middleAlone[i]));
+        if (i >= 32) worstSides = std::max(worstSides, std::abs(0.5 * (z.l[i] - z.r[i]) - sides[i - 32]));
+    }
+    EXPECT_LT(worstMiddle, 1e-9);
+    EXPECT_LT(worstSides, 1e-9);
+}
+
+// New mode: a minimum-phase filter that follows the magnitude of an analog
+// one does not have its phase near Nyquist. The natural-phase mode brings the
+// bands the rest of the way: the phase of the analog curve up to 20 kHz, and
+// what was left of the level.
+DSPARK_TEST(Equalizer_natural_phase_follows_the_phase_of_the_analog_curve)
+{
+    using Type = AnalogEq::BandType;
+    using Mode = AnalogEq::FilterMode;
+    struct Case { AnalogEq::BandConfig cfg; AnalogCascade proto; };
+    const Case cases[] = {
+        { eqBand(Type::HighShelf, 12000.0, 12.0, 0.7071067811865476), eqOne(AnalogSection::highShelf(12000.0, 12.0)) },
+        { eqBand(Type::Peak, 12000.0, 12.0, 2.0), eqOne(AnalogSection::peak(12000.0, 2.0, 12.0)) },
+        { eqBand(Type::Peak, 15000.0, -18.0, 1.0), eqOne(AnalogSection::peak(15000.0, 1.0, -18.0)) },
+        { eqBand(Type::LowPass, 10000.0, 0.0, 0.7071067811865476, 24.0), FilterDesign::highCut(10000.0, 24.0) },
+    };
+    for (const Case& c : cases)
+    {
+        const EqDistance minimum = eqDistance(c.proto, c.cfg, Mode::MinimumPhase);
+        const EqDistance natural = eqDistance(c.proto, c.cfg, Mode::NaturalPhase);
+        EXPECT_GT(minimum.phase, 15.0);                 // 17 to 178 degrees: what the mode is for
+        EXPECT_LT(natural.phase, 1.5);                  // 0.08 to 1.05
+        EXPECT_LT(natural.phase, 0.1 * minimum.phase);
+        EXPECT_LT(natural.level, 0.25);
+    }
+
+    // At 44.1 kHz there is less room between 20 kHz and Nyquist for the correction to fade out, and a
+    // steep cut near the top keeps a few degrees.
+    {
+        const EqDistance bell = eqDistance(eqOne(AnalogSection::peak(15000.0, 1.0, -18.0)),
+                                           eqBand(Type::Peak, 15000.0, -18.0, 1.0), Mode::NaturalPhase, 44100.0);
+        EXPECT_LT(bell.phase, 2.0);                     // minimum phase: 38
+        EXPECT_LT(bell.level, 0.1);
+        const EqDistance cut = eqDistance(FilterDesign::highCut(10000.0, 24.0),
+                                          eqBand(Type::LowPass, 10000.0, 0.0, 0.7071067811865476, 24.0),
+                                          Mode::NaturalPhase, 44100.0);
+        EXPECT_LT(cut.phase, 8.0);                      // minimum phase: 179
+        EXPECT_LT(cut.level, 1.0);
+    }
+
+    // A band in the middle of the spectrum needs no correction and takes no harm from one.
+    const AnalogEq::BandConfig low = eqBand(Type::Peak, 1000.0, 12.0, 1.0);
+    const EqDistance natural = eqDistance(eqOne(AnalogSection::peak(1000.0, 1.0, 12.0)), low, Mode::NaturalPhase);
+    EXPECT_LT(natural.phase, 0.3);
+    EXPECT_LT(natural.level, 0.05);
+}

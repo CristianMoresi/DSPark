@@ -111,7 +111,7 @@
  * delay), so hosts get correct PDC.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
- * Core/FilterDesign.h, Core/NormalizedLadder.h, Core/SimdOps.h,
+ * Core/FilterDesign.h, Core/NormalizedLadder.h, Core/TapeTransport.h, Core/SimdOps.h,
  * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
  * Core/StateBlob.h.
  */
@@ -127,6 +127,7 @@
 #include "../Core/Oversampling.h"
 #include "../Core/SimdOps.h"
 #include "../Core/StateBlob.h"
+#include "../Core/TapeTransport.h"
 
 #include <algorithm>
 #include <array>
@@ -362,16 +363,10 @@ public:
         driftA_ = std::exp(-2.0 * std::numbers::pi * 0.10 * dt);
         scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dt);
         scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dt);
-        tUp_ = std::exp(-dt / kSpeedUpSeconds);
-        tDown_ = std::exp(-dt / kSlowDownSeconds);
-        speedRestore_ = dt / kDelayRestoreSeconds;
-        speedNoiseA_ = std::exp(-2.0 * std::numbers::pi * kSpeedNoiseHz * dt);
-        {
-            // RMS of a uniform noise in [-1, 1) through two such one-poles.
-            const double a = speedNoiseA_;
-            const double gain = (1.0 - a) * (1.0 + a * a) / ((1.0 + a) * (1.0 + a) * (1.0 + a));
-            speedNoiseNorm_ = 1.0 / std::sqrt(std::max(1e-30, gain / 3.0));
-        }
+        // The speed transport: the head distance is the delay centre at the
+        // nominal speed.
+        tapeTransport_.prepare(sampleRate_, static_cast<double>(delayCenter_), speedIps_ > 0.0 ? speedIps_ : 15.0);
+        tapeTransport_.setLimits(3.0, static_cast<double>(delayMask_ - 4));
         asymMeanA_ = std::exp(-2.0 * std::numbers::pi * 10.0 * dt / static_cast<double>(osFactor_));
         trMeanA_ = std::exp(-2.0 * std::numbers::pi * 5.0 * dt);
 
@@ -431,11 +426,8 @@ public:
         for (auto& c : headContour_) for (auto& s : c) s.clear();
         for (auto& n : recNet_) for (auto& s : n) s.reset();
         for (auto& n : playNet_) for (auto& s : n) s.reset();
-        tSpeed_ = 1.0;
-        tDelay_ = static_cast<double>(delayCenter_);
+        tapeTransport_.reset();
         lastMod_ = 0.0;
-        capPhase_ = reelPhase_ = 0.0;
-        speedNoise1_ = speedNoise2_ = 0.0;
         humPhase_ = 0.0;
         aimRamps(true);
         firPos_ = 0;
@@ -884,7 +876,11 @@ private:
         {
             // Into the speed model from where the modulated delay stands; back
             // to the modulated model at its own position.
-            if (speedTransport) { tSpeed_ = 1.0; tDelay_ = static_cast<double>(delayCenter_) + lastMod_; }
+            if (speedTransport)
+            {
+                tapeTransport_.setSpeedNow(speedIps_);
+                tapeTransport_.syncDelay(static_cast<double>(delayCenter_) + lastMod_);
+            }
             speedTransportActive_ = speedTransport;
         }
         const bool circuit = circuitActive_;
@@ -1031,7 +1027,7 @@ private:
             double readPos;
             if (speedTransport)
             {
-                readPos = nextSpeedDelay(wfDepth);
+                readPos = tapeTransport_.next(wfDepth);
             }
             else
             {
@@ -1290,51 +1286,6 @@ private:
         }
         power /= kGrid;
         hissNorm_ = power > 1e-20 ? 1.0 / std::sqrt(power) : 1.0;
-    }
-
-    /**
-     * @brief The delay of the speed transport for the next frame, in samples.
-     *
-     * The speed glides to the nominal of the selected speed with inertia;
-     * its deviation (reel, capstan with its second harmonic, smoothed noise,
-     * scrape) is the reproduce pitch, so the read point advances by
-     * 1 + deviation per sample; the delay is held at the head distance over
-     * the speed by a slow restoring term, and its change per sample is
-     * bounded.
-     */
-    [[nodiscard]] double nextSpeedDelay(double depth) noexcept
-    {
-        tSpeed_ = 1.0 + ((tSpeed_ < 1.0) ? tUp_ : tDown_) * (tSpeed_ - 1.0);
-        if (std::abs(tSpeed_ - 1.0) < 1e-12) tSpeed_ = 1.0;
-        const double ipsNow = speedIps_ * tSpeed_;
-        const double dt = 1.0 / sampleRate_;
-        capPhase_ += kCapstanHzPerIps * ipsNow * dt;
-        if (capPhase_ >= 1.0) capPhase_ -= 1.0;
-        reelPhase_ += kReelHzPerIps * ipsNow * dt;
-        if (reelPhase_ >= 1.0) reelPhase_ -= 1.0;
-
-        rng_ = rng_ * 1664525u + 1013904223u;
-        const double n = static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0;
-        speedNoise1_ = speedNoiseA_ * speedNoise1_ + (1.0 - speedNoiseA_) * n;
-        speedNoise2_ = speedNoiseA_ * speedNoise2_ + (1.0 - speedNoiseA_) * speedNoise1_;
-        scrapeLp1_ = scrapeA1_ * scrapeLp1_ + (1.0 - scrapeA1_) * n;
-        scrapeLp2_ = scrapeA2_ * scrapeLp2_ + (1.0 - scrapeA2_) * n;
-
-        double deviation = 0.0;
-        if (depth > 0.0)
-        {
-            const double twoPi = 2.0 * std::numbers::pi;
-            const double cap = twoPi * capPhase_;
-            deviation = depth * std::sqrt(15.0 / speedIps_)
-                * (kReelDeviation * std::sin(twoPi * reelPhase_)
-                 + kCapstanDeviation * (std::sin(cap) + kCapstanSecond * std::sin(2.0 * cap))
-                 + kNoiseDeviation * speedNoiseNorm_ * speedNoise2_
-                 + kScrapeDeviation * (scrapeLp1_ - scrapeLp2_));
-        }
-        const double target = static_cast<double>(delayCenter_) / tSpeed_;
-        const double step = std::clamp(-deviation + speedRestore_ * (target - tDelay_), -kMaxDelayStep, kMaxDelayStep);
-        tDelay_ = std::clamp(tDelay_ + step, 3.0, static_cast<double>(delayMask_ - 4));
-        return tDelay_;
     }
 
     // -- Building blocks -----------------------------------------------------------
@@ -1625,7 +1576,8 @@ private:
                          : (speed == Speed::IPS_15) ? 15.0 : 30.0;
         // A new speed under the speed transport: the tape keeps moving at the
         // old one and glides to the new one with inertia.
-        if (speedTransportActive_ && speedIps_ > 0.0 && ips != speedIps_) tSpeed_ *= speedIps_ / ips;
+        if (speedTransportActive_ && speedIps_ > 0.0) tapeTransport_.setSpeed(ips);
+        else tapeTransport_.setSpeedNow(ips);
         speedIps_ = ips;
         const double v = ips * 0.0254;            // m/s
         // The record head (sync monitoring) has the wider gap and spacing.
@@ -1853,18 +1805,6 @@ private:
     static constexpr double kUniformToUnitRms = 1.7320508075688772;  ///< sqrt(3)
     static constexpr int kContourSections = 4;
     static constexpr double kContourDb = 3.0;              ///< Peak of the contour's bump at full head bump.
-    static constexpr double kSpeedUpSeconds = 0.45;        ///< Inertia of the speed transport when speeding up.
-    static constexpr double kSlowDownSeconds = 0.7;        ///< ... and when slowing down.
-    static constexpr double kDelayRestoreSeconds = 1.5;    ///< Restoring time of the delay to the head distance.
-    static constexpr double kMaxDelayStep = 0.02;          ///< Largest delay change per sample (pitch within 2 %).
-    static constexpr double kSpeedNoiseHz = 3.0;           ///< Corner of the smoothed speed noise.
-    static constexpr double kCapstanHzPerIps = 1.0 / 3.0;  ///< Capstan rotation: 5 Hz at 15 ips.
-    static constexpr double kReelHzPerIps = 0.04;          ///< Reel rotation: 0.6 Hz at 15 ips.
-    static constexpr double kCapstanSecond = 0.3;          ///< Share of the capstan's second harmonic.
-    static constexpr double kReelDeviation = 0.0012;       ///< Speed deviations at full depth and 15 ips.
-    static constexpr double kCapstanDeviation = 0.0006;
-    static constexpr double kNoiseDeviation = 0.0004;
-    static constexpr double kScrapeDeviation = 0.003;
     static constexpr double kAsymmetryShare = 0.15;        ///< Even term at full asymmetry.
     static constexpr double kTransformerCornerHz = 60.0;
     static constexpr double kTransformerEven = 0.03;       ///< Terms of the transformer's curve.
@@ -1976,9 +1916,8 @@ private:
     // ... and its state (audio thread).
     bool speedTransportActive_ = false, circuitActive_ = false, contourActive_ = false, hissNormDirty_ = true;
     int formApplied_ = -1;
-    double speedIps_ = 0.0, tSpeed_ = 1.0, tDelay_ = 96.0, lastMod_ = 0.0;
-    double tUp_ = 0.0, tDown_ = 0.0, speedRestore_ = 0.0, speedNoiseA_ = 0.0, speedNoiseNorm_ = 1.0;
-    double capPhase_ = 0.0, reelPhase_ = 0.0, speedNoise1_ = 0.0, speedNoise2_ = 0.0;
+    double speedIps_ = 0.0, lastMod_ = 0.0;
+    TapeTransport<T> tapeTransport_;
     double humPhase_ = 0.0, hissNorm_ = 1.0, firNorm_ = 1.0, xtNorm_ = 1.0;
     double asymMeanA_ = 0.0, trMeanA_ = 0.0;
     LinearRamp hiss_, hum_, xt_, tr_, asym_, monitorRamp_ { 1.0, 1.0, 0.0 };

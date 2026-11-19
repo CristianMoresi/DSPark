@@ -50,6 +50,25 @@
  *    wavelengths; it also removes the last even-order bias intermodulation
  *    sidebands near the base-rate Nyquist).
  *
+ * The machine around the tape, all off or at the classic setting by
+ * default (each one is described at its setter):
+ * - setTransport(Transport::Speed): the tape speed as a state with inertia,
+ *   its deviation from the capstan and the reels at rates that follow it,
+ *   and the delay as the head distance over the speed.
+ * - setNoise() puts the hiss on the tape, before the reproduce head and its
+ *   de-emphasis, so it has the colour of the speed and the standard;
+ *   setHum() adds mains hum after the tape; setCrosstalk() leaks each channel
+ *   of a pair into the other, rising with frequency.
+ * - setAsymmetry() adds an even term before the tape; setTransformer() adds
+ *   an output transformer as a parallel branch (low frequencies saturate it).
+ * - setHeadModel(HeadModel::Contour): the reproduce head's low end as a
+ *   chain of resonances; setElectronics(Electronics::Circuit): the record and
+ *   reproduce networks from their analog transfer functions at the internal
+ *   rate; setAlignment(): the reproduce HF and LF trims.
+ * - setFormulation(), setTrackFormat(), setCalibrationLevel() and
+ *   setMonitor(): the tape, the track width, the operating level and the
+ *   monitored head, as on a machine being aligned.
+ *
  * The dry path of the mix control is delay-compensated to getLatency(). The
  * mix ramps at no more than full scale per 20 ms, like the other saturators:
  * the wet stream is aligned to the dry, but at high drive the timbral
@@ -92,8 +111,9 @@
  * delay), so hosts get correct PDC.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
- * Core/SimdOps.h, Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h,
- * Core/DenormalGuard.h, Core/StateBlob.h.
+ * Core/FilterDesign.h, Core/NormalizedLadder.h, Core/SimdOps.h,
+ * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
+ * Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -101,12 +121,15 @@
 #include "../Core/Biquad.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/FilterDesign.h"
 #include "../Core/Hysteresis.h"
+#include "../Core/NormalizedLadder.h"
 #include "../Core/Oversampling.h"
 #include "../Core/SimdOps.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -132,6 +155,78 @@ public:
 
     /** @brief Tape speed. */
     enum class Speed { IPS_7_5, IPS_15, IPS_30 };
+
+    /**
+     * @brief How the transport moves the tape (setTransport()).
+     *
+     * Modulated, the default, reads the tape through a delay moved by a sum
+     * of drift, wow, flutter and scrape. Speed keeps the speed of the tape
+     * as a state: the reproduce pitch is the speed of the moment, whose
+     * deviation is a smoothed noise, the capstan's rotation (with a third of
+     * its second harmonic) and the reel's rotation, at rates that follow the
+     * speed (5 Hz and 0.6 Hz at 15 ips) and deeper at slower speeds (by the
+     * square root of the ratio); the delay is held at the head distance over
+     * the speed, and a change of setSpeed() glides the speed with inertia
+     * (0.45 s to speed up, 0.7 s to slow down) instead of jumping.
+     */
+    enum class Transport { Modulated, Speed };
+
+    /** @brief Mains frequency of the hum (setHum()). */
+    enum class Mains { Hz50, Hz60 };
+
+    /**
+     * @brief Tape formulation (setFormulation()).
+     *
+     * Classic is the default material. HighOutput saturates 3 dB later,
+     * takes 20 % more coercive force from the bias and hisses 1.5 dB less;
+     * Vintage saturates 2 dB earlier with a more reversible loop, takes 20 %
+     * less coercive force and hisses 3 dB more. The bias control keeps its
+     * meaning: 0.5 is the optimum of the material in use.
+     */
+    enum class Formulation { Classic, HighOutput, Vintage };
+
+    /**
+     * @brief Track format (setTrackFormat()): the signal grows with the
+     *        track width and the hiss with its square root, so Half
+     *        (2.0 mm, the default) keeps the hiss as set, Full (6.3 mm)
+     *        lowers it by 5.0 dB and Quarter (1.0 mm) raises it by 3.0 dB.
+     */
+    enum class TrackFormat { Half, Full, Quarter };
+
+    /**
+     * @brief What the output monitors (setMonitor()). Repro, the default, is
+     *        the reproduce head; Sync reads through the record head, whose
+     *        wider gap (6 um against 3) and spacing lose more of the top end;
+     *        Input is the input itself, delayed like the tape path. Changes
+     *        fade over 20 ms.
+     */
+    enum class Monitor { Repro, Sync, Input };
+
+    /**
+     * @brief The reproduce head's low end (setHeadModel()). Bump, the
+     *        default, is the single head-bump resonance; Contour is a chain
+     *        of four resonances, the bump and three ripples above it at 1.45,
+     *        1.95 and 2.5 times its frequency with alternating signs and
+     *        falling size, each designed on its own analog prototype (in
+     *        place at any rate).
+     */
+    enum class HeadModel { Bump, Contour };
+
+    /**
+     * @brief Record and reproduce electronics (setElectronics()).
+     *
+     * Ideal, the default, runs the record emphasis at the session rate and
+     * its inverse after the tape. Circuit runs both networks from their
+     * analog transfer functions at the internal rate, around the tape, as
+     * normalized ladders: the record network (the emphasis and a
+     * second-order record amplifier limit at 45 kHz) and the reproduce
+     * network (the de-emphasis with the trims of setAlignment() and a
+     * first-order amplifier pole at 50 kHz; with the 24 Hz output coupling, a
+     * fifth-order reproduce chain). The round trip then carries the
+     * amplifiers' gentle top-end roll-off. The networks it brings in start
+     * from rest: a setup choice.
+     */
+    enum class Electronics { Ideal, Circuit };
 
     // -- Lifecycle ---------------------------------------------------------------
 
@@ -189,6 +284,34 @@ public:
         playLF_.assign(static_cast<size_t>(numChannels_), {});
         headBump_.assign(static_cast<size_t>(numChannels_), {});
         overBiasLp_.assign(static_cast<size_t>(numChannels_), 0.0);
+        const size_t channels = static_cast<size_t>(numChannels_);
+        hissHF_.assign(channels, {});
+        hissLF_.assign(channels, {});
+        xtHp_.assign(channels, {});
+        trPre_.assign(channels, {});
+        trPost_.assign(channels, {});
+        trMean_.assign(channels, 0.0);
+        asymMean_.assign(channels, 0.0);
+        wet_.assign(channels, 0.0);
+        headContour_.assign(channels, {});
+        recNet_.assign(channels, {});
+        playNet_.assign(channels, {});
+        {
+            // Crosstalk: a first-order high-pass at 10 kHz (its corner kept
+            // in place), scaled to unity at 1 kHz. Transformer branch: a
+            // one-pole low-pass at 60 Hz before the curve (flux follows
+            // voltage over frequency) and its inverse, capped at 4 kHz, after.
+            const double wc = 2.0 * sampleRate_ * std::tan(std::numbers::pi * std::min(10000.0, 0.45 * sampleRate_) / sampleRate_);
+            const ShelfSection hp = firstOrder(1.0, 0.0, 1.0, wc, sampleRate_);
+            for (auto& s : xtHp_) s = hp;
+            xtNorm_ = 1.0 / std::max(1e-9, shelfMagnitude(hp, 2.0 * std::numbers::pi * 1000.0 / sampleRate_));
+            const double w1 = 2.0 * std::numbers::pi * kTransformerCornerHz;
+            const double w2 = 2.0 * std::numbers::pi * std::min(4000.0, 0.45 * sampleRate_);
+            const ShelfSection pre = firstOrder(0.0, w1, 1.0, w1, sampleRate_);
+            const ShelfSection post = firstOrder(1.0 / w1, 1.0, 1.0 / w2, 1.0, sampleRate_);
+            for (auto& s : trPre_) s = pre;
+            for (auto& s : trPost_) s = post;
+        }
 
         // AC-coupled playback amplifier: fixed 2nd-order 24 Hz high-pass
         // (real machines roll off there; also blocks remanence DC).
@@ -226,7 +349,9 @@ public:
         // samples at 48k, scaled by fs/48k) always fits under the centre.
         delayCenter_ = std::max(96, static_cast<int>(96.0 * sampleRate_ / 48000.0));
         int dsz = 1;
-        while (dsz < 2 * delayCenter_ + 8) dsz <<= 1;
+        // Room for the speed transport too: its delay is the head distance
+        // over the speed, from a quarter to four times the centre.
+        while (dsz < 5 * delayCenter_ + 16) dsz <<= 1;
         delayMask_ = dsz - 1;
         delayRing_.assign(static_cast<size_t>(numChannels_),
                           std::vector<T>(static_cast<size_t>(dsz), T(0)));
@@ -237,6 +362,18 @@ public:
         driftA_ = std::exp(-2.0 * std::numbers::pi * 0.10 * dt);
         scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dt);
         scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dt);
+        tUp_ = std::exp(-dt / kSpeedUpSeconds);
+        tDown_ = std::exp(-dt / kSlowDownSeconds);
+        speedRestore_ = dt / kDelayRestoreSeconds;
+        speedNoiseA_ = std::exp(-2.0 * std::numbers::pi * kSpeedNoiseHz * dt);
+        {
+            // RMS of a uniform noise in [-1, 1) through two such one-poles.
+            const double a = speedNoiseA_;
+            const double gain = (1.0 - a) * (1.0 + a * a) / ((1.0 + a) * (1.0 + a) * (1.0 + a));
+            speedNoiseNorm_ = 1.0 / std::sqrt(std::max(1e-30, gain / 3.0));
+        }
+        asymMeanA_ = std::exp(-2.0 * std::numbers::pi * 10.0 * dt / static_cast<double>(osFactor_));
+        trMeanA_ = std::exp(-2.0 * std::numbers::pi * 5.0 * dt);
 
         latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + firCenter_ + delayCenter_;
         drySize_ = 1;
@@ -248,6 +385,10 @@ public:
         // The first calibration runs here, on the setup thread; later
         // parameter changes calibrate incrementally inside processBlock().
         dirty_.store(false, std::memory_order_relaxed);
+        formApplied_ = -1;
+        circuitActive_ = false;
+        speedTransportActive_ = false;
+        speedIps_ = 0.0;
         recomputeLinear();
         calActive_ = false;
         calRestart_ = false;
@@ -279,6 +420,24 @@ public:
         // bump at identity until the next parameter change re-ran recompute.
         for (auto& b : headBump_) b.clear();
         for (auto& h : outHp_) h.clear();
+        for (auto& s : hissHF_) s.clear();
+        for (auto& s : hissLF_) s.clear();
+        for (auto& s : xtHp_) s.clear();
+        for (auto& s : trPre_) s.clear();
+        for (auto& s : trPost_) s.clear();
+        for (auto& v : trMean_) v = 0.0;
+        for (auto& v : asymMean_) v = 0.0;
+        for (auto& v : wet_) v = 0.0;
+        for (auto& c : headContour_) for (auto& s : c) s.clear();
+        for (auto& n : recNet_) for (auto& s : n) s.reset();
+        for (auto& n : playNet_) for (auto& s : n) s.reset();
+        tSpeed_ = 1.0;
+        tDelay_ = static_cast<double>(delayCenter_);
+        lastMod_ = 0.0;
+        capPhase_ = reelPhase_ = 0.0;
+        speedNoise1_ = speedNoise2_ = 0.0;
+        humPhase_ = 0.0;
+        aimRamps(true);
         firPos_ = 0;
         delayPos_ = 0;
         dryPos_ = 0;
@@ -419,9 +578,14 @@ public:
         wowFlutter_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
-    /** @brief Tape hiss RMS level in dBFS (e.g. -55 for audible vintage
-     *  hiss); values <= -120 disable it (default). Non-finite values are
-     *  ignored. The level was 13.9 dB below the setting before. */
+    /** @brief Tape hiss RMS level in dBFS at the output (e.g. -55 for
+     *  audible vintage hiss); values <= -120 disable it (default). The hiss
+     *  is laid on the tape, before the reproduce head and the de-emphasis,
+     *  so its colour follows the speed and the standard; the level is that
+     *  of the output for the half-track format, the classic formulation and
+     *  no calibration offset (see setTrackFormat(), setFormulation() and
+     *  setCalibrationLevel()), and glides over 50 ms. Non-finite values are
+     *  ignored. */
     void setNoise(T dbfs) noexcept
     {
         if (!std::isfinite(dbfs)) return;
@@ -435,6 +599,148 @@ public:
         if (!std::isfinite(mix)) return;
         mix_.store(std::clamp(mix, T(0), T(1)), std::memory_order_relaxed);
     }
+
+    /** @brief Transport model (see Transport). Out-of-range values are clamped. */
+    void setTransport(Transport t) noexcept
+    {
+        transport_.store(std::clamp(static_cast<int>(t), 0, 1), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Mains hum after the tape: the mains frequency and its second
+     *        harmonic 6 dB down, in phase on every channel, its level gliding
+     *        over 50 ms. Non-finite levels are ignored.
+     * @param dbfs  RMS level in dBFS; -120 and below turn it off (the default).
+     * @param mains Mains frequency (50 Hz by default).
+     */
+    void setHum(T dbfs, Mains mains = Mains::Hz50) noexcept
+    {
+        if (!std::isfinite(dbfs)) return;
+        humDb_.store(std::clamp(dbfs, T(-200), T(-20)), std::memory_order_relaxed);
+        mains_.store(std::clamp(static_cast<int>(mains), 0, 1), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Crosstalk between the channels of each pair (0 and 1, 2 and 3,
+     *        and so on): each takes the other through a first-order
+     *        high-pass at 10 kHz (rising 6 dB per octave below it, as between
+     *        the tracks of a head), its level gliding over 50 ms.
+     *        Non-finite values are ignored.
+     * @param dB Level at 1 kHz; -120 and below turn it off (the default).
+     */
+    void setCrosstalk(T dB) noexcept
+    {
+        if (std::isfinite(dB)) crosstalkDb_.store(std::clamp(dB, T(-200), T(-20)), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Even asymmetry of the record path, 0 to 1 (0, the default, is
+     *        off): a share of the square of the recorded signal (less its
+     *        mean) is added before the tape, so the second harmonic grows
+     *        with the level; it glides over 20 ms. Non-finite values are
+     *        ignored.
+     */
+    void setAsymmetry(T amount) noexcept
+    {
+        if (std::isfinite(amount)) asymmetry_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Output transformer, 0 to 1 (0, the default, is off): a parallel
+     *        branch that takes the reproduced signal through a one-pole
+     *        low-pass at 60 Hz (the flux of a transformer follows the voltage
+     *        over the frequency), a curve with an even and an odd term, and
+     *        the inverse filter capped at 4 kHz, and adds what the curve
+     *        changed: the low end saturates first. The branch always runs and
+     *        its share glides over 20 ms. Non-finite values are ignored.
+     */
+    void setTransformer(T amount) noexcept
+    {
+        if (std::isfinite(amount)) transformer_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Reproduce head model (see HeadModel). Out-of-range values are clamped. */
+    void setHeadModel(HeadModel m) noexcept
+    {
+        headModel_.store(std::clamp(static_cast<int>(m), 0, 1), std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Record and reproduce electronics (see Electronics). Out-of-range values are clamped. */
+    void setElectronics(Electronics e) noexcept
+    {
+        electronics_.store(std::clamp(static_cast<int>(e), 0, 1), std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Reproduce alignment trims, as the HF and LF reproduce
+     *        adjustments of a machine (both 0 by default). Non-finite values
+     *        are ignored.
+     * @param hfDb Trim of the de-emphasis at high frequencies, -6 to +6 dB.
+     * @param lfDb Trim of the low end (the NAB LF network, or a shelf at
+     *             50 Hz with CCIR), -6 to +6 dB.
+     */
+    void setAlignment(T hfDb, T lfDb) noexcept
+    {
+        if (!std::isfinite(hfDb) || !std::isfinite(lfDb)) return;
+        alignHf_.store(std::clamp(hfDb, T(-6), T(6)), std::memory_order_relaxed);
+        alignLf_.store(std::clamp(lfDb, T(-6), T(6)), std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Tape formulation (see Formulation). Out-of-range values are clamped. */
+    void setFormulation(Formulation f) noexcept
+    {
+        formulation_.store(std::clamp(static_cast<int>(f), 0, 2), std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Track format (see TrackFormat). Out-of-range values are clamped. */
+    void setTrackFormat(TrackFormat f) noexcept
+    {
+        trackFormat_.store(std::clamp(static_cast<int>(f), 0, 2), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Operating level above the reference flux, 0 to 9 dB (0 by
+     *        default): the tape is driven that much harder for the same input
+     *        while the output level is kept, and the hiss falls by as much
+     *        against the signal (a machine aligned to an elevated level). A
+     *        1 kHz tone at -12 dBFS carries 0.16 % THD at 0 dB, 0.31 % at
+     *        3 dB and 0.60 % at 6 dB: at 6 dB the machine distorts at the
+     *        reference level as tape machines are specified to (0.4 to 0.8 %),
+     *        the distortion rising about fourfold per 6 dB of level (third
+     *        order). Non-finite values are ignored.
+     */
+    void setCalibrationLevel(T dB) noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        calLevel_.store(std::clamp(dB, T(0), T(9)), std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Monitored head or input (see Monitor). Out-of-range values are clamped. */
+    void setMonitor(Monitor m) noexcept
+    {
+        monitor_.store(std::clamp(static_cast<int>(m), 0, 2), std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] Transport getTransport() const noexcept { return static_cast<Transport>(transport_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] T getHum() const noexcept { return humDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Mains getMains() const noexcept { return static_cast<Mains>(mains_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] T getCrosstalk() const noexcept { return crosstalkDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getAsymmetry() const noexcept { return asymmetry_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getTransformer() const noexcept { return transformer_.load(std::memory_order_relaxed); }
+    [[nodiscard]] HeadModel getHeadModel() const noexcept { return static_cast<HeadModel>(headModel_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] Electronics getElectronics() const noexcept { return static_cast<Electronics>(electronics_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] T getAlignmentHf() const noexcept { return alignHf_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getAlignmentLf() const noexcept { return alignLf_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Formulation getFormulation() const noexcept { return static_cast<Formulation>(formulation_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] TrackFormat getTrackFormat() const noexcept { return static_cast<TrackFormat>(trackFormat_.load(std::memory_order_relaxed)); }
+    [[nodiscard]] T getCalibrationLevel() const noexcept { return calLevel_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Monitor getMonitor() const noexcept { return static_cast<Monitor>(monitor_.load(std::memory_order_relaxed)); }
 
     [[nodiscard]] T getDrive() const noexcept { return driveDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getBias() const noexcept { return bias_.load(std::memory_order_relaxed); }
@@ -476,6 +782,20 @@ public:
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("oversampling", osFactor_);
         w.write("oversamplingAuto", osAutomatic_);
+        w.write("transport", transport_.load(std::memory_order_relaxed));
+        w.write("humDb", static_cast<float>(humDb_.load(std::memory_order_relaxed)));
+        w.write("mains", mains_.load(std::memory_order_relaxed));
+        w.write("crosstalk", static_cast<float>(crosstalkDb_.load(std::memory_order_relaxed)));
+        w.write("asymmetry", static_cast<float>(asymmetry_.load(std::memory_order_relaxed)));
+        w.write("transformer", static_cast<float>(transformer_.load(std::memory_order_relaxed)));
+        w.write("headModel", headModel_.load(std::memory_order_relaxed));
+        w.write("electronics", electronics_.load(std::memory_order_relaxed));
+        w.write("alignHf", static_cast<float>(alignHf_.load(std::memory_order_relaxed)));
+        w.write("alignLf", static_cast<float>(alignLf_.load(std::memory_order_relaxed)));
+        w.write("formulation", formulation_.load(std::memory_order_relaxed));
+        w.write("trackFormat", trackFormat_.load(std::memory_order_relaxed));
+        w.write("calibrationLevel", static_cast<float>(calLevel_.load(std::memory_order_relaxed)));
+        w.write("monitor", monitor_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -493,6 +813,18 @@ public:
         setWowFlutter(static_cast<T>(r.read("wowFlutter", 0.15f)));
         setNoise(static_cast<T>(r.read("noise", -200.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setTransport(static_cast<Transport>(r.read("transport", 0)));
+        setHum(static_cast<T>(r.read("humDb", -200.0f)), static_cast<Mains>(r.read("mains", 0)));
+        setCrosstalk(static_cast<T>(r.read("crosstalk", -200.0f)));
+        setAsymmetry(static_cast<T>(r.read("asymmetry", 0.0f)));
+        setTransformer(static_cast<T>(r.read("transformer", 0.0f)));
+        setHeadModel(static_cast<HeadModel>(r.read("headModel", 0)));
+        setElectronics(static_cast<Electronics>(r.read("electronics", 0)));
+        setAlignment(static_cast<T>(r.read("alignHf", 0.0f)), static_cast<T>(r.read("alignLf", 0.0f)));
+        setFormulation(static_cast<Formulation>(r.read("formulation", 0)));
+        setTrackFormat(static_cast<TrackFormat>(r.read("trackFormat", 0)));
+        setCalibrationLevel(static_cast<T>(r.read("calibrationLevel", 0.0f)));
+        setMonitor(static_cast<Monitor>(r.read("monitor", 0)));
         // Default 4 = the historical fixed factor (older blobs restore 4x).
         setOversampling(r.read("oversampling", 4));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
@@ -546,10 +878,24 @@ private:
         const int nS = buffer.getNumSamples();
         const T mixTarget = mix_.load(std::memory_order_relaxed);
         const T mixStart  = currentMix_;
-        const double noiseAmp = std::pow(10.0, static_cast<double>(
-            noiseDb_.load(std::memory_order_relaxed)) / 20.0);
-        const bool noiseOn = noiseDb_.load(std::memory_order_relaxed) > T(-120);
         const double wfDepth = static_cast<double>(wowFlutter_.load(std::memory_order_relaxed));
+        const bool speedTransport = transport_.load(std::memory_order_relaxed) == 1;
+        if (speedTransport != speedTransportActive_)
+        {
+            // Into the speed model from where the modulated delay stands; back
+            // to the modulated model at its own position.
+            if (speedTransport) { tSpeed_ = 1.0; tDelay_ = static_cast<double>(delayCenter_) + lastMod_; }
+            speedTransportActive_ = speedTransport;
+        }
+        const bool circuit = circuitActive_;
+        aimRamps(false);
+        if (hissOn() && hissNormDirty_) computeHissNorm();
+        const bool hissActive = hiss_.active();
+        const bool humActive = hum_.active();
+        const bool xtActive = xt_.active();
+        const bool trActive = tr_.active();
+        const bool monitorMoving = monitorRamp_.now != 1.0 || monitorRamp_.target != 1.0;
+        const double humStep = (mains_.load(std::memory_order_relaxed) == 1 ? 60.0 : 50.0) / sampleRate_;
 
         // 1. Dry snapshot for the latency-compensated mix.
         for (int ch = 0; ch < nCh; ++ch)
@@ -564,14 +910,18 @@ private:
             }
         }
 
-        // 2. Record EQ (emphasis) at base rate.
-        for (int ch = 0; ch < nCh; ++ch)
+        // 2. Record EQ (emphasis) at base rate (the circuit runs its record
+        // network at the internal rate instead).
+        if (!circuit)
         {
-            T* d = buffer.getChannel(ch);
-            auto& hf = recordHF_[static_cast<size_t>(ch)];
-            auto& lf = recordLF_[static_cast<size_t>(ch)];
-            for (int i = 0; i < nS; ++i)
-                d[i] = static_cast<T>(hf.process(lf.process(static_cast<double>(d[i]))));
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* d = buffer.getChannel(ch);
+                auto& hf = recordHF_[static_cast<size_t>(ch)];
+                auto& lf = recordLF_[static_cast<size_t>(ch)];
+                for (int i = 0; i < nS; ++i)
+                    d[i] = static_cast<T>(hf.process(lf.process(static_cast<double>(d[i]))));
+            }
         }
 
         // 3. Push-pull AC-bias hysteresis at 4x. One shared carrier phase for
@@ -607,11 +957,17 @@ private:
                 bRat = std::pow(bEnd / bSm_, inv);
             }
             const bool ramping = hRat != 1.0 || mRat != 1.0 || bRat != 1.0;
+            const bool asymActive = asym_.active();
+            LinearRamp asymAfter = asym_;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = osView.getChannel(ch);
                 auto& hp = hysteresis_[static_cast<size_t>(ch)];
                 auto& hn = hysteresisN_[static_cast<size_t>(ch)];
+                auto& rec = recNet_[static_cast<size_t>(ch)];
+                auto& play = playNet_[static_cast<size_t>(ch)];
+                double& mean = asymMean_[static_cast<size_t>(ch)];
+                LinearRamp asym = asym_;
                 double inScale = hSm_, mS = mSm_, B = bSm_;
                 int phase = phaseStart;
                 for (int i = 0; i < osN; ++i)
@@ -622,14 +978,34 @@ private:
                         mS *= mRat;
                         B *= bRat;
                     }
-                    const double x = inScale * static_cast<double>(d[i]);
+                    double xs = static_cast<double>(d[i]);
+                    if (circuit) xs = rec[1].processSample(rec[0].processSample(xs, 0), 0);
+                    if (asymActive)
+                    {
+                        // Even term less its running mean: no DC reaches the tape.
+                        const double square = xs * xs;
+                        mean = asymMeanA_ * mean + (1.0 - asymMeanA_) * square;
+                        xs += asym.next() * kAsymmetryShare * (square - mean);
+                    }
+                    const double x = inScale * xs;
                     const double c = B * kBiasTable[static_cast<size_t>(phase)];
                     phase = (phase + 1) & 7;
                     const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
                     const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
-                    d[i] = static_cast<T>((mS * 0.5) * (mp + mn));
+                    double out = (mS * 0.5) * (mp + mn);
+                    if (circuit) out = play[1].processSample(play[0].processSample(out, 0), 0);
+                    d[i] = static_cast<T>(out);
                 }
+                asymAfter = asym;
             }
+            if (nCh > 0) asym_ = asymAfter;
+            if (circuit)
+                for (int ch = 0; ch < nCh; ++ch)
+                    for (int s = 0; s < 2; ++s)
+                    {
+                        recNet_[static_cast<size_t>(ch)][static_cast<size_t>(s)].advanceRamp(osN);
+                        playNet_[static_cast<size_t>(ch)][static_cast<size_t>(s)].advanceRamp(osN);
+                    }
             hSm_ = hEnd;
             mSm_ = mEnd;
             bSm_ = bEnd;
@@ -645,33 +1021,60 @@ private:
         const bool overBiasStart = overBiasOn_ && !overBiasActive_;
         overBiasActive_ = overBiasOn_;
 
-        // 4-6. Loss FIR + head bump, transport modulation, playback EQ, noise, mix.
+        // 4-6. Per frame: hiss onto the tape, loss FIR and head, transport,
+        // playback EQ, over-bias, output coupling and transformer per channel;
+        // then crosstalk, hum, monitor and mix across the channels.
         for (int i = 0; i < nS; ++i)
         {
-            // One shared transport modulation per frame (all channels move
-            // together, like tape past a single capstan).
-            const double mod = nextTransportMod(wfDepth);
-            const double readPos = static_cast<double>(delayCenter_) + mod;
+            // One shared transport per frame (all channels move together,
+            // like tape past a single capstan).
+            double readPos;
+            if (speedTransport)
+            {
+                readPos = nextSpeedDelay(wfDepth);
+            }
+            else
+            {
+                lastMod_ = nextTransportMod(wfDepth);
+                readPos = static_cast<double>(delayCenter_) + lastMod_;
+            }
             const auto readInt = static_cast<int>(std::floor(readPos));
             const T frac = static_cast<T>(readPos - readInt);
+            const double hissAmp = hissActive ? hiss_.next() * hissNorm_ * kUniformToUnitRms : 0.0;
+            const double trShare = trActive ? tr_.next() : 0.0;
 
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = buffer.getChannel(ch);
+                T in = d[i];
+
+                // Hiss is magnetic noise on the tape: it is read through the
+                // head losses and the reproduce de-emphasis (own RNG stream:
+                // enabling it must not change the transport's realisation).
+                if (hissActive)
+                {
+                    rngNoise_ = rngNoise_ * 1664525u + 1013904223u;
+                    double n1 = (static_cast<double>(rngNoise_ >> 8) / 8388608.0 - 1.0) * hissAmp;
+                    if (circuit)
+                        n1 = hissLF_[static_cast<size_t>(ch)].process(hissHF_[static_cast<size_t>(ch)].process(n1));
+                    in += static_cast<T>(n1);
+                }
 
                 // Loss FIR (linear phase) on a per-channel mirrored ring.
                 auto& fir = firState_[static_cast<size_t>(ch)];
-                fir[static_cast<size_t>(firPos_)] = d[i];
-                fir[static_cast<size_t>(firPos_ + firHalf_)] = d[i]; // mirrored
+                fir[static_cast<size_t>(firPos_)] = in;
+                fir[static_cast<size_t>(firPos_ + firHalf_)] = in; // mirrored
                 const T* win = &fir[static_cast<size_t>(firPos_ + firHalf_ - (firLen_ - 1))];
                 T y = simd::dotProduct(firTaps_.data(), win, firLen_);
 
-                // Head bump resonance.
-                y = headBump_[static_cast<size_t>(ch)].process(y);
+                // Head bump resonance, or the contour chain.
+                if (contourActive_)
+                    for (auto& s : headContour_[static_cast<size_t>(ch)]) y = s.process(y);
+                else
+                    y = headBump_[static_cast<size_t>(ch)].process(y);
 
-                // Transport (wow & flutter) fractional delay: interpolate at
-                // t - readInt - frac, i.e. between p1 = x(t-readInt) and
-                // p2 = x(t-readInt-1), with Catmull-Rom neighbours around them.
+                // Transport fractional delay: interpolate at t - readInt -
+                // frac, between p1 = x(t-readInt) and p2 = x(t-readInt-1).
                 auto& dl = delayRing_[static_cast<size_t>(ch)];
                 dl[static_cast<size_t>(delayPos_)] = y;
                 const int base = delayPos_ - readInt;
@@ -680,13 +1083,28 @@ private:
                 const T p1 = dl[static_cast<size_t>(base & dm)];
                 const T p2 = dl[static_cast<size_t>((base - 1) & dm)];
                 const T p3 = dl[static_cast<size_t>((base - 2) & dm)];
-                T w = p1 + T(0.5) * frac * (p2 - p0
-                      + frac * (T(2) * p0 - T(5) * p1 + T(4) * p2 - p3
-                      + frac * (T(3) * (p1 - p2) + p3 - p0)));
+                T w;
+                if (speedTransport)
+                {
+                    // Four-point Lagrange (nodes -1, 0, 1, 2).
+                    const T f = frac;
+                    const T fm1 = f - T(1), fm2 = f - T(2), fp1 = f + T(1);
+                    w = -f * fm1 * fm2 * T(1.0 / 6.0) * p0 + fp1 * fm1 * fm2 * T(0.5) * p1
+                        - fp1 * f * fm2 * T(0.5) * p2 + fp1 * f * fm1 * T(1.0 / 6.0) * p3;
+                }
+                else
+                {
+                    // Catmull-Rom.
+                    w = p1 + T(0.5) * frac * (p2 - p0
+                        + frac * (T(2) * p0 - T(5) * p1 + T(4) * p2 - p3
+                        + frac * (T(3) * (p1 - p2) + p3 - p0)));
+                }
 
-                // Playback EQ (exact inverse de-emphasis).
-                w = static_cast<T>(playLF_[static_cast<size_t>(ch)].process(
-                        playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
+                // Playback EQ (exact inverse de-emphasis; the circuit ran its
+                // reproduce network before the downsampler).
+                if (!circuit)
+                    w = static_cast<T>(playLF_[static_cast<size_t>(ch)].process(
+                            playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
 
                 // Over-bias self-erasure: wider recording zone partially
                 // erases short wavelengths (first-order low-pass engaged above
@@ -709,20 +1127,54 @@ private:
                 // subsonic/DC roll-off of the real hardware).
                 w = outHp_[static_cast<size_t>(ch)].process(w);
 
-                // Hiss (own RNG stream: enabling it must not change the
-                // transport modulation's realisation).
-                if (noiseOn)
+                // Output transformer branch: always running, added by its share.
                 {
-                    rngNoise_ = rngNoise_ * 1664525u + 1013904223u;
-                    const double n1 = static_cast<double>(rngNoise_ >> 8) / 8388608.0 - 1.0;
-                    w += static_cast<T>(noiseAmp * n1 * kUniformToUnitRms);
+                    const double wd = static_cast<double>(w);
+                    const double u = trPre_[static_cast<size_t>(ch)].process(wd);
+                    double& m = trMean_[static_cast<size_t>(ch)];
+                    m = trMeanA_ * m + (1.0 - trMeanA_) * u * u;
+                    const double bent = trPost_[static_cast<size_t>(ch)].process(
+                        kTransformerEven * (u * u - m) - kTransformerOdd * u * u * u);
+                    if (trShare > 0.0) w = static_cast<T>(wd + trShare * bent);
                 }
+                wet_[static_cast<size_t>(ch)] = static_cast<double>(w);
+            }
 
-                // Latency-compensated mix.
+            if (xtActive)
+            {
+                const double g = xt_.next();
+                for (int ch = 0; ch + 1 < nCh; ch += 2)
+                {
+                    const double a = wet_[static_cast<size_t>(ch)], b = wet_[static_cast<size_t>(ch + 1)];
+                    const double fromA = xtHp_[static_cast<size_t>(ch)].process(a);
+                    const double fromB = xtHp_[static_cast<size_t>(ch + 1)].process(b);
+                    wet_[static_cast<size_t>(ch)] = a + g * fromB;
+                    wet_[static_cast<size_t>(ch + 1)] = b + g * fromA;
+                }
+            }
+            if (humActive)
+            {
+                const double amp = hum_.next();
+                humPhase_ += humStep;
+                if (humPhase_ >= 1.0) humPhase_ -= 1.0;
+                const double ph = 2.0 * std::numbers::pi * humPhase_;
+                const double h = amp * kHumNorm * (std::sin(ph) + 0.5 * std::sin(2.0 * ph));
+                for (int ch = 0; ch < nCh; ++ch) wet_[static_cast<size_t>(ch)] += h;
+            }
+
+            // Latency-compensated monitor and mix.
+            const double monitor = monitorMoving ? monitorRamp_.next() : 1.0;
+            const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* d = buffer.getChannel(ch);
                 const auto& dry = dryRing_[static_cast<size_t>(ch)];
                 const int dryIdx = (dryPos_ + i - latency_) & (drySize_ - 1);
                 const T drySample = dry[static_cast<size_t>(dryIdx)];
-                const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
+                T w = static_cast<T>(wet_[static_cast<size_t>(ch)]);
+                if (monitor != 1.0)
+                    w = static_cast<T>(static_cast<double>(drySample)
+                        + (static_cast<double>(w) - static_cast<double>(drySample)) * monitor);
                 d[i] = drySample + (w - drySample) * mixVal;
             }
 
@@ -733,6 +1185,159 @@ private:
         currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
 
+    /** @brief A linear ramp towards a target, at a step fixed when it is aimed. */
+    struct LinearRamp
+    {
+        double now = 0.0, target = 0.0, step = 0.0;
+
+        void aim(double to, double samples) noexcept
+        {
+            if (to == target) return;
+            target = to;
+            step = std::abs(to - now) / std::max(1.0, samples);
+        }
+        [[nodiscard]] double next() noexcept
+        {
+            if (now != target)
+                now = (now < target) ? std::min(target, now + step) : std::max(target, now - step);
+            return now;
+        }
+        [[nodiscard]] bool active() const noexcept { return now != 0.0 || target != 0.0; }
+    };
+
+    [[nodiscard]] bool hissOn() const noexcept { return noiseDb_.load(std::memory_order_relaxed) > T(-120); }
+
+    /** @brief Aims the level ramps at the settings (and lands them with `land`). */
+    void aimRamps(bool land) noexcept
+    {
+        const double fs = sampleRate_;
+        // Hiss: the setting, less what the track width, the formulation and
+        // the operating level take off it against the signal.
+        double hiss = 0.0;
+        if (hissOn())
+        {
+            static constexpr double kTrackWidthMm[3] = { 2.0, 6.3, 1.0 };
+            const int track = std::clamp(trackFormat_.load(std::memory_order_relaxed), 0, 2);
+            const double offset = 10.0 * std::log10(kTrackWidthMm[0] / kTrackWidthMm[static_cast<size_t>(track)])
+                + formulationOf(formulation_.load(std::memory_order_relaxed)).hissDb
+                - static_cast<double>(calLevel_.load(std::memory_order_relaxed));
+            hiss = std::pow(10.0, (static_cast<double>(noiseDb_.load(std::memory_order_relaxed)) + offset) / 20.0);
+        }
+        const T humDb = humDb_.load(std::memory_order_relaxed);
+        const double hum = humDb > T(-120) ? std::pow(10.0, static_cast<double>(humDb) / 20.0) : 0.0;
+        const T xtDb = crosstalkDb_.load(std::memory_order_relaxed);
+        const double xt = xtDb > T(-120) ? std::pow(10.0, static_cast<double>(xtDb) / 20.0) * xtNorm_ : 0.0;
+        if (xt > 0.0 && !xt_.active())
+            for (auto& s : xtHp_) s.clear();
+        const double monitor = monitor_.load(std::memory_order_relaxed) == 2 ? 0.0 : 1.0;
+        hiss_.aim(hiss, 0.05 * fs);
+        hum_.aim(hum, 0.05 * fs);
+        xt_.aim(xt, 0.05 * fs);
+        tr_.aim(static_cast<double>(transformer_.load(std::memory_order_relaxed)), 0.02 * fs);
+        asym_.aim(static_cast<double>(asymmetry_.load(std::memory_order_relaxed)), 0.02 * fs * static_cast<double>(osFactor_));
+        monitorRamp_.aim(monitor, 0.02 * fs);
+        if (land)
+        {
+            hiss_.now = hiss_.target;
+            hum_.now = hum_.target;
+            xt_.now = xt_.target;
+            tr_.now = tr_.target;
+            asym_.now = asym_.target;
+            monitorRamp_.now = monitorRamp_.target;
+        }
+    }
+
+    /**
+     * @brief The hiss scale that makes white noise on the tape come out at
+     *        unit RMS: one over the RMS gain of the reproduce chain (loss FIR,
+     *        head, de-emphasis, over-bias and output coupling) over a grid of
+     *        frequencies.
+     */
+    void computeHissNorm() noexcept
+    {
+        hissNormDirty_ = false;
+        if (numChannels_ <= 0) return;
+        constexpr int kGrid = 256;
+        double power = 0.0;
+        for (int k = 0; k < kGrid; ++k)
+        {
+            const double w = std::numbers::pi * (static_cast<double>(k) + 0.5) / kGrid;
+            const double cw = std::cos(w), sw = std::sin(w);
+            double re = 0.0, im = 0.0, rr = 1.0, ri = 0.0;
+            for (int n = 0; n < firLen_; ++n)
+            {
+                re += designTaps_[static_cast<size_t>(n)] * rr;
+                im += designTaps_[static_cast<size_t>(n)] * ri;
+                const double nr = rr * cw + ri * sw;
+                ri = ri * cw - rr * sw;
+                rr = nr;
+            }
+            double g2 = (re * re + im * im) * firNorm_ * firNorm_;
+            if (contourActive_)
+                for (const auto& s : headContour_[0]) g2 *= peakMagnitude(s, w) * peakMagnitude(s, w);
+            else
+                g2 *= peakMagnitude(headBump_[0], w) * peakMagnitude(headBump_[0], w);
+            const double play = shelfMagnitude(playHF_[0], w) * shelfMagnitude(playLF_[0], w);
+            g2 *= play * play;
+            if (overBiasOn_)
+            {
+                const double nr = obB0_ + obB1_ * cw, ni = -obB1_ * sw;
+                const double dr = 1.0 - obP_ * cw, di = obP_ * sw;
+                g2 *= (nr * nr + ni * ni) / (dr * dr + di * di);
+            }
+            g2 *= peakMagnitude(outHp_[0], w) * peakMagnitude(outHp_[0], w);
+            power += g2;
+        }
+        power /= kGrid;
+        hissNorm_ = power > 1e-20 ? 1.0 / std::sqrt(power) : 1.0;
+    }
+
+    /**
+     * @brief The delay of the speed transport for the next frame, in samples.
+     *
+     * The speed glides to the nominal of the selected speed with inertia;
+     * its deviation (reel, capstan with its second harmonic, smoothed noise,
+     * scrape) is the reproduce pitch, so the read point advances by
+     * 1 + deviation per sample; the delay is held at the head distance over
+     * the speed by a slow restoring term, and its change per sample is
+     * bounded.
+     */
+    [[nodiscard]] double nextSpeedDelay(double depth) noexcept
+    {
+        tSpeed_ = 1.0 + ((tSpeed_ < 1.0) ? tUp_ : tDown_) * (tSpeed_ - 1.0);
+        if (std::abs(tSpeed_ - 1.0) < 1e-12) tSpeed_ = 1.0;
+        const double ipsNow = speedIps_ * tSpeed_;
+        const double dt = 1.0 / sampleRate_;
+        capPhase_ += kCapstanHzPerIps * ipsNow * dt;
+        if (capPhase_ >= 1.0) capPhase_ -= 1.0;
+        reelPhase_ += kReelHzPerIps * ipsNow * dt;
+        if (reelPhase_ >= 1.0) reelPhase_ -= 1.0;
+
+        rng_ = rng_ * 1664525u + 1013904223u;
+        const double n = static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0;
+        speedNoise1_ = speedNoiseA_ * speedNoise1_ + (1.0 - speedNoiseA_) * n;
+        speedNoise2_ = speedNoiseA_ * speedNoise2_ + (1.0 - speedNoiseA_) * speedNoise1_;
+        scrapeLp1_ = scrapeA1_ * scrapeLp1_ + (1.0 - scrapeA1_) * n;
+        scrapeLp2_ = scrapeA2_ * scrapeLp2_ + (1.0 - scrapeA2_) * n;
+
+        double deviation = 0.0;
+        if (depth > 0.0)
+        {
+            const double twoPi = 2.0 * std::numbers::pi;
+            const double cap = twoPi * capPhase_;
+            deviation = depth * std::sqrt(15.0 / speedIps_)
+                * (kReelDeviation * std::sin(twoPi * reelPhase_)
+                 + kCapstanDeviation * (std::sin(cap) + kCapstanSecond * std::sin(2.0 * cap))
+                 + kNoiseDeviation * speedNoiseNorm_ * speedNoise2_
+                 + kScrapeDeviation * (scrapeLp1_ - scrapeLp2_));
+        }
+        const double target = static_cast<double>(delayCenter_) / tSpeed_;
+        const double step = std::clamp(-deviation + speedRestore_ * (target - tDelay_), -kMaxDelayStep, kMaxDelayStep);
+        tDelay_ = std::clamp(tDelay_ + step, 3.0, static_cast<double>(delayMask_ - 4));
+        return tDelay_;
+    }
+
+    // -- Building blocks -----------------------------------------------------------
     // -- Building blocks -----------------------------------------------------------
 
     /** @brief One-pole/one-zero section with its exact inverse (double state). */
@@ -788,6 +1393,48 @@ private:
         return { n0 / d0, n1 / d0, d1 / d0, 0.0, 0.0 };
     }
 
+    /** @brief Bilinear transform of (n1 s + n0) / (d1 s + d0). */
+    static ShelfSection firstOrder(double n1, double n0, double d1, double d0, double fs) noexcept
+    {
+        const double k = 2.0 * fs;
+        const double a0 = d1 * k + d0;
+        return { (n1 * k + n0) / a0, (n0 - n1 * k) / a0, (d0 - d1 * k) / a0, 0.0, 0.0 };
+    }
+
+    /** @brief Magnitude of a first-order section at w (radians per sample). */
+    [[nodiscard]] static double shelfMagnitude(const ShelfSection& s, double w) noexcept
+    {
+        const double c = std::cos(w), sn = std::sin(w);
+        const double nr = s.b0 + s.b1 * c, ni = -s.b1 * sn;
+        const double dr = 1.0 + s.a1 * c, di = -s.a1 * sn;
+        return std::sqrt((nr * nr + ni * ni) / std::max(1e-300, dr * dr + di * di));
+    }
+
+    /** @brief Magnitude of a biquad section at w (radians per sample). */
+    [[nodiscard]] static double peakMagnitude(const PeakSection& s, double w) noexcept
+    {
+        const double c1 = std::cos(w), s1 = std::sin(w), c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
+        const double nr = s.b0 + s.b1 * c1 + s.b2 * c2, ni = -(s.b1 * s1 + s.b2 * s2);
+        const double dr = 1.0 + s.a1 * c1 + s.a2 * c2, di = -(s.a1 * s1 + s.a2 * s2);
+        return std::sqrt((nr * nr + ni * ni) / std::max(1e-300, dr * dr + di * di));
+    }
+
+    /** @brief JA parameters and hiss offset of a formulation. */
+    struct FormulationParams
+    {
+        double ms, a, alpha, k, c, hissDb;
+    };
+
+    [[nodiscard]] static FormulationParams formulationOf(int f) noexcept
+    {
+        switch (std::clamp(f, 0, 2))
+        {
+        case 1:  return { 3.5e5 * 1.4125375446227544, 2.2e4 * 1.4125375446227544, 1.6e-3, 2.7e4 * 1.2, 0.17, -1.5 };
+        case 2:  return { 3.5e5 * 0.7943282347242815, 2.2e4 * 0.7943282347242815, 1.6e-3, 2.7e4 * 0.8, 0.25, 3.0 };
+        default: return { 3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17, 0.0 };
+        }
+    }
+
     /** @brief Rebuilds the linear stages (EQ, losses, head bump, over-bias)
      *  and records the calibration request for drive, bias and emphasis. */
     void recomputeLinear() noexcept
@@ -810,8 +1457,21 @@ private:
         // grit and level instability of an under-biased machine. Over-bias
         // adds the self-erasure of short wavelengths (wider recording zone)
         // as a one-pole roll-off.
+        // Formulation: the JA parameters of the material, set on the running
+        // pairs when it changes; the bias scales with its coercive force so
+        // that 0.5 stays the optimum of the material.
+        const int form = formulation_.load(std::memory_order_relaxed);
+        const FormulationParams fp = formulationOf(form);
+        if (form != formApplied_)
+        {
+            for (auto& h : hysteresis_) h.setParameters(fp.ms, fp.a, fp.alpha, fp.k, fp.c);
+            for (auto& h : hysteresisN_) h.setParameters(fp.ms, fp.a, fp.alpha, fp.k, fp.c);
+            formApplied_ = form;
+            hissNormDirty_ = true;
+        }
+        calReq_.form = fp;
         const double biasB = std::min(6.0, 3.0 * std::pow(9.0, bias - 0.5));
-        calReq_.biasAmp = biasB * 2.2e4;
+        calReq_.biasAmp = biasB * 2.2e4 * (fp.k / 2.7e4);
         if (biasB > 3.5)
         {
             // Gentle self-erasure (corner gliding 22 kHz -> ~12.8 kHz at full
@@ -849,6 +1509,9 @@ private:
         constexpr double kHiCap = 4.0;     // +12 dB emphasis cap (practical alignment)
         constexpr double kLoBoost = 2.0;   // +6 dB NAB LF record boost
         const double tLo = 3180e-6;
+        const double hfTrim = static_cast<double>(alignHf_.load(std::memory_order_relaxed));
+        const double lfTrim = static_cast<double>(alignLf_.load(std::memory_order_relaxed));
+        const double gHf = std::pow(10.0, hfTrim / 20.0), gLf = std::pow(10.0, lfTrim / 20.0);
 
         // --- drive scaling with operating-level makeup -------------------------
         // 0 dBFS at nominal drive maps to H = 1.2a: moderate saturation. Tape
@@ -858,7 +1521,10 @@ private:
         // chain on two scratch instances (a few thousand model samples, only
         // on parameter changes). Quieter material reads slightly low, hotter
         // material blooms into compression - like tape.
-        calReq_.hScale = drive * 1.2 * 2.2e4;
+        // The operating level drives the tape harder; the makeup measures the
+        // whole gain, so the output level is kept.
+        const double calGain = std::pow(10.0, static_cast<double>(calLevel_.load(std::memory_order_relaxed)) / 20.0);
+        calReq_.hScale = drive * 1.2 * 2.2e4 * calGain;
         {
             // -12 dBFS reference, seen through the record emphasis: at 1 kHz
             // the HF emphasis already lifts the level (about +3.7 dB NAB-15),
@@ -889,20 +1555,83 @@ private:
             rlf.x1 = lx1; rlf.y1 = ly1;
 
             const double px1 = phf.x1, py1 = phf.y1;
-            phf = makeHFShelf(t2, kHiCap, sampleRate_, true);
+            phf = makeHFShelf(t2, kHiCap / gHf, sampleRate_, true);
             phf.x1 = px1; phf.y1 = py1;
 
             const double qx1 = plf.x1, qy1 = plf.y1;
-            plf = useLF ? makeLFShelf(tLo, kLoBoost, sampleRate_, true) : ShelfSection {};
+            plf = useLF ? makeLFShelf(tLo, kLoBoost / gLf, sampleRate_, true)
+                : (lfTrim != 0.0 ? makeLFShelf(tLo, 1.0 / gLf, sampleRate_, true) : ShelfSection {});
             plf.x1 = qx1; plf.y1 = qy1;
+
+            // The hiss's own de-emphasis, for the circuit (whose reproduce
+            // network runs before the tape's noise is laid on).
+            auto& hhf = hissHF_[static_cast<size_t>(ch)];
+            auto& hlf = hissLF_[static_cast<size_t>(ch)];
+            const double hx1 = hhf.x1, hy1 = hhf.y1, lx = hlf.x1, ly = hlf.y1;
+            hhf = phf; hhf.x1 = hx1; hhf.y1 = hy1;
+            hlf = plf; hlf.x1 = lx; hlf.y1 = ly;
         }
+
+        // Circuit electronics: the record and reproduce networks from their
+        // analog transfer functions, at the internal rate, as ladders.
+        const bool circuitWanted = electronics_.load(std::memory_order_relaxed) == 1;
+        if (circuitWanted)
+        {
+            const double osRate = sampleRate_ * static_cast<double>(osFactor_);
+            const double kLoR = useLF ? kLoBoost : 1.0;
+            const double kHiP = kHiCap / gHf, kLoP = kLoR / gLf;
+            const AnalogSection rec1 = AnalogSection::make(kHiCap * t2 * tLo, kHiCap * t2 * kLoR + tLo, kLoR,
+                                                           t2 * tLo, t2 + tLo, 1.0);
+            const AnalogSection play1 = AnalogSection::make(t2 * tLo, t2 + tLo, 1.0,
+                                                            kHiP * t2 * tLo, kHiP * t2 * kLoP + tLo, kLoP);
+            const double recLimit = std::min(45000.0, 0.45 * osRate), playPole = std::min(50000.0, 0.45 * osRate);
+            const double corner = 1.0 / (2.0 * std::numbers::pi * t2);
+            const BiquadCoeffs r1 = FilterDesign::bilinear(rec1, osRate, corner);
+            const BiquadCoeffs r2 = FilterDesign::bilinear(AnalogSection::lowPass(recLimit), osRate, recLimit);
+            const BiquadCoeffs q1 = FilterDesign::bilinear(play1, osRate, corner);
+            const BiquadCoeffs q2 = FilterDesign::bilinear(AnalogSection::firstOrderLowPass(playPole), osRate, playPole);
+            const int ramp = static_cast<int>(0.05 * osRate);
+            for (int ch = 0; ch < numChannels_; ++ch)
+            {
+                auto& rec = recNet_[static_cast<size_t>(ch)];
+                auto& play = playNet_[static_cast<size_t>(ch)];
+                if (!circuitActive_)
+                {
+                    rec[0].setCoeffs(r1); rec[1].setCoeffs(r2); play[0].setCoeffs(q1); play[1].setCoeffs(q2);
+                    for (auto& s : rec) s.reset();
+                    for (auto& s : play) s.reset();
+                }
+                else
+                {
+                    rec[0].rampCoeffs(r1, ramp); rec[1].rampCoeffs(r2, ramp);
+                    play[0].rampCoeffs(q1, ramp); play[1].rampCoeffs(q2, ramp);
+                }
+            }
+            if (!circuitActive_)
+                for (auto& s : hissHF_) s.clear();
+        }
+        else if (circuitActive_)
+        {
+            // Back to the ideal shelves: they start from rest.
+            for (auto& s : recordHF_) s.clear();
+            for (auto& s : recordLF_) s.clear();
+            for (auto& s : playHF_) s.clear();
+            for (auto& s : playLF_) s.clear();
+        }
+        circuitActive_ = circuitWanted;
 
         // --- loss-effect FIR (63 taps, linear phase) ---------------------------
         const double ips = (speed == Speed::IPS_7_5) ? 7.5
                          : (speed == Speed::IPS_15) ? 15.0 : 30.0;
+        // A new speed under the speed transport: the tape keeps moving at the
+        // old one and glides to the new one with inertia.
+        if (speedTransportActive_ && speedIps_ > 0.0 && ips != speedIps_) tSpeed_ *= speedIps_ / ips;
+        speedIps_ = ips;
         const double v = ips * 0.0254;            // m/s
-        constexpr double gap = 3.0e-6;            // playback head gap (m)
-        constexpr double spacing = 0.5e-6;        // head-tape spacing (m)
+        // The record head (sync monitoring) has the wider gap and spacing.
+        const bool sync = monitor_.load(std::memory_order_relaxed) == 1;
+        const double gap = sync ? 6.0e-6 : 3.0e-6;           // playback head gap (m)
+        const double spacing = sync ? 1.0e-6 : 0.5e-6;       // head-tape spacing (m)
         constexpr double thickness = 1.0e-6;      // effective coating depth (m)
 
         const int grid = firLen_ + 1;             // design grid (64 points at 48 kHz)
@@ -963,6 +1692,7 @@ private:
             const double g = std::sqrt(re * re + im * im);
             const double norm = (g > 1e-9) ? 1.0 / g : 1.0;
             for (int n = 0; n < firLen_; ++n) taps[n] *= norm;
+            firNorm_ = 1.0;
         }
         for (int n = 0; n < firLen_; ++n)
             firTaps_[static_cast<size_t>(firLen_ - 1 - n)] =
@@ -980,6 +1710,29 @@ private:
             b.z1 = pz1;
             b.z2 = pz2;
         }
+
+        // Head contour: the bump and three ripples above it, each a resonance
+        // designed on its analog prototype.
+        contourActive_ = headModel_.load(std::memory_order_relaxed) == 1;
+        if (contourActive_)
+        {
+            static constexpr double kRatio[kContourSections] = { 1.0, 1.45, 1.95, 2.5 };
+            static constexpr double kShare[kContourSections] = { 1.0, -0.5, 0.28, -0.15 };
+            static constexpr double kQ[kContourSections] = { 0.9, 2.0, 2.5, 3.0 };
+            for (int k = 0; k < kContourSections; ++k)
+            {
+                const size_t kk = static_cast<size_t>(k);
+                const BiquadCoeffs c = FilterDesign::digital(
+                    AnalogSection::peak(bumpHz * kRatio[kk], kQ[kk], kContourDb * bumpAmt * kShare[kk]), sampleRate_);
+                for (auto& chain : headContour_)
+                {
+                    auto& s = chain[kk];
+                    const double z1 = s.z1, z2 = s.z2;
+                    s = PeakSection { c.b0, c.b1, c.b2, c.a1, c.a2, z1, z2 };
+                }
+            }
+        }
+        hissNormDirty_ = true;
     }
 
     /** @brief Starts the drive-makeup calibration for the latest request.
@@ -998,10 +1751,11 @@ private:
         calN_ = static_cast<int>(0.024 * fs4);
         calFrom_ = (calN_ * 2) / 3;
         calW_ = 2.0 * std::numbers::pi * 1000.0 / fs4;
+        const FormulationParams& fp = calRun_.form;
         calib_.prepare(fs4);
-        calib_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+        calib_.setParameters(fp.ms, fp.a, fp.alpha, fp.k, fp.c);
         calib2_.prepare(fs4);
-        calib2_.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
+        calib2_.setParameters(fp.ms, fp.a, fp.alpha, fp.k, fp.c);
         calI_ = 0;
         calRe_ = calIm_ = 0.0;
         calMeas_ = 0;
@@ -1097,6 +1851,25 @@ private:
     static constexpr int kFirLenAt48k = 63;
     static constexpr double kGainRampSeconds = 0.03;
     static constexpr double kUniformToUnitRms = 1.7320508075688772;  ///< sqrt(3)
+    static constexpr int kContourSections = 4;
+    static constexpr double kContourDb = 3.0;              ///< Peak of the contour's bump at full head bump.
+    static constexpr double kSpeedUpSeconds = 0.45;        ///< Inertia of the speed transport when speeding up.
+    static constexpr double kSlowDownSeconds = 0.7;        ///< ... and when slowing down.
+    static constexpr double kDelayRestoreSeconds = 1.5;    ///< Restoring time of the delay to the head distance.
+    static constexpr double kMaxDelayStep = 0.02;          ///< Largest delay change per sample (pitch within 2 %).
+    static constexpr double kSpeedNoiseHz = 3.0;           ///< Corner of the smoothed speed noise.
+    static constexpr double kCapstanHzPerIps = 1.0 / 3.0;  ///< Capstan rotation: 5 Hz at 15 ips.
+    static constexpr double kReelHzPerIps = 0.04;          ///< Reel rotation: 0.6 Hz at 15 ips.
+    static constexpr double kCapstanSecond = 0.3;          ///< Share of the capstan's second harmonic.
+    static constexpr double kReelDeviation = 0.0012;       ///< Speed deviations at full depth and 15 ips.
+    static constexpr double kCapstanDeviation = 0.0006;
+    static constexpr double kNoiseDeviation = 0.0004;
+    static constexpr double kScrapeDeviation = 0.003;
+    static constexpr double kAsymmetryShare = 0.15;        ///< Even term at full asymmetry.
+    static constexpr double kTransformerCornerHz = 60.0;
+    static constexpr double kTransformerEven = 0.03;       ///< Terms of the transformer's curve.
+    static constexpr double kTransformerOdd = 0.2;
+    static constexpr double kHumNorm = 1.2649110640673518; ///< 1 / RMS of sin + sin(2x) / 2.
 
     AudioSpec spec_ {};              ///< Last valid spec, for setOversampling re-prepare.
     double sampleRate_ = 48000.0;
@@ -1168,6 +1941,7 @@ private:
     struct CalibrationRequest
     {
         double hScale = 1.0, biasAmp = 3.0 * 2.2e4, calAmp = 0.25, drive = 1.0;
+        FormulationParams form { 3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17, 0.0 };
     };
     CalibrationRequest calReq_, calRun_;
     bool calActive_ = false, calRestart_ = false;
@@ -1192,6 +1966,26 @@ private:
     T currentMix_ = T(1);            ///< Audio-thread mix ramp state (exact landing).
     T mixMaxStep_ = T(1.0 / 960.0);  ///< Mix ramp rate: full scale per 20 ms.
     std::atomic<bool> dirty_ { true };
+
+    // The machine around the tape (settings).
+    std::atomic<int> transport_ { 0 }, mains_ { 0 }, headModel_ { 0 }, electronics_ { 0 };
+    std::atomic<int> formulation_ { 0 }, trackFormat_ { 0 }, monitor_ { 0 };
+    std::atomic<T> humDb_ { T(-200) }, crosstalkDb_ { T(-200) }, asymmetry_ { T(0) }, transformer_ { T(0) };
+    std::atomic<T> alignHf_ { T(0) }, alignLf_ { T(0) }, calLevel_ { T(0) };
+
+    // ... and its state (audio thread).
+    bool speedTransportActive_ = false, circuitActive_ = false, contourActive_ = false, hissNormDirty_ = true;
+    int formApplied_ = -1;
+    double speedIps_ = 0.0, tSpeed_ = 1.0, tDelay_ = 96.0, lastMod_ = 0.0;
+    double tUp_ = 0.0, tDown_ = 0.0, speedRestore_ = 0.0, speedNoiseA_ = 0.0, speedNoiseNorm_ = 1.0;
+    double capPhase_ = 0.0, reelPhase_ = 0.0, speedNoise1_ = 0.0, speedNoise2_ = 0.0;
+    double humPhase_ = 0.0, hissNorm_ = 1.0, firNorm_ = 1.0, xtNorm_ = 1.0;
+    double asymMeanA_ = 0.0, trMeanA_ = 0.0;
+    LinearRamp hiss_, hum_, xt_, tr_, asym_, monitorRamp_ { 1.0, 1.0, 0.0 };
+    std::vector<double> wet_, asymMean_, trMean_;
+    std::vector<ShelfSection> hissHF_, hissLF_, xtHp_, trPre_, trPost_;
+    std::vector<std::array<PeakSection, kContourSections>> headContour_;
+    std::vector<std::array<NormalizedLadder<double, 1>, 2>> recNet_, playNet_;
 };
 
 } // namespace dspark

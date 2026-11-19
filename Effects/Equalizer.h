@@ -16,6 +16,15 @@
  * setNumBands(), setBand()'s enabled flag) crossfades in or out over 20 ms
  * instead of stepping.
  *
+ * Analog response (setAnalogResponse(), off by default): every band is
+ * designed from its analog prototype by FilterDesign, so its curve does not
+ * shrink towards Nyquist, and runs in a BiquadCascade whose coefficients are
+ * ramped: a parameter change glides (slowly for a small move, fast for a
+ * jump) and a band at 0 dB leaves the path and costs nothing. It opens cuts
+ * of any slope from 0 to 96 dB per octave and bells, shelves, notches and
+ * band-passes of order 1 to 16. The all-pass, flat tilt and wall bands, and
+ * any band of order above 1, always run this way.
+ *
  * LinearPhase: one zero-phase FIR of a fixed length, independent of the host
  * block (setLinearPhaseKernelLength(); default 32768 taps at 44.1/48 kHz,
  * scaled with the sample rate to the nearest power of two), run by a
@@ -39,7 +48,8 @@
  * - Audio thread (the one stream owner): processBlock(), processSample(),
  *   reset().
  * - Control thread (one writer): setBand(), setNumBands(), setBandEnabled(),
- *   setFilterMode(), setSoftMode(), setMatchedBells(), setMatchedFilters(). Each band is published
+ *   setFilterMode(), setSoftMode(), setMatchedBells(), setMatchedFilters(),
+ *   setAnalogResponse(). Each band is published
  *   through its own seqlock over std::atomic words, so the audio thread adopts
  *   a whole band configuration or none of it; a change is consumed at the next
  *   block (or the next processSample()). Non-finite band fields are replaced
@@ -49,7 +59,8 @@
  *   coefficients while the dirty flag is re-armed, so the change lands one call
  *   later instead of holding the callback open.
  * - Any thread: getBandConfig(), getMagnitudeForFrequencyArray(), getState(),
- *   getNumBands(), getFilterMode(), getSoftMode(), getLatency(). The first two
+ *   getNumBands(), getFilterMode(), getSoftMode(), getLatency(),
+ *   isAnalogResponse(), buildBandSections(). The first two
  *   read the same seqlock and hand back a private copy, so they never observe a
  *   half-written band. They use the UNBOUNDED StagedBand::read(): a readout has
  *   no previously adopted copy to keep, and it is not real-time.
@@ -57,16 +68,19 @@
  *   band's live FilterEngine (its contract, not the equalizer's).
  *
  * Dependencies: Filters.h (FilterEngine), AudioSpec.h, AudioBuffer.h,
- *               Biquad.h, DenormalGuard.h, DspMath.h, FFT.h, StateBlob.h.
+ *               Biquad.h, BiquadCascade.h, DenormalGuard.h, DspMath.h, FFT.h,
+ *               FilterDesign.h, StateBlob.h.
  */
 
 #include "Filters.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/FFT.h"
+#include "../Core/FilterDesign.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -113,7 +127,11 @@ public:
         HighPass,   ///< Removes frequencies below cutoff.
         Notch,      ///< Narrow rejection at frequency.
         BandPass,   ///< Bandpass around frequency.
-        Tilt        ///< Tilt EQ: pivots spectrum around frequency.
+        Tilt,       ///< Tilt EQ: pivots spectrum around frequency.
+        AllPass,      ///< Turns the phase around frequency, 180 degrees per order; the level stays.
+        FlatTilt,     ///< The same slope across the whole band: gain is in dB per octave (-6 to +6), 0 dB at frequency.
+        LowPassWall,  ///< Elliptic cut above frequency: flat to it, 100 dB down a quarter of an octave later.
+        HighPassWall  ///< Elliptic cut below frequency.
     };
 
     /**
@@ -125,7 +143,8 @@ public:
         T gain          = T(0);             ///< Gain in dB (Peak, Shelf, Tilt).
         T q             = T(0.707);         ///< Q factor (0.1 = wide, 10 = narrow).
         BandType type   = BandType::Peak;   ///< Filter type for this band.
-        int slope       = 12;               ///< Slope in dB/oct (LP/HP only: 6-48).
+        T slope         = T(12);            ///< Slope in dB/oct (LP/HP only): 6 to 48 in steps of 6, or any value from 0 to 96 with the analog response.
+        int order       = 1;                ///< Order of a bell, shelf, notch, band-pass or all-pass (1 to 16; 6 dB/oct each). Above 1 the band runs with the analog response.
         bool enabled    = true;             ///< False to bypass this band.
     };
 
@@ -161,6 +180,17 @@ public:
         bandDry_.assign(static_cast<size_t>(bandDryChannels_) * static_cast<size_t>(bandDryStride_), T(0));
         bandFadeStep_ = static_cast<T>(1.0 / std::max(1.0, spec.sampleRate * kBandFadeSeconds));
         bandSnap_ = true;
+
+        // The engine of the analog response: one cascade per band, settled on
+        // the published configuration.
+        designBand_.prepare(spec.sampleRate);
+        analog_ = std::make_unique<std::array<AnalogBand, MaxBands>>();
+        for (int i = 0; i < MaxBands; ++i)
+        {
+            const BandConfig cfg = staged_[i].read();
+            bandAnalog_[static_cast<size_t>(i)] = usesAnalog(cfg);
+            if (bandAnalog_[static_cast<size_t>(i)]) designAnalogBand(i, cfg, true);
+        }
 
         // Rebuild the linear-phase engine. lpFft_ gates the LP audio path, so
         // it is torn down first and re-created last (basic guarantee if an
@@ -313,8 +343,23 @@ public:
 
         for (int i = 0; i < activeBands; ++i)
         {
-            if (bandEnabled_[i].load(std::memory_order_relaxed))
+            if (!bandEnabled_[i].load(std::memory_order_relaxed)) continue;
+            if (bandAnalog_[static_cast<size_t>(i)] && analog_)
+            {
+                // Ramps move once per frame, on channel 0.
+                AnalogBand& band = (*analog_)[static_cast<size_t>(i)];
+                if (channel == 0)
+                {
+                    band.cascade.advanceRamps(1);
+                    settleAnalogBand(band);
+                }
+                if (channel >= 0 && channel < kEngineChannels && !band.idle)
+                    sample = static_cast<T>(band.cascade.processSample(static_cast<double>(sample), channel));
+            }
+            else
+            {
                 sample = bands_[i].processSample(sample, channel);
+            }
         }
         return sample;
     }
@@ -326,6 +371,8 @@ public:
     {
         for (int i = 0; i < MaxBands; ++i)
             bands_[i].reset();
+        if (analog_)
+            for (auto& band : *analog_) band.cascade.reset();
 
         bandSnap_ = true;
         clearLinearPhaseStream();
@@ -367,9 +414,10 @@ public:
     /**
      * @brief Configures a band with full control over all parameters. Thread-safe.
      *
-     * Non-finite frequency/gain/Q fields fall back to the band's current
-     * values (they would otherwise poison the serialized state, the analysis
-     * curve, and the linear-phase kernel); wild type/slope values clamp.
+     * Non-finite frequency/gain/Q/slope fields and a type that is not one
+     * fall back to the band's current values (they would otherwise poison the
+     * serialized state, the analysis curve, and the linear-phase kernel); a
+     * slope or an order out of range clamps.
      *
      * @param index  Band index.
      * @param config Complete band configuration.
@@ -386,9 +434,11 @@ public:
         if (!std::isfinite(cfg.frequency)) cfg.frequency = prev.frequency;
         if (!std::isfinite(cfg.gain))      cfg.gain      = prev.gain;
         if (!std::isfinite(cfg.q))         cfg.q         = prev.q;
-        cfg.type = static_cast<BandType>(std::clamp(static_cast<int>(cfg.type), 0,
-                                                    static_cast<int>(BandType::Tilt)));
-        cfg.slope = std::clamp(cfg.slope, 6, 48);
+        if (!std::isfinite(cfg.slope))     cfg.slope     = prev.slope;
+        if (static_cast<int>(cfg.type) < 0 || static_cast<int>(cfg.type) > static_cast<int>(BandType::HighPassWall))
+            cfg.type = prev.type;
+        cfg.slope = std::clamp(cfg.slope, T(0), T(96));
+        cfg.order = std::clamp(cfg.order, 1, kMaxBandSections);
 
         masterConfigs_[index] = cfg;
         staged_[index].publish(cfg);
@@ -485,6 +535,28 @@ public:
     [[nodiscard]] bool isMatchedFilters() const noexcept
     {
         return matchedFilters_.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Designs every band from its analog prototype (see the file notes).
+     *
+     * Off by default. With it on, the curve of each band stays on its analog
+     * shape up to Nyquist in every type (FilterDesign), a parameter change
+     * ramps the coefficients of the band instead of stepping them, and the
+     * slope of a cut is any value from 0 to 96 dB per octave. Applies to the
+     * minimum-phase engine, the linear-phase kernel and the analysis curve.
+     * A band switching engine fades in over 20 ms.
+     */
+    void setAnalogResponse(bool enabled) noexcept
+    {
+        analogResponse_.store(enabled, std::memory_order_relaxed);
+        configDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Returns whether bands are designed from their analog prototypes (setAnalogResponse()). */
+    [[nodiscard]] bool isAnalogResponse() const noexcept
+    {
+        return analogResponse_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -618,8 +690,8 @@ public:
             const BandConfig cfg = staged_[b].read();
             if (!cfg.enabled) continue;
 
-            BiquadCoeffs st[5];
-            const int ns = buildBandStages(cfg, st);
+            BiquadCoeffs st[kMaxBandSections];
+            const int ns = buildBandSections(cfg, st, kMaxBandSections);
 
             for (int i = 0; i < numPoints; ++i)
             {
@@ -666,6 +738,7 @@ public:
         w.write("matchedFilters", matchedFilters_.load(std::memory_order_relaxed));
         w.write("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)));
         w.write("softMode", softMode_.load(std::memory_order_relaxed));
+        w.write("analog", analogResponse_.load(std::memory_order_relaxed));
         char key[24];
         for (int i = 0; i < n; ++i)
         {
@@ -679,7 +752,11 @@ public:
             std::snprintf(key, sizeof(key), "b%d.type", i);
             w.write(key, static_cast<int32_t>(cfg.type));
             std::snprintf(key, sizeof(key), "b%d.slope", i);
-            w.write(key, cfg.slope);
+            w.write(key, static_cast<int32_t>(std::lround(static_cast<double>(cfg.slope))));
+            std::snprintf(key, sizeof(key), "b%d.slopeDb", i);
+            w.write(key, static_cast<float>(cfg.slope));
+            std::snprintf(key, sizeof(key), "b%d.order", i);
+            w.write(key, static_cast<int32_t>(cfg.order));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             w.write(key, cfg.enabled);
         }
@@ -698,6 +775,7 @@ public:
         setFilterMode(static_cast<FilterMode>(
             r.read("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)))));
         setSoftMode(r.read("softMode", softMode_.load(std::memory_order_relaxed)));
+        setAnalogResponse(r.read("analog", analogResponse_.load(std::memory_order_relaxed)));
         char key[24];
         for (int i = 0; i < n; ++i)
         {
@@ -711,7 +789,11 @@ public:
             std::snprintf(key, sizeof(key), "b%d.type", i);
             cfg.type = static_cast<BandType>(r.read(key, 0));
             std::snprintf(key, sizeof(key), "b%d.slope", i);
-            cfg.slope = r.read(key, 12);
+            const int wholeSlope = r.read(key, 12);
+            std::snprintf(key, sizeof(key), "b%d.slopeDb", i);
+            cfg.slope = static_cast<T>(r.read(key, static_cast<float>(wholeSlope)));   // older blobs: the whole slope
+            std::snprintf(key, sizeof(key), "b%d.order", i);
+            cfg.order = r.read(key, 1);
             std::snprintf(key, sizeof(key), "b%d.on", i);
             cfg.enabled = r.read(key, true);
             setBand(i, cfg);
@@ -772,6 +854,21 @@ protected:
                 continue;
             }
 
+            // A band of the analog response runs in its cascade; one that
+            // changes engine comes in through the band fade.
+            const bool analog = analog_ != nullptr && usesAnalog(cfg);
+            if (analog != bandAnalog_[static_cast<size_t>(i)])
+            {
+                bandAnalog_[static_cast<size_t>(i)] = analog;
+                bandMix_[static_cast<size_t>(i)] = T(0);
+                if (analog) (*analog_)[static_cast<size_t>(i)].configured = false;
+            }
+            if (analog)
+            {
+                designAnalogBand(i, cfg, false);
+                continue;
+            }
+
             float freq = static_cast<float>(cfg.frequency);
             float gain = static_cast<float>(cfg.gain);
             float q    = static_cast<float>(effectiveQ(cfg));
@@ -788,11 +885,12 @@ protected:
                                               static_cast<float>(shelfSlopeFromQ(q, gain))); break;
                 case BandType::HighShelf: filter.setHighShelf(freq, gain,
                                               static_cast<float>(shelfSlopeFromQ(q, gain))); break;
-                case BandType::LowPass:   filter.setLowPass(freq, q, cfg.slope); break;
-                case BandType::HighPass:  filter.setHighPass(freq, q, cfg.slope); break;
+                case BandType::LowPass:   filter.setLowPass(freq, q, legacySlope(cfg)); break;
+                case BandType::HighPass:  filter.setHighPass(freq, q, legacySlope(cfg)); break;
                 case BandType::Notch:     filter.setNotch(freq, q); break;
                 case BandType::BandPass:  filter.setBandPass(freq, q); break;
                 case BandType::Tilt:      filter.setTilt(freq, gain); break;
+                default:                  break;      // the other types run in the analog engine
             }
         }
     }
@@ -852,6 +950,7 @@ protected:
             case BandType::BandPass:  return mf ? BiquadCoeffs::makeBandPassMatched(sr, f, q)
                                                 : BiquadCoeffs::makeBandPass(sr, f, q);
             case BandType::Tilt:      return BiquadCoeffs::makeTilt(sr, f, g);
+            default:                  break;      // the other types have no single section
         }
         return {};
     }
@@ -879,7 +978,7 @@ public:
         {
             const bool lp = (cfg.type == BandType::LowPass);
             // The user Q scales the final cascade stage exactly like the engine.
-            auto casc = FilterEngine<T>::cascadeForSlope(cfg.slope, static_cast<float>(q));
+            auto casc = FilterEngine<T>::cascadeForSlope(legacySlope(cfg), static_cast<float>(q));
             int n = 0;
             if (casc.hasFirstOrder)
                 stages[n++] = lp ? BiquadCoeffs::makeFirstOrderLowPass(sr, f)
@@ -905,7 +1004,250 @@ public:
         return 1;
     }
 
+public:
+    /**
+     * @brief Fills `sections` with the biquads a band runs, whichever engine
+     *        runs it, and returns how many (up to 16).
+     *
+     * The analysis API for user interfaces: with the analog response a band
+     * can have more sections than buildBandStages() has room for. Requires
+     * prepare().
+     *
+     * @param cfg      Band configuration.
+     * @param sections Receives the sections.
+     * @param capacity Room in sections (16 holds any band).
+     * @return Number of sections written.
+     */
+    [[nodiscard]] int buildBandSections(const BandConfig& cfg, BiquadCoeffs* sections, int capacity) const noexcept
+    {
+        if (usesAnalog(cfg)) return designSections(cfg, sections, capacity);
+        BiquadCoeffs stages[5];
+        const int n = std::min(buildBandStages(cfg, stages), capacity);
+        for (int i = 0; i < n; ++i) sections[i] = stages[i];
+        return n;
+    }
+
 protected:
+    static constexpr int kMaxBandSections = AnalogCascade::kMaxSections;   ///< Most sections a band has.
+    static constexpr int kEngineChannels = 16;                             ///< Channels the band engines hold.
+    static constexpr double kRampSlowMs = 40.0;    ///< Glide of a small move of a band of the analog response.
+    static constexpr double kRampFastMs = 10.0;    ///< Glide of a jump.
+    static constexpr double kRestDb = 0.05;        ///< A gain band closer to 0 dB than this leaves the path.
+
+    /// One band of the analog response.
+    struct AnalogBand
+    {
+        BiquadCascade<T, kMaxBandSections, kEngineChannels> cascade;
+        BandConfig config {};       ///< What the cascade is on, or gliding to.
+        bool soft = false;          ///< Soft mode when it was designed (it changes the Q).
+        int wanted = 0;             ///< Sections of that design (a glide can still carry more).
+        bool configured = false;
+        bool resting = false;       ///< The design is transparent (a gain band at 0 dB).
+        bool idle = false;          ///< Resting and landed: no section is computed.
+    };
+
+    /** @brief The slope the cookbook engine runs: 6 to 48 dB per octave, whole. */
+    [[nodiscard]] static int legacySlope(const BandConfig& cfg) noexcept
+    {
+        return static_cast<int>(std::lround(std::clamp(static_cast<double>(cfg.slope), 6.0, 48.0)));
+    }
+
+    /** @brief Whether a band runs with the analog response (the switch, or a band only it can make). */
+    [[nodiscard]] bool usesAnalog(const BandConfig& cfg) const noexcept
+    {
+        return analogResponse_.load(std::memory_order_relaxed)
+            || static_cast<int>(cfg.type) > static_cast<int>(BandType::Tilt)
+            || cfg.order > 1;
+    }
+
+    /** @brief The analog prototype of a band. */
+    [[nodiscard]] AnalogCascade bandPrototype(const BandConfig& cfg) const noexcept
+    {
+        const double f = std::clamp(static_cast<double>(cfg.frequency), 1.0, 80000.0);
+        const double g = std::clamp(static_cast<double>(cfg.gain), -96.0, 96.0);
+        const double q = std::max(static_cast<double>(effectiveQ(cfg)), 0.025);
+        const int order = std::clamp(cfg.order, 1, kMaxBandSections);
+        const double slope = static_cast<double>(cfg.slope);
+        AnalogCascade one;
+        switch (cfg.type)
+        {
+            case BandType::Peak:
+                if (order > 1) return FilterDesign::bell(f, q, g, order);
+                one.add(AnalogSection::peak(f, q, g));
+                break;
+            case BandType::LowShelf:
+                if (order > 1) return FilterDesign::lowShelf(f, g, order);
+                one.add(AnalogSection::lowShelf(f, g, shelfSlopeFromQ(q, g)));
+                break;
+            case BandType::HighShelf:
+                if (order > 1) return FilterDesign::highShelf(f, g, order);
+                one.add(AnalogSection::highShelf(f, g, shelfSlopeFromQ(q, g)));
+                break;
+            case BandType::LowPass:      return FilterDesign::highCut(f, slope, q);
+            case BandType::HighPass:     return FilterDesign::lowCut(f, slope, q);
+            case BandType::Notch:
+                if (order > 1) return FilterDesign::bandStop(f, q, order);
+                one.add(AnalogSection::notch(f, q));
+                break;
+            case BandType::BandPass:
+                if (order > 1) return FilterDesign::bandPass(f, q, order);
+                one.add(AnalogSection::bandPass(f, q));
+                break;
+            case BandType::Tilt:         one.add(AnalogSection::tilt(f, g)); break;
+            case BandType::AllPass:      return FilterDesign::allPass(f, q, order);
+            case BandType::FlatTilt:     return FilterDesign::tilt(f, g);
+            case BandType::LowPassWall:  return FilterDesign::ellipticHighCut(f);
+            case BandType::HighPassWall: return FilterDesign::ellipticLowCut(f);
+        }
+        return one;
+    }
+
+    /**
+     * @brief The biquads of a band of the analog response.
+     *
+     * Every type follows its prototype (FilterDesign::digital()) except the
+     * walls: an elliptic cut through the bilinear transform, with its corner
+     * held in place, is an elliptic filter again, with its ripple and its
+     * floor exact, and only the wall a little steeper.
+     */
+    [[nodiscard]] int designSections(const BandConfig& cfg, BiquadCoeffs* sections, int capacity) const noexcept
+    {
+        const AnalogCascade proto = bandPrototype(cfg);
+        if (cfg.type != BandType::LowPassWall && cfg.type != BandType::HighPassWall)
+            return FilterDesign::digital(proto, designBand_, sections, capacity);
+        const int n = std::min(proto.count, capacity);
+        const double corner = std::clamp(static_cast<double>(cfg.frequency), 1.0, 80000.0);
+        for (int i = 0; i < n; ++i)
+            sections[i] = FilterDesign::bilinear(proto.sections[static_cast<size_t>(i)], spec_.sampleRate, corner);
+        return n;
+    }
+
+    /** @brief Whether a band does nothing as configured: a gain band within kRestDb of 0 dB. */
+    [[nodiscard]] static bool restsAtUnity(const BandConfig& cfg) noexcept
+    {
+        const double gain = std::abs(static_cast<double>(cfg.gain));
+        switch (cfg.type)
+        {
+            case BandType::Peak:
+            case BandType::LowShelf:
+            case BandType::HighShelf:
+            case BandType::Tilt:      return gain < kRestDb;
+            case BandType::FlatTilt:  return gain < 0.1 * kRestDb;
+            default:                  return false;
+        }
+    }
+
+    /**
+     * @brief How long the coefficients of a band take to reach a new design:
+     *        long for a small move, short for a jump.
+     */
+    [[nodiscard]] int rampSamples(const BandConfig& from, const BandConfig& to) const noexcept
+    {
+        double distance = 1.0;
+        if (from.type == to.type && from.order == to.order)
+        {
+            const double f0 = std::max(static_cast<double>(from.frequency), 1.0), f1 = std::max(static_cast<double>(to.frequency), 1.0);
+            const double q0 = std::max(static_cast<double>(from.q), 0.025), q1 = std::max(static_cast<double>(to.q), 0.025);
+            distance = std::max({ std::abs(static_cast<double>(to.gain) - static_cast<double>(from.gain)) / 24.0,
+                                  std::abs(std::log2(f1 / f0)) / 4.0,
+                                  std::abs(std::log2(q1 / q0)) / 4.0,
+                                  std::abs(static_cast<double>(to.slope) - static_cast<double>(from.slope)) / 48.0 });
+        }
+        const double closeness = std::max(0.0, 1.0 - distance);
+        const double ms = kRampFastMs + (kRampSlowMs - kRampFastMs) * closeness * closeness;
+        return std::max(1, static_cast<int>(ms * 0.001 * spec_.sampleRate));
+    }
+
+    /**
+     * @brief Designs a band of the analog response and starts its cascade
+     *        towards the design (audio thread, or prepare()).
+     *
+     * Sections the design adds come in transparent, with their poles, and
+     * open; sections it drops close and leave when the glide lands; a band
+     * that was resting comes back from the history of its input.
+     *
+     * @param index Band index.
+     * @param cfg   Its configuration.
+     * @param snap  True to land at once (prepare(), or a band with no design yet).
+     */
+    void designAnalogBand(int index, const BandConfig& cfg, bool snap) noexcept
+    {
+        AnalogBand& band = (*analog_)[static_cast<size_t>(index)];
+        const bool soft = softMode_.load(std::memory_order_relaxed);
+        if (!snap && band.configured && band.soft == soft && sameDesign(band.config, cfg)) return;
+        band.soft = soft;
+        BiquadCoeffs target[kMaxBandSections];
+        const int n = designSections(cfg, target, kMaxBandSections);
+        const bool rest = restsAtUnity(cfg);
+        auto& cascade = band.cascade;
+        const bool fresh = snap || !band.configured;
+        const int had = band.configured ? cascade.getNumSections() : 0;
+        const int count = std::max(had, n);
+        const int ramp = fresh ? 0 : rampSamples(band.config, cfg);
+
+        if (!band.configured) cascade.setNumSections(0);
+        for (int s = had; s < count; ++s)
+        {
+            cascade.setSectionEnabled(s, true);
+            cascade.setCoeffs(s, target[s].bypassed());
+        }
+        cascade.setNumSections(count);
+        if (band.idle)
+            for (int s = 0; s < count; ++s) cascade.setSectionEnabled(s, true);
+        for (int s = 0; s < count; ++s)
+        {
+            if (s >= n) cascade.rampToBypass(s, ramp);
+            else cascade.rampCoeffs(s, rest ? target[s].bypassed() : target[s], ramp);
+        }
+        band.config = cfg;
+        band.wanted = n;
+        band.resting = rest;
+        band.idle = false;
+        band.configured = true;
+        settleAnalogBand(band);
+    }
+
+    /** @brief Whether two configurations give the same sections (the enabled flag is not part of the design). */
+    [[nodiscard]] static bool sameDesign(const BandConfig& a, const BandConfig& b) noexcept
+    {
+        return a.frequency == b.frequency && a.gain == b.gain && a.q == b.q && a.type == b.type
+            && a.slope == b.slope && a.order == b.order;
+    }
+
+    /** @brief Once a glide has landed: dropped sections leave, and a resting band stops computing. */
+    void settleAnalogBand(AnalogBand& band) noexcept
+    {
+        auto& cascade = band.cascade;
+        if (cascade.isRamping()) return;
+        if (cascade.getNumSections() > band.wanted) cascade.setNumSections(band.wanted);
+        if (band.resting && !band.idle)
+        {
+            for (int s = 0; s < band.wanted; ++s) cascade.setSectionEnabled(s, false);
+            band.idle = true;
+        }
+    }
+
+    /** @brief One block through a band, in the engine that runs it. */
+    void runBand(int index, AudioBufferView<T> view) noexcept
+    {
+        if (bandAnalog_[static_cast<size_t>(index)] && analog_)
+        {
+            AnalogBand& band = (*analog_)[static_cast<size_t>(index)];
+            if (!band.idle) band.cascade.processBlock(view);
+            settleAnalogBand(band);
+            return;
+        }
+        bands_[index].processBlock(view);
+    }
+
+    void resetBand(int index) noexcept
+    {
+        if (bandAnalog_[static_cast<size_t>(index)] && analog_)
+            (*analog_)[static_cast<size_t>(index)].cascade.reset();
+        else
+            bands_[index].reset();
+    }
+
     static constexpr double kBandFadeSeconds = 0.02;
 
     [[nodiscard]] static T moveTowards(T from, T to, T delta) noexcept
@@ -941,17 +1283,17 @@ protected:
                 if (bandSnap_ || bandDry_.empty()) mix = target;
                 if (mix == target)
                 {
-                    if (on) bands_[i].processBlock(view);
+                    if (on) runBand(i, view);
                     continue;
                 }
 
-                if (mix == T(0)) bands_[i].reset();   // re-entering band: clean state
+                if (mix == T(0)) resetBand(i);   // re-entering band: clean state
 
                 const int nCh = std::min(view.getNumChannels(), bandDryChannels_);
                 for (int ch = 0; ch < nCh; ++ch)
                     std::copy_n(view.getChannel(ch), n,
                                 bandDry_.data() + static_cast<size_t>(ch) * static_cast<size_t>(bandDryStride_));
-                bands_[i].processBlock(view);
+                runBand(i, view);
                 const T start = mix;
                 for (int ch = 0; ch < nCh; ++ch)
                 {
@@ -1053,13 +1395,26 @@ protected:
                         lpStage_ = LpStage::Idle;
                         return;
                     }
-                    lpStageCount_[static_cast<size_t>(b)] = cfg.enabled
-                        ? buildBandStages(cfg, lpStages_.data() + static_cast<size_t>(b) * 5)
-                        : 0;
+                    lpStageCount_[static_cast<size_t>(b)] = 0;
+                    lpAnalogCount_[static_cast<size_t>(b)] = 0;
+                    if (!cfg.enabled) continue;
+                    if (usesAnalog(cfg))
+                    {
+                        // The magnitude of the prototype itself: nothing to shrink.
+                        const AnalogCascade proto = bandPrototype(cfg);
+                        lpAnalogCount_[static_cast<size_t>(b)] = proto.count;
+                        for (int s = 0; s < proto.count; ++s)
+                            lpAnalog_[static_cast<size_t>(b * kMaxBandSections + s)] = proto.sections[static_cast<size_t>(s)];
+                    }
+                    else
+                    {
+                        lpStageCount_[static_cast<size_t>(b)] = buildBandStages(cfg, lpStages_.data() + static_cast<size_t>(b) * 5);
+                    }
                 }
                 lpDesignBands_ = activeBands;
                 lpDesignStages_ = 0;
-                for (int b = 0; b < activeBands; ++b) lpDesignStages_ += lpStageCount_[static_cast<size_t>(b)];
+                for (int b = 0; b < activeBands; ++b)
+                    lpDesignStages_ += lpStageCount_[static_cast<size_t>(b)] + lpAnalogCount_[static_cast<size_t>(b)];
                 lpStep_ = 0;
                 lpStage_ = LpStage::Magnitude;
             }
@@ -1099,6 +1454,10 @@ protected:
                             const double den = dRe * dRe + dIm * dIm;
                             power *= (den > 1e-300) ? (nRe * nRe + nIm * nIm) / den : 0.0;
                         }
+                        const AnalogSection* proto = lpAnalog_.data() + static_cast<size_t>(b * kMaxBandSections);
+                        const double omega = dw * static_cast<double>(k) * spec_.sampleRate;
+                        for (int s = 0; s < lpAnalogCount_[static_cast<size_t>(b)]; ++s)
+                            power *= proto[s].magnitudeSquared(omega);
                     }
                     lpMag_[static_cast<size_t>(k)] = static_cast<T>(std::sqrt(power));
                     const double cn = c1 * rc - s1 * rs;
@@ -1330,7 +1689,8 @@ protected:
         std::atomic<T>    gain      { BandConfig{}.gain };
         std::atomic<T>    q         { BandConfig{}.q };
         std::atomic<int>  type      { static_cast<int>(BandConfig{}.type) };
-        std::atomic<int>  slope     { BandConfig{}.slope };
+        std::atomic<T>    slope     { BandConfig{}.slope };
+        std::atomic<int>  order     { BandConfig{}.order };
         std::atomic<bool> enabled   { BandConfig{}.enabled };
         std::atomic<unsigned> seq   { 0 };
 
@@ -1355,6 +1715,7 @@ protected:
             q.store(c.q, std::memory_order_relaxed);
             type.store(static_cast<int>(c.type), std::memory_order_relaxed);
             slope.store(c.slope, std::memory_order_relaxed);
+            order.store(c.order, std::memory_order_relaxed);
             enabled.store(c.enabled, std::memory_order_relaxed);
             seq.fetch_add(1, std::memory_order_release);   // -> even
         }
@@ -1379,6 +1740,7 @@ protected:
             c.q         = q.load(std::memory_order_relaxed);
             c.type      = static_cast<BandType>(type.load(std::memory_order_relaxed));
             c.slope     = slope.load(std::memory_order_relaxed);
+            c.order     = order.load(std::memory_order_relaxed);
             c.enabled   = enabled.load(std::memory_order_relaxed);
         }
 
@@ -1468,6 +1830,12 @@ protected:
     std::atomic<bool> configDirty_ { false };
     std::atomic<bool> matchedBells_ { true };  ///< Matched (de-cramped) bells by default.
     std::atomic<bool> matchedFilters_ { false }; ///< Matched LP/HP/BP/shelves: opt-in.
+    std::atomic<bool> analogResponse_ { false }; ///< Every band from its analog prototype: opt-in.
+
+    // The engine of the analog response (allocated by prepare(), run by the audio thread).
+    std::unique_ptr<std::array<AnalogBand, MaxBands>> analog_;
+    FilterDesign::Band designBand_;
+    std::array<bool, MaxBands> bandAnalog_ {};   ///< Which engine runs each band.
 
     // Linear-phase state
     std::atomic<FilterMode> filterMode_ { FilterMode::MinimumPhase };
@@ -1510,6 +1878,8 @@ protected:
     int lpDesignStages_ = 0;
     std::array<BiquadCoeffs, MaxBands * 5> lpStages_ {};
     std::array<int, MaxBands> lpStageCount_ {};
+    std::array<AnalogSection, MaxBands * AnalogCascade::kMaxSections> lpAnalog_ {};   ///< Prototypes of the analog bands.
+    std::array<int, MaxBands> lpAnalogCount_ {};
     std::vector<T> lpWindow_, lpMag_;
     std::vector<T> lpDesignSpec_, lpDesignTime_, lpKernelTime_;
 };

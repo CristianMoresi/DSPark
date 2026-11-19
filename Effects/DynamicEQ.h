@@ -33,9 +33,56 @@
  * Non-finite samples read as silence in the detectors and bypass the gain
  * filters for that sample, so one NaN or Inf cannot latch in their state.
  *
+ * A band rests at its own gain (BandConfig::gain, 0 dB by default) and the
+ * dynamic part moves it from there, up to the range of each side.
+ *
+ * Mixed bands (setMixedBands(), off by default): the gain of a band at rest
+ * is then a filter of its own, and the part that moves is the signal and one
+ * fixed filter per side (the end of the range), with only how much of the
+ * filter is heard changing:
+ * ```
+ *   y = x + w * (end(x) - x)
+ * ```
+ * with w from the gain in amplitude, so the centre of a bell (the plateau of
+ * a shelf) sits exactly on the gain the ballistics ask for, sample by
+ * sample. No recursion has its coefficients moved while it plays, and
+ * nothing is designed while the gain moves: the default engine designs the
+ * band again every 16 samples, which is a gain that moves in steps (a steady
+ * 6 kHz tone under a band that opens and closes 25 times a second grows
+ * lines 3 kHz away at -66 dBc; mixed, they are at -104). Two fixed curves
+ * cannot be the nominal band at every depth, so the end is chosen for the
+ * band to be exactly the bell or shelf of its Q, fitted to the analog curve
+ * up to Nyquist, half way through the range in decibels; nearer the rest a
+ * cut is wider than nominal and at the end of the range narrower (by a
+ * factor of 10^(range / 80) in Q at most: 1.41 for 12 dB), and a boost the
+ * other way round. A band that rests at 0 dB and is not acting returns its
+ * input bit for bit.
+ *
+ * What the gain follows, per band (all off by default):
+ * - BandConfig::knee: a soft knee around the threshold, or an automatic one
+ *   that grows with the width of the band and with its range.
+ * - BandConfig::timing = Program: the band listens through a filter 1.5
+ *   times narrower and three followers replace the attack and release
+ *   fields: a fast one, a slow one that follows the fast, and a last one
+ *   over the larger of the two. Their times come from the frequency and the
+ *   width of the band (a band cannot know its level sooner than its own
+ *   filter lets it). A short event releases at the fast rate and a held one
+ *   at the slow rate.
+ * - BandConfig::relativeThreshold: the threshold counts from the band's own
+ *   recent level (a reference that rises at once and falls 2 dB per second)
+ *   instead of from full scale, so the band acts the same on a quiet take
+ *   and on a loud one. When the band is moved to another zone a second
+ *   reference listens there for half a second and then takes over.
+ * - BandConfig::placement: the band acts on every channel (linked by the
+ *   loudest), on the left or the right alone, or on the middle or the sides
+ *   of the first pair, and listens to the same part of the sidechain.
+ *
  * Threading model (per method; the model is docs/threading.md):
  * - prepare() / reset() / setOversampling() / setState(): setup or UI threads
  *   only, never concurrently with processBlock().
+ * - setMixedBands(): any thread; the audio thread changes engine at the next
+ *   block and the bands start clean there (may click: choose it before
+ *   playback).
  * - setBand() / setNumBands() / setLookahead(): RT-safe from one control
  *   thread; the audio thread applies them at the next block. Each band is
  *   published through its own seqlock over std::atomic words, so the audio
@@ -59,14 +106,18 @@
  * - Lookahead changes take effect immediately and may click (configure
  *   before playback).
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h, Hilbert.h,
+ * Dependencies: MidSide.h, AudioBuffer.h, AudioSpec.h, Biquad.h,
+ *               BiquadCascade.h, DspMath.h, FilterDesign.h, Hilbert.h,
  *               Oversampling.h, RingBuffer.h, DenormalGuard.h, StateBlob.h.
  */
 
+#include "MidSide.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
 #include "../Core/DspMath.h"
+#include "../Core/FilterDesign.h"
 #include "../Core/Hilbert.h"
 #include "../Core/Oversampling.h"
 #include "../Core/RingBuffer.h"
@@ -77,10 +128,12 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <numbers>
 #include <type_traits>
 #include <vector>
 
@@ -105,6 +158,26 @@ public:
         HighShelf   ///< Dynamic high shelf; detector hears above freq.
     };
 
+    /** @brief Where in a stereo pair a band acts and listens. */
+    enum class Placement
+    {
+        Stereo, ///< Every channel, linked by the loudest. Default.
+        Left,   ///< The first channel only.
+        Right,  ///< The second channel only.
+        Mid,    ///< The middle of the first two channels: what they share.
+        Side    ///< Their sides: what sets them apart.
+    };
+
+    /** @brief What sets how fast the gain of a band moves. */
+    enum class Timing
+    {
+        Manual,  ///< The attack and release fields, applied to the gain. Default.
+        Program  ///< Three followers of the level, timed from the band's frequency and width.
+    };
+
+    /** @brief BandConfig::knee value that asks for the automatic knee. */
+    static constexpr T kAutomaticKnee = T(-1);
+
     /**
      * @brief Full configuration for a single dynamic EQ band.
      * @note Must remain trivially copyable for the lock-free seqlock publish.
@@ -116,6 +189,12 @@ public:
         T threshold      = T(-20);
         BandShape shape  = BandShape::Bell;
         bool enabled     = true;
+
+        T gain           = T(0);            ///< Gain of the band at rest, in dB (-24 to 24). The dynamic part moves from here.
+        T knee           = T(0);            ///< Width of the knee around the threshold in dB (0 to 40); negative (kAutomaticKnee): from the band's width and range.
+        Placement placement = Placement::Stereo;   ///< The channels the band acts on and listens to.
+        Timing timing    = Timing::Manual;  ///< Program: the times come from the band, and the attack and release fields are not used.
+        bool relativeThreshold = false;     ///< The threshold counts from the band's own recent level instead of from full scale.
 
         T aboveRatio     = T(1);
         T aboveAttackMs  = T(5);
@@ -173,6 +252,17 @@ public:
         }
 
         analytic_.assign(static_cast<size_t>(MaxBands * kMaxChannels), HilbertIIR<double> {});
+
+        // The mixed engine: three fixed filters per band, and the rate their
+        // designs are fitted at (the one the bands run at).
+        mixedEngine_ = std::make_unique<MixedEngine>();
+        for (auto& band : mixedEngine_->bands)
+        {
+            band.rest.setNumSections(1);
+            band.cut.setNumSections(1);
+            band.lift.setNumSections(1);
+        }
+        designBand_.prepare(sampleRate_ * oversamplingFactor_);
 
         int maxLaSamples = static_cast<int>(sampleRate_ * oversamplingFactor_ * 0.01) + 1;
         for (int ch = 0; ch < kMaxChannels; ++ch)
@@ -247,7 +337,10 @@ public:
      * Fields are sanitized on the way in: non-finite values keep the band's
      * previously published value (a NaN frequency/Q/time used to poison the
      * detector or the gain ballistics permanently), wild shape enums are
-     * clamped, and the range fields are floored at 0. Configuring a band at or
+     * clamped (a placement or a timing that is not one keeps the band's own),
+     * the gain at rest is held within 24 dB, the knee within 40 dB (any
+     * negative knee is the automatic one), and the range fields are floored
+     * at 0. Configuring a band at or
      * beyond the current band count raises the count to band + 1 (it used to
      * leave the band silent until setNumBands()).
      */
@@ -265,6 +358,13 @@ public:
         c.q              = keep(c.q, prev.q);
         c.threshold      = keep(c.threshold, prev.threshold);
         c.shape          = static_cast<BandShape>(std::clamp(static_cast<int>(c.shape), 0, 2));
+        c.gain           = std::clamp(keep(c.gain, prev.gain), T(-24), T(24));
+        c.knee           = std::min(keep(c.knee, prev.knee), T(40));
+        if (c.knee < T(0)) c.knee = kAutomaticKnee;
+        if (static_cast<int>(c.placement) < 0 || static_cast<int>(c.placement) > static_cast<int>(Placement::Side))
+            c.placement = prev.placement;
+        if (static_cast<int>(c.timing) < 0 || static_cast<int>(c.timing) > static_cast<int>(Timing::Program))
+            c.timing = prev.timing;
         c.aboveRatio     = keep(c.aboveRatio, prev.aboveRatio);
         c.aboveAttackMs  = keep(c.aboveAttackMs, prev.aboveAttackMs);
         c.aboveReleaseMs = keep(c.aboveReleaseMs, prev.aboveReleaseMs);
@@ -285,6 +385,84 @@ public:
     void setNumBands(int n) noexcept
     {
         numBands_.store(std::clamp(n, 1, MaxBands), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Chooses the engine of the bands: fixed filters mixed by the
+     *        gain, or one filter designed again as the gain moves (the
+     *        default).
+     *
+     * A mixed band is the signal and one fixed filter per side (the end of
+     * the range), none of which ever changes while the gain moves; the gain
+     * sets how much of the filter is heard, sample by sample (see the file
+     * notes). Safe from any thread; the audio thread changes engine at
+     * the next block and every band starts clean there, which may click:
+     * choose it before playback.
+     *
+     * @param on True for the mixed engine.
+     */
+    void setMixedBands(bool on) noexcept { mixedWanted_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the bands are mixed from fixed filters (setMixedBands()). */
+    [[nodiscard]] bool isMixedBands() const noexcept { return mixedWanted_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief The magnitude response of a band with its dynamic part at a
+     *        given gain, as the engine in use plays it.
+     *
+     * For an interface: draw it at getBandGainDb() for the live curve, or at
+     * the range of a side for where the band can go. Reads the published
+     * band; setup or UI threads.
+     *
+     * @param band          Band index.
+     * @param dynamicGainDb Gain of the dynamic part, in dB from the rest.
+     * @param frequencies   Array of frequencies in Hz.
+     * @param magnitudes    Output array (same size, linear scale).
+     * @param numPoints     Number of frequency points.
+     */
+    void getBandMagnitude(int band, T dynamicGainDb, const T* frequencies, T* magnitudes, int numPoints) const noexcept
+    {
+        if (frequencies == nullptr || magnitudes == nullptr) return;
+        for (int i = 0; i < numPoints; ++i) magnitudes[i] = T(1);
+        if (band < 0 || band >= MaxBands || sampleRate_ <= 0.0 || !std::isfinite(dynamicGainDb)) return;
+
+        const BandConfig cfg = staged_[static_cast<size_t>(band)].read();
+        const double fs = sampleRate_ * oversamplingFactor_;
+        const double rest = static_cast<double>(cfg.gain), moved = static_cast<double>(dynamicGainDb);
+
+        if (!isMixedBands())
+        {
+            const double total = rest + moved;
+            BiquadCoeffs c;
+            if (std::abs(total) > 0.01)
+                switch (cfg.shape)
+                {
+                    case BandShape::LowShelf:  c = BiquadCoeffs::makeLowShelf(fs, static_cast<double>(cfg.frequency), total); break;
+                    case BandShape::HighShelf: c = BiquadCoeffs::makeHighShelf(fs, static_cast<double>(cfg.frequency), total); break;
+                    default:                   c = BiquadCoeffs::makePeakMatched(fs, static_cast<double>(cfg.frequency),
+                                                                                 static_cast<double>(cfg.q), total); break;
+                }
+            for (int i = 0; i < numPoints; ++i)
+                magnitudes[i] = static_cast<T>(std::abs(responseOf(c, static_cast<double>(frequencies[i]), fs)));
+            return;
+        }
+
+        // Mixed: the filter at rest, and after it the dry signal plus a share
+        // of what the end of that side adds to it.
+        const double range = rangeTowards(cfg, moved > 0.0);
+        const bool acts = range > kRestDb && moved != 0.0;
+        const double side = moved > 0.0 ? range : -range;
+        const double ratio = std::pow(10.0, moved / 20.0), endRatio = std::pow(10.0, side / 20.0);
+        const double weight = acts ? std::clamp((ratio - 1.0) / (endRatio - 1.0), 0.0, 1.0) : 0.0;
+        const bool rests = std::abs(rest) > kRestDb;
+        const BiquadCoeffs atRest = rests ? designShape(cfg, rest) : BiquadCoeffs {};
+        const BiquadCoeffs atEnd = acts ? designEnd(cfg, side) : BiquadCoeffs {};
+        for (int i = 0; i < numPoints; ++i)
+        {
+            const double hz = static_cast<double>(frequencies[i]);
+            const std::complex<double> moving = 1.0 + weight * (responseOf(atEnd, hz, fs) - 1.0);
+            magnitudes[i] = static_cast<T>(std::abs(responseOf(atRest, hz, fs) * moving));
+        }
     }
 
     /**
@@ -366,6 +544,7 @@ public:
         return la + os;
     }
 
+    /** @brief The gain the dynamic part of a band is applying, in dB from its rest (metering; any thread). */
     [[nodiscard]] T getBandGainDb(int band) const noexcept
     {
         if (band < 0 || band >= MaxBands) return T(0);
@@ -374,20 +553,17 @@ public:
 
     void reset() noexcept
     {
+        // The analytic detectors and the oversamplers hold signal history
+        // too: leaving it made reset() replay the old programme (a silent
+        // input produced a 0.84 peak at 2x and a -13 dB gain reading).
         for (int b = 0; b < MaxBands; ++b)
         {
-            bandDetector_[b].reset();
-            bandFilter_[b].reset();
-            currentGainDb_[b] = T(0);
+            cleanBand(b);
             meterGainDb_[b].store(T(0), std::memory_order_relaxed);
             paramsDirty_[b].store(true, std::memory_order_relaxed);
         }
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].reset();
-        // The analytic detectors and the oversamplers hold signal history
-        // too: leaving it made reset() replay the old programme (a silent
-        // input produced a 0.84 peak at 2x and a -13 dB gain reading).
-        for (auto& a : analytic_) a.reset();
         if (oversampler_) oversampler_->reset();
         if (oversamplerSc_) oversamplerSc_->reset();
         refreshCounter_ = 0;
@@ -402,6 +578,7 @@ public:
         const int n = numBands_.load(std::memory_order_relaxed);
         w.write("numBands", n);
         w.write("lookahead", static_cast<float>(lookaheadMs_));
+        w.write("mixed", isMixedBands());
         char key[28];
         for (int i = 0; i < n; ++i)
         {
@@ -419,6 +596,16 @@ public:
             w.write(key, static_cast<int>(c.shape));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             w.write(key, c.enabled);
+            std::snprintf(key, sizeof(key), "b%d.gain", i);
+            w.write(key, static_cast<float>(c.gain));
+            std::snprintf(key, sizeof(key), "b%d.knee", i);
+            w.write(key, static_cast<float>(c.knee));
+            std::snprintf(key, sizeof(key), "b%d.place", i);
+            w.write(key, static_cast<int>(c.placement));
+            std::snprintf(key, sizeof(key), "b%d.timing", i);
+            w.write(key, static_cast<int>(c.timing));
+            std::snprintf(key, sizeof(key), "b%d.relative", i);
+            w.write(key, c.relativeThreshold);
             std::snprintf(key, sizeof(key), "b%d.aRatio", i);
             w.write(key, static_cast<float>(c.aboveRatio));
             std::snprintf(key, sizeof(key), "b%d.aAtk", i);
@@ -463,6 +650,16 @@ public:
             c.shape = static_cast<BandShape>(std::clamp(r.read(key, 0), 0, 2));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             c.enabled = r.read(key, true);
+            std::snprintf(key, sizeof(key), "b%d.gain", i);
+            c.gain = static_cast<T>(r.read(key, 0.0f));
+            std::snprintf(key, sizeof(key), "b%d.knee", i);
+            c.knee = static_cast<T>(r.read(key, 0.0f));
+            std::snprintf(key, sizeof(key), "b%d.place", i);
+            c.placement = static_cast<Placement>(std::clamp(r.read(key, 0), 0, static_cast<int>(Placement::Side)));
+            std::snprintf(key, sizeof(key), "b%d.timing", i);
+            c.timing = static_cast<Timing>(std::clamp(r.read(key, 0), 0, static_cast<int>(Timing::Program)));
+            std::snprintf(key, sizeof(key), "b%d.relative", i);
+            c.relativeThreshold = r.read(key, false);
             std::snprintf(key, sizeof(key), "b%d.aRatio", i);
             c.aboveRatio = static_cast<T>(r.read(key, 1.0f));
             std::snprintf(key, sizeof(key), "b%d.aAtk", i);
@@ -488,6 +685,7 @@ public:
         setNumBands(n);
         // Blobs written before the key existed were rendered without lookahead.
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
+        setMixedBands(r.read("mixed", false));
         return true;
     }
 
@@ -495,13 +693,79 @@ private:
     static constexpr int kMaxChannels = 16;
     static constexpr T kMinLevelDb = T(-100.0);
     static constexpr T kMinEnvelope = T(1e-12); // Prevents NaN in log10
+    static constexpr int kDetChunk = 64;
+
+    // Program timing. The followers count their times in units of the time
+    // constant of the detector's own envelope (Q / (pi f) for a band-pass),
+    // each with a floor: a band cannot know its level sooner than its filter
+    // lets it, and a narrow or low band is slower for that reason alone.
+    static constexpr double kDetectorNarrowing = 1.5;   ///< The detector's Q over the band's.
+    static constexpr double kFastRiseFloor = 0.0003;    ///< Seconds; the fast follower rises in one unit.
+    static constexpr double kFastFallUnits = 12.0;
+    static constexpr double kFastFallFloor = 0.020;
+    static constexpr double kSlowRiseUnits = 40.0;
+    static constexpr double kSlowRiseFloor = 0.080;
+    static constexpr double kSlowFallUnits = 150.0;
+    static constexpr double kSlowFallFloor = 0.400;
+    static constexpr double kLastFallShare = 0.25;      ///< Fall of the last follower, as a share of the fast one's.
+    static constexpr double kDbPerNeper = 8.685889638065037;
+
+    static constexpr double kReferenceFallDb = 2.0;     ///< dB per second the reference level falls.
+    static constexpr double kReferenceWatch = 0.5;      ///< Seconds a second reference listens to a new zone.
+
+    static constexpr double kKneePerOctave = 3.0;       ///< Automatic knee: dB per (1 + octaves of width), at a range of 12 dB.
+    static constexpr double kMixedRampMs = 20.0;        ///< Glide of a mixed band's filters to a new design.
+    static constexpr double kRestDb = 0.01;             ///< A gain or a range closer to 0 dB than this is no filter.
 
     struct BandState
     {
         BandConfig cfg;
-        T aboveAtkCoeff, aboveRelCoeff;
-        T belowAtkCoeff, belowRelCoeff;
+        T aboveAtkCoeff = T(0), aboveRelCoeff = T(0);
+        T belowAtkCoeff = T(0), belowRelCoeff = T(0);
+        T knee = T(0);                      ///< Knee in use (the automatic one resolved).
+
+        // Program timing: the three followers, in amplitude.
+        double fastUp = 1.0, fastDown = 1.0, slowUp = 1.0, slowDown = 1.0, lastDown = 1.0;
+        double fast = 0.0, slow = 0.0, heard = 0.0;
+
+        // Relative threshold: the reference level and the one that listens to a new zone.
+        double reference = -100.0, candidate = -100.0;
+        double referenceFall = 0.0;         ///< dB per sample.
+        int watching = 0;                   ///< Samples the candidate still listens.
+
+        // Mixed engine.
+        bool rests = false;                 ///< The band has a filter at rest (its gain is not 0 dB).
+        bool cuts = false, lifts = false;   ///< It has an end below its rest, and one above.
+        double cutScale = 0.0, liftScale = 0.0;   ///< 1 / (1 - end) and 1 / (end - 1), the ends as amplitude ratios to the rest.
+        bool designed = false;              ///< Its filters carry a design: the next one glides.
     };
+
+    /** @brief The fixed filters of a mixed band: its rest (in series), and the end of the range on each side. */
+    struct MixedBand
+    {
+        BiquadCascade<T, 1, kMaxChannels> rest, cut, lift;
+    };
+
+    /** @brief Everything the mixed engine needs, allocated in prepare(). */
+    struct MixedEngine
+    {
+        std::array<MixedBand, MaxBands> bands;
+        std::array<std::array<T, kDetChunk>, kMaxChannels> cut {}, lift {};   ///< What the ends give for the chunk.
+        std::array<std::array<T, kDetChunk>, kMaxChannels> held {};           ///< Non-finite samples kept out of the filters.
+        std::array<double, kDetChunk> cutWeight {}, liftWeight {};
+    };
+
+    [[nodiscard]] static bool ofThePair(const BandConfig& cfg) noexcept
+    {
+        return cfg.placement == Placement::Mid || cfg.placement == Placement::Side;
+    }
+
+    /** @brief Whether a band has something to act on: one channel has no right and no sides. */
+    [[nodiscard]] static bool plays(const BandConfig& cfg, int numChannels) noexcept
+    {
+        if (!cfg.enabled) return false;
+        return numChannels >= 2 || (cfg.placement != Placement::Right && cfg.placement != Placement::Side);
+    }
 
     void processCore(AudioBufferView<T>& audio, AudioBufferView<T>& sidechain, double currentFs) noexcept
     {
@@ -512,19 +776,19 @@ private:
         const int nb   = numBands_.load(std::memory_order_relaxed);
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
 
+        // A change of engine: every band starts clean in the new one.
+        const bool mixed = mixedWanted_.load(std::memory_order_relaxed) && mixedEngine_ != nullptr;
+        if (mixed != mixedActive_)
+        {
+            mixedActive_ = mixed;
+            for (int b = 0; b < MaxBands; ++b) restartBand(b);
+        }
+
         // Bands re-activated by a band-count increase start clean: they would
         // otherwise replay the gain and filter state from when they were last
         // active (a boosted band re-added on a 0.001 tone peaked at 5.4).
         if (nb > lastNumBands_)
-            for (int b = lastNumBands_; b < nb; ++b)
-            {
-                bandDetector_[b].reset();
-                bandFilter_[b].reset();
-                currentGainDb_[b] = T(0);
-                meterGainDb_[b].store(T(0), std::memory_order_relaxed);
-                for (int ch = 0; ch < kMaxChannels; ++ch)
-                    analytic_[static_cast<size_t>(b * kMaxChannels + ch)].reset();
-            }
+            for (int b = lastNumBands_; b < nb; ++b) restartBand(b);
         lastNumBands_ = nb;
 
         // 1. Thread-Safe State Update
@@ -534,141 +798,489 @@ private:
                 updateBandInternalState(b, currentFs);
         }
 
-        // 2. Chunks: the detection of every band runs first, band by band and
-        //    channel by channel, so each detector (and its allpass pair) keeps
-        //    its state in registers; the gain computers and filters then run
-        //    sample by sample. Feed-forward, so the order changes nothing.
+        // The bands that play, in the order they are applied: the stereo, left
+        // and right ones first, then the ones of the middle and the sides.
+        numFirst_ = numSecond_ = 0;
+        for (int b = 0; b < nb; ++b)
+        {
+            playing_[static_cast<size_t>(b)] = plays(states_[b].cfg, nCh);
+            if (!playing_[static_cast<size_t>(b)]) continue;
+            if (ofThePair(states_[b].cfg)) second_[static_cast<size_t>(numSecond_++)] = b;
+            else first_[static_cast<size_t>(numFirst_++)] = b;
+        }
+
+        // 2. Chunks: the detection and the gain of every band run first, band
+        //    by band and channel by channel, so each detector (and its allpass
+        //    pair) keeps its state in registers; the filters then run over
+        //    the chunk. Feed-forward, so the order changes nothing.
         for (int chunkStart = 0; chunkStart < nS; chunkStart += kDetChunk)
         {
             const int chunkLen = std::min(kDetChunk, nS - chunkStart);
 
             for (int b = 0; b < nb; ++b)
             {
-                if (!states_[b].cfg.enabled) continue;
-                T* levels = detLevelDb_[static_cast<size_t>(b)].data();
-                std::fill(levels, levels + chunkLen, kMinLevelDb);
-
-                // Sidechain Detection (Stereo Linked by Max Peak)
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    const T* sc = sidechain.getChannel(std::min(ch, scCh - 1)) + chunkStart;
-                    for (int j = 0; j < chunkLen; ++j)
-                        detBand_[static_cast<size_t>(j)] = static_cast<double>(bandDetector_[b].processSample(
-                            std::isfinite(sc[j]) ? sc[j] : T(0), ch)); // non-finite would latch
-                    analytic_[static_cast<size_t>(b * kMaxChannels + ch)].magnitudeBlock(
-                        detBand_.data(), detMag_.data(), chunkLen);
-                    for (int j = 0; j < chunkLen; ++j)
-                    {
-                        // max(|x|, analytic magnitude): a steady tone reads as
-                        // its flat amplitude, not a rectified wave (see @file).
-                        const T detected = std::max(static_cast<T>(std::abs(detBand_[static_cast<size_t>(j)])),
-                                                    static_cast<T>(detMag_[static_cast<size_t>(j)]));
-                        const T levelDb = gainToDecibels(std::max(detected, kMinEnvelope));
-                        if (levelDb > levels[j]) levels[j] = levelDb;
-                    }
-                }
+                if (!playing_[static_cast<size_t>(b)]) continue;
+                detectBand(b, sidechain, chunkStart, chunkLen, nCh, scCh);
+                computeGains(b, chunkLen);
             }
 
-            for (int j = 0; j < chunkLen; ++j)
+            if (mixedActive_) applyMixed(audio, chunkStart, chunkLen, nCh, laSamples);
+            else applyRedesigned(audio, chunkStart, chunkLen, nCh, nb, laSamples, currentFs);
+        }
+    }
+
+    /**
+     * @brief The level a band hears over one chunk: every channel (the
+     *        loudest), one channel, or the middle or the sides of the first
+     *        pair of the sidechain.
+     *
+     * Leaves decibels in detLevelDb_ (manual timing) or amplitudes in
+     * detLinear_ (program timing).
+     */
+    void detectBand(int b, AudioBufferView<T>& sidechain, int start, int n, int nCh, int scCh) noexcept
+    {
+        const BandConfig& cfg = states_[b].cfg;
+        const bool program = cfg.timing == Timing::Program;
+        T* levels = detLevelDb_[static_cast<size_t>(b)].data();
+        std::fill(levels, levels + n, kMinLevelDb);
+        if (program) std::fill(detLinear_.begin(), detLinear_.begin() + n, 0.0);
+
+        const Placement where = cfg.placement;
+        const int listeners = where == Placement::Stereo ? nCh : 1;
+        for (int k = 0; k < listeners; ++k)
+        {
+            int slot = k;
+            const T* first = sidechain.getChannel(std::min(k, scCh - 1)) + start;
+            const T* second = nullptr;
+            T sign = T(1);
+            if (where == Placement::Right)
             {
-                const int i = chunkStart + j;
-                for (int b = 0; b < nb; ++b)
+                slot = 1;
+                first = sidechain.getChannel(std::min(1, scCh - 1)) + start;
+            }
+            else if (where == Placement::Mid || where == Placement::Side)
+            {
+                if (scCh >= 2) second = sidechain.getChannel(1) + start;
+                else if (where == Placement::Side) break;   // one channel has no sides: silence
+                sign = where == Placement::Mid ? T(1) : T(-1);
+            }
+
+            if (second == nullptr)
+            {
+                for (int j = 0; j < n; ++j)
+                    detBand_[static_cast<size_t>(j)] = static_cast<double>(bandDetector_[b].processSample(
+                        std::isfinite(first[j]) ? first[j] : T(0), slot)); // non-finite would latch
+            }
+            else
+            {
+                for (int j = 0; j < n; ++j)
                 {
-                    if (!states_[b].cfg.enabled) continue;
-
-                    const T maxLevelDb = detLevelDb_[static_cast<size_t>(b)][static_cast<size_t>(j)];
-
-                    // Gain Computer
-                    T targetGainDb = computeTargetGain(states_[b].cfg, maxLevelDb);
-
-                    // Gain Ballistics (Attack/Release applied to the Gain itself)
-                    T& currentGain = currentGainDb_[b];
-                    T diff = targetGainDb - currentGain;
-                
-                    T coeff;
-                    if (maxLevelDb > states_[b].cfg.threshold) {
-                        coeff = (std::abs(targetGainDb) > std::abs(currentGain)) 
-                                ? states_[b].aboveAtkCoeff : states_[b].aboveRelCoeff;
-                    } else {
-                        coeff = (std::abs(targetGainDb) > std::abs(currentGain)) 
-                                ? states_[b].belowAtkCoeff : states_[b].belowRelCoeff;
-                    }
-                
-                    currentGain += coeff * diff;
-
-                    // Refresh gain-filter coefficients every 16 samples - the gain
-                    // envelope is slow enough that this granularity is inaudible.
-                    // The grid is a free-running counter, not the block index, so
-                    // the output does not depend on how the host cuts the stream.
-                    // Bells run the matched design; at 1/16th rate it stays
-                    // negligible (+1.6% CPU over the cookbook form).
-                    // Stream-owner direct writes (setCoeffsNow): these values are
-                    // computed HERE, on the audio thread, for this thread's own
-                    // use, so they never touch the staged cross-thread channel.
-                    if ((refreshCounter_ & 15u) == 0u)
-                    {
-                        if (std::abs(currentGain) > T(0.01))
-                        {
-                            switch (states_[b].cfg.shape)
-                            {
-                            case BandShape::Bell:
-                                bandFilter_[b].setCoeffsNow(BiquadCoeffs::makePeakMatched(
-                                    currentFs, static_cast<double>(states_[b].cfg.frequency),
-                                    static_cast<double>(states_[b].cfg.q), static_cast<double>(currentGain)));
-                                break;
-                            case BandShape::LowShelf:
-                                bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeLowShelf(
-                                    currentFs, static_cast<double>(states_[b].cfg.frequency),
-                                    static_cast<double>(currentGain)));
-                                break;
-                            case BandShape::HighShelf:
-                                bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeHighShelf(
-                                    currentFs, static_cast<double>(states_[b].cfg.frequency),
-                                    static_cast<double>(currentGain)));
-                                break;
-                            }
-                        }
-                        else
-                            bandFilter_[b].setCoeffsNow(BiquadCoeffs{}); // Bypass
-                    }
-
-                    if ((refreshCounter_ & 63u) == 0u) // Sub-sample metering update
-                        meterGainDb_[b].store(currentGain, std::memory_order_relaxed);
+                    const T one = std::isfinite(first[j]) ? first[j] : T(0);
+                    const T other = std::isfinite(second[j]) ? second[j] : T(0);
+                    detBand_[static_cast<size_t>(j)] = static_cast<double>(
+                        bandDetector_[b].processSample((one + sign * other) * T(0.5), slot));
                 }
-                ++refreshCounter_;
+            }
+            analytic_[static_cast<size_t>(b * kMaxChannels + slot)].magnitudeBlock(
+                detBand_.data(), detMag_.data(), n);
 
-                // Apply Filters
-                for (int ch = 0; ch < nCh; ++ch)
+            // max(|x|, analytic magnitude): a steady tone reads as its flat
+            // amplitude, not a rectified wave (see @file).
+            if (program)
+            {
+                for (int j = 0; j < n; ++j)
+                    detLinear_[static_cast<size_t>(j)] = std::max(detLinear_[static_cast<size_t>(j)],
+                        std::max(std::abs(detBand_[static_cast<size_t>(j)]), detMag_[static_cast<size_t>(j)]));
+            }
+            else
+            {
+                for (int j = 0; j < n; ++j)
                 {
-                    T audioSample = audio.getChannel(ch)[i];
-                
-                    if (laSamples > 0) {
-                        lookaheadBuf_[ch].push(audioSample);
-                        audioSample = lookaheadBuf_[ch].read(laSamples);
-                    }
-
-                    // A non-finite sample passes without entering the filter
-                    // state, where it would latch for good.
-                    if (std::isfinite(audioSample))
-                        for (int b = 0; b < nb; ++b) {
-                            if (states_[b].cfg.enabled) {
-                                audioSample = bandFilter_[b].processSample(audioSample, ch);
-                            }
-                        }
-                    audio.getChannel(ch)[i] = audioSample;
+                    const T detected = std::max(static_cast<T>(std::abs(detBand_[static_cast<size_t>(j)])),
+                                                static_cast<T>(detMag_[static_cast<size_t>(j)]));
+                    const T levelDb = gainToDecibels(std::max(detected, kMinEnvelope));
+                    if (levelDb > levels[j]) levels[j] = levelDb;
                 }
             }
         }
     }
 
-    [[nodiscard]] T computeTargetGain(const BandConfig& cfg, T levelDb) const noexcept
+    /**
+     * @brief The dynamic gain of a band over one chunk, in decibels from its
+     *        rest, into dynDb_.
+     */
+    void computeGains(int b, int n) noexcept
+    {
+        BandState& st = states_[b];
+        const BandConfig& cfg = st.cfg;
+        const bool program = cfg.timing == Timing::Program;
+        const T* levels = detLevelDb_[static_cast<size_t>(b)].data();
+        T* gains = dynDb_[static_cast<size_t>(b)].data();
+        T& currentGain = currentGainDb_[b];
+
+        for (int j = 0; j < n; ++j)
+        {
+            T levelDb;
+            if (program)
+            {
+                // Fast; slow, which follows the fast; and a last one over the
+                // larger of the two, which takes the corner out of the hand-over.
+                const double x = detLinear_[static_cast<size_t>(j)];
+                st.fast += (x > st.fast ? st.fastUp : st.fastDown) * (x - st.fast);
+                st.slow += (st.fast > st.slow ? st.slowUp : st.slowDown) * (st.fast - st.slow);
+                const double larger = std::max(st.fast, st.slow);
+                st.heard = larger > st.heard ? larger : st.heard + st.lastDown * (larger - st.heard);
+                levelDb = std::max(static_cast<T>(fastLog(std::max(st.heard, 1e-12)) * kDbPerNeper), kMinLevelDb);
+            }
+            else
+            {
+                levelDb = levels[j];
+            }
+
+            T threshold = cfg.threshold;
+            if (cfg.relativeThreshold)
+            {
+                const double level = static_cast<double>(levelDb);
+                st.reference = std::max(level, st.reference - st.referenceFall);
+                if (st.watching > 0)
+                {
+                    st.candidate = std::max(level, st.candidate - st.referenceFall);
+                    if (--st.watching == 0) st.reference = st.candidate;
+                }
+                threshold = static_cast<T>(st.reference + static_cast<double>(cfg.threshold));
+            }
+
+            // Gain Computer
+            const T targetGainDb = computeTargetGain(cfg, levelDb, threshold, st.knee);
+
+            if (program)
+            {
+                currentGain = targetGainDb;     // the followers have set the pace
+            }
+            else
+            {
+                // Gain Ballistics (Attack/Release applied to the Gain itself)
+                const T diff = targetGainDb - currentGain;
+                T coeff;
+                if (levelDb > threshold) {
+                    coeff = (std::abs(targetGainDb) > std::abs(currentGain))
+                            ? st.aboveAtkCoeff : st.aboveRelCoeff;
+                } else {
+                    coeff = (std::abs(targetGainDb) > std::abs(currentGain))
+                            ? st.belowAtkCoeff : st.belowRelCoeff;
+                }
+                currentGain += coeff * diff;
+            }
+            gains[j] = currentGain;
+        }
+
+        // A follower left to fall for long reaches numbers too small to carry.
+        if (st.fast < 1e-30) st.fast = 0.0;
+        if (st.slow < 1e-30) st.slow = 0.0;
+        if (st.heard < 1e-30) st.heard = 0.0;
+    }
+
+    /**
+     * @brief The default engine over one chunk: one filter per band, designed
+     *        again at the gain of the moment every 16 samples.
+     */
+    void applyRedesigned(AudioBufferView<T>& audio, int start, int n, int nCh, int nb,
+                         int laSamples, double currentFs) noexcept
+    {
+        for (int j = 0; j < n; ++j)
+        {
+            const int i = start + j;
+            for (int b = 0; b < nb; ++b)
+            {
+                if (!playing_[static_cast<size_t>(b)]) continue;
+                const T currentGain = dynDb_[static_cast<size_t>(b)][static_cast<size_t>(j)];
+
+                // Refresh gain-filter coefficients every 16 samples - the gain
+                // envelope is slow enough that this granularity is inaudible.
+                // The grid is a free-running counter, not the block index, so
+                // the output does not depend on how the host cuts the stream.
+                // Bells run the matched design; at 1/16th rate it stays
+                // negligible (+1.6% CPU over the cookbook form).
+                // Stream-owner direct writes (setCoeffsNow): these values are
+                // computed HERE, on the audio thread, for this thread's own
+                // use, so they never touch the staged cross-thread channel.
+                if ((refreshCounter_ & 15u) == 0u)
+                {
+                    const T total = states_[b].cfg.gain + currentGain;
+                    if (std::abs(total) > T(0.01))
+                    {
+                        switch (states_[b].cfg.shape)
+                        {
+                        case BandShape::Bell:
+                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makePeakMatched(
+                                currentFs, static_cast<double>(states_[b].cfg.frequency),
+                                static_cast<double>(states_[b].cfg.q), static_cast<double>(total)));
+                            break;
+                        case BandShape::LowShelf:
+                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeLowShelf(
+                                currentFs, static_cast<double>(states_[b].cfg.frequency),
+                                static_cast<double>(total)));
+                            break;
+                        case BandShape::HighShelf:
+                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeHighShelf(
+                                currentFs, static_cast<double>(states_[b].cfg.frequency),
+                                static_cast<double>(total)));
+                            break;
+                        }
+                    }
+                    else
+                        bandFilter_[b].setCoeffsNow(BiquadCoeffs{}); // Bypass
+                }
+
+                if ((refreshCounter_ & 63u) == 0u) // Sub-sample metering update
+                    meterGainDb_[b].store(currentGain, std::memory_order_relaxed);
+            }
+            ++refreshCounter_;
+
+            // The frame, delayed by the lookahead. A non-finite sample passes
+            // without entering the filter state, where it would latch for good.
+            T frame[kMaxChannels] = {};
+            bool finite[kMaxChannels] = {};
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T audioSample = audio.getChannel(ch)[i];
+                if (laSamples > 0) {
+                    lookaheadBuf_[ch].push(audioSample);
+                    audioSample = lookaheadBuf_[ch].read(laSamples);
+                }
+                frame[ch] = audioSample;
+                finite[ch] = std::isfinite(audioSample);
+            }
+
+            for (int k = 0; k < numFirst_; ++k)
+            {
+                const int b = first_[static_cast<size_t>(k)];
+                switch (states_[b].cfg.placement)
+                {
+                case Placement::Left:
+                    if (finite[0]) frame[0] = bandFilter_[b].processSample(frame[0], 0);
+                    break;
+                case Placement::Right:
+                    if (finite[1]) frame[1] = bandFilter_[b].processSample(frame[1], 1);
+                    break;
+                default:
+                    for (int ch = 0; ch < nCh; ++ch)
+                        if (finite[ch]) frame[ch] = bandFilter_[b].processSample(frame[ch], ch);
+                    break;
+                }
+            }
+
+            if (numSecond_ > 0 && finite[0] && (nCh < 2 || finite[1]))
+            {
+                // The middle and the sides of the pair (one channel is its own middle).
+                T middle = frame[0], sides = T(0);
+                if (nCh >= 2)
+                {
+                    middle = (frame[0] + frame[1]) * T(0.5);
+                    sides = (frame[0] - frame[1]) * T(0.5);
+                }
+                for (int k = 0; k < numSecond_; ++k)
+                {
+                    const int b = second_[static_cast<size_t>(k)];
+                    if (states_[b].cfg.placement == Placement::Mid)
+                        middle = bandFilter_[b].processSample(middle, 0);
+                    else
+                        sides = bandFilter_[b].processSample(sides, 0);
+                }
+                if (nCh >= 2)
+                {
+                    frame[0] = middle + sides;
+                    frame[1] = middle - sides;
+                }
+                else
+                {
+                    frame[0] = middle;
+                }
+            }
+
+            for (int ch = 0; ch < nCh; ++ch)
+                audio.getChannel(ch)[i] = frame[ch];
+        }
+    }
+
+    /**
+     * @brief The mixed engine over one chunk: the bands in series, each one
+     *        its fixed filters mixed by its gain.
+     */
+    void applyMixed(AudioBufferView<T>& audio, int start, int n, int nCh, int laSamples) noexcept
+    {
+        MixedEngine& engine = *mixedEngine_;
+        T* channels[kMaxChannels] = {};
+        bool bad[kMaxChannels] = {};     // channels with a non-finite sample in this chunk
+        bool anyBad = false;
+
+        // The chunk, delayed by the lookahead. A non-finite sample stays out
+        // of the filters and goes back to its place at the end.
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* data = audio.getChannel(ch) + start;
+            channels[ch] = data;
+            if (laSamples > 0)
+                for (int j = 0; j < n; ++j)
+                {
+                    lookaheadBuf_[ch].push(data[j]);
+                    data[j] = lookaheadBuf_[ch].read(laSamples);
+                }
+            for (int j = 0; j < n; ++j)
+                if (!std::isfinite(data[j]))
+                {
+                    auto& held = engine.held[static_cast<size_t>(ch)];
+                    if (!bad[ch]) held.fill(T(0));
+                    held[static_cast<size_t>(j)] = data[j];
+                    data[j] = T(0);
+                    bad[ch] = anyBad = true;
+                }
+        }
+
+        for (int k = 0; k < numFirst_; ++k)
+        {
+            const int b = first_[static_cast<size_t>(k)];
+            const Placement where = states_[b].cfg.placement;
+            if (where == Placement::Stereo)
+            {
+                mixBand(b, AudioBufferView<T>(channels, nCh, n), n);
+            }
+            else
+            {
+                T* single[1] = { channels[where == Placement::Left ? 0 : 1] };
+                mixBand(b, AudioBufferView<T>(single, 1, n), n);
+            }
+        }
+
+        if (numSecond_ > 0)
+        {
+            AudioBufferView<T> pair(channels, nCh, n);
+            if (nCh >= 2) MidSide<T>::encode(pair);
+            for (int k = 0; k < numSecond_; ++k)
+            {
+                const int b = second_[static_cast<size_t>(k)];
+                T* single[1] = { channels[states_[b].cfg.placement == Placement::Mid ? 0 : 1] };
+                mixBand(b, AudioBufferView<T>(single, 1, n), n);
+            }
+            if (nCh >= 2) MidSide<T>::decode(pair);
+        }
+
+        if (anyBad)
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                if (!bad[ch]) continue;
+                const auto& held = engine.held[static_cast<size_t>(ch)];
+                for (int j = 0; j < n; ++j)
+                    if (!std::isfinite(held[static_cast<size_t>(j)])) channels[ch][j] = held[static_cast<size_t>(j)];
+            }
+    }
+
+    /**
+     * @brief One mixed band over one chunk of the channels it acts on.
+     *
+     * The weights come from the gain in amplitude: with the band at d dB
+     * from its rest and the end of that side at e dB, w = (1 - 10^(d/20)) /
+     * (1 - 10^(e/20)), which puts the centre of the band exactly d dB from
+     * the rest.
+     */
+    void mixBand(int b, AudioBufferView<T> where, int n) noexcept
+    {
+        const BandState& st = states_[b];
+        MixedEngine& engine = *mixedEngine_;
+        MixedBand& filters = engine.bands[static_cast<size_t>(b)];
+        const T* gains = dynDb_[static_cast<size_t>(b)].data();
+        const int count = where.getNumChannels();
+
+        bool down = false, up = false;
+        for (int j = 0; j < n; ++j)
+        {
+            const double d = static_cast<double>(gains[j]);
+            double cut = 0.0, lift = 0.0;
+            if (d < 0.0 && st.cuts) cut = std::min((1.0 - fastPow10(d * 0.05)) * st.cutScale, 1.0);
+            else if (d > 0.0 && st.lifts) lift = std::min((fastPow10(d * 0.05) - 1.0) * st.liftScale, 1.0);
+            engine.cutWeight[static_cast<size_t>(j)] = cut;
+            engine.liftWeight[static_cast<size_t>(j)] = lift;
+            down = down || cut > 0.0;
+            up = up || lift > 0.0;
+        }
+        meterGainDb_[b].store(gains[n - 1], std::memory_order_relaxed);
+
+        // The filter at rest is a filter in series. The ends hear what comes
+        // out of it, on copies: always, moving or not, so that their memory
+        // is the signal's.
+        if (st.rests) filters.rest.processBlock(where);
+        T* copies[kMaxChannels] = {};
+        if (st.cuts)
+        {
+            for (int ch = 0; ch < count; ++ch)
+            {
+                copies[ch] = engine.cut[static_cast<size_t>(ch)].data();
+                std::copy_n(where.getChannel(ch), n, copies[ch]);
+            }
+            filters.cut.processBlock(AudioBufferView<T>(copies, count, n));
+        }
+        if (st.lifts)
+        {
+            for (int ch = 0; ch < count; ++ch)
+            {
+                copies[ch] = engine.lift[static_cast<size_t>(ch)].data();
+                std::copy_n(where.getChannel(ch), n, copies[ch]);
+            }
+            filters.lift.processBlock(AudioBufferView<T>(copies, count, n));
+        }
+
+        for (int ch = 0; ch < count; ++ch)
+        {
+            T* y = where.getChannel(ch);
+            if (down)
+            {
+                const T* end = engine.cut[static_cast<size_t>(ch)].data();
+                for (int j = 0; j < n; ++j)
+                    y[j] += static_cast<T>(engine.cutWeight[static_cast<size_t>(j)]) * (end[j] - y[j]);
+            }
+            if (up)
+            {
+                const T* end = engine.lift[static_cast<size_t>(ch)].data();
+                for (int j = 0; j < n; ++j)
+                    y[j] += static_cast<T>(engine.liftWeight[static_cast<size_t>(j)]) * (end[j] - y[j]);
+            }
+        }
+    }
+
+    /**
+     * @brief The gain the level asks for, in decibels from the band's rest.
+     *
+     * With a knee of W dB the slope of each side comes in over W around the
+     * threshold, as a parabola, instead of at a corner.
+     */
+    [[nodiscard]] static T computeTargetGain(const BandConfig& cfg, T levelDb, T threshold, T knee) noexcept
     {
         T gainDb = T(0);
 
-        if (levelDb > cfg.threshold)
+        if (knee > T(0))
+        {
+            const T over = levelDb - threshold;
+            const T half = knee * T(0.5);
+            if (cfg.aboveRatio > T(1.001) && over > -half)
+            {
+                const T bent = over < half ? (over + half) * (over + half) / (T(2) * knee) : over;
+                const T amount = std::min(bent * (T(1) - T(1) / cfg.aboveRatio), cfg.aboveRangeDb);
+                gainDb += cfg.aboveBoost ? amount : -amount;
+            }
+            if (cfg.belowRatio > T(1.001) && over < half)
+            {
+                const T under = -over;
+                const T bent = under < half ? (under + half) * (under + half) / (T(2) * knee) : under;
+                const T amount = std::min(bent * (T(1) - T(1) / cfg.belowRatio), cfg.belowRangeDb);
+                gainDb += cfg.belowBoost ? amount : -amount;
+            }
+            return gainDb;
+        }
+
+        if (levelDb > threshold)
         {
             if (cfg.aboveRatio > T(1.001)) {
-                T overDb = levelDb - cfg.threshold;
+                T overDb = levelDb - threshold;
                 T amount = std::min(overDb * (T(1) - T(1) / cfg.aboveRatio), cfg.aboveRangeDb);
                 gainDb += cfg.aboveBoost ? amount : -amount;
             }
@@ -676,12 +1288,134 @@ private:
         else
         {
             if (cfg.belowRatio > T(1.001)) {
-                T underDb = cfg.threshold - levelDb;
+                T underDb = threshold - levelDb;
                 T amount = std::min(underDb * (T(1) - T(1) / cfg.belowRatio), cfg.belowRangeDb);
                 gainDb += cfg.belowBoost ? amount : -amount;
             }
         }
         return gainDb;
+    }
+
+    /** @brief Clears everything a band remembers of the signal (its configuration stays). */
+    void cleanBand(int b) noexcept
+    {
+        bandDetector_[b].reset();
+        bandFilter_[b].reset();
+        currentGainDb_[b] = T(0);
+        BandState& st = states_[b];
+        st.fast = st.slow = st.heard = 0.0;
+        st.reference = st.candidate = static_cast<double>(kMinLevelDb);
+        st.watching = 0;
+        st.designed = false;
+        if (!analytic_.empty())     // allocated in prepare()
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+                analytic_[static_cast<size_t>(b * kMaxChannels + ch)].reset();
+        if (mixedEngine_)
+        {
+            MixedBand& filters = mixedEngine_->bands[static_cast<size_t>(b)];
+            filters.rest.reset();
+            filters.cut.reset();
+            filters.lift.reset();
+        }
+    }
+
+    /** @brief A band that comes into play: clean, and designed again at the next update. */
+    void restartBand(int b) noexcept
+    {
+        cleanBand(b);
+        meterGainDb_[b].store(T(0), std::memory_order_relaxed);
+        paramsDirty_[b].store(true, std::memory_order_release);
+    }
+
+    /** @brief The complex response of a section at one frequency. */
+    [[nodiscard]] static std::complex<double> responseOf(const BiquadCoeffs& c, double hz, double fs) noexcept
+    {
+        const double w = 2.0 * std::numbers::pi * std::clamp(hz, 0.0, 0.5 * fs) / fs;
+        const std::complex<double> z1 = std::polar(1.0, -w), z2 = std::polar(1.0, -2.0 * w);
+        return (c.b0 + c.b1 * z1 + c.b2 * z2) / (1.0 + c.a1 * z1 + c.a2 * z2);
+    }
+
+    /** @brief The larger range among the sides of a band that act in one direction. */
+    [[nodiscard]] static double rangeTowards(const BandConfig& cfg, bool boost) noexcept
+    {
+        double range = 0.0;
+        if (cfg.aboveRatio > T(1.001) && cfg.aboveBoost == boost)
+            range = std::max(range, static_cast<double>(cfg.aboveRangeDb));
+        if (cfg.belowRatio > T(1.001) && cfg.belowBoost == boost)
+            range = std::max(range, static_cast<double>(cfg.belowRangeDb));
+        return range;
+    }
+
+    /** @brief The filter of a band's shape at one gain, fitted to its analog curve. */
+    [[nodiscard]] BiquadCoeffs designShape(const BandConfig& cfg, double gainDb) const noexcept
+    {
+        const double hz = std::clamp(static_cast<double>(cfg.frequency), 1.0, 80000.0);
+        const double q = std::max(static_cast<double>(cfg.q), 0.025);
+        const double gain = std::clamp(gainDb, -96.0, 96.0);
+        switch (cfg.shape)
+        {
+            case BandShape::LowShelf:  return FilterDesign::digital(AnalogSection::lowShelf(hz, gain), designBand_);
+            case BandShape::HighShelf: return FilterDesign::digital(AnalogSection::highShelf(hz, gain), designBand_);
+            default:                   return FilterDesign::digital(AnalogSection::peak(hz, q, gain), designBand_);
+        }
+    }
+
+    /**
+     * @brief The fixed filter at the end of one side of a mixed band.
+     *
+     * Not the band at that gain: the filter that makes the band, half way
+     * through the range in decibels, exactly the bell or shelf of that gain
+     * and of its Q. With H the band at half the range and r its gain there
+     * as an amplitude, the end is 1 + (1 + r) (H - 1): the same poles, and
+     * the whole range at its centre. A fixed pair cannot be the nominal
+     * curve at every depth, and this choice splits the difference: nearer
+     * the rest a cut is wider than nominal and at the end narrower, by a
+     * factor of 10^(range / 80) in Q at most (1.41 for 12 dB); a boost, the
+     * other way round.
+     *
+     * @param cfg     The band.
+     * @param rangeDb The range of the side: negative for a cut.
+     */
+    [[nodiscard]] BiquadCoeffs designEnd(const BandConfig& cfg, double rangeDb) const noexcept
+    {
+        const BiquadCoeffs half = designShape(cfg, 0.5 * rangeDb);
+        const double reach = 1.0 + std::pow(10.0, rangeDb / 40.0);
+        BiquadCoeffs end = half;
+        end.b0 = 1.0 + reach * (half.b0 - 1.0);
+        end.b1 = half.a1 + reach * (half.b1 - half.a1);
+        end.b2 = half.a2 + reach * (half.b2 - half.a2);
+        return end;
+    }
+
+    /** @brief Designs the fixed filters of a mixed band: at rest and at the end of each side. */
+    void designMixedBand(int b, double fs) noexcept
+    {
+        BandState& st = states_[b];
+        const BandConfig& cfg = st.cfg;
+        MixedBand& filters = mixedEngine_->bands[static_cast<size_t>(b)];
+        const double rest = static_cast<double>(cfg.gain);
+        const double cutRange = rangeTowards(cfg, false), liftRange = rangeTowards(cfg, true);
+        const bool cuts = cutRange > kRestDb, lifts = liftRange > kRestDb;
+        const bool rests = std::abs(rest) > kRestDb;
+
+        // A filter that was out of the band comes in clean; one that was
+        // playing glides to its new design.
+        const int ramp = static_cast<int>(kMixedRampMs * 0.001 * fs);
+        const auto place = [&](BiquadCascade<T, 1, kMaxChannels>& filter, const BiquadCoeffs& design, bool was, bool is) noexcept {
+            if (!is) return;
+            if (!was || !st.designed) filter.reset();
+            filter.rampCoeffs(0, design, was && st.designed ? ramp : 0);
+        };
+        if (rests) place(filters.rest, designShape(cfg, rest), st.rests, rests);
+        if (cuts) place(filters.cut, designEnd(cfg, -cutRange), st.cuts, cuts);
+        if (lifts) place(filters.lift, designEnd(cfg, liftRange), st.lifts, lifts);
+
+        st.rests = rests;
+        st.cuts = cuts;
+        st.lifts = lifts;
+        st.cutScale = cuts ? 1.0 / (1.0 - std::pow(10.0, -cutRange / 20.0)) : 0.0;
+        st.liftScale = lifts ? 1.0 / (std::pow(10.0, liftRange / 20.0) - 1.0) : 0.0;
+        st.designed = true;
     }
 
     void updateBandInternalState(int b, double fs) noexcept
@@ -703,27 +1437,52 @@ private:
             return;
         }
 
+        BandState& st = states_[b];
+        const BandConfig old = st.cfg;
+
         // A band re-enabled after being disabled would replay arbitrarily old
-        // filter history and gain state: start it clean.
-        const bool wasEnabled = states_[b].cfg.enabled;
-        if (cfg.enabled && !wasEnabled)
+        // filter history and gain state: start it clean. So does one that
+        // moves to other channels, whose memory is of another signal.
+        if ((cfg.enabled && !old.enabled) || cfg.placement != old.placement)
+            cleanBand(b);
+
+        // The zone the band listens to has moved: with a relative threshold,
+        // a second reference listens there before it takes over.
+        const bool moved = cfg.frequency != old.frequency || cfg.q != old.q || cfg.shape != old.shape
+                           || cfg.timing != old.timing;
+        if (cfg.relativeThreshold && old.relativeThreshold && moved)
         {
+            // The detector starts clean there: what it still rings of the old
+            // zone is not the level of the new one.
             bandDetector_[b].reset();
-            bandFilter_[b].reset();
-            currentGainDb_[b] = T(0);
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+                analytic_[static_cast<size_t>(b * kMaxChannels + ch)].reset();
+            st.fast = st.slow = st.heard = 0.0;
+            st.candidate = static_cast<double>(kMinLevelDb);
+            st.watching = std::max(1, static_cast<int>(kReferenceWatch * fs));
         }
-        states_[b].cfg = cfg;
+        else if (cfg.relativeThreshold && !old.relativeThreshold)
+        {
+            st.reference = st.candidate = static_cast<double>(kMinLevelDb);
+            st.watching = 0;
+        }
+        st.referenceFall = kReferenceFallDb / fs;
+        st.cfg = cfg;
 
         // Detector listens where the gain filter acts: bandpass for bells,
-        // the corresponding half of the spectrum for shelves.
+        // the corresponding half of the spectrum for shelves. With program
+        // timing the band-pass is narrower than the band, so what sets the
+        // gain is the middle of it.
         // Direct writes (setCoeffsNow): this runs on the audio thread, which
         // owns these Biquads (one-master rule, see the threading block), so
         // even this cold reconfiguration must not self-publish through the
         // staged channel.
+        const bool program = cfg.timing == Timing::Program;
+        const T detectorQ = program ? cfg.q * static_cast<T>(kDetectorNarrowing) : cfg.q;
         switch (cfg.shape)
         {
         case BandShape::Bell:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeBandPass(fs, cfg.frequency, cfg.q));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeBandPass(fs, cfg.frequency, detectorQ));
             break;
         case BandShape::LowShelf:
             bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeLowPass(fs, cfg.frequency, T(0.707)));
@@ -738,10 +1497,41 @@ private:
             return static_cast<T>(1.0 - std::exp(-1.0 / (fs * tauSec)));
         };
 
-        states_[b].aboveAtkCoeff = calcCoeff(cfg.aboveAttackMs);
-        states_[b].aboveRelCoeff = calcCoeff(cfg.aboveReleaseMs);
-        states_[b].belowAtkCoeff = calcCoeff(cfg.belowAttackMs);
-        states_[b].belowRelCoeff = calcCoeff(cfg.belowReleaseMs);
+        st.aboveAtkCoeff = calcCoeff(cfg.aboveAttackMs);
+        st.aboveRelCoeff = calcCoeff(cfg.aboveReleaseMs);
+        st.belowAtkCoeff = calcCoeff(cfg.belowAttackMs);
+        st.belowRelCoeff = calcCoeff(cfg.belowReleaseMs);
+
+        // Program timing: the time constant of the detector's envelope is the unit.
+        const double hz = std::clamp(static_cast<double>(cfg.frequency), 10.0, 0.45 * fs);
+        const double unit = cfg.shape == BandShape::Bell
+            ? std::max(static_cast<double>(detectorQ), 0.1) / (std::numbers::pi * hz)
+            : 1.0 / (std::numbers::pi * hz);
+        const auto pole = [fs](double seconds) noexcept { return 1.0 - std::exp(-1.0 / (fs * seconds)); };
+        const double fastFall = std::max(kFastFallUnits * unit, kFastFallFloor);
+        st.fastUp = pole(std::max(unit, kFastRiseFloor));
+        st.fastDown = pole(fastFall);
+        st.slowUp = pole(std::max(kSlowRiseUnits * unit, kSlowRiseFloor));
+        st.slowDown = pole(std::max(kSlowFallUnits * unit, kSlowFallFloor));
+        st.lastDown = pole(kLastFallShare * fastFall);
+
+        // The knee: the one asked for, or one that grows with the width of the
+        // band (a wide band is a tone control and wants a gentle onset) and
+        // with the root of its range.
+        if (cfg.knee >= T(0))
+        {
+            st.knee = cfg.knee;
+        }
+        else
+        {
+            const double range = std::max(rangeTowards(cfg, false), rangeTowards(cfg, true));
+            const double octaves = cfg.shape == BandShape::Bell
+                ? 2.0 / std::numbers::ln2 * std::asinh(0.5 / std::max(static_cast<double>(cfg.q), 0.05))
+                : 2.0;
+            st.knee = static_cast<T>(std::min(kKneePerOctave * (1.0 + octaves) * std::sqrt(range / 12.0), 40.0));
+        }
+
+        if (mixedActive_) designMixedBand(b, fs);
     }
 
     void updateLookahead() noexcept
@@ -776,6 +1566,11 @@ private:
         std::atomic<T>    threshold      { T(-20) };
         std::atomic<int>  shape          { static_cast<int>(BandShape::Bell) };
         std::atomic<bool> enabled        { true };
+        std::atomic<T>    gain           { T(0) };
+        std::atomic<T>    knee           { T(0) };
+        std::atomic<int>  placement      { static_cast<int>(Placement::Stereo) };
+        std::atomic<int>  timing         { static_cast<int>(Timing::Manual) };
+        std::atomic<bool> relative       { false };
 
         std::atomic<T>    aboveRatio     { T(1) };
         std::atomic<T>    aboveAttackMs  { T(5) };
@@ -811,6 +1606,11 @@ private:
             threshold.store(c.threshold, std::memory_order_relaxed);
             shape.store(static_cast<int>(c.shape), std::memory_order_relaxed);
             enabled.store(c.enabled, std::memory_order_relaxed);
+            gain.store(c.gain, std::memory_order_relaxed);
+            knee.store(c.knee, std::memory_order_relaxed);
+            placement.store(static_cast<int>(c.placement), std::memory_order_relaxed);
+            timing.store(static_cast<int>(c.timing), std::memory_order_relaxed);
+            relative.store(c.relativeThreshold, std::memory_order_relaxed);
             aboveRatio.store(c.aboveRatio, std::memory_order_relaxed);
             aboveAttackMs.store(c.aboveAttackMs, std::memory_order_relaxed);
             aboveReleaseMs.store(c.aboveReleaseMs, std::memory_order_relaxed);
@@ -831,7 +1631,7 @@ private:
         /// more of the block budget on it.
         static constexpr int kSeqlockMaxAttempts = 3;
 
-        /** @brief Relaxed copy of the fifteen published words (no ordering of
+        /** @brief Relaxed copy of the twenty published words (no ordering of
          *  its own; the caller's fences and counter checks provide that).
          *
          *  Shared by both readers below so the word list exists exactly once: a
@@ -844,6 +1644,11 @@ private:
             c.threshold      = threshold.load(std::memory_order_relaxed);
             c.shape          = static_cast<BandShape>(shape.load(std::memory_order_relaxed));
             c.enabled        = enabled.load(std::memory_order_relaxed);
+            c.gain           = gain.load(std::memory_order_relaxed);
+            c.knee           = knee.load(std::memory_order_relaxed);
+            c.placement      = static_cast<Placement>(placement.load(std::memory_order_relaxed));
+            c.timing         = static_cast<Timing>(timing.load(std::memory_order_relaxed));
+            c.relativeThreshold = relative.load(std::memory_order_relaxed);
             c.aboveRatio     = aboveRatio.load(std::memory_order_relaxed);
             c.aboveAttackMs  = aboveAttackMs.load(std::memory_order_relaxed);
             c.aboveReleaseMs = aboveReleaseMs.load(std::memory_order_relaxed);
@@ -869,7 +1674,7 @@ private:
          * it is still using and a give-up leaves it intact.
          *
          * An odd counter means the writer is mid-publish: skip the copy
-         * entirely instead of copying fifteen words that would be discarded.
+         * entirely instead of copying twenty words that would be discarded.
          *
          * @param out Receives the band configuration if and only if true is returned.
          * @return true if a consistent configuration was adopted; false if the
@@ -954,10 +1759,21 @@ private:
     std::atomic<int> lookaheadSamples_ { 0 };
     std::array<RingBuffer<T>, kMaxChannels> lookaheadBuf_ {};
     std::vector<HilbertIIR<double>> analytic_; ///< Per band and channel: ripple-free detector level.
-    static constexpr int kDetChunk = 64;
     std::array<double, kDetChunk> detBand_ {};                    ///< Detector chunk scratch.
     std::array<double, kDetChunk> detMag_ {};                     ///< Its analytic magnitude.
     std::array<std::array<T, kDetChunk>, MaxBands> detLevelDb_ {}; ///< Linked level per band.
+    std::array<double, kDetChunk> detLinear_ {};                  ///< Linked amplitude of the band in hand (program timing).
+    std::array<std::array<T, kDetChunk>, MaxBands> dynDb_ {};     ///< Dynamic gain per band, in dB from its rest.
+
+    std::array<bool, MaxBands> playing_ {};      ///< Bands with something to act on in this block.
+    std::array<int, MaxBands> first_ {};         ///< The stereo, left and right ones, in order.
+    std::array<int, MaxBands> second_ {};        ///< The ones of the middle and the sides, in order.
+    int numFirst_ = 0, numSecond_ = 0;
+
+    std::atomic<bool> mixedWanted_ { false };    ///< setMixedBands().
+    bool mixedActive_ = false;                   ///< The engine the audio thread is running.
+    std::unique_ptr<MixedEngine> mixedEngine_;
+    FilterDesign::Band designBand_;              ///< The frequencies the mixed bands are fitted over.
 };
 
 } // namespace dspark

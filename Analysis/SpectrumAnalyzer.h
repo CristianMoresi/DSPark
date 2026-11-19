@@ -47,7 +47,7 @@
  *   model; single-word relaxed atomics, picked up once per analysis frame).
  *   Non-finite values are ignored.
  *
- * Dependencies: DspMath.h, FFT.h, WindowFunctions.h.
+ * Dependencies: AuditoryBands.h, DspMath.h, FFT.h, WindowFunctions.h.
  *
  * @code
  * dspark::SpectrumAnalyzer<float> analyzer;
@@ -67,6 +67,7 @@
  * @endcode
  */
 
+#include "../Core/AuditoryBands.h"
 #include "../Core/DspMath.h"
 #include "../Core/FFT.h"
 #include "../Core/WindowFunctions.h"
@@ -424,6 +425,27 @@ public:
     [[nodiscard]] const T* getMagnitudesDb() const noexcept
     {
         return snapshotFrame(false);
+    }
+
+    /**
+     * @brief A spectrum read in bands of the ear's scale (Bark), the
+     *        perceptual view of getMagnitudesDb(): each band's power in dB.
+     * @param bands        An AuditoryBands prepared for this analyzer's rate
+     *                     and FFT size (its band count is the output's).
+     * @param magnitudesDb getNumBins() values, as getMagnitudesDb() returns them.
+     * @param outDb        bands.getNumBands() values.
+     * @param scratch      getNumBins() + bands.getNumBands() doubles of the
+     *                     caller's storage (nothing is allocated).
+     */
+    static void toAuditoryBands(const AuditoryBands<double>& bands, const T* magnitudesDb, T* outDb,
+                                double* scratch) noexcept
+    {
+        const int bins = bands.getNumBins(), n = bands.getNumBands();
+        if (magnitudesDb == nullptr || outDb == nullptr || scratch == nullptr || bins <= 0) return;
+        for (int k = 0; k < bins; ++k) scratch[k] = std::pow(10.0, static_cast<double>(magnitudesDb[k]) / 10.0);
+        double* p = scratch + bins;
+        bands.bandPowers(scratch, p);
+        for (int b = 0; b < n; ++b) outDb[b] = static_cast<T>(10.0 * std::log10(std::max(p[b], 1e-30)));
     }
 
     /**

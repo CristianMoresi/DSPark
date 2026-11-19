@@ -30,7 +30,7 @@
  * - processBlock(): audio thread (single stream owner).
  * - reset(): stream owner or setup (touches the same plain accumulators
  *   processBlock() writes; allocation-free).
- * - getCorrelation() / getBalance() / getGonioPoints(): any thread,
+ * - getCorrelation() / getBalance() / getDominantLevelDb() / getGonioPoints(): any thread,
  *   lock-free. Goniometer points are individually atomic, so a concurrent
  *   reader never observes torn values; a reader that overlaps a large
  *   writer block may briefly copy points newer than the published write
@@ -38,11 +38,19 @@
  * - getWindowMs(): reflects the last successful prepare(); read it from the
  *   setup thread or once preparation is complete.
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h.
+ * getDominantLevelDb() is the level of the dominant component of the pair,
+ * wherever it sits in the image: the larger eigenvalue of the averaged
+ * covariance of the two channels (AuditoryScale::dominantPower()), as a
+ * power in dB: a full-scale sine in both channels in phase reads 0 dB (the
+ * mean square of the pair), in one channel only -3 dB, and in both channels
+ * in opposite phase 0 dB again (the dominant component is the side).
+ *
+ * Dependencies: AudioBuffer.h, AudioSpec.h, AuditoryBands.h, DspMath.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/AuditoryBands.h"
 #include "../Core/DspMath.h"
 
 #include <algorithm>
@@ -115,6 +123,7 @@ public:
         gonioWrite_.store(0, std::memory_order_relaxed);
         correlation_.store(T(0), std::memory_order_relaxed);
         balance_.store(T(0), std::memory_order_relaxed);
+        dominantDb_.store(T(-200), std::memory_order_relaxed);
     }
 
     // -- Processing -------------------------------------------------------------------
@@ -196,6 +205,8 @@ public:
         const double total = ll + rr;
         const double bal = (total > 1e-12) ? (rr - ll) / total : 0.0;
         balance_.store(static_cast<T>(bal), std::memory_order_relaxed);
+        const double dom = AuditoryScale::dominantPower(ll, rr, lr);
+        dominantDb_.store(static_cast<T>(dom > 1e-20 ? 10.0 * std::log10(dom) : -200.0), std::memory_order_relaxed);
     }
 
     // -- Readout (lock-free, any thread) ------------------------------------------------
@@ -210,6 +221,12 @@ public:
     [[nodiscard]] T getBalance() const noexcept
     {
         return balance_.load(std::memory_order_relaxed);
+    }
+
+    /** @return The power of the dominant component in dB (-200 in silence). */
+    [[nodiscard]] T getDominantLevelDb() const noexcept
+    {
+        return dominantDb_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -244,6 +261,7 @@ private:
     std::atomic<bool> prepared_ { false };
 
     double lr_ = 0.0, ll_ = 0.0, rr_ = 0.0;
+    std::atomic<T> dominantDb_ { T(-200) };
 
     int gonioDecim_ = 2;
     int decimCount_ = 0;

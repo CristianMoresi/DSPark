@@ -11,6 +11,7 @@
 #include "../DSPark.h"
 
 #include <clocale>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <memory>
@@ -578,4 +579,133 @@ DSPARK_TEST(State_json_float_limits_and_malformed_text)
     const std::string longKey = "{\"id\":1,\"version\":2,\"params\":{\""
                               + std::string(300, 'x') + "\":true}}";
     EXPECT_TRUE(stateFromJson(longKey).empty());
+}
+
+// ============================================================================
+// Oversampling factor chosen from the host rate
+// ============================================================================
+
+namespace {
+
+struct RateFactor { double rate; int factor; };
+
+// Automatic on: every prepare() takes the factor of the rate, the processor
+// runs at it, the choice survives a state round trip and an explicit factor
+// turns it off.
+template <typename Effect, typename FactorOf>
+bool automaticOversamplingFollowsTheRate(FactorOf&& factorOf, std::initializer_list<RateFactor> expected)
+{
+    auto fx = std::make_unique<Effect>();
+    if (fx->isOversamplingAutomatic()) return false;        // off by default
+    fx->setAutomaticOversampling(true);
+    if (!fx->isOversamplingAutomatic()) return false;
+
+    double lastRate = 48000.0;
+    int lastFactor = 1;
+    for (const RateFactor& each : expected)
+    {
+        fx->prepare(spec(each.rate, 256, 2));
+        if (factorOf(*fx) != each.factor) return false;
+        auto block = makeStereoBuffer(256);
+        for (int pass = 0; pass < 4; ++pass)
+        {
+            block.fillSine(1000.0f, static_cast<float>(each.rate), 0.25f);
+            fx->processBlock(block.view());
+            if (hasNaN(block.ch(0), 256) || hasNaN(block.ch(1), 256)) return false;
+        }
+        lastRate = each.rate;
+        lastFactor = each.factor;
+    }
+
+    const auto blob = fx->getState();
+    auto other = std::make_unique<Effect>();
+    other->prepare(spec(lastRate, 256, 2));
+    if (!other->setState(blob.data(), blob.size())) return false;
+    other->prepare(spec(lastRate, 256, 2));
+    if (!other->isOversamplingAutomatic() || factorOf(*other) != lastFactor) return false;
+    if (!blobsEqual(blob, other->getState())) return false;
+
+    fx->setOversampling(4);
+    if (fx->isOversamplingAutomatic()) return false;
+    fx->prepare(spec(96000.0, 256, 2));
+    return factorOf(*fx) == 4;
+}
+
+} // namespace
+
+DSPARK_TEST(Automatic_oversampling_follows_the_host_rate)
+{
+    const auto factor = [](const auto& fx) { return fx.getOversamplingFactor(); };
+
+    // Processors whose default is 2x keep that internal rate (88.2 kHz).
+    EXPECT_TRUE(automaticOversamplingFollowsTheRate<Saturation<float>>(factor,
+        { { 44100.0, 2 }, { 48000.0, 2 }, { 88200.0, 1 }, { 96000.0, 1 }, { 192000.0, 1 } }));
+    EXPECT_TRUE(automaticOversamplingFollowsTheRate<TransformerModel<float>>(factor,
+        { { 48000.0, 2 }, { 96000.0, 1 } }));
+    EXPECT_TRUE(automaticOversamplingFollowsTheRate<TubePreamp<float>>(factor,
+        { { 48000.0, 2 }, { 96000.0, 1 } }));
+
+    // The tape core runs at 4x by default: 176.4 kHz.
+    EXPECT_TRUE(automaticOversamplingFollowsTheRate<TapeMachine<float>>(factor,
+        { { 44100.0, 4 }, { 96000.0, 2 }, { 192000.0, 1 } }));
+
+    // The clipper is off by default; automatic is the same 88.2 kHz.
+    EXPECT_TRUE(automaticOversamplingFollowsTheRate<Clipper<float>>(
+        [](const Clipper<float>& fx) { return fx.getOversampling(); },
+        { { 44100.0, 2 }, { 48000.0, 2 }, { 96000.0, 1 } }));
+
+    // The latency the host is told follows the factor in use.
+    {
+        Saturation<float> fx;
+        fx.setAutomaticOversampling(true);
+        fx.prepare(spec(48000.0, 256, 2));
+        EXPECT_GT(fx.getLatency(), 0);
+        fx.prepare(spec(96000.0, 256, 2));
+        EXPECT_EQ(fx.getLatency(), 0);
+        // Turned on after prepare(), it takes effect at once.
+        Saturation<float> late;
+        late.prepare(spec(96000.0, 256, 2));
+        EXPECT_EQ(late.getOversamplingFactor(), 2);
+        late.setAutomaticOversampling(true);
+        EXPECT_EQ(late.getOversamplingFactor(), 1);
+        EXPECT_EQ(late.getLatency(), 0);
+    }
+
+    // DynamicEQ (no state key for its factor) and the waveshape table.
+    {
+        auto eq = std::make_unique<DynamicEQ<float>>();
+        EXPECT_FALSE(eq->isOversamplingAutomatic());
+        eq->setAutomaticOversampling(true);
+        eq->prepare(spec(48000.0, 256, 2));
+        EXPECT_EQ(eq->getOversamplingFactor(), 2);
+        EXPECT_GT(eq->getLatency(), 0);
+        eq->prepare(spec(96000.0, 256, 2));
+        EXPECT_EQ(eq->getOversamplingFactor(), 1);
+        EXPECT_EQ(eq->getLatency(), 0);
+        eq->prepare(spec(22050.0, 256, 2));
+        EXPECT_EQ(eq->getOversamplingFactor(), 4);          // its largest factor
+        eq->setOversampling(2);
+        EXPECT_FALSE(eq->isOversamplingAutomatic());
+        eq->prepare(spec(96000.0, 256, 2));
+        EXPECT_EQ(eq->getOversamplingFactor(), 2);
+    }
+    {
+        WaveshapeTable<float> table;
+        EXPECT_FALSE(table.isOversamplingAutomatic());
+        table.setAutomaticOversampling(true);
+        table.prepare(spec(48000.0, 256, 2));
+        EXPECT_EQ(table.getOversamplingFactor(), 2);
+        EXPECT_GT(table.getLatency(), 0);
+        table.prepare(spec(96000.0, 256, 2));
+        EXPECT_EQ(table.getOversamplingFactor(), 1);
+        EXPECT_EQ(table.getLatency(), 0);
+        auto block = makeStereoBuffer(256);
+        block.fillSine(1000.0f, 96000.0f, 0.25f);
+        table.processBlock(block.view());
+        EXPECT_FALSE(hasNaN(block.ch(0), 256));
+        table.setOversampling(4);
+        EXPECT_FALSE(table.isOversamplingAutomatic());
+        table.prepare(spec(96000.0, 256, 2));
+        EXPECT_EQ(table.getOversamplingFactor(), 4);
+    }
 }

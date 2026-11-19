@@ -2251,3 +2251,246 @@ DSPARK_TEST(RingBuffer_unrepresentable_byte_size_leaves_it_unprepared)
         EXPECT_EQ(rb.getCapacity(), 1024);
     }
 }
+
+// ============================================================================
+// Step-dependent ramps, factor by rate, dry path of an oversampler
+// ============================================================================
+
+DSPARK_TEST(SmoothedValue_adaptive_ramp_lasts_by_the_size_of_the_step)
+{
+    using SV = SmoothedValue<double>;
+    const auto samplesToArrive = [](SV& sv) {
+        int n = 0;
+        while (sv.isSmoothing() && n < 1000000) { (void)sv.getNextValue(); ++n; }
+        return static_cast<double>(n);
+    };
+
+    SV sv;
+    sv.prepare(48000.0, 10.0);
+    sv.setSmoothingType(SV::SmoothingType::Linear);
+    sv.setAdaptiveRamp(1.0, 20.0, 150.0);
+    EXPECT_TRUE(sv.hasAdaptiveRamp());
+
+    // A step of the whole span lands in the fast time, and so does a larger one.
+    sv.reset(0.0);
+    sv.setTargetValue(1.0);
+    EXPECT_NEAR(samplesToArrive(sv), 960.0, 2.0);
+    EXPECT_TRUE(sv.getCurrentValue() == 1.0);
+    sv.setTargetValue(5.0);
+    EXPECT_NEAR(samplesToArrive(sv), 960.0, 2.0);
+    EXPECT_TRUE(sv.getCurrentValue() == 5.0);
+
+    // Half the span: 20 + 130 * 0.5^2 = 52.5 ms.
+    sv.reset(0.0);
+    sv.setTargetValue(0.5);
+    EXPECT_NEAR(samplesToArrive(sv), 52.5 * 48.0, 2.0);
+
+    // A nudge glides over almost the whole slow time.
+    sv.reset(0.0);
+    sv.setTargetValue(0.001);
+    EXPECT_NEAR(samplesToArrive(sv), (20.0 + 130.0 * 0.999 * 0.999) * 48.0, 3.0);
+    EXPECT_TRUE(sv.getCurrentValue() == 0.001);
+
+    // An edit in mid ramp starts from the value already reached, without a
+    // jump, and its duration is that of the step that is left.
+    sv.reset(0.0);
+    sv.setTargetValue(1.0);
+    for (int i = 0; i < 100; ++i) (void)sv.getNextValue();
+    const double reached = sv.getCurrentValue();
+    EXPECT_NEAR(reached, 100.0 / 960.0, 1e-9);
+    sv.setTargetValue(0.0);
+    const double next = sv.getNextValue();
+    EXPECT_LT(next, reached);
+    EXPECT_GT(next, reached - 1e-3);
+    const double closeness = 1.0 - reached;
+    EXPECT_NEAR(samplesToArrive(sv) + 1.0, (20.0 + 130.0 * closeness * closeness) * 48.0, 3.0);
+
+    // The block form gives the same values as the per-sample form.
+    SV a, b;
+    for (SV* each : { &a, &b })
+    {
+        each->prepare(48000.0, 10.0);
+        each->setSmoothingType(SV::SmoothingType::Linear);
+        each->setAdaptiveRamp(2.0, 5.0, 60.0);
+        each->reset(1.0);
+        each->setTargetValue(1.75);
+    }
+    std::vector<double> block(4096);
+    a.processBlock(block);
+    bool same = true;
+    for (double v : block) same = same && (v == b.getNextValue());
+    EXPECT_TRUE(same);
+
+    // Off again: the ramp time of prepare(), whatever the step.
+    sv.setAdaptiveRamp(0.0, 20.0, 150.0);
+    EXPECT_FALSE(sv.hasAdaptiveRamp());
+    sv.reset(0.0);
+    sv.setTargetValue(0.001);
+    EXPECT_NEAR(samplesToArrive(sv), 480.0, 2.0);
+
+    // Arguments that are not finite turn it off instead of poisoning the rate.
+    sv.setAdaptiveRamp(1.0, std::numeric_limits<double>::quiet_NaN(), 150.0);
+    EXPECT_FALSE(sv.hasAdaptiveRamp());
+    sv.setAdaptiveRamp(std::numeric_limits<double>::infinity(), 20.0, 150.0);
+    EXPECT_FALSE(sv.hasAdaptiveRamp());
+    sv.reset(0.0);
+    sv.setTargetValue(1.0);
+    EXPECT_NEAR(samplesToArrive(sv), 480.0, 2.0);
+}
+
+DSPARK_TEST(Oversampling_factor_follows_the_host_rate)
+{
+    using Os = Oversampling<float>;
+    static_assert(Os::factorForRate(48000.0) == 4);
+
+    // Default: an internal rate of at least 176.4 kHz.
+    EXPECT_EQ(Os::factorForRate(44100.0), 4);
+    EXPECT_EQ(Os::factorForRate(48000.0), 4);
+    EXPECT_EQ(Os::factorForRate(88200.0), 2);
+    EXPECT_EQ(Os::factorForRate(96000.0), 2);
+    EXPECT_EQ(Os::factorForRate(176400.0), 1);
+    EXPECT_EQ(Os::factorForRate(192000.0), 1);
+    EXPECT_EQ(Os::factorForRate(32000.0), 8);
+    EXPECT_EQ(Os::factorForRate(22050.0), 8);
+    EXPECT_EQ(Os::factorForRate(8000.0), 16);     // the largest factor there is
+    EXPECT_EQ(Os::factorForRate(44099.99999), 4); // a rounding error short of the rate still counts
+
+    // Another internal rate, and a ceiling on the factor.
+    EXPECT_EQ(Os::factorForRate(44100.0, 88200.0), 2);
+    EXPECT_EQ(Os::factorForRate(48000.0, 88200.0), 2);
+    EXPECT_EQ(Os::factorForRate(88200.0, 88200.0), 1);
+    EXPECT_EQ(Os::factorForRate(96000.0, 88200.0), 1);
+    EXPECT_EQ(Os::factorForRate(8000.0, 176400.0, 4), 4);
+    EXPECT_EQ(Os::factorForRate(8000.0, 176400.0, 0), 1);
+    EXPECT_EQ(Os::factorForRate(8000.0, 176400.0, 1000), 16);
+
+    // A rate that is not a positive finite number asks for nothing.
+    EXPECT_EQ(Os::factorForRate(0.0), 1);
+    EXPECT_EQ(Os::factorForRate(-48000.0), 1);
+    EXPECT_EQ(Os::factorForRate(std::numeric_limits<double>::quiet_NaN()), 1);
+    EXPECT_EQ(Os::factorForRate(std::numeric_limits<double>::infinity()), 1);
+}
+
+DSPARK_TEST(OversamplingDryPath_adds_in_phase_with_the_engine)
+{
+    using Os = Oversampling<float>;
+    constexpr int kBlock = 256;
+    constexpr int kBlocks = 48;
+    constexpr double kRate = 48000.0;
+    constexpr double kTone = 17987.0;   // near the band edge, where the delay is furthest from its rounded figure
+    const AudioSpec s = spec(kRate, kBlock, 2);
+
+    for (const int factor : { 2, 4 })
+    {
+        Os engine(factor, Os::Quality::High, Os::Mode::PolyphaseIir);
+        engine.prepare(s);
+        OversamplingDryPath<float> dry;
+        dry.prepare(s, engine);
+        EXPECT_EQ(dry.getLatency(), engine.getLatency());
+
+        const int latency = engine.getLatency();
+        std::vector<float> history(static_cast<size_t>(latency), 0.0f);   // the rounded delay
+        size_t historyPos = 0;
+
+        AudioBuffer<float> wet, aligned;
+        wet.resize(2, kBlock);
+        aligned.resize(2, kBlock);
+        double worstAligned = 0.0, worstDelayed = 0.0;
+        int64_t n = 0;
+        for (int b = 0; b < kBlocks; ++b)
+        {
+            for (int i = 0; i < kBlock; ++i, ++n)
+            {
+                const float x = static_cast<float>(std::sin(2.0 * 3.14159265358979323846 * kTone * static_cast<double>(n) / kRate));
+                wet.getChannel(0)[i] = aligned.getChannel(0)[i] = x;
+                wet.getChannel(1)[i] = aligned.getChannel(1)[i] = -0.5f * x;
+            }
+            // Irregular blocks: the two paths are streams, not blocks.
+            const int length = (b % 3 == 0) ? kBlock : (b % 3 == 1 ? 17 : 200);
+            const auto wetView = wet.toView().getSubView(0, length);
+            const auto dryView = aligned.toView().getSubView(0, length);
+            std::vector<float> input(wet.getChannel(0), wet.getChannel(0) + length);
+            (void)engine.upsample(wetView);
+            engine.downsample(wetView);
+            dry.process(dryView);
+            for (int i = 0; i < length; ++i)
+            {
+                const float delayed = latency > 0 ? history[historyPos] : input[static_cast<size_t>(i)];
+                if (latency > 0)
+                {
+                    history[historyPos] = input[static_cast<size_t>(i)];
+                    historyPos = (historyPos + 1) % history.size();
+                }
+                if (b < 12) continue;   // past the start of both filters
+                for (int ch = 0; ch < 2; ++ch)
+                    worstAligned = std::max(worstAligned,
+                        static_cast<double>(std::abs(wet.getChannel(ch)[i] - aligned.getChannel(ch)[i])));
+                worstDelayed = std::max(worstDelayed,
+                    static_cast<double>(std::abs(wet.getChannel(0)[i] - delayed)));
+            }
+            n -= (kBlock - length);   // the tone goes on from where this block stopped
+        }
+
+        // Through the path the dry signal is the wet one, sample for sample.
+        EXPECT_TRUE(worstAligned == 0.0);
+        // Against the rounded delay the two are out of phase by what the
+        // engine reports: the difference a 50 % mix would leave as a dip.
+        const double excess = engine.getRoundTripDelay(kTone) - static_cast<double>(latency);
+        const double expected = 2.0 * std::abs(std::sin(3.14159265358979323846 * kTone / kRate * excess));
+        EXPECT_NEAR(worstDelayed, expected, 0.05);
+        if (factor == 2) { EXPECT_GT(worstDelayed, 1.0); }
+    }
+
+    // Linear phase: the path is the whole-sample delay of the engine.
+    {
+        Os engine(2, Os::Quality::High);
+        engine.prepare(s);
+        OversamplingDryPath<float> dry;
+        dry.prepare(s, engine);
+        const int latency = engine.getLatency();
+        EXPECT_EQ(dry.getLatency(), latency);
+        EXPECT_GT(latency, 0);
+        EXPECT_LT(latency, kBlock - 8);
+
+        AudioBuffer<float> block;
+        block.resize(2, kBlock);
+        block.clear();
+        block.getChannel(0)[5] = 1.0f;
+        block.getChannel(1)[7] = -0.25f;
+        dry.process(block.toView());
+        bool exact = true;
+        for (int i = 0; i < kBlock; ++i)
+        {
+            exact = exact && block.getChannel(0)[i] == (i == 5 + latency ? 1.0f : 0.0f);
+            exact = exact && block.getChannel(1)[i] == (i == 7 + latency ? -0.25f : 0.0f);
+        }
+        EXPECT_TRUE(exact);
+
+        // reset() empties the line.
+        block.clear();
+        block.getChannel(0)[kBlock - 1] = 1.0f;
+        dry.process(block.toView());
+        dry.reset();
+        block.clear();
+        dry.process(block.toView());
+        bool silent = true;
+        for (int i = 0; i < kBlock; ++i) silent = silent && block.getChannel(0)[i] == 0.0f;
+        EXPECT_TRUE(silent);
+    }
+
+    // No oversampling: nothing to match, the signal is left alone.
+    {
+        Os engine(1);
+        engine.prepare(s);
+        OversamplingDryPath<float> dry;
+        dry.prepare(s, engine);
+        EXPECT_EQ(dry.getLatency(), 0);
+        AudioBuffer<float> block;
+        block.resize(2, kBlock);
+        for (int i = 0; i < kBlock; ++i) block.getChannel(0)[i] = block.getChannel(1)[i] = static_cast<float>(i);
+        dry.process(block.toView());
+        bool untouched = true;
+        for (int i = 0; i < kBlock; ++i) untouched = untouched && block.getChannel(1)[i] == static_cast<float>(i);
+        EXPECT_TRUE(untouched);
+    }
+}

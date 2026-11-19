@@ -15,13 +15,23 @@
  * Reads use 4-point Hermite interpolation by default, or optionally the
  * framework's 32-tap Kaiser sinc reader (setInterpolation()).
  *
+ * setModel(Model::Analog) (off by default) runs each channel through a
+ * bucket-brigade line of 1024 stages (Core/BucketBrigade.h) whose clock the
+ * same sweep moves (delay = stages / (2 f_clk)), with the device's anti-alias
+ * and reconstruction filters at a fifth of the slowest clock the sweep needs
+ * (so a deep, slow sweep, a long delay, is darker, as on the hardware) and
+ * the line's hiss (setAnalogNoise(), -84 dBFS by default), which grows with
+ * the delay. The sweep's trough sits 12 samples behind the input (the
+ * fastest clock the line runs). The engines do not crossfade: a switch
+ * starts the analog line empty.
+ *
  * Threading: prepare() belongs to the setup thread; processBlock() and reset()
  * belong to the audio thread. Setters are lock-free atomic publications, safe
  * from any thread, consumed at the next processBlock(). Non-finite setter
  * arguments are ignored.
  *
  * Dependencies: Phasor.h, RingBuffer.h, DspMath.h, AudioSpec.h, AudioBuffer.h,
- *               Interpolation.h, StateBlob.h.
+ *               BucketBrigade.h, Interpolation.h, StateBlob.h.
  *
  * @code
  *   dspark::Vibrato<float> vibrato;
@@ -34,6 +44,7 @@
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/BucketBrigade.h"
 #include "../Core/DspMath.h"
 #include "../Core/Interpolation.h"
 #include "../Core/Phasor.h"
@@ -75,6 +86,13 @@ public:
         Sinc      ///< 32-tap Kaiser sinc: transparent to 15 kHz at 44.1/48 kHz,
                   ///< about 5x the read cost; the sweep trough sits 16 samples
                   ///< (0.33 ms at 48 kHz) behind the input instead of 4.
+    };
+
+    /** @brief The engine. */
+    enum class Model
+    {
+        Digital,  ///< Interpolated reads of a delay line (default).
+        Analog    ///< A bucket-brigade line per channel (see the file comment).
     };
 
     /**
@@ -122,12 +140,18 @@ public:
         readPos_.assign(static_cast<size_t>(numChannels_), -1.0);
         sinc_ = &sincTable();   // built on this setup thread, once per process
 
+        bbd_.resize(static_cast<size_t>(numChannels_));
+        noiseLp_.assign(static_cast<size_t>(numChannels_), 0.0);
+        noiseRng_.resize(static_cast<size_t>(numChannels_));
         for (int ch = 0; ch < numChannels_; ++ch)
         {
             delays_[ch].prepare(maxDelaySamples);
             phasors_[ch].prepare(sampleRate_);
             modPhasors_[ch].prepare(sampleRate_);
+            bbd_[static_cast<size_t>(ch)].prepare(sampleRate_, kAnalogStages, 0.45 * sampleRate_);
+            noiseRng_[static_cast<size_t>(ch)] = 0x5A17C3u + 0x9E3779B9u * static_cast<uint32_t>(ch);
         }
+        analogCornerFor_ = -1.0;
 
         // Initialize smoothing state to prevent startup ramps
         currentRate_ = rate_.load(std::memory_order_relaxed);
@@ -168,13 +192,43 @@ public:
 
         constexpr double kTwoPi = 2.0 * std::numbers::pi;
         const double deviationScaler = (std::numbers::ln2 * sampleRate_) / (kTwoPi * 12.0);
-        const bool sinc = sinc_ && interpolation_.load(std::memory_order_relaxed) == Interpolation::Sinc;
+        const bool analog = model_.load(std::memory_order_relaxed) == Model::Analog;
+        const bool sinc = !analog && sinc_ && interpolation_.load(std::memory_order_relaxed) == Interpolation::Sinc;
         // Trough headroom and read window: Hermite reads 1 sample later and 2
-        // earlier; the sinc reader needs 16 later and 16 earlier.
-        const double centreOffset = sinc ? static_cast<double>(SincInterpolator<T>::kAfter)
+        // earlier; the sinc reader needs 16 later and 16 earlier; the analog
+        // line's trough is the fastest clock it runs.
+        const double centreOffset = analog ? kAnalogTrough
+                                  : sinc ? static_cast<double>(SincInterpolator<T>::kAfter)
                                          : static_cast<double>(kCentreOffset);
         const double maxRead = static_cast<double>(delays_[0].getCapacity()
                              - (sinc ? SincInterpolator<T>::kAfter + 1 : 4));
+
+        double noiseAmp = 0.0;
+        if (analog)
+        {
+            // The filters sit at a fifth of the slowest clock of this block's
+            // sweep (its peak delay, 2 * deviation + trough).
+            const auto deviationOf = [&](T depth, T rate) {
+                return static_cast<double>(depth) * deviationScaler / std::max(static_cast<double>(rate), 0.1);
+            };
+            const double peak = 2.0 * std::max(deviationOf(currentDepth_, currentRate_), deviationOf(targetDepth, targetRate))
+                              + centreOffset;
+            const double slowest = static_cast<double>(kAnalogStages) * sampleRate_ / (2.0 * peak);
+            if (std::abs(slowest - analogCornerFor_) > 1e-3 * slowest)
+            {
+                const double corner = std::min(0.2 * slowest, 0.45 * sampleRate_);
+                for (auto& b : bbd_) b.setCorner(corner);
+                noiseCoeff_ = 1.0 - std::exp(-2.0 * std::numbers::pi * corner / sampleRate_);
+                analogCornerFor_ = slowest;
+            }
+            const T noiseDb = analogNoiseDb_.load(std::memory_order_relaxed);
+            // White noise through a one-pole at the corner, scaled by that
+            // filter's own gain (the same level at any rate), and by the
+            // delay against the sweep's centre (a slower clock, more hiss).
+            if (noiseDb > T(-120))
+                noiseAmp = std::pow(10.0, static_cast<double>(noiseDb) / 20.0) * 1.7320508075688772
+                         / std::sqrt(std::max(1e-9, noiseCoeff_ / (2.0 - noiseCoeff_)));
+        }
 
         for (int ch = 0; ch < numCh; ++ch)
         {
@@ -223,7 +277,7 @@ public:
 
                 // Safety clamp to the interpolator's read window.
                 const double delaySamples = std::clamp(centre + lfo * deviation,
-                                                       sinc ? centreOffset : 1.0, maxRead);
+                                                       (sinc || analog) ? centreOffset : 1.0, maxRead);
 
                 // Read-position slew limit. Depth and rate scale the deviation
                 // and centre, so a parameter change moves the read point;
@@ -237,7 +291,23 @@ public:
                 pos = (pos < 0.0) ? delaySamples
                                   : pos + std::clamp(delaySamples - pos, -kMaxReadSlope, kMaxReadSlope);
 
-                data[i] = sinc ? readSinc(delay, pos) : readHermite(delay, pos);
+                if (analog)
+                {
+                    const auto c = static_cast<size_t>(ch);
+                    double y = static_cast<double>(bbd_[c].processSample(data[i], pos / sampleRate_));
+                    if (noiseAmp > 0.0)
+                    {
+                        noiseRng_[c] = noiseRng_[c] * 1664525u + 1013904223u;
+                        const double n = static_cast<double>(noiseRng_[c] >> 8) / 8388608.0 - 1.0;
+                        noiseLp_[c] += noiseCoeff_ * (n - noiseLp_[c]);
+                        y += noiseAmp * (pos / centre) * noiseLp_[c];
+                    }
+                    data[i] = static_cast<T>(y);
+                }
+                else
+                {
+                    data[i] = sinc ? readSinc(delay, pos) : readHermite(delay, pos);
+                }
             }
         }
 
@@ -260,6 +330,8 @@ public:
             phasors_[ch].reset();
             modPhasors_[ch].reset();
         }
+        for (auto& b : bbd_) b.reset();
+        std::fill(noiseLp_.begin(), noiseLp_.end(), 0.0);
         std::fill(readPos_.begin(), readPos_.end(), -1.0); // re-seed on the next sample
     }
 
@@ -341,6 +413,28 @@ public:
         return interpolation_.load(std::memory_order_relaxed);
     }
 
+    /** @brief Selects the engine (see Model). Thread-safe; the engines do not
+     *  crossfade; out-of-range values are clamped. */
+    void setModel(Model m) noexcept
+    {
+        model_.store(static_cast<Model>(std::clamp(static_cast<int>(m), 0, 1)), std::memory_order_relaxed);
+    }
+    /** @return The engine. */
+    [[nodiscard]] Model getModel() const noexcept { return model_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Hiss of the analog line at the sweep's centre.
+     * @param dbfs RMS level in dBFS, clamped to [-140, -40]; -120 or less is
+     *             silent. Non-finite values are ignored.
+     */
+    void setAnalogNoise(T dbfs) noexcept
+    {
+        if (!std::isfinite(dbfs)) return;
+        analogNoiseDb_.store(std::clamp(dbfs, T(-140), T(-40)), std::memory_order_relaxed);
+    }
+    /** @return The hiss level of the analog line in dBFS. */
+    [[nodiscard]] T getAnalogNoise() const noexcept { return analogNoiseDb_.load(std::memory_order_relaxed); }
+
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
@@ -352,6 +446,8 @@ public:
         w.write("modRate", static_cast<float>(modRate_.load(std::memory_order_relaxed)));
         w.write("modDepth", static_cast<float>(modDepth_.load(std::memory_order_relaxed)));
         w.write("interp", static_cast<int32_t>(interpolation_.load(std::memory_order_relaxed)));
+        w.write("model", static_cast<int32_t>(model_.load(std::memory_order_relaxed)));
+        w.write("analogNoise", static_cast<float>(analogNoiseDb_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -365,6 +461,8 @@ public:
         setModRate(static_cast<T>(r.read("modRate", 0.0f)));
         setModDepth(static_cast<T>(r.read("modDepth", 0.0f)));
         setInterpolation(r.read("interp", 0) == 1 ? Interpolation::Sinc : Interpolation::Hermite);
+        setModel(r.read("model", 0) == 1 ? Model::Analog : Model::Digital);
+        setAnalogNoise(static_cast<T>(r.read("analogNoise", -84.0f)));
         return true;
     }
 
@@ -374,6 +472,10 @@ private:
     static constexpr T kCentreOffset = T(4);
     /// Largest read-position change per sample (see processBlock()).
     static constexpr double kMaxReadSlope = 0.5;
+    /// Stages of the analog line, and its trough in samples: 1024 stages
+    /// clocked at most 64 times per sample give no less than 8 samples.
+    static constexpr int kAnalogStages = 1024;
+    static constexpr double kAnalogTrough = 12.0;
 
     /** @brief The shared sinc table (built on first use: prepare() calls it). */
     static const SincInterpolator<T>& sincTable()
@@ -424,6 +526,13 @@ private:
     std::vector<double> readPos_;   ///< Slew-limited read position per channel (-1 = unseeded).
     std::atomic<Interpolation> interpolation_ { Interpolation::Hermite };
     const SincInterpolator<T>* sinc_ = nullptr;   ///< Set by prepare().
+
+    std::atomic<Model> model_ { Model::Digital };
+    std::atomic<T> analogNoiseDb_ { T(-84) };
+    std::vector<BucketBrigade<T>> bbd_;       ///< One analog line per channel.
+    std::vector<double> noiseLp_;             ///< Hiss filter state per channel.
+    std::vector<uint32_t> noiseRng_;          ///< Hiss generator per channel.
+    double noiseCoeff_ = 0.0, analogCornerFor_ = -1.0;
 };
 
 } // namespace dspark

@@ -55,6 +55,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
 #include "../Core/DspMath.h"
+#include "../Core/NormalizedLadder.h"
 #include "../Core/Smoothers.h"
 #include "../Core/AnalogRandom.h"
 #include "../Core/DenormalGuard.h"
@@ -128,6 +129,7 @@ public:
     void reset() noexcept
     {
         for (auto& stage : stages_) stage.reset();
+        for (auto& ladder : ladders_) ladder.reset();
         // A pinned drift restarts from its seed, so a reset render replays it.
         if (const std::uint64_t seed = driftSeed_.load(std::memory_order_relaxed); seed != 0)
             driftGen_.reseed(seed);
@@ -319,6 +321,34 @@ public:
     {
         return matchedFilters_.load(std::memory_order_relaxed);
     }
+
+    /** @brief How each second-order section is realised (see setStructure()). */
+    enum class Structure
+    {
+        DirectForm,  ///< Direct form with a double memory: the cheapest (default).
+        Ladder       ///< Normalized ladder: passive under any change of its coefficients.
+    };
+
+    /**
+     * @brief Chooses how the sections are realised.
+     *
+     * Ladder runs every section as a normalized ladder (NormalizedLadder):
+     * the same response, and a memory that can only lose energy however
+     * fast the cutoff moves (audio-rate modulation, hard jumps of the
+     * shape), for about twice the arithmetic. The coefficients ramp on the
+     * same 16-sample grid. Thread-safe; the switch restarts the sections'
+     * memory at the next block, which may click: choose it before playback.
+     *
+     * @param structure DirectForm (default) or Ladder.
+     */
+    void setStructure(Structure structure) noexcept
+    {
+        structure_.store(static_cast<Structure>(std::clamp(static_cast<int>(structure), 0, 1)),
+                         std::memory_order_relaxed);
+    }
+
+    /** @return How the sections are realised. */
+    [[nodiscard]] Structure getStructure() const noexcept { return structure_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Sets the shelf slope S on its own (LowShelf/HighShelf shapes).
@@ -551,6 +581,19 @@ public:
         const bool  drift    = driftEnabled_.load(std::memory_order_relaxed);
         const float driftInt = driftIntensity_.load(std::memory_order_relaxed);
 
+        // A change of structure restarts the memory of the sections.
+        const bool ladder = structure_.load(std::memory_order_relaxed) == Structure::Ladder;
+        if (ladder != ladderActive_)
+        {
+            ladderActive_ = ladder;
+            for (int s = 0; s < kMaxStages; ++s)
+            {
+                stages_[s].reset();
+                ladders_[s].reset();
+                ladders_[s].setCoeffs(stages_[s].getCoeffs());
+            }
+        }
+
         const bool needSmoothing = freqSmoother_.isSmoothing() || resSmoother_.isSmoothing() || gainSmoother_.isSmoothing();
         const bool dynamicPath = needSmoothing || drift || (nonLin > T(0));
         
@@ -582,6 +625,7 @@ public:
                     mf != lastMatchedFilters_ || ssl != lastShelfSlope_)
                 {
                     updateCoefficients(f, q, g);
+                    if (ladder) syncLadders();
                     lastFreq_ = f; lastQ_ = q; lastGain_ = g;
                     lastShape_ = sh; lastSlopeDb_ = sdb; lastMatched_ = mp;
                     lastMatchedFilters_ = mf;
@@ -589,6 +633,21 @@ public:
                 }
 
                 const int ns = activeStages();
+                if (ladder)
+                {
+                    for (int ch = 0; ch < nCh; ++ch)
+                    {
+                        T* channelData = buffer.getChannel(ch);
+                        for (int i = 0; i < nS; ++i)
+                        {
+                            double sample = static_cast<double>(channelData[i]);
+                            for (int s = 0; s < ns; ++s)
+                                sample = ladders_[s].processSample(sample, ch);
+                            channelData[i] = static_cast<T>(sample);
+                        }
+                    }
+                    return;
+                }
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T* channelData = buffer.getChannel(ch);
@@ -651,6 +710,15 @@ public:
 
                         float nyquist = static_cast<float>(spec_.sampleRate) * 0.499f;
                         startCoefficientRamp(std::clamp(freq, 10.0f, nyquist), std::max(res, 0.1f), gain);
+                        if (ladder)
+                        {
+                            const int n = activeStages();
+                            for (int s = 0; s < n; ++s)
+                            {
+                                if (rampPos_ == 0) ladders_[s].rampCoeffs(rampTo_[s], kChunkSize);
+                                else ladders_[s].setCoeffs(rampTo_[s]);
+                            }
+                        }
                         lastFreq_ = -1.0f; // invalidate the static-path cache
                     }
                     else if (drift)
@@ -691,10 +759,16 @@ public:
                 {
                     T* d = buffer.getChannel(ch) + i;
                     for (int j = 0; j < seg; ++j) tmp[static_cast<size_t>(j)] = static_cast<double>(d[j]);
-                    for (int s = 0; s < ns; ++s)
-                        stages_[s].processRampCore(tmp.data(), seg, ch, c0[s], step[s]);
+                    if (ladder)
+                        for (int s = 0; s < ns; ++s)
+                            ladders_[s].processSegment(tmp.data(), seg, ch);
+                    else
+                        for (int s = 0; s < ns; ++s)
+                            stages_[s].processRampCore(tmp.data(), seg, ch, c0[s], step[s]);
                     for (int j = 0; j < seg; ++j) d[j] = static_cast<T>(tmp[static_cast<size_t>(j)]);
                 }
+                if (ladder)
+                    for (int s = 0; s < ns; ++s) ladders_[s].advanceRamp(seg);
 
                 if (ramping)
                 {
@@ -730,6 +804,12 @@ public:
         if (channel < 0 || channel >= MaxChannels) return input;
         double sample = static_cast<double>(input);
         const int ns = activeStages();
+        if (ladderActive_)
+        {
+            for (int s = 0; s < ns; ++s)
+                sample = ladders_[s].processSample(sample, channel);
+            return static_cast<T>(sample);
+        }
         for (int s = 0; s < ns; ++s)
             sample = stages_[s].processSampleCore(sample, channel);
         return static_cast<T>(sample);
@@ -763,6 +843,8 @@ public:
         q = std::max(q, 0.1f);
 
         updateCoefficients(f, q, g);
+        ladderActive_ = structure_.load(std::memory_order_relaxed) == Structure::Ladder;
+        if (ladderActive_) syncLadders();
         lastFreq_ = f; lastQ_ = q; lastGain_ = g;
         lastShape_ = shape_.load(std::memory_order_relaxed);
         lastSlopeDb_ = slopeDb_.load(std::memory_order_relaxed);
@@ -783,6 +865,7 @@ public:
         w.write("res", targetRes_.load(std::memory_order_relaxed));
         w.write("gain", targetGain_.load(std::memory_order_relaxed));
         w.write("nonlin", static_cast<float>(targetNonlinearity_.load(std::memory_order_relaxed)));
+        w.write("structure", static_cast<int32_t>(getStructure()));
         return w.blob();
     }
 
@@ -820,6 +903,7 @@ public:
         // tilt helpers above do not take the resonance).
         setResonance(res);
         setShelfSlope(r.read("shelfSlope", getShelfSlope()));
+        setStructure(static_cast<Structure>(r.read("structure", 0)));
         setGain(gain);
         setNonlinearity(static_cast<T>(r.read("nonlin", 0.0f)));
         return true;
@@ -870,6 +954,13 @@ protected:
     {
         int order = std::clamp(slopeDb / 6, 1, kMaxOrder);
         return (order + 1) / 2;
+    }
+
+    /** @brief The ladders take the sections' coefficients at once (ends their ramps). */
+    void syncLadders() noexcept
+    {
+        const int n = activeStages();
+        for (int s = 0; s < n; ++s) ladders_[s].setCoeffs(stages_[s].getCoeffs());
     }
 
     /** @brief Designs and installs the coefficients at once (static path). */
@@ -1007,6 +1098,9 @@ protected:
     std::atomic<bool> matchedFilters_ { false };
 
     std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};
+    std::array<NormalizedLadder<T, MaxChannels>, kMaxStages> ladders_ {}; ///< The sections as ladders (setStructure()).
+    std::atomic<Structure> structure_ { Structure::DirectForm };
+    bool ladderActive_ = false;      ///< The audio thread runs the ladders.
 
     static constexpr float kFreqGlideMs = 165.0f;   ///< Cutoff glide time (10-90% in 100 ms).
     Smoothers::HermiteSmoother freqSmoother_;

@@ -230,6 +230,42 @@ public:
     }
 
     /**
+     * @brief Runs one channel's samples through the section, in double and in
+     *        place, walking the ramp from where it stands without moving it on.
+     *
+     * For owners that run their channels one after another over the same
+     * frames: every channel walks the same coefficients, and advanceRamp()
+     * by the same count, once all of them have run, moves the ramp on (the
+     * result is processBlock()'s, to the bit).
+     *
+     * @param data       Samples of the channel, filtered in place.
+     * @param numSamples Number of samples.
+     * @param channel    Channel whose memory the samples run through.
+     * @pre channel in [0, MaxChannels).
+     */
+    void processSegment(double* data, int numSamples, int channel) noexcept
+    {
+        assert(channel >= 0 && channel < MaxChannels && "Channel index out of bounds");
+        if (numSamples <= 0) return;
+        State& s = state_[static_cast<size_t>(channel)];
+        double x1 = s.x1, x2 = s.x2;
+        const int moving = std::min(rampLeft_, numSamples);
+        Coeffs c = current_;
+        for (int i = 0; i < moving; ++i)
+        {
+            c.c1 += step_.c1; c.s1 += step_.s1; c.c2 += step_.c2; c.s2 += step_.s2;
+            c.v0 += step_.v0; c.v1 += step_.v1; c.v2 += step_.v2;
+            data[i] = advance(data[i], c, x1, x2);
+        }
+        if (moving > 0 && moving == rampLeft_) c = target_;
+        for (int i = moving; i < numSamples; ++i)
+            data[i] = advance(data[i], c, x1, x2);
+        if (!std::isfinite(x1 + x2)) { x1 = 0.0; x2 = 0.0; }
+        s.x1 = x1;
+        s.x2 = x2;
+    }
+
+    /**
      * @brief Moves the ramp on by a number of samples (for processSample() callers).
      * @param samples Samples gone by; a ramp with fewer left lands on its target.
      */

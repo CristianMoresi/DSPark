@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 308,
+    "first_party_ascii_text": 310,
     "third_party_utf8_exact": 84,
-    "total": 576
+    "total": 578
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -169,6 +169,10 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Core/BiquadCascade.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Core/Convolver.h"
     },
     {
@@ -226,6 +230,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Core/ModulationRouter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/NormalizedLadder.h"
     },
     {
       "kind": "first_party_ascii_text",

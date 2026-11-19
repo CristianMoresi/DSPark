@@ -6,6 +6,51 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `BiquadCascade<T, MaxSections, MaxChannels>` (new,
+  `Core/BiquadCascade.h`): second-order sections in series, run up to four
+  at a time inside one loop over the samples, in direct form I with the node
+  history shared between neighbours (two values of double state per
+  section) and pairs of channels in the lanes of one register. A pass of
+  one `Biquad` per section is bound by the latency of each recursion; with
+  the sections in the same loop their recursions overlap. Measured on float
+  stereo blocks of 512, five compiler and machine pairs: eight sections cost
+  0.36 to 0.72 of eight `Biquad::processBlock()` passes and 0.29 to 0.60 of
+  running every section per sample through `processSampleCore()`;
+  twenty-four cost 0.34 to 0.68 and 0.29 to 0.47 (21 to 51 ns per stereo
+  frame). One section costs what a `Biquad` pass does (0.81 to 1.34). A mono
+  block costs 0.33 to 0.61 of the passes and 0.6 to 1.3 of the per-sample
+  chain, which already overlaps its sections: no gain there. The state is
+  signal, not weighted sums, so the coefficients can move:
+  `rampCoeffs(section, target, samples)` interpolates all five linearly and
+  lands exactly (a block whose sections all ramp costs about twice a still
+  one), `rampToBypass()` takes a section out of the path with its poles
+  still running, and `setSectionEnabled()` stops computing a transparent
+  section and brings it back from the history of its input. The output is
+  the same for any partition of the stream, bit for bit, with or without a
+  ramp in flight. Owner-managed: its setters belong to the processing
+  thread.
+- `BiquadCoeffs::bypassed()`: the set with the same poles whose numerator
+  equals its denominator (unity at every frequency). A bell at 0 dB already
+  is that set.
+- `NormalizedLadder<T, MaxChannels>` (new, `Core/NormalizedLadder.h`): a
+  second-order section as two plane rotations and three taps (Gray and
+  Markel, 1975), with `fromBiquad()` / `toBiquad()` between the two forms
+  and linear ramps of rotations and taps. With no input the energy of its
+  memory cannot rise, whatever the coefficients do from one sample to the
+  next, so it survives what a direct form does not. Measured at 48 kHz in
+  double against the transposed form (`Biquad`), the direct form
+  (`BiquadCascade`) and `StateVariableFilter`: a low-pass of Q 8 switched
+  between 300 Hz and 3 kHz every seven samples under a tone of 0.5 leaves
+  both direct forms non-finite, the ladder peaking at 0.65 and the
+  state-variable filter at 0.50; its cutoff modulated at 5 kHz over 2.5
+  octaves each way at Q 10 under noise, the same (ladder 1.09, state-variable
+  0.98); with the input removed and a random cutoff every sample at Q 30 the
+  direct forms diverge and the ladder decays. Under an occasional hard
+  switch the direct form I is the quieter of the two (peak 0.59 against
+  2.27 for the ladder's taps at Q 8, switched every 137 samples), so the
+  ladder is for coefficients that move fast and is ramped where they jump.
+  It costs 1.1 to 1.65 times a transposed biquad per mono frame (3.6 to
+  3.8 ns against 2.7 to 3.5).
 - Automatic oversampling factor. `Oversampling::factorForRate(sampleRate,
   minimumInternalRate = 176400, maxFactor = 16)` gives the smallest power of
   two that brings a host rate up to an internal rate (4 at 44.1 and 48 kHz,

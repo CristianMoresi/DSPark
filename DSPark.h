@@ -447,6 +447,8 @@
  * | `AudioSpec`              | Core/AudioSpec.h          | Audio environment descriptor (rate, block, channels) |
  * | `Biquad<T>`              | Core/Biquad.h             | Single biquad filter with 9 coefficient types     |
  * | `BiquadCoeffs`           | Core/Biquad.h             | Filter coefficient calculator (Audio EQ Cookbook)  |
+ * | `BiquadCascade<T>`       | Core/BiquadCascade.h      | Sections in series in one pass: coefficient ramps, click-free bypass |
+ * | `NormalizedLadder<T>`    | Core/NormalizedLadder.h   | Second-order section that stays passive under any modulation |
  * | `FFTReal<T>`             | Core/FFT.h                | Real FFT by vector lanes, SIMD (SSE2/AVX/NEON)    |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
@@ -685,6 +687,8 @@
 #include "Core/SpinLock.h"
 #include "Core/SpscQueue.h"
 #include "Core/Biquad.h"
+#include "Core/BiquadCascade.h"
+#include "Core/NormalizedLadder.h"
 #include "Core/DryWetMixer.h"
 #include "Core/Smoothers.h"
 #include "Core/AnalogRandom.h"

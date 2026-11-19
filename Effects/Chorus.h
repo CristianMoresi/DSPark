@@ -26,6 +26,16 @@
  *   out over 50 ms with the level normalisation following the fade.
  * - Delay reads use 4-point Hermite interpolation by default, or optionally the
  *   framework's 32-tap Kaiser sinc reader (setInterpolation()).
+ * - setModel(Model::Analog) (off by default) runs a bucket-brigade chorus:
+ *   the channels summed to mono, high-passed at 5 Hz, into two bucket-brigade
+ *   lines of 512 stages (Core/BucketBrigade.h) whose clocks a triangle wave
+ *   moves in opposition (left and right taps half a cycle apart; in phase in
+ *   the Vibrato mode), each with the device's anti-alias and reconstruction
+ *   filters at a fifth of the slowest clock, and the line's hiss, which grows
+ *   with the delay (a slower clock). The dry signal keeps its stereo; there is
+ *   no feedback and the voices, feedback and interpolation settings do not
+ *   apply. setAnalogMode() loads three presets of rate, depth and centre.
+ *   From 176.4 kHz the analog engine runs at half the rate.
  *
  * Threading: prepare() belongs to the setup thread (allocates; never call it
  * concurrently with processing). processBlock() and reset() belong to the
@@ -36,7 +46,7 @@
  *
  * Dependencies: RingBuffer.h, Oscillator.h, DryWetMixer.h, DspMath.h,
  *               AudioSpec.h, AudioBuffer.h, DenormalGuard.h, Interpolation.h,
- *               StateBlob.h.
+ *               StateBlob.h, BucketBrigade.h, Biquad.h.
  */
 
 #include "../Core/RingBuffer.h"
@@ -48,6 +58,8 @@
 #include "../Core/DenormalGuard.h"
 #include "../Core/Interpolation.h"
 #include "../Core/StateBlob.h"
+#include "../Core/BucketBrigade.h"
+#include "../Core/Biquad.h"
 
 #include <algorithm>
 #include <array>
@@ -80,6 +92,21 @@ public:
         Hermite,  ///< 4-point cubic (default).
         Sinc      ///< 32-tap Kaiser sinc: transparent to 15 kHz at 44.1/48 kHz,
                   ///< about 5x the read cost; the shortest delay is 16 samples.
+    };
+
+    /** @brief The engine (setModel()). */
+    enum class Model
+    {
+        Digital,  ///< Delay lines read by interpolation, voices and feedback (default).
+        Analog    ///< Two bucket-brigade lines on the mono sum (see the file notes).
+    };
+
+    /** @brief Presets of the analog model (setAnalogMode()). */
+    enum class AnalogMode
+    {
+        Slow,     ///< 0.5 Hz, 1.6 ms of depth about 5 ms, taps in opposition.
+        Fast,     ///< 0.85 Hz, the same depth and centre.
+        Vibrato   ///< 7 Hz, 0.25 ms about 7 ms, taps in phase.
     };
 
     // -- Lifecycle --------------------------------------------------------------
@@ -127,6 +154,19 @@ public:
         smoothedCenterSamples_ = centerDelayMs_.load(std::memory_order_relaxed) * static_cast<T>(spec.sampleRate) / T(1000);
         smoothedDepthSamples_  = depthMs_.load(std::memory_order_relaxed) * static_cast<T>(spec.sampleRate) / T(1000);
 
+        // The analog engine: at half the rate from 176.4 kHz.
+        halfRate_ = spec.sampleRate >= 176400.0;
+        engineRate_ = halfRate_ ? 0.5 * spec.sampleRate : spec.sampleRate;
+        for (auto& b : bbd_) b.prepare(engineRate_, kAnalogStages, 4000.0);
+        analogCornerFor_ = -1.0;
+        {
+            static constexpr double kQ4[2] = { 0.5411961001461970, 1.3065629648763764 };
+            for (int k = 0; k < 2; ++k)
+                decimate_[static_cast<size_t>(k)] = BiquadCoeffs::makeLowPass(spec.sampleRate, std::min(20000.0, 0.2 * spec.sampleRate), kQ4[k]);
+        }
+        hpCoeff_ = std::exp(-2.0 * 3.141592653589793 * 5.0 / spec.sampleRate);
+        noiseCoeff_ = 0.0;
+
         updateLfoPhases();
         reset();
     }
@@ -173,6 +213,14 @@ public:
             fbState_[ch] = T(0);
         }
         mixer_.reset();
+        for (auto& b : bbd_) b.reset();
+        analogPhase_ = 0.0;
+        hpX1_ = hpY1_ = 0.0;
+        for (auto& s : decimateState_) s = {};
+        engineOut_ = {};
+        engineLast_ = {};
+        noiseLp_ = {};
+        decimatePhase_ = 0;
         // A reset starts on the target layout: phases set, voices at level.
         const int nv = numVoices_.load(std::memory_order_relaxed);
         for (int v = 0; v < kMaxVoices; ++v)
@@ -291,6 +339,53 @@ public:
     }
 
 
+    /** @brief Selects the engine (see Model). Thread-safe; the engines do not crossfade. */
+    void setModel(Model m) noexcept
+    {
+        model_.store(m == Model::Analog ? Model::Analog : Model::Digital, std::memory_order_relaxed);
+    }
+    /** @return The engine. */
+    [[nodiscard]] Model getModel() const noexcept { return model_.load(std::memory_order_relaxed); }
+
+    /** @return The LFO rate in hertz. */
+    [[nodiscard]] T getRate() const noexcept { return rate_.load(std::memory_order_relaxed); }
+    /** @return The modulation depth in milliseconds. */
+    [[nodiscard]] T getDepthMs() const noexcept { return depthMs_.load(std::memory_order_relaxed); }
+    /** @return The centre delay in milliseconds. */
+    [[nodiscard]] T getCenterDelay() const noexcept { return centerDelayMs_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Loads a preset of the analog model: rate, depth and centre (through
+     *        their setters, so they glide) and whether the taps move in
+     *        opposition or in phase. Out-of-range values are clamped.
+     */
+    void setAnalogMode(AnalogMode mode) noexcept
+    {
+        const int m = std::clamp(static_cast<int>(mode), 0, 2);
+        analogMode_.store(m, std::memory_order_relaxed);
+        static constexpr float kRate[3] = { 0.5f, 0.85f, 7.0f };
+        static constexpr float kDepth[3] = { 1.6f, 1.6f, 0.25f };
+        static constexpr float kCentre[3] = { 5.0f, 5.0f, 7.0f };
+        setRate(static_cast<T>(kRate[m]));
+        setDepthMs(static_cast<T>(kDepth[m]));
+        setCenterDelay(static_cast<T>(kCentre[m]));
+    }
+    /** @return The analog preset last loaded. */
+    [[nodiscard]] AnalogMode getAnalogMode() const noexcept { return static_cast<AnalogMode>(analogMode_.load(std::memory_order_relaxed)); }
+
+    /**
+     * @brief Hiss of the analog lines: its RMS level in dBFS at the centre
+     *        delay (it grows in proportion to the delay), the same at any rate;
+     *        -120 and below turn it off (default -84). Non-finite values are
+     *        ignored.
+     */
+    void setAnalogNoise(T dB) noexcept
+    {
+        if (std::isfinite(dB)) analogNoiseDb_.store(std::clamp(dB, T(-200), T(-40)), std::memory_order_relaxed);
+    }
+    /** @return The hiss level of the analog lines. */
+    [[nodiscard]] T getAnalogNoise() const noexcept { return analogNoiseDb_.load(std::memory_order_relaxed); }
+
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
@@ -308,6 +403,9 @@ public:
         w.write("waveform",
                 static_cast<int32_t>(lfoWaveform_.load(std::memory_order_relaxed)));
         w.write("interp", static_cast<int32_t>(interpolation_.load(std::memory_order_relaxed)));
+        w.write("model", static_cast<int32_t>(getModel()));
+        w.write("analogMode", analogMode_.load(std::memory_order_relaxed));
+        w.write("analogNoise", static_cast<float>(getAnalogNoise()));
         return w.blob();
     }
 
@@ -327,6 +425,10 @@ public:
         setModWaveform(static_cast<typename Oscillator<T>::Waveform>(
             r.read("waveform", 0)));
         setInterpolation(r.read("interp", 0) == 1 ? Interpolation::Sinc : Interpolation::Hermite);
+        setModel(r.read("model", 0) == 1 ? Model::Analog : Model::Digital);
+        // The preset index only (rate, depth and centre were read above).
+        analogMode_.store(std::clamp(static_cast<int>(r.read("analogMode", 0)), 0, 2), std::memory_order_relaxed);
+        setAnalogNoise(static_cast<T>(r.read("analogNoise", -84.0f)));
         return true;
     }
 
@@ -395,6 +497,12 @@ protected:
         const bool sinc = interpolation_.load(std::memory_order_relaxed) == Interpolation::Sinc && sinc_;
 
         mixer_.pushDry(buffer);
+        if (model_.load(std::memory_order_relaxed) == Model::Analog)
+        {
+            processAnalog(buffer, nCh, nS);
+            mixer_.mixWet(buffer, mixVal);
+            return;
+        }
 
         // Deferred LFO config on the AUDIO thread (setters only publish). A
         // voice-count change needs no phase reset: the glide below moves the
@@ -564,6 +672,99 @@ protected:
         return from < to ? std::min(to, from + delta) : std::max(to, from - delta);
     }
 
+    /**
+     * @brief The analog model on one block: the mono sum, high-passed, into
+     *        two bucket-brigade lines whose delays a slightly asymmetric
+     *        triangle moves (in opposition, or in phase for the Vibrato mode),
+     *        each with its hiss; the even channels take the first line, the
+     *        odd ones the second. At half rate the sum is low-passed and every
+     *        other sample runs the engine; between them the output is the mean
+     *        of the last two.
+     */
+    void processAnalog(AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
+        const double rate = static_cast<double>(rate_.load(std::memory_order_relaxed));
+        const double centre = static_cast<double>(centerDelayMs_.load(std::memory_order_relaxed)) * 1e-3;
+        const double depth = std::min(static_cast<double>(depthMs_.load(std::memory_order_relaxed)) * 1e-3, 0.9 * centre);
+        const bool inPhase = analogMode_.load(std::memory_order_relaxed) == 2;
+        // The filters sit at a fifth of the slowest clock the sweep needs.
+        const double slowest = (centre + depth) > 0.0 ? static_cast<double>(kAnalogStages) / (2.0 * (centre + depth)) : 1e5;
+        if (std::abs(slowest - analogCornerFor_) > 1e-3 * slowest)
+        {
+            for (auto& b : bbd_) b.setCorner(0.2 * slowest);
+            noiseCoeff_ = 1.0 - std::exp(-2.0 * 3.141592653589793 * std::min(0.2 * slowest, 0.45 * engineRate_) / engineRate_);
+            analogCornerFor_ = slowest;
+        }
+        const T noiseDb = analogNoiseDb_.load(std::memory_order_relaxed);
+        // White noise through a one-pole at the corner, scaled by that
+        // filter's own gain: the same level (and density) at any rate.
+        const double noiseAmp = noiseDb > T(-120)
+            ? std::pow(10.0, static_cast<double>(noiseDb) / 20.0)
+                  * 1.7320508075688772 / std::sqrt(std::max(1e-9, noiseCoeff_ / (2.0 - noiseCoeff_)))
+            : 0.0;
+        const double step = rate / engineRate_;
+        static constexpr double kRise = 0.53;   // the triangle's rising share
+        const auto triangle = [](double p) noexcept {
+            p -= std::floor(p);
+            return p < kRise ? -1.0 + 2.0 * p / kRise : 1.0 - 2.0 * (p - kRise) / (1.0 - kRise);
+        };
+        const int channels = std::max(1, nCh);
+        for (int i = 0; i < nS; ++i)
+        {
+            double mono = 0.0;
+            for (int ch = 0; ch < nCh; ++ch) mono += static_cast<double>(buffer.getChannel(ch)[i]);
+            mono /= channels;
+            const double hp = mono - hpX1_ + hpCoeff_ * hpY1_;
+            hpX1_ = mono;
+            hpY1_ = hp;
+            double x = hp;
+            bool run = true;
+            if (halfRate_)
+            {
+                for (size_t k = 0; k < 2; ++k)
+                {
+                    auto& s = decimateState_[k];
+                    const auto& c = decimate_[k];
+                    const double y = c.b0 * x + s[0];
+                    s[0] = c.b1 * x - c.a1 * y + s[1];
+                    s[1] = c.b2 * x - c.a2 * y;
+                    x = y;
+                }
+                decimatePhase_ ^= 1;
+                run = decimatePhase_ == 1;
+            }
+            if (run)
+            {
+                analogPhase_ += step;
+                if (analogPhase_ >= 1.0) analogPhase_ -= 1.0;
+                const double dA = centre + depth * triangle(analogPhase_);
+                const double dB = centre + depth * triangle(analogPhase_ + (inPhase ? 0.0 : 0.5));
+                const double d[2] = { dA, dB };
+                for (size_t k = 0; k < 2; ++k)
+                {
+                    double y = static_cast<double>(bbd_[k].processSample(static_cast<T>(x), d[k]));
+                    if (noiseAmp > 0.0)
+                    {
+                        noiseRng_ = noiseRng_ * 1664525u + 1013904223u;
+                        const double n = static_cast<double>(noiseRng_ >> 8) / 8388608.0 - 1.0;
+                        noiseLp_[k] += noiseCoeff_ * (n - noiseLp_[k]);
+                        y += noiseAmp * (d[k] / std::max(centre, 1e-4)) * noiseLp_[k];
+                    }
+                    engineLast_[k] = engineOut_[k];
+                    engineOut_[k] = y;
+                }
+            }
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const size_t k = static_cast<size_t>(ch & 1);
+                const double out = (halfRate_ && !run) ? 0.5 * (engineOut_[k] + engineLast_[k]) : engineOut_[k];
+                buffer.getChannel(ch)[i] = static_cast<T>(out);
+            }
+        }
+    }
+
+    static constexpr int kAnalogStages = 512;   ///< Stages of each analog line.
+
     static constexpr T kMaxGlideHz = T(0.5);   ///< Phase glide: half a cycle per second.
 
     AudioSpec spec_ {};
@@ -599,6 +800,20 @@ protected:
     const SincInterpolator<T>* sinc_ = nullptr;     ///< Set by prepare().
 
     DryWetMixer<T> mixer_;
+
+    // The analog model.
+    std::atomic<Model> model_ { Model::Digital };
+    std::atomic<int> analogMode_ { 0 };
+    std::atomic<T> analogNoiseDb_ { T(-84) };
+    std::array<BucketBrigade<T>, 2> bbd_ {};
+    bool halfRate_ = false;
+    double engineRate_ = 48000.0, analogCornerFor_ = -1.0, hpCoeff_ = 0.0, noiseCoeff_ = 0.0;
+    double analogPhase_ = 0.0, hpX1_ = 0.0, hpY1_ = 0.0;
+    std::array<BiquadCoeffs, 2> decimate_ {};
+    std::array<std::array<double, 2>, 2> decimateState_ {};
+    std::array<double, 2> engineOut_ {}, engineLast_ {}, noiseLp_ {};
+    int decimatePhase_ = 0;
+    uint32_t noiseRng_ = 0x6B43A9u;
 };
 
 } // namespace dspark

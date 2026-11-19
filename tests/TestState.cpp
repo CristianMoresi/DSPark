@@ -164,6 +164,10 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         c.setFeedback(0.2f);
         c.setModWaveform(Oscillator<float>::Waveform::Triangle);
     })));
+    EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
+        c.setModel(Chorus<float>::Model::Analog); c.setAnalogMode(Chorus<float>::AnalogMode::Fast);
+        c.setAnalogNoise(-70.0f);
+    })));
     EXPECT_TRUE((roundTrip<Phaser<float>>([](auto& p) {
         p.setRate(0.9f); p.setStages(6); p.setFeedback(0.5f);
         p.setLfoWaveform(Oscillator<float>::Waveform::Triangle);
@@ -173,6 +177,9 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     })));
     EXPECT_TRUE((roundTrip<Vibrato<float>>([](auto& v) {
         v.setRate(4.2f); v.setDepth(0.3f); v.setModRate(1.5f); v.setModDepth(0.6f);
+    })));
+    EXPECT_TRUE((roundTrip<Vibrato<float>>([](auto& v) {
+        v.setModel(Vibrato<float>::Model::Analog); v.setAnalogNoise(-72.0f);
     })));
     EXPECT_TRUE((roundTrip<RingModulator<float>>([](auto& r) {
         r.setFrequency(220.0f); r.setMix(0.6f);
@@ -185,6 +192,13 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         d.setDelayMs(370.0f); d.setFeedback(0.45f);
         d.setFeedbackLpHz(4500.0f); d.setFeedbackHpHz(150.0f);
     }, 2.0)));   // prepare(spec, maxDelaySeconds)
+    EXPECT_TRUE((roundTrip<Delay<float>>([](auto& d) {
+        d.setCharacter(Delay<float>::Character::Tape); d.setWowFlutter(0.8f);
+        d.setCharacterNoise(-70.0f);
+    }, 2.0)));
+    EXPECT_TRUE((roundTrip<Delay<float>>([](auto& d) {
+        d.setCharacter(Delay<float>::Character::Bucket);
+    }, 2.0)));
     EXPECT_TRUE((roundTrip<DCBlocker<float>>([](auto& d) {
         d.setOrder(2); d.setCutoff(10.0f);
     })));
@@ -211,9 +225,23 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         r.setPreDelay(18.0f); r.setWidth(1.4f);
         r.setQuality(AlgorithmicReverb<float>::Quality::Eco);
     })));
+    using AR = AlgorithmicReverb<float>;
+    EXPECT_TRUE((roundTrip<AR>([](auto& r) {
+        r.setDecayBand(0, { AR::DecayShape::Bell, 2500.0f, 1.2f, 1.8f });
+        r.setDecayBand(3, { AR::DecayShape::LowShelf, 180.0f, 0.7f, 0.6f });
+        r.setFreeze(true); r.setDucking(6.0f); r.setGate(-40.0f); r.setGateHold(220.0f); r.setGateRelease(90.0f);
+        r.setDistance(0.4f); r.setThickness(0.5f); r.setThicknessSaturation(true);
+        r.setTempo(98.0f); r.setPreDelayNote(AR::NoteValue::Eighth, AR::NoteFeel::Dotted);
+        r.setGateHoldNote(AR::NoteValue::Quarter); r.setInputWidth(0.6f); r.setWidthLaw(AR::WidthLaw::PowerKept);
+        r.setModulationStyle(AR::ModulationStyle::Segments); r.setSpaceLayout(AR::SpaceLayout::Geometric);
+        r.setShimmer(0.3f);
+        KeyEqualizer<float, 2>::Band b; b.shape = KeyEqualizer<float, 2>::Shape::Bell; b.frequency = 900.0f; b.gainDb = -3.0f;
+        r.setPostEqBand(2, b);
+    })));
     EXPECT_TRUE((roundTrip<Reverb<float>>([](auto& r) {
         r.setMix(0.55f); r.setPreDelay(25.0f);
         r.setDecayScale(0.7f); r.setStretch(1.3f);
+        r.setDucking(9.0f); r.setGate(-35.0f); r.setGateHold(300.0f); r.setGateRelease(80.0f);
     })));
     EXPECT_TRUE((roundTrip<Equalizer<float>>([](auto& e) {
         Equalizer<float>::BandConfig b;

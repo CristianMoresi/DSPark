@@ -15,6 +15,7 @@
 #include "../Effects/FrequencyShifter.h"
 #include "../Effects/DeEsser.h"
 #include "../Effects/NoiseGenerator.h"
+#include "../Core/BucketBrigade.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -2060,6 +2062,310 @@ DSPARK_TEST(Chorus_survives_nonfinite_input)
     }
     EXPECT_TRUE(finite);
     EXPECT_GT(energy, 1e-3);
+}
+
+
+// ============================================================================
+// Chorus: the bucket-brigade model
+// ============================================================================
+
+namespace {
+
+std::pair<std::vector<float>, std::vector<float>> l12Chorus(double fs, const std::vector<float>& in,
+                                                            Chorus<float>::AnalogMode mode, float noiseDb, float mix = 1.0f)
+{
+    auto c = std::make_unique<Chorus<float>>();
+    c->setModel(Chorus<float>::Model::Analog);
+    c->setAnalogMode(mode);
+    c->setAnalogNoise(noiseDb);
+    c->setMix(mix);
+    c->prepare(spec(fs, 256, 2));
+    std::vector<float> l = in, r = in;
+    for (size_t off = 0; off < l.size(); off += 256)
+    {
+        const int n = static_cast<int>(std::min<size_t>(256, l.size() - off));
+        float* p[2] = { l.data() + off, r.data() + off };
+        c->processBlock(AudioBufferView<float>(p, 2, n));
+    }
+    return { l, r };
+}
+
+double l12Line(const std::vector<float>& v, double hz, double fs, size_t from, size_t n)
+{
+    double re = 0.0, im = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double ph = 2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / fs;
+        const double w = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * static_cast<double>(i) / static_cast<double>(n));
+        re += w * static_cast<double>(v[from + i]) * std::cos(ph);
+        im += w * static_cast<double>(v[from + i]) * std::sin(ph);
+    }
+    return 20.0 * std::log10(std::max(4.0 * std::sqrt(re * re + im * im) / static_cast<double>(n), 1e-15));
+}
+
+double l12RmsDb(const std::vector<float>& v, size_t from, size_t to)
+{
+    double s = 0.0;
+    for (size_t i = from; i < to; ++i) s += static_cast<double>(v[i]) * v[i];
+    return 10.0 * std::log10(std::max(s / static_cast<double>(to - from), 1e-30));
+}
+
+} // namespace
+
+// New: the analog model. A tone passes the two bucket-brigade lines at its
+// level and stays clean (no line of the clock's images or of aliasing within
+// 45 dB in the band), the taps move in opposition (the channels differ) or in
+// phase (identical), and the result is the same at 192 kHz, where the engine
+// runs at half the rate.
+DSPARK_TEST(Chorus_analog_model_runs_through_bucket_lines)
+{
+    const size_t n = 48000 * 2;
+    std::vector<float> tone(n);
+    for (size_t i = 0; i < n; ++i) tone[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * 500.0 * static_cast<double>(i) / 48000.0));
+    // The triangle detunes the tone by a constant +-0.3 % (two lines 1.6 Hz
+    // from 500 Hz), so its level is read as RMS.
+    const auto slow = l12Chorus(48000.0, tone, Chorus<float>::AnalogMode::Slow, -200.0f);
+    const double level = l12RmsDb(slow.first, 48000, n);
+    EXPECT_NEAR(level, 20.0 * std::log10(0.25 / std::sqrt(2.0)), 1.5);
+    double worst = -300.0;
+    for (double f = 1200.0; f <= 20000.0; f += 37.0) worst = std::max(worst, l12Line(slow.first, f, 48000.0, 48000, 48000));
+    EXPECT_LT(worst, 20.0 * std::log10(0.25) - 45.0);
+    double differ = 0.0;
+    for (size_t i = 48000; i < n; ++i) differ = std::max(differ, std::abs(static_cast<double>(slow.first[i] - slow.second[i])));
+    EXPECT_GT(differ, 1e-3);
+
+    const auto vib = l12Chorus(48000.0, tone, Chorus<float>::AnalogMode::Vibrato, -200.0f);
+    double same = 0.0;
+    for (size_t i = 0; i < n; ++i) same = std::max(same, std::abs(static_cast<double>(vib.first[i] - vib.second[i])));
+    EXPECT_EQ(same, 0.0);
+
+    std::vector<float> hi(n * 4);
+    for (size_t i = 0; i < hi.size(); ++i) hi[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * 500.0 * static_cast<double>(i) / 192000.0));
+    const auto fast = l12Chorus(192000.0, hi, Chorus<float>::AnalogMode::Slow, -200.0f);
+    EXPECT_NEAR(l12RmsDb(fast.first, 192000, hi.size()), level, 1.0);
+}
+
+// New: the analog lines' hiss sits at the level set (off below -120 dBFS),
+// and a mode loads its rate, depth and centre.
+DSPARK_TEST(Chorus_analog_hiss_and_modes)
+{
+    const std::vector<float> silence(48000 * 2, 0.0f);
+    const auto hiss = l12Chorus(48000.0, silence, Chorus<float>::AnalogMode::Slow, -84.0f);
+    EXPECT_NEAR(l12RmsDb(hiss.first, 48000, 96000), -84.0, 3.0);
+    const auto none = l12Chorus(48000.0, silence, Chorus<float>::AnalogMode::Slow, -200.0f);
+    double top = 0.0;
+    for (float x : none.first) top = std::max(top, std::abs(static_cast<double>(x)));
+    EXPECT_EQ(top, 0.0);
+
+    Chorus<float> c;
+    c.setAnalogMode(Chorus<float>::AnalogMode::Vibrato);
+    EXPECT_TRUE(c.getAnalogMode() == Chorus<float>::AnalogMode::Vibrato);
+    EXPECT_NEAR(static_cast<double>(c.getRate()), 7.0, 1e-6);
+    EXPECT_NEAR(static_cast<double>(c.getDepthMs()), 0.25, 1e-6);
+    EXPECT_NEAR(static_cast<double>(c.getCenterDelay()), 7.0, 1e-6);
+    c.setAnalogMode(static_cast<Chorus<float>::AnalogMode>(9));
+    EXPECT_TRUE(c.getAnalogMode() == Chorus<float>::AnalogMode::Vibrato);
+    c.setAnalogNoise(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(c.getAnalogNoise(), -84.0f);
+    EXPECT_TRUE(c.getModel() == Chorus<float>::Model::Digital);
+}
+
+// New: the bucket-brigade line delays by N / (2 f_clk): an impulse comes out
+// at the delay set, and a tone below its corner passes at its level.
+DSPARK_TEST(BucketBrigade_delays_by_its_stages_over_its_clock)
+{
+    BucketBrigade<float> b;
+    b.prepare(48000.0, 1024, 6000.0);
+    EXPECT_EQ(b.getStages(), 1024);
+    std::vector<float> out(4800);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = b.processSample(i == 0 ? 1.0f : 0.0f, 0.040);
+    size_t peak = 0;
+    for (size_t i = 0; i < out.size(); ++i) if (std::abs(out[i]) > std::abs(out[peak])) peak = i;
+    EXPECT_NEAR(static_cast<double>(peak), 0.040 * 48000.0, 0.002 * 48000.0);
+
+    b.reset();
+    std::vector<float> tone(48000), y(48000);
+    for (size_t i = 0; i < tone.size(); ++i) tone[i] = static_cast<float>(0.3 * std::sin(2.0 * 3.14159265358979323846 * 400.0 * static_cast<double>(i) / 48000.0));
+    for (size_t i = 0; i < tone.size(); ++i) y[i] = b.processSample(tone[i], 0.010);
+    EXPECT_NEAR(l12Line(y, 400.0, 48000.0, 24000, 24000), 20.0 * std::log10(0.3), 1.0);
+}
+
+namespace {
+
+std::vector<float> l12Tone(double hz, size_t n)
+{
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0));
+    return v;
+}
+
+std::vector<float> l12Vibrato(Vibrato<float>::Model model, double hz, float depth, float rate, float noiseDb, size_t n)
+{
+    auto v = std::make_unique<Vibrato<float>>();
+    v->setModel(model);
+    v->setAnalogNoise(noiseDb);
+    v->setDepth(depth);
+    v->setRate(rate);
+    v->prepare(spec(48000.0, 256, 2));
+    std::vector<float> l = l12Tone(hz, n), r = l;
+    for (size_t off = 0; off < n; off += 256)
+    {
+        const int m = static_cast<int>(std::min<size_t>(256, n - off));
+        float* p[2] = { l.data() + off, r.data() + off };
+        v->processBlock(AudioBufferView<float>(p, 2, m));
+    }
+    return l;
+}
+
+// The delay as an insert, wet only, on a tone (or an impulse with hz 0 and
+// impulse set); thenMs is set two seconds in.
+std::vector<float> l12Delay(Delay<float>::Character chr, float wow, float ms, float thenMs, double hz,
+                            float feedback, float noiseDb, size_t n, bool impulse = false)
+{
+    auto d = std::make_unique<Delay<float>>();
+    d->setCharacter(chr);
+    d->setWowFlutter(wow);
+    d->setCharacterNoise(noiseDb);
+    d->setDelayMs(ms);
+    d->setFeedback(feedback);
+    d->setMix(1.0f);
+    d->prepare(spec(48000.0, 256, 2), 2.0);
+    std::vector<float> l = l12Tone(hz, n), r;
+    if (impulse) l[0] = 1.0f;
+    r = l;
+    for (size_t off = 0; off < n; off += 256)
+    {
+        if (off == 96000) d->setDelayMs(thenMs);
+        const int m = static_cast<int>(std::min<size_t>(256, n - off));
+        float* p[2] = { l.data() + off, r.data() + off };
+        d->processBlock(AudioBufferView<float>(p, 2, m));
+    }
+    return l;
+}
+
+// Frequency from the rising zero crossings in [from, from + len).
+double l12ZeroCrossingHz(const std::vector<float>& v, size_t from, size_t len)
+{
+    double first = -1.0, last = -1.0;
+    int count = 0;
+    for (size_t i = from + 1; i < from + len; ++i)
+        if (v[i - 1] < 0.0f && v[i] >= 0.0f)
+        {
+            const double t = static_cast<double>(i - 1) + static_cast<double>(v[i - 1]) / static_cast<double>(v[i - 1] - v[i]);
+            if (first < 0.0) first = t; else ++count;
+            last = t;
+        }
+    return count > 0 ? 48000.0 * count / (last - first) : 0.0;
+}
+
+} // namespace
+
+// New: the vibrato's analog model. A tone keeps its level through the
+// bucket-brigade line and its images stay far under it, a deep slow sweep (a
+// long delay, a slow clock) is darker than the digital line, and the hiss sits
+// at the level set (silent below -120 dBFS).
+DSPARK_TEST(Vibrato_analog_model_runs_through_a_bucket_line)
+{
+    using M = Vibrato<float>::Model;
+    const size_t n = 48000 * 3;
+    const auto an = l12Vibrato(M::Analog, 500.0, 0.5f, 5.0f, -200.0f, n);
+    EXPECT_NEAR(l12RmsDb(an, 48000, n), 20.0 * std::log10(0.25 / std::sqrt(2.0)), 1.0);
+    double worst = -300.0;
+    for (double f = 1200.0; f <= 20000.0; f += 37.0) worst = std::max(worst, l12Line(an, f, 48000.0, 48000, 96000));
+    EXPECT_LT(worst, 20.0 * std::log10(0.25) - 50.0);
+    const auto dg = l12Vibrato(M::Digital, 500.0, 0.5f, 5.0f, -200.0f, n);
+    double differ = 0.0;
+    for (size_t i = 48000; i < n; ++i) differ = std::max(differ, std::abs(static_cast<double>(an[i] - dg[i])));
+    EXPECT_GT(differ, 1e-3);
+
+    const size_t m = 48000 * 4;
+    const auto deepA = l12Vibrato(M::Analog, 5000.0, 4.0f, 1.0f, -200.0f, m);
+    const auto deepD = l12Vibrato(M::Digital, 5000.0, 4.0f, 1.0f, -200.0f, m);
+    EXPECT_LT(l12RmsDb(deepA, 48000, m), l12RmsDb(deepD, 48000, m) - 10.0);
+
+    const auto hiss = l12Vibrato(M::Analog, 0.0, 0.5f, 5.0f, -84.0f, 48000 * 2);
+    EXPECT_NEAR(l12RmsDb(hiss, 48000, 96000), -84.0, 3.0);
+    const auto quiet = l12Vibrato(M::Analog, 0.0, 0.5f, 5.0f, -200.0f, 48000);
+    double top = 0.0;
+    for (float x : quiet) top = std::max(top, std::abs(static_cast<double>(x)));
+    EXPECT_EQ(top, 0.0);
+
+    Vibrato<float> v;
+    EXPECT_TRUE(v.getModel() == M::Digital);
+    v.setModel(static_cast<M>(7));
+    EXPECT_TRUE(v.getModel() == M::Analog);
+    v.setAnalogNoise(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(v.getAnalogNoise(), -84.0f);
+    v.setAnalogNoise(-300.0f);
+    EXPECT_EQ(v.getAnalogNoise(), -140.0f);
+}
+
+// New: the tape character. A change of the delay is a change of tape speed
+// reached with the motor's inertia: 0.15 s after 300 -> 150 ms the pitch is
+// still bent up (the clean line has settled), and 2 s after it is back. With
+// no wow and flutter the tone keeps its pitch and level; with them it wanders.
+DSPARK_TEST(Delay_tape_character_glides_and_wanders)
+{
+    using C = Delay<float>::Character;
+    const size_t n = 48000 * 5;
+    const auto clean = l12Delay(C::Clean, 0.0f, 300.0f, 150.0f, 1000.0, 0.0f, -200.0f, n);
+    const auto tape = l12Delay(C::Tape, 0.0f, 300.0f, 150.0f, 1000.0, 0.0f, -200.0f, n);
+    EXPECT_NEAR(l12ZeroCrossingHz(clean, 96000 + 7200, 2400), 1000.0, 10.0);
+    EXPECT_GT(l12ZeroCrossingHz(tape, 96000 + 7200, 2400), 1100.0);
+    EXPECT_NEAR(l12ZeroCrossingHz(tape, 96000 + 96000, 2400), 1000.0, 10.0);
+
+    const auto steady = l12Delay(C::Tape, 0.0f, 300.0f, 300.0f, 1000.0, 0.0f, -200.0f, n);
+    const auto wobbly = l12Delay(C::Tape, 1.0f, 300.0f, 300.0f, 1000.0, 0.0f, -200.0f, n);
+    EXPECT_NEAR(l12Line(steady, 1000.0, 48000.0, 48000, 96000), 20.0 * std::log10(0.25), 0.5);
+    double lo[2] = { 1e9, 1e9 }, hi[2] = { 0.0, 0.0 };
+    for (size_t off = 96000; off + 4800 <= n; off += 4800)
+    {
+        const double a = l12ZeroCrossingHz(steady, off, 4800), b = l12ZeroCrossingHz(wobbly, off, 4800);
+        lo[0] = std::min(lo[0], a); hi[0] = std::max(hi[0], a);
+        lo[1] = std::min(lo[1], b); hi[1] = std::max(hi[1], b);
+    }
+    EXPECT_LT(hi[0] - lo[0], 0.2);
+    EXPECT_GT(hi[1] - lo[1], 1.0);
+}
+
+// New: the bucket character. The device's filters follow its clock: at
+// 300 ms a 500 Hz tone passes and a 4 kHz one is cut; at 50 ms 4 kHz passes.
+// The echo comes out at the delay set and the feedback goes round the
+// device. The hiss sits at the level set; the setters clamp.
+DSPARK_TEST(Delay_bucket_character_darkens_with_the_delay)
+{
+    using C = Delay<float>::Character;
+    const size_t n = 48000 * 2;
+    const auto level = [&](float ms, double hz) {
+        return l12Line(l12Delay(C::Bucket, 0.0f, ms, ms, hz, 0.0f, -200.0f, n), hz, 48000.0, 48000, 48000)
+             - 20.0 * std::log10(0.25);
+    };
+    EXPECT_NEAR(level(300.0f, 500.0), 0.0, 1.5);
+    EXPECT_LT(level(300.0f, 4000.0), -12.0);
+    EXPECT_NEAR(level(50.0f, 4000.0), 0.0, 1.5);
+
+    const auto echoes = l12Delay(C::Bucket, 0.0f, 300.0f, 300.0f, 0.0, 0.5f, -200.0f, n, true);
+    size_t p1 = 0, p2 = 24000;
+    for (size_t i = 0; i < 24000; ++i) if (std::abs(echoes[i]) > std::abs(echoes[p1])) p1 = i;
+    for (size_t i = 24000; i < 48000; ++i) if (std::abs(echoes[i]) > std::abs(echoes[p2])) p2 = i;
+    EXPECT_NEAR(static_cast<double>(p1), 0.300 * 48000.0, 0.002 * 48000.0);
+    EXPECT_NEAR(static_cast<double>(p2), 0.600 * 48000.0, 0.004 * 48000.0);
+    EXPECT_LT(std::abs(echoes[p2]), std::abs(echoes[p1]));
+    EXPECT_GT(std::abs(echoes[p2]), 0.1 * std::abs(echoes[p1]));
+
+    const auto hiss = l12Delay(C::Bucket, 0.0f, 300.0f, 300.0f, 0.0, 0.0f, -84.0f, n);
+    EXPECT_NEAR(l12RmsDb(hiss, 48000, n), -84.0, 3.0);
+
+    Delay<float> d;
+    EXPECT_TRUE(d.getCharacter() == C::Clean);
+    d.setCharacter(static_cast<C>(9));
+    EXPECT_TRUE(d.getCharacter() == C::Bucket);
+    d.setWowFlutter(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(d.getWowFlutter(), 0.5f);
+    d.setWowFlutter(5.0f);
+    EXPECT_EQ(d.getWowFlutter(), 1.0f);
+    d.setCharacterNoise(std::numeric_limits<float>::infinity());
+    EXPECT_EQ(d.getCharacterNoise(), -84.0f);
 }
 
 DSPARK_TEST(Phaser_survives_nonfinite_input)

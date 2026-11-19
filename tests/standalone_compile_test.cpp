@@ -42,6 +42,9 @@ void instantiate()
     [[maybe_unused]] const AnalogCascade designedCut = FilterDesign::highCut(1000.0, 18.0);
     [[maybe_unused]] FirBank<T> firBank;
     [[maybe_unused]] KeyEqualizer<T> keyEqualizer;
+    [[maybe_unused]] TailShaper<T> tailShaper;
+    [[maybe_unused]] BucketBrigade<T> bucketBrigade;
+    [[maybe_unused]] TapeTransport<T> tapeTransport;
     [[maybe_unused]] CabinetModel<T> cabinetModel;
     Oversampling<T> ov(2);
     OversamplingDryPath<T> ovDry;

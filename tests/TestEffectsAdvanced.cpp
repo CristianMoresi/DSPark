@@ -20,6 +20,8 @@
 #include "../Effects/Filters.h"
 #include "../Effects/AlgorithmicReverb.h"
 #include "../Effects/Reverb.h"
+#include "../Core/TailShaper.h"
+#include "../Core/KeyEqualizer.h"
 #include "../Effects/Panner.h"
 #include "../Effects/PitchShifter.h"
 #include "../Effects/TimeStretch.h"
@@ -44,6 +46,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 using namespace dspark;
 using namespace dspark::test;
@@ -4017,6 +4020,381 @@ DSPARK_TEST(AlgoReverb_short_small_room_does_not_ring)
     double top = 0.0;
     for (const double v : avg) top = std::max(top, 10.0 * std::log10(v));
     EXPECT_LT(top, 8.8);
+}
+
+// ============================================================================
+// AlgorithmicReverb: around the tank
+// ============================================================================
+
+namespace {
+
+// A stereo signal through a reverb in blocks of 256, with a hook per block.
+template <class Rev, class Hook>
+std::pair<std::vector<float>, std::vector<float>> l11Run(Rev& rev, std::vector<float> l, std::vector<float> r, Hook&& hook)
+{
+    for (size_t off = 0; off < l.size(); off += 256)
+    {
+        hook(off);
+        const int n = static_cast<int>(std::min<size_t>(256, l.size() - off));
+        float* p[2] = { l.data() + off, r.data() + off };
+        rev.processBlock(AudioBufferView<float>(p, 2, n));
+    }
+    return { l, r };
+}
+
+std::vector<float> l11Noise(size_t n, float amp, uint32_t seed)
+{
+    std::vector<float> v(n);
+    for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
+    return v;
+}
+
+std::vector<float> l11Tone(double hz, double amp, size_t n)
+{
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0));
+    return v;
+}
+
+double l11RmsDb(const std::vector<float>& v, size_t from, size_t to)
+{
+    double s = 0.0;
+    for (size_t i = from; i < to; ++i) s += static_cast<double>(v[i]) * v[i];
+    return 10.0 * std::log10(std::max(s / static_cast<double>(to - from), 1e-30));
+}
+
+// Level of a frequency over [from, from + n), Hann window, in dB.
+double l11Line(const std::vector<float>& v, double hz, size_t from, size_t n)
+{
+    double re = 0.0, im = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double ph = 2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0;
+        const double w = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * static_cast<double>(i) / static_cast<double>(n));
+        re += w * static_cast<double>(v[from + i]) * std::cos(ph);
+        im += w * static_cast<double>(v[from + i]) * std::sin(ph);
+    }
+    return 20.0 * std::log10(std::max(4.0 * std::sqrt(re * re + im * im) / static_cast<double>(n), 1e-15));
+}
+
+// A wet-only reverb of a type, its preset committed.
+void l11Wet(ARevF& rev, ARevF::Type type)
+{
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(type);
+    rev.setMix(1.0f);
+    auto w = makeBuffer(2, 64);
+    rev.processBlock(w.view());
+}
+
+} // namespace
+
+// New: the decay equalizer. A bell that doubles the decay at 2 kHz lengthens
+// it there and leaves the low end alone; one that halves it at 4 kHz
+// shortens it; a strong low boost on a long bass stays stable (its boost is
+// scaled down until no loop passes 0.9995).
+DSPARK_TEST(AlgoReverb_decay_band_moves_the_decay_in_its_band)
+{
+    const double fs = 48000.0;
+    const auto t60s = [&](auto&& setup) {
+        auto rev = std::make_unique<ARevF>();
+        algoReverbLateHall(*rev, fs);
+        rev->setDecay(1.5f);
+        rev->setHighDecayMultiplier(1.0f);
+        rev->setBassDecayMultiplier(1.0f);
+        setup(*rev);
+        std::vector<float> right;
+        const auto ir = algoReverbIR(*rev, fs, 6.0, false, &right);
+        std::array<double, 3> t {};
+        const double bands[3] = { 125.0, 2000.0, 4000.0 };
+        for (size_t b = 0; b < 3; ++b) t[b] = 0.5 * (algoReverbT60(ir, fs, bands[b]) + algoReverbT60(right, fs, bands[b]));
+        return t;
+    };
+    const auto plain = t60s([](ARevF&) {});
+    const auto longer = t60s([](ARevF& r) { r.setDecayBand(0, { ARevF::DecayShape::Bell, 2000.0f, 1.5f, 2.0f }); });
+    const auto shorter = t60s([](ARevF& r) { r.setDecayBand(2, { ARevF::DecayShape::Bell, 4000.0f, 1.5f, 0.5f }); });
+    EXPECT_GT(longer[1], 1.5 * plain[1]);
+    EXPECT_NEAR(longer[0], plain[0], 0.2 * plain[0]);
+    EXPECT_LT(shorter[2], 0.75 * plain[2]);
+    EXPECT_NEAR(shorter[0], plain[0], 0.2 * plain[0]);
+
+    auto rev = std::make_unique<ARevF>();
+    algoReverbLateHall(*rev, fs);
+    rev->setDecay(8.0f);
+    rev->setBassDecayMultiplier(3.0f);
+    rev->setDecayBand(1, { ARevF::DecayShape::LowShelf, 150.0f, 0.7f, 4.0f });
+    const auto ir = algoReverbIR(*rev, fs, 6.0);
+    double first = 0.0, last = 0.0;
+    for (size_t i = 0; i < ir.size(); ++i)
+    {
+        EXPECT_TRUE(std::isfinite(ir[i]));
+        if (i < 48000) first += static_cast<double>(ir[i]) * ir[i];
+        if (i >= ir.size() - 48000) last += static_cast<double>(ir[i]) * ir[i];
+    }
+    EXPECT_LT(last, first);
+    EXPECT_TRUE(rev->getDecayBand(1).shape == ARevF::DecayShape::LowShelf);
+    EXPECT_EQ(rev->getDecayBand(1).multiplier, 4.0f);
+}
+
+// New: freeze holds the tail at its level and with its highs, and the input
+// played meanwhile does not enter it; released, it decays again.
+DSPARK_TEST(AlgoReverb_freeze_holds_the_tail)
+{
+    const size_t n = 48000 * 5;
+    const auto burst = [&](bool playOn) {
+        // Both are silent from 0.5 s; the played one starts again at 1 s,
+        // once the freeze has settled.
+        std::vector<float> in = l11Noise(n, 0.3f, 7u);
+        for (size_t i = 24000; i < n; ++i) if (!playOn || i < 48000) in[i] = 0.0f;
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        rev->setDecay(1.0f);
+        return l11Run(*rev, in, in, [&](size_t off) {
+            if (off == 24064) rev->setFreeze(true);
+            if (off == 48000 * 4) rev->setFreeze(false);
+        }).first;
+    };
+    const auto quiet = burst(false);
+    const auto played = burst(true);
+    const double at1 = l11RmsDb(quiet, 48000, 72000), at3 = l11RmsDb(quiet, 144000, 168000);
+    EXPECT_NEAR(at3, at1, 3.0);
+    EXPECT_NEAR(l11Line(quiet, 6000.0, 144000, 24000) - l11Line(quiet, 6000.0, 48000, 24000), 0.0, 4.0);
+    double worst = 0.0, top = 0.0;
+    for (size_t i = 48000; i < 48000 * 4; ++i)
+    {
+        worst = std::max(worst, std::abs(static_cast<double>(played[i] - quiet[i])));
+        top = std::max(top, std::abs(static_cast<double>(quiet[i])));
+    }
+    EXPECT_LT(worst, 1e-4 * top);
+    EXPECT_LT(l11RmsDb(quiet, n - 24000, n), at1 - 20.0);
+}
+
+// New: ducking lowers the wet signal while the dry one plays and lets it back
+// after; the gate cuts the tail once the dry signal has stopped. Off, the
+// shaper's gain is exactly 1.
+DSPARK_TEST(AlgoReverb_ducking_and_gate_follow_the_dry_signal)
+{
+    const size_t n = 48000 * 3;
+    std::vector<float> in = l11Noise(n, 0.3f, 9u);
+    for (size_t i = 48000; i < n; ++i) in[i] = 0.0f;
+    const auto wet = [&](auto&& setup) {
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        rev->setDecay(2.0f);
+        setup(*rev);
+        return l11Run(*rev, in, in, [](size_t) {}).first;
+    };
+    const auto plain = wet([](ARevF&) {});
+    const auto ducked = wet([](ARevF& r) { r.setDucking(12.0f); });
+    const auto gated = wet([](ARevF& r) { r.setGate(-30.0f); r.setGateHold(50.0f); r.setGateRelease(40.0f); });
+    EXPECT_LT(l11RmsDb(ducked, 24000, 48000), l11RmsDb(plain, 24000, 48000) - 8.0);
+    EXPECT_NEAR(l11RmsDb(ducked, 48000 + 72000, 48000 + 96000), l11RmsDb(plain, 48000 + 72000, 48000 + 96000), 2.0);
+    EXPECT_NEAR(l11RmsDb(gated, 24000, 48000), l11RmsDb(plain, 24000, 48000), 0.5);
+    EXPECT_LT(l11RmsDb(gated, 48000 + 24000, 48000 + 48000), l11RmsDb(plain, 48000 + 24000, 48000 + 48000) - 40.0);
+
+    TailShaper<float> shaper;
+    shaper.prepare(48000.0);
+    shaper.sync();
+    EXPECT_TRUE(!shaper.isActive());
+    for (int i = 0; i < 1000; ++i) EXPECT_EQ(shaper.next(i % 7 == 0 ? 0.9f : 0.01f), 1.0f);
+    shaper.setDucking(std::numeric_limits<float>::quiet_NaN());
+    shaper.setGate(-300.0f);
+    EXPECT_EQ(shaper.getDucking(), 0.0f);
+    EXPECT_EQ(shaper.getGate(), -200.0f);
+}
+
+// New: distance moves the balance from the early field to the tail and
+// darkens the wet signal; thickness lifts a quiet input into the tank and
+// holds a loud one back; the input width centres the excitation; the power
+// width law keeps the tail's power when the side is narrowed.
+DSPARK_TEST(AlgoReverb_distance_thickness_and_width)
+{
+    const size_t n = 48000 * 2;
+    const auto noise = l11Noise(n, 0.3f, 3u);
+    const auto run = [&](const std::vector<float>& l, const std::vector<float>& r, auto&& setup) {
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        setup(*rev);
+        return l11Run(*rev, l, r, [](size_t) {});
+    };
+    const auto near0 = run(noise, noise, [](ARevF&) {}).first;
+    const auto far1 = run(noise, noise, [](ARevF& r) { r.setDistance(1.0f); }).first;
+    EXPECT_LT(l11Line(far1, 8000.0, 48000, 48000) - l11Line(far1, 500.0, 48000, 48000),
+              l11Line(near0, 8000.0, 48000, 48000) - l11Line(near0, 500.0, 48000, 48000) - 6.0);
+
+    for (const float amp : { 0.01f, 0.25f })
+    {
+        const auto in = l11Noise(n, amp * 1.7320508f, 4u);
+        const double plain = l11RmsDb(run(in, in, [](ARevF&) {}).first, 48000, n);
+        const double thick = l11RmsDb(run(in, in, [](ARevF& r) { r.setThickness(1.0f); }).first, 48000, n);
+        if (amp < 0.1f) EXPECT_GT(thick, plain + 6.0);
+        else EXPECT_LT(thick, plain);
+    }
+
+    std::vector<float> antiR(noise);
+    for (auto& x : antiR) x = -x;
+    const double sideWide = l11RmsDb(run(noise, antiR, [](ARevF&) {}).first, 48000, n);
+    const double sideNarrow = l11RmsDb(run(noise, antiR, [](ARevF& r) { r.setInputWidth(0.0f); }).first, 48000, n);
+    EXPECT_LT(sideNarrow, sideWide - 60.0);
+
+    const auto power = [&](auto&& setup) {
+        const auto out = run(noise, l11Noise(n, 0.3f, 5u), setup);
+        return 0.5 * (std::pow(10.0, l11RmsDb(out.first, 48000, n) / 10.0) + std::pow(10.0, l11RmsDb(out.second, 48000, n) / 10.0));
+    };
+    const double natural = power([](ARevF&) {});
+    const double kept = power([](ARevF& r) { r.setWidth(0.0f); r.setWidthLaw(ARevF::WidthLaw::PowerKept); });
+    const double side = power([](ARevF& r) { r.setWidth(0.0f); });
+    // Folding to mid keeps only the correlated part of the tail (measured
+    // -1.1 dB here); the power-kept law restores it.
+    EXPECT_NEAR(10.0 * std::log10(kept / natural), 0.0, 1.5);
+    EXPECT_LT(10.0 * std::log10(side / natural), -0.8);
+    EXPECT_GT(kept, side * 1.15);
+}
+
+// New: pre-delay at a tempo, the wet equalizer, modulation by segments, the
+// geometric layout and the shimmer.
+DSPARK_TEST(AlgoReverb_tempo_wet_eq_modulation_layout_and_shimmer)
+{
+    ARevF rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setTempo(120.0f);
+    rev.setPreDelayNote(ARevF::NoteValue::Sixteenth);
+    EXPECT_NEAR(static_cast<double>(rev.getEffectivePreDelay()), 125.0, 1e-3);
+    rev.setPreDelayNote(ARevF::NoteValue::Sixteenth, ARevF::NoteFeel::Dotted);
+    EXPECT_NEAR(static_cast<double>(rev.getEffectivePreDelay()), 187.5, 1e-3);
+    rev.setPreDelayNote(ARevF::NoteValue::Eighth, ARevF::NoteFeel::Triplet);
+    EXPECT_NEAR(static_cast<double>(rev.getEffectivePreDelay()), 1000.0 / 6.0, 1e-3);
+    rev.setTempo(40.0f);
+    EXPECT_NEAR(static_cast<double>(rev.getEffectivePreDelay()), 500.0, 1e-3);
+    rev.setPreDelayNote(ARevF::NoteValue::Off);
+    rev.setPreDelay(30.0f);
+    EXPECT_NEAR(static_cast<double>(rev.getEffectivePreDelay()), 30.0, 1e-3);
+
+    // The wet signal's onset waits for the note value.
+    {
+        auto r = std::make_unique<ARevF>();
+        l11Wet(*r, ARevF::Type::Room);
+        r->setTempo(120.0f);
+        r->setPreDelayNote(ARevF::NoteValue::Sixteenth);
+        const auto ir = algoReverbIR(*r, 48000.0, 0.5);
+        size_t first = 0;
+        while (first < ir.size() && std::abs(ir[first]) < 1e-4f) ++first;
+        EXPECT_GT(static_cast<double>(first), 0.12 * 48000.0);
+    }
+
+    const size_t n = 48000 * 2;
+    const auto noise = l11Noise(n, 0.3f, 6u);
+    const auto wet = [&](auto&& setup) {
+        auto r = std::make_unique<ARevF>();
+        l11Wet(*r, ARevF::Type::Hall);
+        setup(*r);
+        return l11Run(*r, noise, noise, [](size_t) {}).first;
+    };
+    const auto plain = wet([](ARevF&) {});
+    KeyEqualizer<float, 2>::Band cut;
+    cut.shape = KeyEqualizer<float, 2>::Shape::HighCut;
+    cut.frequency = 2000.0f;
+    cut.slope = 24.0f;
+    const auto eq = wet([&](ARevF& r) { r.setPostEqBand(0, cut); });
+    EXPECT_LT(l11Line(eq, 8000.0, 48000, 48000), l11Line(plain, 8000.0, 48000, 48000) - 20.0);
+    EXPECT_NEAR(l11Line(eq, 300.0, 48000, 48000), l11Line(plain, 300.0, 48000, 48000), 1.0);
+
+    const auto segments = wet([](ARevF& r) { r.setModulationStyle(ARevF::ModulationStyle::Segments); });
+    for (float x : segments) EXPECT_TRUE(std::isfinite(x));
+    EXPECT_NEAR(l11RmsDb(segments, 48000, n), l11RmsDb(plain, 48000, n), 1.5);
+
+    {
+        auto r = std::make_unique<ARevF>();
+        algoReverbLateHall(*r, 48000.0);
+        r->setSpaceLayout(ARevF::SpaceLayout::Geometric);
+        r->setDecay(2.0f);
+        auto w = makeBuffer(2, 64);
+        r->processBlock(w.view());
+        EXPECT_NEAR(algoReverbTmid(*r, 48000.0, 5.0), 2.0, 0.2);
+    }
+
+    // Shimmer: a 500 Hz burst rings on an octave up, and stays bounded.
+    std::vector<float> tone = l11Tone(500.0, 0.3, 48000 * 10);
+    for (size_t i = 14400; i < tone.size(); ++i) tone[i] = 0.0f;
+    const auto shimmerOf = [&](float amount) {
+        auto r = std::make_unique<ARevF>();
+        l11Wet(*r, ARevF::Type::Hall);
+        r->setDecay(4.0f);
+        r->setShimmer(amount);
+        return l11Run(*r, tone, tone, [](size_t) {}).first;
+    };
+    const auto dry = shimmerOf(0.0f), shim = shimmerOf(1.0f);
+    const double octaveDry = l11Line(dry, 1000.0, 48000, 48000) - l11Line(dry, 500.0, 48000, 48000);
+    const double octaveShim = l11Line(shim, 1000.0, 48000, 48000) - l11Line(shim, 500.0, 48000, 48000);
+    EXPECT_GT(octaveShim, octaveDry + 6.0);
+    double top = 0.0;
+    for (float x : shim) { EXPECT_TRUE(std::isfinite(x)); top = std::max(top, std::abs(static_cast<double>(x))); }
+    EXPECT_LT(top, 4.0);
+}
+
+// New: the controls around the tank clamp what is out of range and ignore
+// what is not finite.
+DSPARK_TEST(AlgoReverb_tank_controls_clamp_and_ignore_invalid_values)
+{
+    ARevF r;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    r.setDistance(nan);
+    r.setThickness(2.0f);
+    r.setTempo(1000.0f);
+    r.setInputWidth(-1.0f);
+    r.setShimmer(nan);
+    r.setGateHold(nan);
+    r.setDecayBand(9, { ARevF::DecayShape::Bell, 1000.0f, 1.0f, 2.0f });
+    r.setDecayBand(0, { static_cast<ARevF::DecayShape>(9), nan, 50.0f, 9.0f });
+    r.setWidthLaw(static_cast<ARevF::WidthLaw>(5));
+    r.setModulationStyle(static_cast<ARevF::ModulationStyle>(-2));
+    r.setSpaceLayout(static_cast<ARevF::SpaceLayout>(3));
+    EXPECT_EQ(r.getDistance(), 0.0f);
+    EXPECT_EQ(r.getThickness(), 1.0f);
+    EXPECT_EQ(r.getTempo(), 400.0f);
+    EXPECT_EQ(r.getInputWidth(), 0.0f);
+    EXPECT_EQ(r.getShimmer(), 0.0f);
+    EXPECT_EQ(r.getGateHold(), 100.0f);
+    const auto band = r.getDecayBand(0);
+    EXPECT_TRUE(band.shape == ARevF::DecayShape::HighShelf);
+    EXPECT_EQ(band.frequency, 1000.0f);
+    EXPECT_EQ(band.q, 10.0f);
+    EXPECT_EQ(band.multiplier, 4.0f);
+    EXPECT_TRUE(r.getDecayBand(9).shape == ARevF::DecayShape::Off);
+    EXPECT_TRUE(r.getWidthLaw() == ARevF::WidthLaw::PowerKept);
+    EXPECT_TRUE(r.getModulationStyle() == ARevF::ModulationStyle::Smooth);
+    EXPECT_TRUE(r.getSpaceLayout() == ARevF::SpaceLayout::Geometric);
+}
+
+// New: the convolution reverb's ducking and gate.
+DSPARK_TEST(ConvReverb_ducking_and_gate_follow_the_dry_signal)
+{
+    std::vector<float> ir(72000);
+    uint32_t seed = 11u;
+    for (size_t i = 0; i < ir.size(); ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        ir[i] = 0.05f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f) * std::exp(-4.6f * static_cast<float>(i) / 72000.0f);
+    }
+    const size_t n = 48000 * 3;
+    std::vector<float> in = l11Noise(n, 0.3f, 13u);
+    for (size_t i = 48000; i < n; ++i) in[i] = 0.0f;
+    bool loaded = true;
+    const auto wet = [&](auto&& setup) {
+        auto rev = std::make_unique<Reverb<float>>();
+        rev->prepare(spec(48000.0, 256, 2));
+        loaded = loaded && rev->loadIR(ir.data(), static_cast<int>(ir.size()), 48000.0);
+        rev->setMix(1.0f);
+        setup(*rev);
+        return l11Run(*rev, in, in, [](size_t) {}).first;
+    };
+    const auto plain = wet([](Reverb<float>&) {});
+    const auto ducked = wet([](Reverb<float>& r) { r.setDucking(12.0f); });
+    const auto gated = wet([](Reverb<float>& r) { r.setGate(-30.0f); r.setGateHold(50.0f); r.setGateRelease(40.0f); });
+    EXPECT_TRUE(loaded);
+    EXPECT_LT(l11RmsDb(ducked, 24000, 48000), l11RmsDb(plain, 24000, 48000) - 8.0);
+    EXPECT_LT(l11RmsDb(gated, 72000, 96000), l11RmsDb(plain, 72000, 96000) - 40.0);
+    EXPECT_NEAR(l11RmsDb(gated, 24000, 48000), l11RmsDb(plain, 24000, 48000), 0.5);
 }
 
 // ============================================================================

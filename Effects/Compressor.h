@@ -266,6 +266,8 @@ public:
         T fs = static_cast<T>(sampleRate_);
         updateTimeConstants(fs);
         timeConstantsDirty_.store(false, std::memory_order_relaxed);
+        linkCoeff_ = 1.0 - std::exp(-1.0 / (0.02 * sampleRate_));
+        linkLL_ = linkRR_ = linkLR_ = 0.0;
 
         // Smoothed parameters initialization
         T thresh = threshold_.load(std::memory_order_relaxed);
@@ -586,6 +588,7 @@ public:
     void reset() noexcept
     {
         keyEq_.reset();
+        linkLL_ = linkRR_ = linkLR_ = 0.0;
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             envFastDb_[ch] = 0.0; // 0 dB gain change = neutral
@@ -759,6 +762,37 @@ public:
         if (!std::isfinite(amount)) return;
         stereoLink_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
+
+    /** @brief What the linked level of a stereo pair reads (see setLinkMode()). */
+    enum class LinkMode
+    {
+        Loudest,  ///< The louder channel's level (the default).
+        Dominant  ///< The level of the pair's dominant component, wherever it sits in the image.
+    };
+
+    /**
+     * @brief Chooses how a stereo pair is linked.
+     *
+     * Loudest links to the louder channel. Dominant links to the level of
+     * the pair's dominant component: the larger eigenvalue of the
+     * covariance of the two detector levels, the correlation taken from the
+     * key over 20 ms. A source panned anywhere with an equal-power law
+     * reads the same level (a centred source reads its level in each
+     * channel, as Loudest does; panned hard it reads 3 dB less than
+     * Loudest), and two uncorrelated channels read the louder one 3 dB
+     * down, so wide ambience pushes less than a solid source of the same
+     * level. It applies to two-channel blocks with some link; other
+     * channel counts link to the loudest. Setup or any thread.
+     *
+     * @param mode Loudest (default) or Dominant.
+     */
+    void setLinkMode(LinkMode mode) noexcept
+    {
+        linkMode_.store(clampEnum(mode, LinkMode::Dominant), std::memory_order_relaxed);
+    }
+
+    /** @return How a stereo pair is linked. */
+    [[nodiscard]] LinkMode getLinkMode() const noexcept { return linkMode_.load(std::memory_order_relaxed); }
 
     /** @brief Sets dry/wet balance for parallel (New York) compression (1.0 = fully wet). */
     void setMix(T dryWet) noexcept
@@ -1311,6 +1345,7 @@ public:
         w.write("autoMakeup", amMode != AutoMakeupMode::Off); // legacy bool key
         w.write("autoMakeupMode", static_cast<int32_t>(amMode));
         w.write("stereoLink", static_cast<float>(stereoLink_.load(std::memory_order_relaxed)));
+        w.write("linkMode", static_cast<int32_t>(linkMode_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
@@ -1354,6 +1389,7 @@ public:
         setAutoMakeup(static_cast<AutoMakeupMode>(
             std::clamp(r.read("autoMakeupMode", amLegacy), 0, 3)));
         setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
+        setLinkMode(static_cast<LinkMode>(r.read("linkMode", 0)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setHoldTime(static_cast<T>(r.read("hold", 0.0f)));
@@ -1451,6 +1487,7 @@ protected:
         bool scHpf     = scHpfEnabled_.load(std::memory_order_relaxed);
         auto autoMkup  = autoMakeupMode_.load(std::memory_order_relaxed);
         T sLink        = stereoLink_.load(std::memory_order_relaxed);
+        const LinkMode linkMode = linkMode_.load(std::memory_order_relaxed);
 
         // The FET character is a feedback design like the 1176 it models: it
         // always detects on the compressed output with the hardware's peak
@@ -1493,6 +1530,9 @@ protected:
         // release reads each channel's own output, so it keeps the
         // per-channel path.
         const bool shared = (sLink >= T(1)) && !splitAdaptive && nCh > 1;
+        // The dominant link reads the pair as one (two channels, some link).
+        const bool dominantLink = linkMode == LinkMode::Dominant && nCh == 2 && sLink > T(0);
+        if (dominantLink) flushLinkCovariance();
 
         // Settled parameter smoothers: read once per block instead of a call
         // per sample (a settled smoother returns its target either way).
@@ -1535,7 +1575,8 @@ protected:
                                          activeLookahead, scHpf, shared, decoupled,
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
                                          paramsMoving, autoThr, activeLookahead - lookaheadSamples_,
-                                         program_.active, keyBalance, keyEqOn, listen, layered, gainSmooth };
+                                         program_.active, keyBalance, keyEqOn, listen, layered, gainSmooth,
+                                         dominantLink };
             const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal,
                                           staticMakeupDb + analyticDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
@@ -1579,6 +1620,7 @@ protected:
 
             // 1. Detection path (per channel: every detector keeps its own state)
             T linkedLin[kDetectorPoints] = {};
+            T pairLevel[2][kDetectorPoints] = {};
             T heard[kMaxChannels] = {};
             double lowSq = 0.0, highSq = 0.0;
             for (int ch = 0; ch < nCh; ++ch)
@@ -1613,6 +1655,14 @@ protected:
                     linkedLin[j] = std::max(linkedLin[j], level[j]);
                     if (!shared) pointLevelDb_[ch][j] = gainToDecibels(level[j]);
                 }
+                if (dominantLink && ch < 2)
+                    for (int j = 0; j < count; ++j) pairLevel[ch][j] = level[j];
+            }
+            if (dominantLink)
+            {
+                const double rho2 = linkCorrelation(heard[0], heard[1]);
+                for (int j = 0; j < count; ++j)
+                    linkedLin[j] = dominantLevel(pairLevel[0][j], pairLevel[1][j], rho2);
             }
 
             if (keyBalance) (void)balanceAdvance(lowSq, highSq);
@@ -1658,6 +1708,11 @@ protected:
                 T linkedDb[kDetectorPoints] = {};
                 for (int j = 0; j < count; ++j)
                 {
+                    if (dominantLink)
+                    {
+                        linkedDb[j] = gainToDecibels(linkedLin[j]);
+                        continue;
+                    }
                     linkedDb[j] = pointLevelDb_[0][j];
                     for (int ch = 1; ch < nCh; ++ch) linkedDb[j] = std::max(linkedDb[j], pointLevelDb_[ch][j]);
                 }
@@ -1738,6 +1793,7 @@ protected:
         bool listen;            ///< The key goes out instead of the audio.
         bool layered;           ///< The character runs its two layers.
         bool gainSmooth;        ///< The gain is smoothed after the ballistics.
+        bool dominant;          ///< The pair links to its dominant component.
     };
 
     /** @brief Parameter values of a block whose smoothers are settled. */
@@ -1813,7 +1869,7 @@ protected:
                 const T* src = ((scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))
                                            : audio.getChannel(ch)) + o;
                 T* lv = level[ch];
-                if (ff.detType == DetectorType::Peak && !ff.scHpf && !ff.keyEq && !ff.listen)
+                if (ff.detType == DetectorType::Peak && !ff.scHpf && !ff.keyEq && !ff.listen && !ff.dominant)
                 {
                     for (int k = 0; k < m; ++k) lv[k] = std::abs(detectorSafe(src[k]));
                 }
@@ -1831,6 +1887,11 @@ protected:
                 }
             }
             if (ff.keyEq) keyEq_.advance(m);
+
+            // The correlation of the key, frame by frame, for the dominant link.
+            double rho2[kChunk] = {};
+            if (ff.dominant)
+                for (int k = 0; k < m; ++k) rho2[k] = linkCorrelation(heard[0][k], heard[1][k]);
 
             // The spectral balance of the key, for the timing that follows it
             // (the key as the detector reads it, before the sidechain filter).
@@ -1872,12 +1933,17 @@ protected:
                 for (int k = 0; k < m; ++k)
                 {
                     T mx = level[0][k];
-                    for (int ch = 1; ch < nCh; ++ch) mx = std::max(mx, level[ch][k]);
+                    if (ff.dominant) mx = dominantLevel(level[0][k], level[1][k], rho2[k]);
+                    else for (int ch = 1; ch < nCh; ++ch) mx = std::max(mx, level[ch][k]);
                     level[0][k] = gainToDecibels(mx);
                 }
             }
             else
             {
+                T dominantDb[kChunk] = {};
+                if (ff.dominant)
+                    for (int k = 0; k < m; ++k)
+                        dominantDb[k] = gainToDecibels(dominantLevel(level[0][k], level[1][k], rho2[k]));
                 for (int ch = 0; ch < nCh; ++ch)
                     for (int k = 0; k < m; ++k) level[ch][k] = gainToDecibels(level[ch][k]);
                 if (nCh > 1 && ff.sLink > T(0))
@@ -1885,7 +1951,8 @@ protected:
                     for (int k = 0; k < m; ++k)
                     {
                         T linked = level[0][k];
-                        for (int ch = 1; ch < nCh; ++ch) linked = std::max(linked, level[ch][k]);
+                        if (ff.dominant) linked = dominantDb[k];
+                        else for (int ch = 1; ch < nCh; ++ch) linked = std::max(linked, level[ch][k]);
                         for (int ch = 0; ch < nCh; ++ch)
                             level[ch][k] = level[ch][k] + ff.sLink * (linked - level[ch][k]);
                     }
@@ -2522,6 +2589,37 @@ protected:
         // |x| <= max is false for NaN and both infinities: the same test as
         // std::isfinite, as one compare (MSVC calls a library routine for it).
         return (std::abs(x) <= std::numeric_limits<T>::max()) ? x : T(0);
+    }
+
+    /** One frame of the key's covariance for the dominant link; returns the
+     *  squared correlation of the pair (0 when either side is silent). */
+    double linkCorrelation(T keyL, T keyR) noexcept
+    {
+        const double l = static_cast<double>(keyL);
+        const double r = static_cast<double>(keyR);
+        linkLL_ += linkCoeff_ * (l * l - linkLL_);
+        linkRR_ += linkCoeff_ * (r * r - linkRR_);
+        linkLR_ += linkCoeff_ * (l * r - linkLR_);
+        const double den = linkLL_ * linkRR_;
+        return den > 1e-60 ? std::min(1.0, linkLR_ * linkLR_ / den) : 0.0;
+    }
+
+    /** The covariance decays toward zero in silence: flushed before it
+     *  reaches the subnormal range (once per block). */
+    void flushLinkCovariance() noexcept
+    {
+        if (linkLL_ < 1e-30) linkLL_ = 0.0;
+        if (linkRR_ < 1e-30) linkRR_ = 0.0;
+        if (std::abs(linkLR_) < 1e-30) linkLR_ = 0.0;
+    }
+
+    /** The level of the pair's dominant component from the two detector
+     *  levels and the squared correlation of the key: the larger eigenvalue
+     *  of their covariance, halved, so a source in both channels reads its
+     *  level in each and an equal-power pan reads alike anywhere. */
+    [[nodiscard]] static T dominantLevel(T levelL, T levelR, double rho2) noexcept
+    {
+        return dominantPairLevel(levelL, levelR, rho2);
     }
 
     /**
@@ -4233,6 +4331,9 @@ protected:
     std::atomic<T> kneeWidth_ { T(0) };     ///< Knee width in dB.
     std::atomic<T> makeupGain_ { T(0) };    ///< Static makeup gain in dB.
     std::atomic<T> stereoLink_ { T(1) };    ///< Stereo linking amount (0 to 1).
+    std::atomic<LinkMode> linkMode_ { LinkMode::Loudest }; ///< What the linked level reads.
+    double linkCoeff_ = 0.0;                ///< One-pole coefficient of the key's covariance (20 ms).
+    double linkLL_ = 0.0, linkRR_ = 0.0, linkLR_ = 0.0; ///< The key's covariance (dominant link).
     std::atomic<T> mix_ { T(1) };           ///< Wet/Dry mix (1 = full wet).
     std::atomic<T> lookaheadMs_ { T(0) };    ///< Lookahead latency target in ms.
     std::atomic<T> characterColor_ { T(0) }; ///< Character harmonic amount (0 to 1).

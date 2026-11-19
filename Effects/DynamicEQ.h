@@ -499,6 +499,33 @@ public:
     /** @brief Whether the bands are mixed from fixed filters (setMixedBands()). */
     [[nodiscard]] bool isMixedBands() const noexcept { return mixedWanted_.load(std::memory_order_relaxed); }
 
+    /** @brief What a stereo band's linked level reads (see setLinkMode()). */
+    enum class LinkMode
+    {
+        Loudest,  ///< The louder channel's level (the default).
+        Dominant  ///< The level of the pair's dominant component in the band.
+    };
+
+    /**
+     * @brief Chooses how the bands placed on the stereo pair link it.
+     *
+     * Dominant reads, in each band, the level of the pair's dominant
+     * component: the two channels' band levels and their correlation over
+     * 20 ms make a covariance whose larger eigenvalue is read (see
+     * dominantPairLevel()). A source reads the same wherever an equal-power
+     * pan puts it, and uncorrelated channels read the louder 3 dB down. It
+     * applies to Placement::Stereo bands on two channels. Safe from any thread.
+     *
+     * @param mode Loudest (default) or Dominant.
+     */
+    void setLinkMode(LinkMode mode) noexcept
+    {
+        linkMode_.store(static_cast<LinkMode>(std::clamp(static_cast<int>(mode), 0, 1)), std::memory_order_relaxed);
+    }
+
+    /** @return How the stereo bands link the pair. */
+    [[nodiscard]] LinkMode getLinkMode() const noexcept { return linkMode_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Linear phase: the bands change the level of the signal and nothing of its phase.
      *
@@ -724,6 +751,7 @@ public:
         // The analytic detectors and the oversamplers hold signal history
         // too: leaving it made reset() replay the old programme (a silent
         // input produced a 0.84 peak at 2x and a -13 dB gain reading).
+        for (auto& c : bandCov_) c = {};
         for (int b = 0; b < MaxBands; ++b)
         {
             cleanBand(b);
@@ -756,6 +784,7 @@ public:
         w.write("numBands", n);
         w.write("lookahead", static_cast<float>(lookaheadMs_));
         w.write("mixed", isMixedBands());
+        w.write("linkMode", static_cast<int32_t>(getLinkMode()));
         w.write("linear", linearWanted_);
         w.write("linearTaps", linearTaps_);
         char key[28];
@@ -865,6 +894,7 @@ public:
         // Blobs written before the key existed were rendered without lookahead.
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setMixedBands(r.read("mixed", false));
+        setLinkMode(static_cast<LinkMode>(r.read("linkMode", 0)));
         setLinearPhaseKernelLength(r.read("linearTaps", 0));
         setLinearPhase(r.read("linear", false));
         return true;
@@ -959,6 +989,17 @@ private:
         if (scCh <= 0) return; // a 0-channel sidechain would index getChannel(-1)
         const int nb   = numBands_.load(std::memory_order_relaxed);
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
+        dominantLink_ = linkMode_.load(std::memory_order_relaxed) == LinkMode::Dominant && nCh == 2;
+        if (dominantLink_)
+        {
+            if (currentFs != linkRate_)
+            {
+                linkRate_ = currentFs;
+                linkCoeff_ = 1.0 - std::exp(-1.0 / (0.02 * currentFs));
+            }
+            for (auto& c : bandCov_)
+                for (double& v : c) if (std::abs(v) < 1e-30) v = 0.0;   // no subnormals in silence
+        }
 
         // A change of engine: every band starts clean in the new one.
         const bool mixed = mixedWanted_.load(std::memory_order_relaxed) && mixedEngine_ != nullptr && !linear_;
@@ -1033,6 +1074,7 @@ private:
 
         const Placement where = cfg.placement;
         const int listeners = where == Placement::Stereo ? nCh : 1;
+        const bool dominant = dominantLink_ && where == Placement::Stereo;
         for (int k = 0; k < listeners; ++k)
         {
             int slot = k;
@@ -1069,6 +1111,33 @@ private:
             }
             analytic_[static_cast<size_t>(b * kMaxChannels + slot)].magnitudeBlock(
                 detBand_.data(), detMag_.data(), n);
+
+            // The dominant link reads the pair once the second channel is in.
+            if (dominant)
+            {
+                if (k == 0)
+                {
+                    std::copy_n(detBand_.begin(), n, pairBand_.begin());
+                    std::copy_n(detMag_.begin(), n, pairMag_.begin());
+                    continue;
+                }
+                auto& cov = bandCov_[static_cast<size_t>(b)];
+                for (int j = 0; j < n; ++j)
+                {
+                    const size_t s = static_cast<size_t>(j);
+                    const double l = pairBand_[s], r = detBand_[s];
+                    cov[0] += linkCoeff_ * (l * l - cov[0]);
+                    cov[1] += linkCoeff_ * (r * r - cov[1]);
+                    cov[2] += linkCoeff_ * (l * r - cov[2]);
+                    const double den = cov[0] * cov[1];
+                    const double rho2 = den > 1e-60 ? std::min(1.0, cov[2] * cov[2] / den) : 0.0;
+                    const double amp = dominantPairLevel(std::max(std::abs(l), pairMag_[s]),
+                                                         std::max(std::abs(r), detMag_[s]), rho2);
+                    if (program) detLinear_[s] = amp;
+                    else levels[j] = gainToDecibels(std::max(static_cast<T>(amp), kMinEnvelope));
+                }
+                continue;
+            }
 
             // max(|x|, analytic magnitude): a steady tone reads as its flat
             // amplitude, not a rectified wave (see @file).
@@ -2268,6 +2337,13 @@ private:
     std::vector<HilbertIIR<double>> analytic_; ///< Per band and channel: ripple-free detector level.
     std::array<double, kDetChunk> detBand_ {};                    ///< Detector chunk scratch.
     std::array<double, kDetChunk> detMag_ {};                     ///< Its analytic magnitude.
+    std::array<double, kDetChunk> pairBand_ {};                   ///< The first channel's band (dominant link).
+    std::array<double, kDetChunk> pairMag_ {};                    ///< Its analytic magnitude.
+    std::array<std::array<double, 3>, MaxBands> bandCov_ {};      ///< Covariance of the pair per band (dominant link).
+    std::atomic<LinkMode> linkMode_ { LinkMode::Loudest };        ///< setLinkMode().
+    bool dominantLink_ = false;                                   ///< This block links by the dominant component.
+    double linkRate_ = 0.0;                                       ///< Rate the link coefficient was made for.
+    double linkCoeff_ = 0.0;                                      ///< One-pole coefficient of the covariance (20 ms).
     std::array<std::array<T, kDetChunk>, MaxBands> detLevelDb_ {}; ///< Linked level per band.
     std::array<double, kDetChunk> detLinear_ {};                  ///< Linked amplitude of the band in hand (program timing).
     std::array<std::array<T, kDetChunk>, MaxBands> dynDb_ {};     ///< Dynamic gain per band, in dB from its rest.

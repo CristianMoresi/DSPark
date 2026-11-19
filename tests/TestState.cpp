@@ -79,6 +79,9 @@ DSPARK_TEST(State_roundtrip_dynamics)
         c.setCleanBallistics(Compressor<float>::CleanBallistics::Decoupled);
         c.setAutoMakeup(Compressor<float>::AutoMakeupMode::Analytic);
         c.setPrecision(Compressor<float>::Precision::High);
+        c.setDetector(Compressor<float>::DetectorType::Hybrid);
+        c.setProgramRelease(0.7f); c.setAdaptiveAttack(0.3f);
+        c.setSpectralTiming(0.5f); c.setAttackEmphasis(-0.4f);
     })));
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);

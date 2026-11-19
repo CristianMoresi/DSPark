@@ -258,6 +258,38 @@ DSPARK_TEST(DspMath_fast_approximations_meet_documented_bounds)
     EXPECT_LT(logF, 2.7e-7);
 }
 
+// New: e^(-x) by a rational approximation, for the coefficient of a follower
+// whose time changes every sample. It is within the error its documentation
+// states, falls all the way, and holds its argument to [0, 4].
+DSPARK_TEST(DspMath_fastDecay_follows_the_exponential)
+{
+    double worstToOne = 0.0, worstToTwo = 0.0, worstToThree = 0.0, quarter = 0.0;
+    double last = 2.0;
+    bool falls = true;
+    for (int i = 0; i <= 3000; ++i)
+    {
+        const double x = i * 1e-3;
+        const double approx = fastDecay(x);
+        const double error = std::abs(approx / std::exp(-x) - 1.0);
+        if (x <= 0.25) quarter = std::max(quarter, error);
+        if (x <= 1.0) worstToOne = std::max(worstToOne, error);
+        if (x <= 2.0) worstToTwo = std::max(worstToTwo, error);
+        worstToThree = std::max(worstToThree, error);
+        falls = falls && approx < last;
+        last = approx;
+    }
+    EXPECT_TRUE(falls);
+    EXPECT_LT(quarter, 3e-9);
+    EXPECT_LT(worstToOne, 1.1e-5);
+    EXPECT_LT(worstToTwo, 1.5e-3);
+    EXPECT_LT(worstToThree, 3.1e-2);
+    EXPECT_EQ(fastDecay(0.0), 1.0);
+    EXPECT_EQ(fastDecay(-3.0), 1.0);
+    EXPECT_EQ(fastDecay(9.0), fastDecay(4.0));
+    EXPECT_GT(fastDecay(4.0), 0.0);
+    EXPECT_NEAR(static_cast<double>(fastDecay(0.5f)), std::exp(-0.5), 1e-6);
+}
+
 DSPARK_TEST(DspMath_wrapPhase_stays_in_range_for_large_phases)
 {
     // Regression: for large phases the k * twoPi product can overshoot the

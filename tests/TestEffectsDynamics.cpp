@@ -2632,7 +2632,7 @@ DSPARK_TEST(Compressor_invalid_inputs_are_ignored)
     EXPECT_EQ(static_cast<int>(subject.getCharacter()), 3);
     subject.setCharacter(Comp::Character::Clean);
     subject.setDetector(static_cast<Comp::DetectorType>(77));
-    EXPECT_EQ(static_cast<int>(subject.getDetector()), 4);
+    EXPECT_EQ(static_cast<int>(subject.getDetector()), 5);
     subject.setDetector(Comp::DetectorType::Peak);
 
     EXPECT_EQ(subject.getLatency(), 0); // NaN lookahead never reached the host
@@ -4696,6 +4696,377 @@ DSPARK_TEST(Compressor_high_precision_latency_paths_and_state)
     const auto wild = other.getState();
     EXPECT_TRUE(third.setState(wild.data(), wild.size()));
     EXPECT_TRUE(third.getState() == wild);
+}
+
+// ============================================================================
+// Compressor: timing that follows the programme, and the Hybrid detector
+// ============================================================================
+
+namespace {
+
+// The gain reduction a compressor shows every 16 samples over a signal.
+template <class Setup>
+std::vector<double> compTrace(const Vec& in, Setup&& setup)
+{
+    Compressor<float> c;
+    setup(c);
+    c.prepare(AudioSpec{ 48000.0, 16, 1 });
+    std::vector<Vec> x { in };
+    std::vector<double> trace;
+    processInBlocks(x, 16, [&](AudioBufferView<float> b) {
+        c.processBlock(b);
+        trace.push_back(static_cast<double>(c.getGainReductionDb()));
+    });
+    return trace;
+}
+
+// Milliseconds after sample `from` for the reduction to come back to 1/e of what it was there.
+double compReleaseMs(const std::vector<double>& trace, int from)
+{
+    const size_t at = static_cast<size_t>(from / 16);
+    const double start = std::abs(trace[at - 1]);
+    for (size_t i = at; i < trace.size(); ++i)
+        if (std::abs(trace[i]) <= start * 0.36788) return static_cast<double>(i - at + 1) * 16.0 * 1000.0 / 48000.0;
+    return 1e9;
+}
+
+// Milliseconds after sample `from` for the reduction to cover 63 % of the way from what it was
+// there to `settled`.
+double compAttackMs(const std::vector<double>& trace, int from, double settled)
+{
+    const size_t at = static_cast<size_t>(from / 16);
+    const double start = trace[at - 1];
+    const double mark = start + 0.63212 * (settled - start);
+    for (size_t i = at; i < trace.size(); ++i)
+        if (trace[i] <= mark) return static_cast<double>(i - at + 1) * 16.0 * 1000.0 / 48000.0;
+    return 1e9;
+}
+
+// A tone that lasts `seconds`, then silence up to `total` seconds.
+Vec compToneThenSilence(double hz, double amplitude, double seconds, double total)
+{
+    Vec v = makeSine(hz, amplitude, 48000.0, static_cast<int>(total * 48000.0));
+    for (size_t i = static_cast<size_t>(seconds * 48000.0); i < v.size(); ++i) v[i] = 0.0f;
+    return v;
+}
+
+} // namespace
+
+// New: a release that knows how long the compressor has been working. After
+// 30 ms of reduction it lets go at the knob's time; after three seconds, six
+// to eight times slower. At zero the two are the same release.
+DSPARK_TEST(Compressor_program_release_follows_how_long_the_reduction_lasted)
+{
+    using C = Compressor<float>;
+    const auto release = [&](double seconds, float amount) {
+        const Vec in = compToneThenSilence(1000.0, 0.4, seconds, seconds + 2.5);
+        const auto trace = compTrace(in, [&](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(100.0f);
+            c.setProgramRelease(amount);
+        });
+        return compReleaseMs(trace, static_cast<int>(seconds * 48000.0));
+    };
+    const double briefFixed = release(0.03, 0.0f), longFixed = release(3.0, 0.0f);
+    const double briefProgram = release(0.03, 1.0f), longProgram = release(3.0, 1.0f);
+    const double longHalf = release(3.0, 0.5f);
+    std::cout << "  release after 30 ms / 3 s: fixed " << briefFixed << " / " << longFixed << " ms, programme "
+              << briefProgram << " / " << longProgram << " ms (half weight " << longHalf << " ms)\n";
+    EXPECT_NEAR(briefFixed, 100.0, 6.0);
+    EXPECT_NEAR(longFixed, 100.0, 6.0);
+    EXPECT_LT(briefProgram, 125.0);
+    EXPECT_GT(longProgram, 600.0);
+    EXPECT_LT(longProgram, 820.0);
+    EXPECT_GT(longHalf, 300.0);
+    EXPECT_LT(longHalf, longProgram - 150.0);
+}
+
+// New: an attack that depends on how far the target is. A step of 1 dB over
+// a settled reduction is taken several times slower than the knob says; a
+// step of 12 dB is caught nearly at the knob's time.
+DSPARK_TEST(Compressor_adaptive_attack_takes_a_small_step_slowly_and_a_large_one_fast)
+{
+    using C = Compressor<float>;
+    const int n = 48000 * 3, from = 48000;
+    const auto attack = [&](double stepDb, float amount) {
+        Vec in = makeSine(1000.0, 0.1, 48000.0, n);
+        const float up = static_cast<float>(std::pow(10.0, stepDb / 20.0));
+        for (int i = from; i < n; ++i) in[static_cast<size_t>(i)] *= up;
+        const auto trace = compTrace(in, [&](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setAttack(20.0f);
+            c.setRelease(200.0f);
+            c.setAdaptiveAttack(amount);
+        });
+        return compAttackMs(trace, from, trace.back());
+    };
+    const double smallFixed = attack(1.0, 0.0f), largeFixed = attack(12.0, 0.0f);
+    const double smallAdaptive = attack(1.0, 1.0f), largeAdaptive = attack(12.0, 1.0f);
+    std::cout << "  attack to 63 % of a 1 dB / 12 dB step: fixed " << smallFixed << " / " << largeFixed
+              << " ms, adaptive " << smallAdaptive << " / " << largeAdaptive << " ms\n";
+    EXPECT_NEAR(smallFixed, 20.0, 3.0);
+    EXPECT_NEAR(largeFixed, 20.0, 3.0);
+    EXPECT_GT(smallAdaptive, 2.5 * smallFixed);
+    EXPECT_LT(smallAdaptive, 4.5 * smallFixed);
+    EXPECT_LT(largeAdaptive, 1.8 * largeFixed);
+    EXPECT_GT(largeAdaptive, largeFixed);
+}
+
+// New: times that follow the spectral balance of the key. The same second of
+// a tone releases several times sooner at 6 kHz than at 100 Hz; with the
+// weight at zero, at the same time.
+DSPARK_TEST(Compressor_spectral_timing_is_fast_on_a_bright_key_and_slow_on_a_dark_one)
+{
+    using C = Compressor<float>;
+    const auto release = [&](double hz, float amount) {
+        const Vec in = compToneThenSilence(hz, 0.4, 1.0, 3.5);
+        const auto trace = compTrace(in, [&](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(5.0f);
+            c.setRelease(100.0f);
+            c.setSpectralTiming(amount);
+        });
+        return compReleaseMs(trace, 48000);
+    };
+    const double darkFixed = release(100.0, 0.0f), brightFixed = release(6000.0, 0.0f);
+    const double dark = release(100.0, 1.0f), bright = release(6000.0, 1.0f);
+    std::cout << "  release after 100 Hz / 6 kHz: fixed " << darkFixed << " / " << brightFixed << " ms, spectral "
+              << dark << " / " << bright << " ms\n";
+    EXPECT_NEAR(darkFixed, brightFixed, 25.0);
+    EXPECT_GT(dark, 240.0);
+    EXPECT_LT(dark, 345.0);
+    EXPECT_GT(bright, 25.0);
+    EXPECT_LT(bright, 45.0);
+
+    // Programme with the same power in every octave stays on the knobs.
+    const Vec pink = compPinkNoise(48000 * 4, -14.0, 3u);
+    Vec passage = pink;
+    passage.resize(static_cast<size_t>(48000) * 6, 0.0f);
+    const auto level = [&](float amount) {
+        const auto trace = compTrace(passage, [&](C& c) {
+            c.setDetector(C::DetectorType::Rms);
+            c.setRmsWindow(50.0f);
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setRelease(100.0f);
+            c.setSpectralTiming(amount);
+        });
+        return compReleaseMs(trace, 48000 * 4);
+    };
+    const double plain = level(0.0f), balanced = level(1.0f);
+    std::cout << "  release after pink noise: " << plain << " ms fixed, " << balanced << " ms spectral\n";
+    EXPECT_GT(balanced, plain * 0.75);
+    EXPECT_LT(balanced, plain * 1.35);
+}
+
+// New: the emphasis of the attack. At +1 the leading edge of a reduction
+// goes well past where it settles; at -1 it follows a smoothed course and
+// lets the onset through; either way the settled gain is the same.
+DSPARK_TEST(Compressor_attack_emphasis_deepens_or_softens_the_leading_edge)
+{
+    using C = Compressor<float>;
+    Vec in = makeSine(1000.0, 0.4, 48000.0, 48000 * 2);
+    for (int i = 0; i < 4800; ++i) in[static_cast<size_t>(i)] = 0.0f;
+    const auto trace = [&](float emphasis) {
+        return compTrace(in, [&](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(10.0f);
+            c.setRelease(200.0f);
+            c.setAttackEmphasis(emphasis);
+        });
+    };
+    const auto plain = trace(0.0f), more = trace(1.0f), less = trace(-1.0f);
+    const auto deepest = [](const std::vector<double>& t) {
+        double d = 0.0;
+        for (double v : t) d = std::min(d, v);
+        return d;
+    };
+    const size_t early = static_cast<size_t>((4800 + 480) / 16);     // 10 ms after the onset
+    std::cout << "  settled " << plain.back() << " dB; deepest " << deepest(plain) << " / " << deepest(more)
+              << " dB plain / emphasised; 10 ms in: " << plain[early] << " / " << less[early] << " dB plain / softened\n";
+    EXPECT_NEAR(more.back(), plain.back(), 0.02);
+    EXPECT_NEAR(less.back(), plain.back(), 0.02);
+    EXPECT_LT(deepest(more), deepest(plain) - 2.0);
+    EXPECT_NEAR(deepest(less), deepest(plain), 0.05);
+    EXPECT_GT(less[early], plain[early] + 2.0);
+}
+
+// New: the Hybrid detector. A steady tone reads its peak, with none of the
+// ripple the rectifier leaves in the gain; an onset is read exactly as the
+// Peak detector reads it until the running mean catches up.
+DSPARK_TEST(Compressor_hybrid_detector_holds_a_tone_and_catches_an_onset)
+{
+    using C = Compressor<float>;
+    const Vec tone = makeSine(1000.0, 0.4, 48000.0, 48000);
+    const auto trace = [&](C::DetectorType det) {
+        return compTrace(tone, [&](C& c) {
+            c.setDetector(det);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(5.0f);
+        });
+    };
+    const auto ripple = [](const std::vector<double>& t, double& mean) {
+        double lo = 1e9, hi = -1e9, sum = 0.0;
+        const size_t from = t.size() - 600;
+        for (size_t i = from; i < t.size(); ++i) { lo = std::min(lo, t[i]); hi = std::max(hi, t[i]); sum += t[i]; }
+        mean = sum / 600.0;
+        return hi - lo;
+    };
+    double hybridMean = 0.0, peakMean = 0.0;
+    const double hybridRipple = ripple(trace(C::DetectorType::Hybrid), hybridMean);
+    const double peakRipple = ripple(trace(C::DetectorType::Peak), peakMean);
+    const double onTheCurve = -0.75 * (20.0 * std::log10(0.4) + 20.0);
+    std::cout << "  1 kHz tone: hybrid " << hybridMean << " dB, ripple " << hybridRipple << " dB; peak " << peakMean
+              << " dB, ripple " << peakRipple << " dB; the curve asks " << onTheCurve << " dB\n";
+    EXPECT_NEAR(hybridMean, onTheCurve, 0.1);
+    EXPECT_LT(hybridRipple, 0.08);
+    EXPECT_GT(peakRipple, 0.15);
+    EXPECT_GT(peakRipple, 3.0 * hybridRipple);
+
+    // An onset: the first samples come out as with the Peak detector.
+    Vec onset(4800, 0.0f);
+    for (int i = 2400; i < 4800; ++i)
+        onset[static_cast<size_t>(i)] = static_cast<float>(0.9 * std::sin(2.0 * kPiD * 1000.0 * (i - 2400) / 48000.0));
+    const auto out = [&](C::DetectorType det) {
+        C c;
+        c.setDetector(det);
+        c.setThreshold(-20.0f);
+        c.setRatio(8.0f);
+        c.setAttack(0.1f);
+        c.prepare(AudioSpec{ 48000.0, 512, 1 });
+        std::vector<Vec> x { onset };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+        return x[0];
+    };
+    const Vec hybrid = out(C::DetectorType::Hybrid), peak = out(C::DetectorType::Peak);
+    double apart = 0.0;
+    for (int i = 2400; i < 2410; ++i)
+        apart = std::max(apart, std::abs(static_cast<double>(hybrid[static_cast<size_t>(i)]) - peak[static_cast<size_t>(i)]));
+    EXPECT_LT(apart, 1e-6);
+    EXPECT_GT(std::abs(peak[2409]), 0.05f);     // and the reduction had begun
+    EXPECT_LT(std::abs(peak[2409]), 0.8f);
+}
+
+// The programme-dependent timing keeps what the class guarantees: one
+// channel through processSample() is the block path bit for bit, the precise
+// path honours it, the state carries it, and where it does not apply (Opto,
+// FET, feedback, Decoupled) the output is the one without it.
+DSPARK_TEST(Compressor_program_timing_paths_scope_and_state)
+{
+    using C = Compressor<float>;
+    const int n = 24000;
+    Vec a(static_cast<size_t>(n));
+    uint32_t seed = 9u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double t = i / 48000.0;
+        const double env = 0.1 + 0.7 * std::exp(-std::fmod(t, 0.2) * 20.0);
+        a[static_cast<size_t>(i)] = static_cast<float>(env * (0.6 * std::sin(2.0 * kPiD * 440.0 * t)
+                                  + 0.2 * (static_cast<double>(seed) / 4294967296.0 - 0.5)));
+    }
+    const auto timed = [](C& c) {
+        c.setThreshold(-18.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(80.0f);
+        c.setProgramRelease(0.8f);
+        c.setAdaptiveAttack(0.6f);
+        c.setSpectralTiming(0.7f);
+        c.setAttackEmphasis(0.4f);
+    };
+    const auto blockOut = [&](auto&& setup) {
+        C c;
+        setup(c);
+        c.prepare(AudioSpec{ 48000.0, 512, 1 });
+        std::vector<Vec> x { a };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+        return x[0];
+    };
+    const auto farthest = [&](const Vec& p, const Vec& q) {
+        double d = 0.0;
+        for (int i = 0; i < n; ++i)
+            d = std::max(d, std::abs(static_cast<double>(p[static_cast<size_t>(i)]) - q[static_cast<size_t>(i)]));
+        return d;
+    };
+
+    const Vec block = blockOut(timed);
+    const Vec plain = blockOut([](C& c) { c.setThreshold(-18.0f); c.setRatio(4.0f); c.setAttack(2.0f); c.setRelease(80.0f); });
+    EXPECT_GT(farthest(block, plain), 0.01);
+
+    C single;
+    timed(single);
+    single.prepare(AudioSpec{ 48000.0, 512, 1 });
+    Vec y = a;
+    for (auto& s : y) s = single.processSample(s, 0);
+    EXPECT_EQ(farthest(block, y), 0.0);
+
+    // Where the timing does not apply, nothing changes.
+    const auto unchanged = [&](auto&& routing) {
+        const Vec with = blockOut([&](C& c) { timed(c); routing(c); });
+        const Vec without = blockOut([&](C& c) {
+            c.setThreshold(-18.0f);
+            c.setRatio(4.0f);
+            c.setAttack(2.0f);
+            c.setRelease(80.0f);
+            routing(c);
+        });
+        return farthest(with, without);
+    };
+    EXPECT_EQ(unchanged([](C& c) { c.setCharacter(C::Character::Opto); }), 0.0);
+    EXPECT_EQ(unchanged([](C& c) { c.setCharacter(C::Character::FET); }), 0.0);
+    EXPECT_EQ(unchanged([](C& c) { c.setTopology(C::Topology::FeedBack); }), 0.0);
+    EXPECT_EQ(unchanged([](C& c) { c.setCleanBallistics(C::CleanBallistics::Decoupled); }), 0.0);
+    EXPECT_GT(unchanged([](C& c) { c.setCharacter(C::Character::Varimu); }), 0.01);
+
+    // At Precision::High the release still knows how long the reduction lasted.
+    const auto release = [&](float amount) {
+        const Vec in = compToneThenSilence(1000.0, 0.4, 3.0, 5.5);
+        const auto trace = compTrace(in, [&](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(100.0f);
+            c.setProgramRelease(amount);
+            c.setPrecision(C::Precision::High);
+        });
+        return compReleaseMs(trace, 48000 * 3);
+    };
+    const double fixed = release(0.0f), program = release(1.0f);
+    EXPECT_NEAR(fixed, 100.0, 6.0);
+    EXPECT_GT(program, 600.0);
+
+    // State and wild values.
+    C c;
+    timed(c);
+    c.setDetector(C::DetectorType::Hybrid);
+    const auto blob = c.getState();
+    C other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(other.getProgramRelease()), 0.8, 1e-6);
+    EXPECT_NEAR(static_cast<double>(other.getAdaptiveAttack()), 0.6, 1e-6);
+    EXPECT_NEAR(static_cast<double>(other.getSpectralTiming()), 0.7, 1e-6);
+    EXPECT_NEAR(static_cast<double>(other.getAttackEmphasis()), 0.4, 1e-6);
+    EXPECT_TRUE(other.getDetector() == C::DetectorType::Hybrid);
+    EXPECT_TRUE(other.getState() == blob);
+    other.setProgramRelease(std::numeric_limits<float>::quiet_NaN());
+    other.setAttackEmphasis(-7.0f);
+    other.setDetector(static_cast<C::DetectorType>(99));
+    EXPECT_NEAR(static_cast<double>(other.getProgramRelease()), 0.8, 1e-6);
+    EXPECT_NEAR(static_cast<double>(other.getAttackEmphasis()), -1.0, 1e-6);
+    EXPECT_TRUE(other.getDetector() == C::DetectorType::Hybrid);
 }
 
 // ============================================================================

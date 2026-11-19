@@ -105,6 +105,29 @@ All notable user-facing changes to DSPark are documented here.
   `processBlock()`, which sees both channels of a frame.
   `getMagnitudeForFrequencyArray()` takes the place to draw (the stereo
   bands and the ones placed there). The state carries `place` per band.
+- `Equalizer::FilterMode::NaturalPhase` (new mode): the phase of the analog
+  curve, 32 samples late. A minimum-phase digital filter that follows the
+  magnitude of an analog one does not have its phase, because the analog
+  curve goes on above Nyquist and the digital one folds there. In this mode
+  every band runs from its analog prototype and one 64-tap filter per
+  channel takes the bands the rest of the way: it is designed, each time a
+  band changes, from the analog response over the digital one of every
+  section, reduced to nothing between the top of the audio band and Nyquist
+  and faded in over 20 ms. Worst distance in phase to the analog curve from
+  200 Hz to 20 kHz at 48 kHz (minimum phase with the analog response; this
+  mode): a bell at 12 kHz, Q 2, +12 dB 17.1 degrees; 0.08. A bell at
+  15 kHz, -18 dB 34.0; 0.15. A high shelf of +12 dB at 12 kHz 24.2; 0.11. A
+  12 dB per octave low-pass at 16 kHz 88; 0.34. A 24 dB per octave low-pass
+  at 10 kHz 178; 1.05. A bell at 1 kHz 2.7; 0.01. The level gets closer too
+  (the bell at 12 kHz: 0.104 dB; 0.003). At 44.1 kHz, where there is less
+  room for the correction to fade out, 21 to 38 degrees become 0.5 to 0.9
+  and the steep cut keeps 5.4; at 96 kHz everything is within 0.01. Eight
+  bands on a stereo block cost 31.9 ns per frame against 23.8 in minimum
+  phase, and a block of 64 that takes a moved band 8.9 us against 3.4. With
+  placed bands the correction is a matrix between the two channels, as in
+  LinearPhase. A set of bands at 0 dB is the signal, 32 samples late, to the
+  bit. `getLatency()` reports 32 at any rate; `processSample()` runs the
+  bands of the mode without the correction.
 - `DynamicEQ::setMixedBands(true)` (off by default): a band is the signal
   and one fixed filter per side, the end of its range, and what moves is how
   much of the filter is heard, with the weight taken from the gain in

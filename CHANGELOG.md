@@ -6,6 +6,45 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Automatic oversampling factor. `Oversampling::factorForRate(sampleRate,
+  minimumInternalRate = 176400, maxFactor = 16)` gives the smallest power of
+  two that brings a host rate up to an internal rate (4 at 44.1 and 48 kHz,
+  2 at 88.2 and 96 kHz, 1 from 176.4 kHz up with the default), and the
+  processors that oversample inside can take it on their own:
+  `setAutomaticOversampling(true)` on `Saturation`, `Clipper`,
+  `TapeMachine`, `TubePreamp`, `TransformerModel`, `DynamicEQ` and
+  `WaveshapeTable` makes every `prepare()` choose the factor that reaches the
+  internal rate their default factor gives at 44.1 kHz (176.4 kHz for the
+  tape, 88.2 kHz for the others). Off by default, stored in the state
+  (`oversamplingAuto`), and turned off by an explicit `setOversampling()`.
+  The nonlinear stage then runs at about the same rate in every session and
+  a high-rate session stops paying for a factor it does not need. Measured
+  with a 1 kHz tone at -12 dBFS, stereo, on two machines: `TapeMachine` at
+  96 kHz gives 0.1547 % of harmonic distortion at 4x and at the automatic 2x
+  for 0.51 of the cost, and at 192 kHz 0.1548 % at 4x and at the automatic
+  1x for 0.27 of the cost (a second of stereo audio at 192 kHz took 874 ms
+  at 4x and 237 ms with the automatic factor on one of the machines);
+  `TubePreamp` at 96 kHz 11.903 % and 11.908 % for 0.23 of the cost and no
+  latency instead of 71 samples; `TransformerModel` 1.2546 % and 1.2545 %
+  for 0.50; `Saturation` 6.7065 % both ways for 0.64 (soft clip) and 0.52
+  (tape curve), with no latency instead of 64 samples. `DynamicEQ` gains
+  `getOversamplingFactor()`.
+- `OversamplingDryPath<T>` (new, in `Core/Oversampling.h`): carries a dry
+  signal through the same round trip as an `Oversampling` engine, so a
+  dry/wet mix adds in phase at every frequency. With the linear-phase engine
+  it is the engine's whole-sample delay. With the polyphase IIR engine,
+  whose delay is fractional and rises towards the band edge, it is a twin of
+  the engine with nothing between its two halves: an untouched wet signal
+  nulls against the dry one exactly, where against a dry signal delayed by
+  the rounded latency a tone near 18 kHz at 48 kHz (2x, High) leaves a
+  difference of 1.98 times its amplitude, the two close to opposite.
+- `SmoothedValue::setAdaptiveRamp(span, fastMs, slowMs)` (opt-in, Linear
+  curve): the duration of each ramp follows the size of the step that starts
+  it. A step of `span` or more lands in `fastMs`, a vanishing one glides
+  over `slowMs`, and a step d in between takes
+  fastMs + (slowMs - fastMs) (1 - d / span)^2, so fine automation hides its
+  steps and a preset change does not drag. An edit in mid ramp starts from
+  the value already reached.
 - `DownbeatEstimator<T>` (new, `Analysis/DownbeatEstimator.h`; offline):
   names the beats that open a bar, from a signal and its beats
   (`BeatTracker`'s, a host's grid or a tap). `estimate(mono, sampleRate,

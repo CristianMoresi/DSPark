@@ -300,6 +300,30 @@ is setup-thread only - it reallocates and may re-calibrate like
   drops to 0. Always query `getLatency()` for the active factor rather than
   assuming a value.
 
+The factor can follow the session rate. `Oversampling<float>::factorForRate(
+spec.sampleRate)` is the smallest factor that reaches an internal rate of
+176.4 kHz (4 at 44.1 and 48 kHz, 2 at 88.2 and 96 kHz, 1 above), for a
+section of your own:
+
+```cpp
+Oversampling<float> os(Oversampling<float>::factorForRate(spec.sampleRate));
+```
+
+and every processor with a factor takes `setAutomaticOversampling(true)`,
+which makes each `prepare()` choose the factor that keeps the internal rate
+its default factor has at 44.1 kHz. The nonlinear stage then sounds the same
+in a 48 kHz and a 96 kHz session, and the 96 kHz session costs what the
+48 kHz one does (a `TapeMachine` at 192 kHz: 0.27 of the cost of its 4x,
+with the same distortion to four digits).
+
+A dry/wet mix around an oversampled section needs the dry signal delayed
+like the wet one. `OversamplingDryPath<float>` does it for either filter
+family: `dry.prepare(spec, os)` once, then `dry.process(dryBlock)` per
+block. With the linear-phase filters that is a delay; with
+`Mode::PolyphaseIir`, whose few samples of delay are not the same at every
+frequency, it runs the dry signal through the same filters so the two add
+in phase up to the band edge.
+
 `Clipper` and `Core/WaveshapeTable` also expose `setOversampling` (both
 defaulting to 1x=off); `WaveshapeTable` is a memoryless table (no ADAA), so
 its Hermite interpolation reduces table noise but not aliasing - oversample it

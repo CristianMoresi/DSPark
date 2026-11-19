@@ -37,6 +37,8 @@ void instantiate()
     ModulationRouter<T> modRouter;
     Oscillator<T> osc;
     Oversampling<T> ov(2);
+    OversamplingDryPath<T> ovDry;
+    [[maybe_unused]] const int ovFactor = Oversampling<T>::factorForRate(48000.0);
     Phasor<T> ph;
     Resampler<T> rs;
     RingBuffer<T> ring;

@@ -129,10 +129,12 @@ inline EffectSlot makeEqualizer()
     }
     // Global controls (indices 20/21, appended so band indices stay stable):
     // Phase Mode switches the IIR cascade for the FFT overlap-save engine
-    // (adds maxBlockSize of latency, audible as a small delay here), and
+    // (adds maxBlockSize of latency, audible as a small delay here) or for the
+    // natural-phase mode (the bands from their analog prototypes plus a short
+    // correction of their phase, 32 samples late), and
     // Matched Bells selects the analog-matched de-cramped design for Peak bands
     // (audible on high-frequency bells; the curve follows).
-    s.addChoice("Phase Mode", {"Minimum","Linear"}, 0);
+    s.addChoice("Phase Mode", {"Minimum","Linear","Natural"}, 0);
     s.addToggle("Matched Bells", true);
     // Analog Response (index 22): every band designed from its analog prototype
     // (no shrinking towards Nyquist, in both phase modes), with glided changes.
@@ -181,8 +183,10 @@ inline EffectSlot makeEqualizer()
         }
         if (i == 20)
         {
-            p->setFilterMode(static_cast<int>(v) == 1 ? EQ::FilterMode::LinearPhase
-                                                      : EQ::FilterMode::MinimumPhase);
+            const int mode = static_cast<int>(v);
+            p->setFilterMode(mode == 1 ? EQ::FilterMode::LinearPhase
+                           : mode == 2 ? EQ::FilterMode::NaturalPhase
+                                       : EQ::FilterMode::MinimumPhase);
             return;
         }
         if (i == 21) { p->setMatchedBells(v > 0.5f); return; }

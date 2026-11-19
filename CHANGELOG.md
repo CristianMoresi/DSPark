@@ -245,6 +245,14 @@ All notable user-facing changes to DSPark are documented here.
   to the audio of a compressor that never listened. It is a monitoring
   switch and is not part of the state. State keys `key<band>.shape`,
   `.freq`, `.gain`, `.q` and `.slope`.
+- `NoiseGate` and `Expander`: the same equalizer on the key and the same key
+  listen as the compressor (`setSidechainBand()`, `getSidechainBand()`,
+  `getSidechainResponse()`, `setSidechainListen()`), after their sidechain
+  high-pass, on the programme or on the external key. A 60 Hz hum at
+  -10 dBFS that holds a gate open at a -30 dB threshold stops doing so with
+  a 24 dB per octave low cut at 500 Hz on its key, and the audio is the one
+  of an external key through the same filter. State keys as in the
+  compressor.
 - `Compressor`, timing that follows the programme: four weights, all 0 by
   default, on the Clean and Varimu characters in feed-forward with Branching
   ballistics, in `processBlock()`, `processSample()` and at

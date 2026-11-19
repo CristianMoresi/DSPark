@@ -214,6 +214,46 @@ All notable user-facing changes to DSPark are documented here.
   average over three sorted values is not the average along the waveform;
   and the eight steps alone, with the target on a line between samples,
   gave 10 to 30 dB up to 5 kHz and nothing at 18 kHz. State key `precision`.
+- `Compressor`, timing that follows the programme: four weights, all 0 by
+  default, on the Clean and Varimu characters in feed-forward with Branching
+  ballistics, in `processBlock()`, `processSample()` and at
+  `Precision::High` (Opto and FET have a memory of their own; Decoupled,
+  feedback and the SplitPolarity detector keep fixed times).
+  `setProgramRelease(0..1)`: the release is the knob's after a brief
+  reduction and up to eight times the knob's after a sustained one, told
+  apart by a slow follower of the depth of the gain change against the depth
+  itself; a 100 ms release measures 101 ms after 30 ms or 3 s of reduction
+  with the weight at 0, and 105 ms and 777 ms at 1 (439 ms at 0.5), so the
+  level does not pump back up between phrases while a stray peak is let go
+  at once. `setAdaptiveAttack(0..1)`: the attack is the knob's for a target
+  6 dB or more past the gain and up to four times longer for one that is
+  only just past it; a 20 ms attack covers 63 % of a 12 dB step in 29 ms and
+  of a 1 dB step in 76 ms (20 and 21 ms with the weight at 0).
+  `setSpectralTiming(0..1)`: both times follow the balance of the key
+  between two bands of the same width on a logarithmic axis, 30 to 200 Hz
+  and 2.5 to 16 kHz (what lies under 30 Hz is left out); a 100 ms release
+  measures 304 ms after a 100 Hz tone and 34 ms after a 6 kHz one (105 and
+  100 with the weight at 0), and pink noise stays on the knob (144 ms where
+  the fixed release gives 133). `setAttackEmphasis(-1..+1)`: the difference
+  between the gain and a copy of it smoothed over 30 ms is added back while
+  the gain falls; a 9.0 dB reduction reaches 13.1 dB at its leading edge at
+  +1, and at -1 is 1.0 dB down 10 ms into the onset where the plain attack
+  is 5.8 dB down; the settled gain is the same. State keys `programRelease`,
+  `adaptiveAttack`, `spectralTiming` and `attackEmphasis`.
+- `Compressor::DetectorType::Hybrid`: the larger of the root of twice the
+  mean square (a one-pole mean over the time of `setRmsWindow()`) and the
+  rectified sample. A steady tone reads its peak with next to no ripple and
+  whatever rises over the running level is caught in the same sample: a
+  1 kHz tone 12 dB over a 4:1 threshold with a 1 ms attack and a 5 ms
+  release settles on 9.04 dB of reduction (the curve asks 9.03) with
+  0.001 dB of ripple, where the Peak detector rides the waveform at 7.42 dB
+  with 0.22 dB of ripple; the first samples of an onset come out exactly as
+  with the Peak detector. The analytic makeup knows it.
+- `fastDecay(x)` (`Core/DspMath.h`): e^(-x) for x >= 0 by a [3/3] rational
+  approximation, for the coefficient of a one-pole whose time changes every
+  sample (four multiplies and a division, no call into the math library).
+  Relative error 1.1e-5 at x = 1, 1.5e-3 at x = 2 and 3.1 % at x = 3; the
+  argument is held to [0, 4].
 - `Limiter::setMaxLookahead(ms)`: a latency kept for the lookahead. The
   audio always waits that long, `getLatency()` reports it, and
   `setLookahead()` moves under it with the gain held back by the difference,

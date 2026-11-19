@@ -214,6 +214,105 @@ All notable user-facing changes to DSPark are documented here.
   average over three sorted values is not the average along the waveform;
   and the eight steps alone, with the target on a line between samples,
   gave 10 to 30 dB up to 5 kHz and nothing at 18 kHz. State key `precision`.
+- `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
+  (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
+  the origin and the ceiling: how far it stays a straight line before it
+  turns (0 to 0.95 of its ceiling), how fast it turns (an exponent, 0.5 to
+  4, of tanh(u^p)^(1/p)) and how low one half-cycle's ceiling is (to
+  2^-asymmetry; neither half goes past 1). At its defaults it is tanh, to
+  0.1 dB of its Fourier series in the third harmonic; a 1 kHz tone at
+  -6 dBFS with 12 dB of drive carries its third harmonic at -15.5 dBc, at
+  -13.8 and -13.1 with a hardness of 0.5 and 0.8, at -16.7, -14.0 and -13.2
+  with a curvature of 0.5, 2 and 4, and its second at -23.8 and -18.3 with
+  an asymmetry of 0.5 and 1. With a curvature other than 1 it costs 112 ns
+  per stereo frame at 2x against 61 for SoftClip.
+- `Saturation::setOversamplingMode(MinimumPhase)`: elliptic allpass
+  half-bands in place of the linear-phase ones, with 3 samples of latency at
+  2x and 4 at 4x (64 and 70 with linear phase), and the dry path of the mix,
+  of the Delta output and of the adaptive blend through the same filters
+  with nothing in between: a half mix of a tone the curve leaves alone is
+  within 0.002 dB of the wet signal from 500 Hz to 19 kHz, and its Delta
+  output is 48 dB down (what is left is the phase of the input high-pass).
+  81 ns per stereo frame at 2x against 61. State key `oversamplingMode`.
+- `Saturation`, stages around the curve of any algorithm, all off by
+  default and at the base rate:
+  `setAsymmetry(-1..1)` adds a share of the square of the signal (less its
+  mean) before the curve: a 1 kHz tone at -6 dBFS through SoftClip carries
+  its second harmonic at -36.6, -30.6 and -24.6 dBc at 0.25, 0.5 and 1
+  (-38.3, -32.3 and -26.2 with 12 dB of drive).
+  `setProgramNoise(dB)` adds white noise counted from the recent peak of
+  the programme (held 50 ms, released over 150 ms) before the curve, which
+  shapes it: at -40 the noise under a tone measures 45.2 dB under its peak,
+  is 5e-5 half a second after the tone stops and under 1e-11 after three
+  seconds.
+  `setDynamics(-1..1)` moves the level into the curve with a follower of the
+  programme (10 ms up, 150 ms down, smoothed over 5 ms) and takes it back
+  after the curve, in time with the wet path: at +1 a 1 kHz tone through
+  SoftClip with 12 dB of drive carries its third harmonic at -32.8 dBc and
+  comes out 11.40 dB up at -36, -24, -12 and -6 dBFS alike (without it,
+  -69.6, -45.7, -23.5 and -15.5 dBc); at -1 the level moves twice as far
+  (-107, -59, -16.2 and -10.0 dBc). `setDynamicsFocus(hz)` has the follower
+  hear only the programme under a frequency.
+  `setFeedback(amount, hz)` returns the output of the curve to its input,
+  inverted, one period of the frequency later (the latency of the
+  processor included): at 0.8 and 200 Hz the gain is -5.11 dB at 200 and
+  400 Hz and +13.95 dB at 300 Hz, 1/(1 + a) and 1/(1 - a); while it is on
+  the block is processed in pieces no longer than the delay, and the output
+  does not depend on the host's block size. `getFeedbackFrequency()` gives
+  the frequency the latency allows.
+  `setDriveCompensation(true)` measures the gain of the curve on pink noise
+  at -18 dBFS through a twin of the processor (against the same noise 40 dB
+  down at no drive, so that the input filters cancel) whenever the
+  algorithm, drive, character, shape, antialiasing or oversampling move, at
+  most every 50 ms, and takes three quarters of it back at the output: with
+  SoftClip the level of such noise goes from -1.13 to 9.72, 15.87 and
+  17.39 dB at 0, 12, 24 and 36 dB of drive without it, and from -1.07 to
+  1.56, 2.95 and 3.31 dB with it.
+  State keys `curveHardness`, `curveCurvature`, `curveAsymmetry`,
+  `asymmetry`, `programNoise`, `dynamics`, `dynamicsFocus`, `feedback`,
+  `feedbackHz` and `driveCompensation`.
+- `MultibandSaturation` (new, `Effects/MultibandSaturation.h`): a
+  Linkwitz-Riley crossover of 2 to 6 bands, a `Saturation` per band, and a
+  level, a pan, a mute and a solo per band before the bands are summed. The
+  bands are summed in time whatever each one runs with: a band with less
+  latency than the slowest is delayed by the difference (bands at 2x, 4x
+  and 8x sum back to the input's level within 0.15 dB at 100 Hz to 10 kHz).
+  Level and pan glide over 20 ms, mute and solo fade over 20 ms on a ramp
+  of their own, and a band that is not heard is not computed until it is
+  heard again. Oversampling, its filters and antialiasing are set for every
+  band at once; each band's Saturation is reachable for the rest.
+- `CabinetModel` (new, `Core/CabinetModel.h`): a loudspeaker cabinet with
+  no latency and no convolution. Its colour is a 12 dB per octave low cut
+  with the cone's resonance (140 Hz in a small box to 70 Hz in a large one),
+  a shallow dip at 450 Hz, the breakup peak and a 24 dB per octave roll-off
+  (3 to 7 kHz by the brightness), designed from their analog prototypes;
+  its box is six reflections between 0.29 and 3.41 ms with alternating
+  signs through two allpass diffusers, added by the distance of the
+  microphone with the level kept (pink noise within 1.5 dB from no distance
+  to full). Settings glide over 20 ms.
+- `TubePreamp::setCabinet(true)` runs the wet signal through a
+  `CabinetModel` (`getCabinet()`), after the circuit and before the mix,
+  with no latency and a fade of 20 ms. State keys `cabinet`, `cab.size`,
+  `cab.brightness` and `cab.distance`.
+- `TransientFollower` (new, in `Analysis/EnvelopeFollower.h`): how sudden the
+  signal is, 0 to 1, whatever its level, as a modulation source: the
+  loudest channel's analytic magnitude through a follower with a fast
+  attack (0.5 ms) and one with a slow attack (30 ms), the same release for
+  both; their distance in decibels over a range (12 dB by default), held
+  20 ms and released over 80 ms. The same bursts give the same values at
+  -40 and -10 dBFS (to 1e-4), a held tone gives none and a step of 12 dB
+  reaches three quarters of the range or more. `EnvelopeFollower::
+  getEnvelopeNormalized(channel, floorDb)` gives the envelope in decibels
+  mapped to 0..1.
+- `LoFi` (new, `Effects/LoFi.h`): grains that smear (`setSmear()`) and move
+  the pitch (`setPitch()`, -24 to +12 semitones), a fold (`setFold()`,
+  sin(g x)) whose output keeps the level of a sine at -12 dBFS at any gain
+  (within 0.1 dB from 6 to 36 dB), a hold at a lower sample rate
+  (`setRate()`, with a 48 dB per octave low-pass in front at 0.45 of the
+  rate with `setRateFilter(true)`) and fewer bits (`setBits()`, 1 to 24,
+  with triangular dither by `setDither(true)`), then a mix and an output
+  gain. Every stage is off at its default; then the output is the input to
+  the bit. No latency.
 - `KeyEqualizer` (new, `Core/KeyEqualizer.h`): a parametric equalizer for the
   key of a dynamics processor, the signal its detector reacts to. Six bands,
   each a low or a high cut from 6 to 48 dB per octave, a bell, a low or a

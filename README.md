@@ -125,10 +125,10 @@ for complete programs.
 
 | Area | Representative APIs |
 |---|---|
-| Filters and equalization | `Biquad`, `BiquadCascade`, `NormalizedLadder`, `FilterDesign`, `FirBank`, `KeyEqualizer`, `StateVariableFilter`, `LadderFilter`, `FilterEngine`, `Equalizer`, `CrossoverFilter` |
+| Filters and equalization | `Biquad`, `BiquadCascade`, `NormalizedLadder`, `FilterDesign`, `FirBank`, `KeyEqualizer`, `CabinetModel`, `StateVariableFilter`, `LadderFilter`, `FilterEngine`, `Equalizer`, `CrossoverFilter` |
 | Dynamics and level control | `Compressor`, `Limiter`, `NoiseGate`, `Expander`, `DynamicEQ`, `MultibandCompressor`, `DeEsser` |
 | Offline dynamics, clipping, stereo and analysis | `OfflineLeveler`, `OfflineBeatCompressor`, `OfflinePeakCompressor`, `OfflinePunch`, `OfflineSoftClipper`, `OfflineHardClipper`, `OfflineStereoGenerator`, `OfflineStereoBalance`, `OfflineEnergyAnalyzer`, `OfflineTransientAnalyzer`, `OfflineTempoAnalyzer` ([worker API](docs/offline-processing.md)) |
-| Nonlinear and analog modeling | `Saturation`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `wdf::*` |
+| Nonlinear and analog modeling | `Saturation`, `MultibandSaturation`, `LoFi`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `wdf::*` |
 | Time, pitch, and spatial processing | `Delay`, `AlgorithmicReverb`, `Reverb`, `PitchShifter`, `TimeStretch`, `PitchCorrector`, `GranularProcessor` |
 | Spectral processing | `FFTReal`, `Convolver`, `ZeroLatencyConvolver`, `SpectralProcessor`, `SpectralFreeze`, `SpectralDenoiser` |
 | Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `AudioIntervalAnalyzer`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `DownbeatEstimator`, `LoopFinder`, `DelayEstimator` |

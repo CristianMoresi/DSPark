@@ -356,6 +356,8 @@
  * | `Expander<T>`            | Effects/Expander.h    | Downward expander with ratio, hysteresis, ext. sidechain            |
  * | `CrossoverFilter<T>`     | Effects/CrossoverFilter.h | Linkwitz-Riley crossover (2-12 bands, LR12/24/48, IIR + linear-phase) |
  * | `MultibandCompressor<T>` | Effects/MultibandCompressor.h | Multi-band compressor (crossover split + per-band Compressor) |
+ * | `MultibandSaturation<T>` | Effects/MultibandSaturation.h | Multi-band saturation (crossover split + per-band Saturation; level, pan, mute, solo) |
+ * | `LoFi<T>`                | Effects/LoFi.h            | Grains that smear and drop the pitch, a level-kept fold, a lower sample rate, fewer bits |
  * | `DynamicEQ<T>`           | Effects/DynamicEQ.h   | Per-band dynamic EQ (above/below threshold, ext. sidechain)        |
  * | `TransientDesigner<T>`   | Effects/TransientDesigner.h | Dual-envelope transient shaper (attack/sustain control)       |
  * | `OfflineBeatCompressor<T>` | Effects/OfflineBeatCompressor.h | Pulse peak leveling with local tempo release; offline worker only |
@@ -413,6 +415,7 @@
  * | `PhaseCorrelation<T>`    | Analysis/PhaseCorrelation.h | Stereo correlation/balance meter + goniometer feed |
  * | `DelayEstimator<T>`      | Analysis/DelayEstimator.h | Delay between two recordings: GCC-PHAT, sub-sample, confidence |
  * | `EnvelopeFollower<T>`    | Analysis/EnvelopeFollower.h | Peak/RMS envelope source with per-channel readouts |
+ * | `TransientFollower<T>`   | Analysis/EnvelopeFollower.h | How sudden the signal is, 0..1, whatever its level (a modulation source) |
  * | `OnsetDetector<T>`       | Analysis/OnsetDetector.h  | Causal SuperFlux onset detection (Boeck-2012 picker, shared beat front-end) |
  * | `BeatTracker<T>`         | Analysis/BeatTracker.h    | Tempo and beat tracking: offline dynamic programming plus a causal resonator bank |
  * | `DownbeatEstimator<T>`   | Analysis/DownbeatEstimator.h | Which beats open a bar: bar length (3 or 4) and first beat, from a signal and its beats (offline) |
@@ -452,6 +455,7 @@
  * | `FilterDesign`           | Core/FilterDesign.h       | Biquads that follow their analog prototypes to Nyquist; cuts of any slope, high-order bells and shelves, tilt, elliptic wall |
  * | `FirBank<T>`             | Core/FirBank.h            | Many long FIR kernels over shared inputs, by one partitioned convolution; kernels replaced with a crossfade |
  * | `KeyEqualizer<T>`        | Core/KeyEqualizer.h       | Six bands of cuts, bells, shelves and tilts over the key of a dynamics processor |
+ * | `CabinetModel<T>`        | Core/CabinetModel.h       | A loudspeaker cabinet with no latency: colour filters, sparse reflections, two diffusers |
  * | `FFTReal<T>`             | Core/FFT.h                | Real FFT by vector lanes, SIMD (SSE2/AVX/NEON)    |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
@@ -695,6 +699,7 @@
 #include "Core/FilterDesign.h"
 #include "Core/FirBank.h"
 #include "Core/KeyEqualizer.h"
+#include "Core/CabinetModel.h"
 #include "Core/DryWetMixer.h"
 #include "Core/Smoothers.h"
 #include "Core/AnalogRandom.h"
@@ -774,6 +779,8 @@
 #include "Effects/OfflineStereoBalance.h"
 #include "Effects/DynamicEQ.h"
 #include "Effects/MultibandCompressor.h"
+#include "Effects/MultibandSaturation.h"
+#include "Effects/LoFi.h"
 #include "Effects/Clipper.h"
 #include "Effects/PitchShifter.h"
 #include "Effects/TimeStretch.h"

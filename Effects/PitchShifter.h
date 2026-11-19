@@ -118,10 +118,10 @@ public:
      *
      * @param spec    Audio environment specification.
      * @param fftSize STFT frame size, a power of two, used by whichever
-     *                engine is selected. 0 (the default) selects 2048 for
-     *                Standard and High, and the power of two nearest 43 ms
-     *                for Studio (2048 at 44.1 and 48 kHz, 4096 at 88.2 and
-     *                96 kHz). Smaller sizes lower latency and favour
+     *                engine is selected. 0 (the default) selects, for every
+     *                engine, the power of two nearest 43 ms, so the analysis
+     *                spans the same time at any rate (2048 at 44.1 and 48 kHz,
+     *                4096 at 88.2 and 96 kHz). Smaller sizes lower latency and favour
      *                transients; larger sizes favour low-pitched material
      *                (Studio at 4096: lower spectral error, see the file
      *                overview, at 1.5 times the latency).
@@ -136,11 +136,10 @@ public:
         prepared_.store(false, std::memory_order_relaxed);
 
         numChannels_ = std::max(1, spec.numChannels);
-        // 0 selects each engine's default frame: 2048 for Standard/High (the
-        // published rendering), about 43 ms for Studio (2048 at 44.1 and
-        // 48 kHz, 4096 at 88.2 and 96 kHz).
-        const int fftStudio = fftSize != 0 ? fftSize : studioDefaultFrame(spec.sampleRate);
-        if (fftSize == 0) fftSize = 2048;
+        // 0 selects about 43 ms for every engine (2048 at 44.1 and 48 kHz,
+        // the published rendering; 4096 at 88.2 and 96 kHz).
+        if (fftSize == 0) fftSize = defaultFrame(spec.sampleRate);
+        const int fftStudio = fftSize;
 
         // The reader trails the write head by readOffset_; the window/OLA
         // chain adds another fftSize - synthHop, so the measured wet latency
@@ -600,8 +599,8 @@ private:
         currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS));
     }
 
-    /** @brief Studio's default frame: the power of two nearest 43 ms. */
-    [[nodiscard]] static int studioDefaultFrame(double sampleRate) noexcept
+    /** @brief The default frame of every engine: the power of two nearest 43 ms. */
+    [[nodiscard]] static int defaultFrame(double sampleRate) noexcept
     {
         int n = 256;
         while (n < (1 << 16) && static_cast<double>(n) * 1.5 < 0.0427 * sampleRate) n <<= 1;

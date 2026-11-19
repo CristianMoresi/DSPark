@@ -87,7 +87,10 @@ namespace dspark {
  *       wrap this compressor in an oversampled section like any other stage
  *       with Core/Oversampling: one resampler for the whole section instead
  *       of one per module (see docs/cookbook.md, "Oversampling a nonlinear
- *       section").
+ *       section"). setPrecision(High) lowers those lines by 20 to 40 dB
+ *       at the host rate, working out only the control signal between the
+ *       samples (the Peak detector at a 0.1 ms attack then reaches -66 dBc
+ *       at 18 kHz and the FET character -66 dBc, at 7 samples of latency).
  *
  * @tparam T Floating-point sample type (float or double).
  */
@@ -188,7 +191,7 @@ public:
                    ///< reduction on dense programme (see setCleanBallistics).
     };
 
-    /** @brief Automatic makeup-gain behavior (applies in Downward mode). */
+    /** @brief Automatic makeup-gain behavior (Static and Adaptive apply in Downward mode). */
     enum class AutoMakeupMode
     {
         Off,      ///< Manual makeup only (setMakeupGain).
@@ -201,9 +204,27 @@ public:
                   ///< even on a -40 dBFS passage). That is the defined behaviour, not a
                   ///< side effect: to add makeup only where gain is actually reduced,
                   ///< choose Adaptive.
-        Adaptive  ///< Loudness matching: tracks the smoothed gain reduction (~300 ms)
+        Adaptive, ///< Loudness matching: tracks the smoothed gain reduction (~300 ms)
                   ///< and compensates it in full, keeping the average output level
                   ///< matched to the input (quiet passages are lifted).
+        Analytic  ///< Worked out, not measured: the gain the ballistics settle on over dense
+                  ///< programme (the levels of a Gaussian signal as the selected detector
+                  ///< reads them, weighed by attack and release as the follower weighs
+                  ///< them), taken back in full. A constant, so it never pumps, and it
+                  ///< follows the curve, the times, the character, the detector and the
+                  ///< amount. The programme is taken at -18 dBFS RMS; with
+                  ///< setAutoThreshold() the threshold counts from the programme's own
+                  ///< peak and the result holds at any level. Both modes (in Upward it
+                  ///< takes the boost back). See setAutoMakeup().
+    };
+
+    /** @brief How finely the control signal is computed (see setPrecision()). */
+    enum class Precision
+    {
+        Standard, ///< One value of the gain per sample (default).
+        High      ///< The control signal is worked out between the samples too: the
+                  ///< detectors that rectify read the key at four points per sample and
+                  ///< the ballistics take eight steps per sample. See setPrecision().
     };
 
     // -- Lifecycle --------------------------------------------------------------
@@ -246,12 +267,21 @@ public:
         colorSmooth_.reset(characterColor_.load(std::memory_order_relaxed));
         amountSmooth_.prepare(sampleRate_, 30.0);
         amountSmooth_.reset(amount_.load(std::memory_order_relaxed));
+        analyticSmooth_.prepare(sampleRate_, 30.0);
+        makeupKey_.valid = false;
+        analyticSmooth_.reset(analyticTarget());
+
+        // The detector's points between samples at Precision::High: a
+        // Kaiser-windowed sinc per quarter of a sample.
+        for (int p = 0; p < kDetectorPoints - 1; ++p)
+            detail::designSincPhase<kInterpTaps>(interpPhase_[p], kInterpBeta,
+                                                 static_cast<double>(p + 1) / kDetectorPoints);
 
         // Pre-allocate and initialize per-channel instances. Capacity covers
         // the 10 ms user lookahead. Every channel slot gets a delay line, not just spec.numChannels:
         // a view wider than the spec would otherwise read an unprepared ring
         // (silence) on the extra channels whenever lookahead is active.
-        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1;
+        int maxLaSamples = static_cast<int>(sampleRate_ * 0.01) + 1 + kDetectorDelay;
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             lookaheadBuffers_[ch].prepare(maxLaSamples);
@@ -325,6 +355,10 @@ public:
      * @note getLatency() reports the processBlock() path (its lookahead).
      *       This per-sample path BYPASSES the lookahead delay line,
      *       so it adds no lookahead latency regardless of setLookahead().
+     *
+     * @note This path runs at Precision::Standard whatever setPrecision()
+     *       says: the finer control signal waits for a detector that reads
+     *       late, and there is no delay line here for the audio to wait in.
      *
      * @note Shared state (parameter smoothers, auto-makeup envelope) advances
      *       once per sample FRAME and is driven by channel 0. Multi-channel
@@ -461,6 +495,19 @@ public:
                 makeup += computeGain(T(0), thresh, ratio, knee, charType,
                                       Mode::Downward, T(0)) * T(-0.5);
         }
+        // The analytic makeup has a smoother of its own, advanced with the
+        // shared ones.
+        if (advanceShared)
+        {
+            analyticSmooth_.setTargetValue(autoMkup == AutoMakeupMode::Analytic
+                ? analyticMakeupDb(charType, modeType, detTypeEff, decoupled,
+                                   topoEff == Topology::FeedBack) : T(0));
+            makeup += analyticSmooth_.getNextValue();
+        }
+        else
+        {
+            makeup += analyticSmooth_.getCurrentValue();
+        }
 
         T output = input * smoothedGainLinear;
         if (colorAmt > T(0) && charType == Character::FET)
@@ -496,7 +543,10 @@ public:
             fetDcState_[ch] = T(0);
             scHpfState_[ch] = T(0);
             scHpfPrev_[ch] = T(0);
-            channelLevelDb_[ch] = T(-200);
+            pointLevelDb_[ch].fill(T(-200));
+            precLevel_[ch] = -100.0;
+            precTarget_[ch] = 0.0;
+            interp_[ch] = {};
             lookaheadBuffers_[ch].reset();
             gainDelay_[ch].reset();
             autoRefDb_[ch] = -100.0;
@@ -523,6 +573,7 @@ public:
         mixSmooth_.skip();
         colorSmooth_.skip();
         amountSmooth_.skip();
+        analyticSmooth_.skip();
     }
 
     // =========================================================================
@@ -605,11 +656,25 @@ public:
      * Adaptive is loudness matching: it tracks the smoothed gain reduction
      * (~300 ms) and compensates it in full, so the average output level
      * stays matched to the input and quiet passages are lifted accordingly
-     * (macro-dynamics are reduced). For a fixed offset use setMakeupGain().
+     * (macro-dynamics are reduced). Analytic works the gain out of the
+     * settings instead of measuring it: where the ballistics come to rest
+     * over dense programme, for the curve, the times, the character and the
+     * detector selected; it is a constant between edits of those, and moves
+     * to its new value over a few tens of milliseconds after one. It takes
+     * the programme at -18 dBFS RMS unless setAutoThreshold() is on, which
+     * makes it hold at any level. Measured on pink noise at that level, as
+     * the level left over the input's: within 0.1 dB with the Peak detector
+     * over thresholds from -30 to -10 dB, ratios from 2 to 10, attacks from
+     * 0.5 to 100 ms and releases from 20 ms to 1 s (the Static mode leaves
+     * -2.4 to +6.1 dB there), 0.2 dB decoupled and in feedback, 0.3 dB with
+     * the RMS, Hilbert and TruePeak detectors and with Opto, 0.5 dB with FET;
+     * the same figures at -36 and -6 dBFS with the automatic threshold. The
+     * RMS window reads the low end of the programme: on white noise it is
+     * off by up to 1.3 dB. For a fixed offset use setMakeupGain().
      */
     void setAutoMakeup(AutoMakeupMode mode) noexcept
     {
-        autoMakeupMode_.store(clampEnum(mode, AutoMakeupMode::Adaptive),
+        autoMakeupMode_.store(clampEnum(mode, AutoMakeupMode::Analytic),
                               std::memory_order_relaxed);
     }
 
@@ -721,6 +786,54 @@ public:
 
     /** @brief Whether the gain change approaches the range without a corner (setSoftRange()). */
     [[nodiscard]] bool isSoftRange() const noexcept { return softRange_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Selects how finely the control signal is computed (default: Standard).
+     *
+     * A gain that moves within a cycle of the signal has a spectrum far wider
+     * than the audio band; computed once per sample, what lies above half the
+     * rate folds back and ends as lines that are not harmonics of the signal.
+     * High works the control signal out between the samples too, the audio
+     * being left at its rate:
+     *
+     * - the Peak and TruePeak detectors read the key at four points per
+     *   sample (the sample and three points between it and the last one,
+     *   from a windowed-sinc interpolation), so the rectifier works on the
+     *   waveform and not on its samples;
+     * - the ballistics take eight steps per sample, with the coefficients of
+     *   an eighth of a sample, towards a target that moves along the line
+     *   between those points (between samples for the RMS and Hilbert
+     *   detectors, whose reading is already smooth); the gain is the mean of
+     *   the eight.
+     *
+     * It applies in processBlock(), in feed-forward and in the feedback loops
+     * solved against the input (the Peak detector, Downward: the FET
+     * character among them); the SplitPolarity detector and the other
+     * feedback loops stay as they are. The interpolated detectors read 7
+     * samples late and the audio waits for them: getLatency() reports those
+     * 7 samples more with Peak or TruePeak, none with RMS or Hilbert. Change
+     * it while stopped (the delay of the audio moves at once).
+     *
+     * Measured at 48 kHz on a tone 12 dB over the threshold of a 4:1 curve,
+     * as the largest line that is no harmonic of the tone (Standard to
+     * High). Peak detector, attack 0.1 ms, release 50 ms: -77 to -111 dBc at
+     * 1 kHz, -66 to -86 at 5 kHz, -51 to -85 at 15 kHz, -38 to -66 at
+     * 18 kHz. FET character at its 20 us attack, ratio 20, 30 dB over: -68
+     * to -91, -50 to -66, -49 to -70 and -37 to -66. Hilbert detector: -124
+     * to -153 at 1 kHz. The level the detector reads does not move: the gain
+     * of the tone stays within 0.1 dB in every case. The cost of a stereo
+     * frame goes from 17 to 125 ns in feed-forward and from 52 to 190 with
+     * the FET character (x64 server core).
+     *
+     * State key "precision" (absent = Standard).
+     */
+    void setPrecision(Precision precision) noexcept
+    {
+        precision_.store(clampEnum(precision, Precision::High), std::memory_order_relaxed);
+    }
+
+    /** @brief How finely the control signal is computed (see setPrecision()). */
+    [[nodiscard]] Precision getPrecision() const noexcept { return precision_.load(std::memory_order_relaxed); }
 
     /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, Hilbert). */
     void setDetector(DetectorType type) noexcept
@@ -895,15 +1008,22 @@ public:
      *
      * The lookahead. Feedback operation (Topology::FeedBack, or the FET
      * character, which always detects in feedback) disables it, so latency
-     * is 0 there. The plugin layer re-reads this after parameter
-     * changes and re-notifies the host when it moves.
+     * is 0 there. With setPrecision(High), the Peak and TruePeak detectors
+     * read 7 samples late and the audio waits for them, in feed-forward and
+     * in the feedback loops that mode covers. The plugin layer re-reads this
+     * after parameter changes and re-notifies the host when it moves.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        const bool feedback =
-            topology_.load(std::memory_order_relaxed) == Topology::FeedBack
-            || character_.load(std::memory_order_relaxed) == Character::FET;
-        if (feedback) return 0;
+        const bool fet = character_.load(std::memory_order_relaxed) == Character::FET;
+        const bool feedback = fet || topology_.load(std::memory_order_relaxed) == Topology::FeedBack;
+        const DetectorType detType = fet ? DetectorType::Peak : detectorType_.load(std::memory_order_relaxed);
+        // The same routing as processBlock(): see usePrecision().
+        const bool solved = feedback && detType == DetectorType::Peak
+                         && mode_.load(std::memory_order_relaxed) == Mode::Downward;
+        const int reading = (precision_.load(std::memory_order_relaxed) == Precision::High
+                             && readsBetweenSamples(detType) && (!feedback || solved)) ? kDetectorDelay : 0;
+        if (feedback) return reading;
         // Derive the lookahead from the published parameter rather than the
         // audio-thread cache: hosts re-read the latency right after a setter,
         // before the next block has consumed the coefficient-update flag.
@@ -911,7 +1031,7 @@ public:
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
         const int kept = static_cast<int>(static_cast<T>(sampleRate_) * std::clamp(
             maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
-        return std::max(lookNow, kept);
+        return std::max(lookNow, kept) + reading;
     }
 
 
@@ -948,6 +1068,7 @@ public:
         w.write("maxLookahead", static_cast<float>(maxLookaheadMs_.load(std::memory_order_relaxed)));
         w.write("amount", static_cast<float>(amount_.load(std::memory_order_relaxed)));
         w.write("softRange", softRange_.load(std::memory_order_relaxed));
+        w.write("precision", static_cast<int32_t>(precision_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -965,7 +1086,7 @@ public:
         // The mode key wins; legacy blobs only carry the bool (true = Adaptive).
         const int amLegacy = r.read("autoMakeup", false) ? 2 : 0;
         setAutoMakeup(static_cast<AutoMakeupMode>(
-            std::clamp(r.read("autoMakeupMode", amLegacy), 0, 2)));
+            std::clamp(r.read("autoMakeupMode", amLegacy), 0, 3)));
         setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
@@ -983,6 +1104,7 @@ public:
         setMaxLookahead(static_cast<T>(r.read("maxLookahead", 0.0f)));
         setAmount(static_cast<T>(r.read("amount", 1.0f)));
         setSoftRange(r.read("softRange", false));
+        setPrecision(static_cast<Precision>(r.read("precision", 0)));
         return true;
     }
 
@@ -1074,6 +1196,8 @@ protected:
         const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
         const bool decoupled = useDecoupled(charType, topoEff);
         syncDecoupledState(decoupled);
+        const bool precise = usePrecision(topoEff, fbImplicit, splitAdaptive);
+        syncPrecisionState(precise);
 
         // Lookahead breaks causal logic in Feedback mode, so it is strictly
         // disabled there.
@@ -1090,10 +1214,13 @@ protected:
 
         // Settled parameter smoothers: read once per block instead of a call
         // per sample (a settled smoother returns its target either way).
+        analyticSmooth_.setTargetValue(autoMkup == AutoMakeupMode::Analytic
+            ? analyticMakeupDb(charType, modeType, detTypeEff, decoupled,
+                               topoEff == Topology::FeedBack) : T(0));
         const bool paramsMoving = thresholdSmooth_.isSmoothing() || ratioSmooth_.isSmoothing()
                                || kneeSmooth_.isSmoothing() || makeupSmooth_.isSmoothing()
                                || mixSmooth_.isSmoothing() || colorSmooth_.isSmoothing()
-                               || amountSmooth_.isSmoothing();
+                               || amountSmooth_.isSmoothing() || analyticSmooth_.isSmoothing();
         T thresh   = thresholdSmooth_.getCurrentValue();
         T ratio    = ratioSmooth_.getCurrentValue();
         T knee     = kneeSmooth_.getCurrentValue();
@@ -1107,23 +1234,35 @@ protected:
         T staticMakeupDb = staticMakeup
             ? computeGain(T(0), thresh, ratio, knee, charType, Mode::Downward, T(0)) * T(-0.5)
             : T(0);
+        T analyticDb = analyticSmooth_.getCurrentValue();
 
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
                                    feedbackDetectorDelay(detTypeEff) };
 
         // Feed-forward: the detector never reads the output, so the block
         // runs in passes (see processFeedForward). Feedback loops stay per
-        // sample.
-        if (topoEff == Topology::FeedForward)
+        // sample, and so does Precision::High, whose control signal is
+        // worked out several times per sample.
+        const bool feedForward = topoEff == Topology::FeedForward;
+        if (feedForward && !precise)
         {
             const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
                                          activeLookahead, scHpf, shared, decoupled,
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
                                          paramsMoving, autoThr, activeLookahead - lookaheadSamples_ };
-            const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal, staticMakeupDb, amount };
+            const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal,
+                                          staticMakeupDb + analyticDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
             return;
         }
+
+        // At Precision::High the detectors that rectify read the key at
+        // kDetectorPoints points per sample, kDetectorDelay samples late, and
+        // the audio waits for them. The others keep one level per sample.
+        const bool points = precise && readsBetweenSamples(detTypeEff);
+        const int count = points ? kDetectorPoints : 1;
+        const int audioDelay = activeLookahead + (points ? kDetectorDelay : 0);
+        const int gainDelay = feedForward ? activeLookahead - lookaheadSamples_ : 0;
 
         for (int i = 0; i < nS; ++i)
         {
@@ -1141,86 +1280,111 @@ protected:
                 if (staticMakeup)
                     staticMakeupDb = computeGain(T(0), thresh, ratio, knee, charType,
                                                  Mode::Downward, T(0)) * T(-0.5);
+                analyticDb = analyticSmooth_.getNextValue();
             }
 
             // Makeup: shared by every channel of the frame, and usually
             // unchanged from the previous frame (the conversion is cached).
             // The adaptive envelope is the one left by the previous frame.
-            T makeupDb = mkupBase + staticMakeupDb;
+            T makeupDb = mkupBase + staticMakeupDb + analyticDb;
             if (adaptiveMakeup)
                 makeupDb += -autoMakeupEnv_;
             const T makeupLin = makeupToGain(makeupDb);
 
-            // The automatic threshold: here (FeedBack) its reference follows
-            // the linked input, since the detector reads the output.
-            T threshNow = thresh;
-            if (autoThr)
-            {
-                T top = T(0);
-                for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(detectorSafe(audio.getChannel(ch)[i])));
-                autoRefDb_[0] = std::max(static_cast<double>(gainToDecibels(top)), autoRefDb_[0] - autoRefFall_);
-                threshNow = thresh + static_cast<T>(autoRefDb_[0]);
-            }
-
             // 1. Detection path (per channel: every detector keeps its own state)
-            T linkedLin = T(0);
+            T linkedLin[kDetectorPoints] = {};
             for (int ch = 0; ch < nCh; ++ch)
             {
-                // Fallback to internal channel if sidechain buffer lacks channels
-                T sample = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
-                                      : audio.getChannel(ch)[i];
-
                 // The sidechain filter must process whatever the detector
-                // consumes. In FeedBack that is the compressed output (the
-                // external key is ignored): the previous sample on the
-                // explicit path, or the channel's own current input on the
-                // semi-implicit path (the loop equation supplies the gain).
+                // consumes. In feed-forward that is the key (the audio when
+                // the sidechain buffer lacks channels). In FeedBack it is the
+                // compressed output (the external key is ignored): the
+                // previous sample on the explicit path, or the channel's own
+                // current input on the semi-implicit path (the loop equation
+                // supplies the gain).
                 T detectorIn;
-                if (topoEff == Topology::FeedBack)
-                    detectorIn = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
+                if (feedForward)
+                    detectorIn = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
+                                            : audio.getChannel(ch)[i];
                 else
-                    detectorIn = sample;
+                    detectorIn = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
                 detectorIn = detectorSafe(detectorIn);
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
 
                 // dB is monotonic in the linear level, so the linked level is
-                // the dB of the largest linear level (one log per frame when
-                // the channels share the gain computer).
-                const T levelLin = detectLevelLinear(detectorIn, ch, detTypeEff);
-                linkedLin = std::max(linkedLin, levelLin);
-                if (!shared) channelLevelDb_[ch] = gainToDecibels(levelLin);
+                // the dB of the largest linear level (one log per frame and
+                // point when the channels share the gain computer).
+                T level[kDetectorPoints] = {};
+                if (points) detectorPoints(detectorIn, ch, level);
+                else level[0] = detectLevelLinear(detectorIn, ch, detTypeEff);
+                for (int j = 0; j < count; ++j)
+                {
+                    linkedLin[j] = std::max(linkedLin[j], level[j]);
+                    if (!shared) pointLevelDb_[ch][j] = gainToDecibels(level[j]);
+                }
             }
 
-            // 2. Stereo linking, static curve and character ballistics (log domain)
+            // The automatic threshold: its reference follows the largest
+            // level the gain computers read in feed-forward, and the linked
+            // input in feedback, where the detector reads the output.
+            T threshNow = thresh;
+            if (autoThr)
+            {
+                T top = T(0);
+                if (feedForward)
+                    for (int j = 0; j < count; ++j) top = std::max(top, linkedLin[j]);
+                else
+                    for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(detectorSafe(audio.getChannel(ch)[i])));
+                autoRefDb_[0] = std::max(static_cast<double>(gainToDecibels(top)), autoRefDb_[0] - autoRefFall_);
+                threshNow = thresh + static_cast<T>(autoRefDb_[0]);
+            }
+
+            // 2. Stereo linking, static curve and character ballistics (log
+            //    domain). What is heard of the gain is held back inside a
+            //    latency kept for the lookahead and scaled by the amount; the
+            //    loop keeps the whole.
             T blockGR = T(0);
             if (shared)
             {
-                blockGR = gainPath(gainToDecibels(linkedLin), 0, cfg, threshNow, ratio, knee);
+                T levelDb[kDetectorPoints] = {};
+                for (int j = 0; j < count; ++j) levelDb[j] = gainToDecibels(linkedLin[j]);
+                const T loopGR = precise ? gainPathPrecise(levelDb, count, 0, cfg, threshNow, ratio, knee)
+                                         : gainPath(levelDb[0], 0, cfg, threshNow, ratio, knee);
                 // (0 dB is the common case below threshold: skip the exp.)
-                const T gainLin = (blockGR == T(0)) ? T(1) : decibelsToGain(blockGR);
-                // The amount scales what is applied; the loop keeps the whole.
+                const T gainLin = (loopGR == T(0)) ? T(1) : decibelsToGain(loopGR);
+                blockGR = heldBack(loopGR, 0, gainDelay);
                 if (amount < T(1)) blockGR *= amount;
-                const T outLin = (amount < T(1)) ? decibelsToGain(blockGR) : gainLin;
+                const T outLin = (blockGR == loopGR) ? gainLin : decibelsToGain(blockGR);
                 for (int ch = 0; ch < nCh; ++ch)
-                    applyGain(audio, ch, i, gainLin, blockGR, activeLookahead, charType,
+                    applyGain(audio, ch, i, gainLin, blockGR, audioDelay, charType,
                               colorAmt, makeupLin, mixVal, outLin);
             }
             else
             {
-                T linkedLevel = channelLevelDb_[0];
-                for (int ch = 1; ch < nCh; ++ch) linkedLevel = std::max(linkedLevel, channelLevelDb_[ch]);
+                T linkedDb[kDetectorPoints] = {};
+                for (int j = 0; j < count; ++j)
+                {
+                    linkedDb[j] = pointLevelDb_[0][j];
+                    for (int ch = 1; ch < nCh; ++ch) linkedDb[j] = std::max(linkedDb[j], pointLevelDb_[ch][j]);
+                }
                 for (int ch = 0; ch < nCh; ++ch)
                 {
-                    const T chLevel = channelLevelDb_[ch];
-                    const T inputDb = chLevel + sLink * (linkedLevel - chLevel);
-                    T smoothedGR_Db = gainPath(inputDb, ch, cfg, threshNow, ratio, knee);
-                    const T gainLin = (smoothedGR_Db == T(0)) ? T(1) : decibelsToGain(smoothedGR_Db);
-                    if (amount < T(1)) smoothedGR_Db *= amount;
-                    const T outLin = (amount < T(1)) ? decibelsToGain(smoothedGR_Db) : gainLin;
-                    applyGain(audio, ch, i, gainLin, smoothedGR_Db, activeLookahead, charType,
+                    T levelDb[kDetectorPoints] = {};
+                    for (int j = 0; j < count; ++j)
+                    {
+                        const T own = pointLevelDb_[ch][j];
+                        levelDb[j] = own + sLink * (linkedDb[j] - own);
+                    }
+                    const T loopGR = precise ? gainPathPrecise(levelDb, count, ch, cfg, threshNow, ratio, knee)
+                                             : gainPath(levelDb[0], ch, cfg, threshNow, ratio, knee);
+                    const T gainLin = (loopGR == T(0)) ? T(1) : decibelsToGain(loopGR);
+                    T heardGR = heldBack(loopGR, ch, gainDelay);
+                    if (amount < T(1)) heardGR *= amount;
+                    const T outLin = (heardGR == loopGR) ? gainLin : decibelsToGain(heardGR);
+                    applyGain(audio, ch, i, gainLin, heardGR, audioDelay, charType,
                               colorAmt, makeupLin, mixVal, outLin);
-                    if (ch == 0 || smoothedGR_Db < blockGR)
-                        blockGR = smoothedGR_Db; // Track worst-case GR for metering
+                    if (ch == 0 || heardGR < blockGR)
+                        blockGR = heardGR; // Track worst-case GR for metering
                 }
             }
 
@@ -1233,18 +1397,7 @@ protected:
 
         // The shared gain computer ran on channel 0's state: hand it to the
         // other channels so a later unlinked block continues from it.
-        if (shared && nS > 0)
-        {
-            for (int ch = 1; ch < nCh; ++ch)
-            {
-                envFastDb_[ch] = envFastDb_[0];
-                envSlowDb_[ch] = envSlowDb_[0];
-                envHoldDb_[ch] = envHoldDb_[0];
-                upwardGuardDb_[ch] = upwardGuardDb_[0];
-                holdCounters_[ch] = holdCounters_[0];
-                heldGrDb_[ch] = heldGrDb_[0];
-            }
-        }
+        if (shared && nS > 0) copyGainStateFromChannel0(nCh);
     }
 
     /** @brief Per-block routing of the gain path (see gainPath()). */
@@ -1339,9 +1492,9 @@ protected:
                     mixA[k] = mixSmooth_.getNextValue();
                     (void)colorSmooth_.getNextValue();
                     amt[k]  = amountSmooth_.getNextValue();
-                    stMk[k] = ff.staticMakeup
+                    stMk[k] = (ff.staticMakeup
                         ? computeGain(T(0), thr[k], rat[k], kn[k], ff.charType, Mode::Downward, T(0)) * T(-0.5)
-                        : T(0);
+                        : T(0)) + analyticSmooth_.getNextValue();
                 }
             }
 
@@ -1535,6 +1688,8 @@ protected:
             upwardGuardDb_[ch] = upwardGuardDb_[0];
             holdCounters_[ch] = holdCounters_[0];
             heldGrDb_[ch] = heldGrDb_[0];
+            precLevel_[ch] = precLevel_[0];
+            precTarget_[ch] = precTarget_[0];
         }
     }
 
@@ -1809,6 +1964,20 @@ protected:
             }
         }
 
+        // The attack as it is observed (a feedback loop, below, changes the
+        // coefficient and not the result), and the coefficients of an eighth
+        // of a sample: the eight steps per sample of Precision::High.
+        rawAttCoeff_ = charAttCoeff_;
+        {
+            const auto eighth = [](double c) { return std::pow(c, 1.0 / kSubsteps); };
+            subAttCoeff_       = eighth(charAttCoeff_);
+            subRelCoeff_       = eighth(charRelCoeff_);
+            subSlowRelCoeff_   = eighth(charSlowRelCoeff_);
+            subChargeCoeff_    = eighth(charChargeCoeff_);
+            subDecHoldCoeff_   = eighth(decHoldCoeff_);
+            subDecSmoothCoeff_ = eighth(decSmoothCoeff_);
+        }
+
         // A live character change moves the fast/slow blend weight. Re-seat
         // the envelopes so the gain shown before and after the change is the
         // same (otherwise the blend jumps by up to the full reduction).
@@ -1844,6 +2013,10 @@ protected:
                                       * (static_cast<double>(std::max(ratio_.load(std::memory_order_relaxed), T(1))) - 1.0);
                 const double rho = charAttCoeff_;
                 charAttCoeff_ = 1.0 - (1.0 - rho) / (1.0 + rho * loopGain);
+                // The same for a step of an eighth of a sample: eight of
+                // them then observe the knob's attack too.
+                const double rhoSub = subAttCoeff_;
+                subAttCoeff_ = 1.0 - (1.0 - rhoSub) / (1.0 + rhoSub * loopGain);
             }
         }
 
@@ -2352,6 +2525,24 @@ protected:
     [[nodiscard]] T applyBallisticsFeedbackImplicit(T inDb, int ch, Character charType,
                                                     T thresh, T ratio, T knee) noexcept
     {
+        const LoopCoeffs coeffs { charAttCoeff_, charRelCoeff_, charChargeCoeff_, charSlowRelCoeff_ };
+        return boundImplicit(stepImplicit(inDb, ch, charType, thresh, ratio, knee, coeffs), ch);
+    }
+
+    /** @brief Coefficients of one step of the semi-implicit loop. */
+    struct LoopCoeffs
+    {
+        double attack;       ///< Fast stage while the reduction deepens.
+        double release;      ///< Fast stage while it recovers.
+        double charge;       ///< Memory stage while it charges.
+        double slowRelease;  ///< Memory stage while it discharges.
+    };
+
+    /** @brief One step of the semi-implicit loop on the channel's envelopes:
+     *  the blended gain it leaves, before hold and range. */
+    [[nodiscard]] T stepImplicit(T inDb, int ch, Character charType, T thresh, T ratio, T knee,
+                                 const LoopCoeffs& coeffs) noexcept
+    {
         double& fast = envFastDb_[ch];
         double& slow = envSlowDb_[ch];
         const double wFast = static_cast<double>(charFastWeight_);
@@ -2372,8 +2563,8 @@ protected:
                 -range, range);
             const double st = static_cast<double>(slowTarget);
             const bool charging = st < slow;
-            slow = st + (charging ? charChargeCoeff_ : charSlowRelCoeff_) * (slow - st);
-            if (std::abs(slow) < 1e-4) slow = 0.0;
+            slow = st + (charging ? coeffs.charge : coeffs.slowRelease) * (slow - st);
+            if (atRest(slow, st)) slow = 0.0;
         }
 
         // Branch on the direction the loop is about to move: attack while
@@ -2381,7 +2572,7 @@ protected:
         const T shownPrev = static_cast<T>(dual ? wFast * fast + (1.0 - wFast) * slow : fast);
         const T probe = computeGainFeedback(inDb + shownPrev, thresh, ratio, knee, charType).target;
         const bool engaging = static_cast<double>(probe) < fast;
-        const double coeff = engaging ? charAttCoeff_ : charRelCoeff_;
+        const double coeff = engaging ? coeffs.attack : coeffs.release;
         const double beta = 1.0 - coeff;
 
         const T k = static_cast<T>(dual ? wFast * coeff * fast + (1.0 - wFast) * slow : coeff * fast);
@@ -2390,22 +2581,45 @@ protected:
 
         const double solT = static_cast<double>(sol.target);
         fast = solT + coeff * (fast - solT);
-        if (std::abs(fast) < 1e-4) fast = 0.0;
-        T shown = static_cast<T>(dual ? wFast * fast + (1.0 - wFast) * slow : fast);
+        if (atRest(fast, solT)) fast = 0.0;
+        return static_cast<T>(dual ? wFast * fast + (1.0 - wFast) * slow : fast);
+    }
 
-        // Hold and range act on the OBSERVED gain: the element's internal
-        // target is loop-amplified by up to (R - 1) during transients, so
-        // clamping THAT to the user's range would throttle the attack, and
-        // holding it would compare mismatched domains. When they override,
-        // the fast stage is rewritten so the blend lands on the bound.
+    /**
+     * @brief Hold and range of the semi-implicit loop.
+     *
+     * They act on the OBSERVED gain: the element's internal target is
+     * loop-amplified by up to (R - 1) during transients, so clamping THAT to
+     * the user's range would throttle the attack, and holding it would
+     * compare mismatched domains. When they override, the fast stage is
+     * rewritten so the blend lands on the bound.
+     */
+    [[nodiscard]] T boundImplicit(T shown, int ch) noexcept
+    {
         const T bounded = applyHoldAndRange(shown, ch);
         if (bounded != shown)
         {
-            shown = bounded;
-            const double sh = static_cast<double>(shown);
-            fast = dual ? (sh - (1.0 - wFast) * slow) / wFast : sh;
+            const double wFast = static_cast<double>(charFastWeight_);
+            const double sh = static_cast<double>(bounded);
+            envFastDb_[ch] = (wFast < 1.0) ? (sh - (1.0 - wFast) * envSlowDb_[ch]) / wFast : sh;
         }
-        return shown;
+        return bounded;
+    }
+
+    /**
+     * @brief An envelope within 1e-4 dB of no gain change, heading there: it
+     *        is put on it, to end the asymptotic tail of a release.
+     *
+     * The target has to be at rest too. Asking only the envelope (as this
+     * did) also caught an envelope leaving zero in steps shorter than that:
+     * with a slow attack or a slow charge of the memory stage and a shallow
+     * target, each step was undone and the gain never moved (100 ms of
+     * attack at 96 kHz ignored any target under 1 dB; the memory stage of
+     * Opto with a release of 500 ms, any under 9.6 dB at 48 kHz).
+     */
+    [[nodiscard]] static bool atRest(double envelope, double target) noexcept
+    {
+        return std::abs(envelope) < 1e-4 && std::abs(target) < 1e-4;
     }
 
     // ---- Ballistics (log domain) ----
@@ -2514,8 +2728,16 @@ protected:
     [[nodiscard]] double ballisticsStep(double tgt, double& fast, double& slow,
                                         double attCoeff, double relCoeff) const noexcept
     {
+        return ballisticsCore(tgt, fast, slow, attCoeff, relCoeff, charChargeCoeff_, charSlowRelCoeff_);
+    }
+
+    /** @brief ballisticsStep() with the coefficients of the memory stage given too. */
+    [[nodiscard]] double ballisticsCore(double tgt, double& fast, double& slow, double attCoeff,
+                                        double relCoeff, double chargeCoeff,
+                                        double slowRelCoeff) const noexcept
+    {
         fast = branchingStep(fast, tgt, attCoeff, relCoeff);
-        if (std::abs(fast) < 1e-4) fast = 0.0; // kill the asymptotic dB tail
+        if (atRest(fast, tgt)) fast = 0.0; // end the asymptotic dB tail
 
         if (charFastWeight_ >= T(1)) // Clean / Varimu: single envelope
             return fast;
@@ -2523,8 +2745,8 @@ protected:
         // Opto / FET memory stage: charges toward the target over the history
         // time constant and discharges with the slow release, so its level
         // encodes how long (and how deep) the compressor has been working.
-        slow = branchingStep(slow, tgt, charChargeCoeff_, charSlowRelCoeff_);
-        if (std::abs(slow) < 1e-4) slow = 0.0;
+        slow = branchingStep(slow, tgt, chargeCoeff, slowRelCoeff);
+        if (atRest(slow, tgt)) slow = 0.0;
 
         const double w = static_cast<double>(charFastWeight_);
         return w * fast + (1.0 - w) * slow;
@@ -2626,17 +2848,24 @@ protected:
     [[nodiscard]] double decoupledStep(double tgt, double& hold, double& fast,
                                        double holdCoeff) const noexcept
     {
+        return decoupledCore(tgt, hold, fast, holdCoeff, charAttCoeff_, decSmoothCoeff_);
+    }
+
+    /** @brief decoupledStep() with the coefficients of the smoothing stage given too. */
+    [[nodiscard]] static double decoupledCore(double tgt, double& hold, double& fast, double holdCoeff,
+                                              double attCoeff, double smoothCoeff) noexcept
+    {
         // Hold stage: a deeper (lower) target is taken at once; otherwise
         // release toward the target. Same direction rule as the branching
         // ballistics: a falling gain is the attack side in both modes.
         hold = std::min(tgt, tgt + holdCoeff * (hold - tgt));
-        if (std::abs(hold) < 1e-4) hold = 0.0; // kill the asymptotic dB tail
+        if (atRest(hold, tgt)) hold = 0.0; // end the asymptotic dB tail
 
         // Smoothing stage: the attack pole while the held gain is below the
         // output (deepening), the release-side pole otherwise (never slower
         // than the attack, see updateTimeConstants).
-        fast = branchingStep(fast, hold, charAttCoeff_, decSmoothCoeff_);
-        if (std::abs(fast) < 1e-4) fast = 0.0;
+        fast = branchingStep(fast, hold, attCoeff, smoothCoeff);
+        if (atRest(fast, hold)) fast = 0.0;
         return fast;
     }
 
@@ -2665,6 +2894,403 @@ protected:
             if (remaining(mid) < target) lo = mid; else hi = mid;
         }
         return 0.5 * (lo + hi);
+    }
+
+    // ---- Precision of the control signal (setPrecision) ----
+
+    /** @brief Whether the control signal runs at Precision::High with this
+     *  routing: feed-forward, and feedback solved against the input. */
+    [[nodiscard]] bool usePrecision(Topology topoEff, bool fbImplicit, bool splitAdaptive) const noexcept
+    {
+        return precision_.load(std::memory_order_relaxed) == Precision::High && !splitAdaptive
+            && (topoEff == Topology::FeedForward || fbImplicit);
+    }
+
+    /** @brief The detectors that rectify: at Precision::High they read the
+     *  key between the samples too. */
+    [[nodiscard]] static bool readsBetweenSamples(DetectorType detType) noexcept
+    {
+        return detType == DetectorType::Peak || detType == DetectorType::TruePeak;
+    }
+
+    /**
+     * @brief Seats the history of the precise path when it engages: it starts
+     *        from the gain that is sounding and from silence at the detector.
+     *        Audio thread only.
+     */
+    void syncPrecisionState(bool precise) noexcept
+    {
+        if (precise && !precisionActive_)
+        {
+            const double w = static_cast<double>(charFastWeight_);
+            for (size_t ch = 0; ch < static_cast<size_t>(kMaxChannels); ++ch)
+            {
+                interp_[ch] = {};
+                precLevel_[ch] = -100.0;
+                precTarget_[ch] = (w < 1.0) ? w * envFastDb_[ch] + (1.0 - w) * envSlowDb_[ch]
+                                            : envFastDb_[ch];
+            }
+        }
+        precisionActive_ = precise;
+    }
+
+    /**
+     * @brief The rectified key at kDetectorPoints points per sample.
+     *
+     * Feeds the channel's history and writes, in time order, the magnitude
+     * of the key at a quarter, a half and three quarters of the way from one
+     * sample to the next (a windowed-sinc interpolation of kInterpTaps
+     * samples) and at that next sample itself, which is kDetectorDelay
+     * samples old.
+     *
+     * @param sample The key (after the sidechain filter).
+     * @param ch     Channel whose history is advanced.
+     * @param points Receives kDetectorPoints magnitudes.
+     */
+    void detectorPoints(T sample, int ch, T* points) noexcept
+    {
+        auto& h = interp_[static_cast<size_t>(ch)];
+        // Mirrored ring: the window of the last kInterpTaps samples is
+        // contiguous, oldest first.
+        h.x[h.at] = sample;
+        h.x[h.at + kInterpTaps] = sample;
+        const T* window = &h.x[h.at + 1];
+        h.at = (h.at + 1) & (kInterpTaps - 1);
+        for (int p = 0; p < kDetectorPoints - 1; ++p)
+            points[p] = std::abs(simd::dotProduct(interpPhase_[p], window, kInterpTaps));
+        points[kDetectorPoints - 1] = std::abs(window[kInterpTaps / 2]);
+    }
+
+    /** @brief The gain as it is heard with a latency kept for the lookahead:
+     *  older by the difference (see setMaxLookahead()). */
+    [[nodiscard]] T heldBack(T grDb, int g, int delay) noexcept
+    {
+        if (delay <= 0) return grDb;
+        auto& line = gainDelay_[static_cast<size_t>(g)];
+        line.push(grDb);
+        return line.read(delay);
+    }
+
+    /**
+     * @brief The gain of one frame at Precision::High, for one gain computer.
+     *
+     * The frame brings `count` levels in time order (kDetectorPoints from a
+     * detector read between the samples, one otherwise). The ballistics take
+     * kSubsteps steps in all, with the coefficients of that share of a
+     * sample: in feed-forward towards a target that moves along the line
+     * from one level's target to the next; in the loop solved against the
+     * input, with the level moving along that line and the loop solved at
+     * each step. The gain is the mean of the steps. Hold and range act once
+     * per level in feed-forward and once per frame, on the gain the last
+     * step leaves, in the loop.
+     *
+     * @param levelDb Levels in dB, oldest first.
+     * @param count   How many (1 or kDetectorPoints).
+     * @param ch      Channel whose state is advanced.
+     * @param cfg     Routing derived once per block.
+     * @param thresh  Threshold in dB.
+     * @param ratio   Ratio.
+     * @param knee    Knee width in dB.
+     */
+    [[nodiscard]] T gainPathPrecise(const T* levelDb, int count, int ch, const GainPathConfig& cfg,
+                                    T thresh, T ratio, T knee) noexcept
+    {
+        const int stepsEach = kSubsteps / count;
+        const double share = 1.0 / stepsEach;
+        const size_t c = static_cast<size_t>(ch);
+        double sum = 0.0;
+
+        if (cfg.fbImplicit)
+        {
+            const LoopCoeffs coeffs { subAttCoeff_, subRelCoeff_, subChargeCoeff_, subSlowRelCoeff_ };
+            double last = precLevel_[c];
+            T shown = T(0);
+            for (int j = 0; j < count; ++j)
+            {
+                const double to = static_cast<double>(levelDb[j]);
+                for (int s = 1; s <= stepsEach; ++s)
+                {
+                    const double at = last + (to - last) * (s * share);
+                    shown = stepImplicit(static_cast<T>(at), ch, cfg.charType, thresh, ratio, knee, coeffs);
+                    sum += static_cast<double>(shown);
+                }
+                last = to;
+            }
+            precLevel_[c] = last;
+            const T bounded = boundImplicit(shown, ch);
+            return (bounded != shown) ? bounded : static_cast<T>(sum * (1.0 / kSubsteps));
+        }
+
+        // Sustained-level guard of the Upward curve, on the frame's top level.
+        T guardDb = levelDb[0];
+        for (int j = 1; j < count; ++j) guardDb = std::max(guardDb, levelDb[j]);
+        if (cfg.modeType == Mode::Upward)
+        {
+            T& guard = upwardGuardDb_[c];
+            guard = std::max(guardDb, guard - upwardGuardDecay_);
+            guardDb = guard;
+        }
+
+        const T range = rangeDb_.load(std::memory_order_relaxed);
+        const bool soft = softRange_.load(std::memory_order_relaxed);
+        const int holdLength = holdSamples_ * count; // the hold counts levels here
+        double last = precTarget_[c];
+        double& hold = envHoldDb_[c];
+        double& fast = envFastDb_[c];
+        double& slow = envSlowDb_[c];
+        for (int j = 0; j < count; ++j)
+        {
+            const T target = holdAndRange(
+                computeGain(levelDb[j], thresh, ratio, knee, cfg.charType, cfg.modeType, guardDb),
+                range, holdLength, heldGrDb_[c], holdCounters_[c], soft);
+            const double to = static_cast<double>(target);
+            for (int s = 1; s <= stepsEach; ++s)
+            {
+                const double at = last + (to - last) * (s * share);
+                sum += cfg.decoupled
+                    ? decoupledCore(at, hold, fast, subDecHoldCoeff_, subAttCoeff_, subDecSmoothCoeff_)
+                    : ballisticsCore(at, fast, slow, subAttCoeff_, subRelCoeff_, subChargeCoeff_,
+                                     subSlowRelCoeff_);
+            }
+            last = to;
+        }
+        precTarget_[c] = last;
+        return static_cast<T>(sum * (1.0 / kSubsteps));
+    }
+
+    // ---- Analytic makeup ----
+
+    /** @brief Everything the analytic makeup depends on: it is worked out
+     *  again only when one of these changes. */
+    struct MakeupModelKey
+    {
+        T thresh = T(0);            ///< Threshold (dB).
+        T ratio = T(1);             ///< Ratio.
+        T knee = T(0);              ///< Knee width (dB).
+        T amount = T(1);            ///< Share of the gain change that is applied.
+        T range = T(0);             ///< Largest gain change (dB).
+        T fastWeight = T(1);        ///< Blend of the fast and memory stages.
+        T window = T(0);            ///< Length of the RMS window (ms).
+        double attack = 0.0;        ///< Observed attack coefficient.
+        double release = 0.0;       ///< Release coefficient.
+        double charge = 0.0;        ///< Charge coefficient of the memory stage.
+        double slowRelease = 0.0;   ///< Release coefficient of the memory stage.
+        double hold = 0.0;          ///< Release coefficient of the decoupled hold stage.
+        Character charType = Character::Clean;       ///< Character.
+        Mode modeType = Mode::Downward;              ///< Direction.
+        DetectorType detType = DetectorType::Peak;   ///< Effective detector.
+        bool decoupled = false;     ///< Decoupled ballistics.
+        bool loop = false;          ///< The detector reads the output (feedback).
+        bool autoThreshold = false; ///< The threshold counts from the key's peak.
+        bool soft = false;          ///< Range with no corner.
+        bool valid = false;         ///< False until the first solve.
+
+        bool operator==(const MakeupModelKey&) const = default;
+    };
+
+    /**
+     * @brief Target of the analytic makeup, in dB, for a routing that is
+     *        already known (the solve only runs when a setting changed).
+     */
+    [[nodiscard]] T analyticMakeupDb(Character charType, Mode modeType, DetectorType detType,
+                                     bool decoupled, bool loop) noexcept
+    {
+        MakeupModelKey key;
+        key.thresh = threshold_.load(std::memory_order_relaxed);
+        key.ratio = std::max(ratio_.load(std::memory_order_relaxed), T(1));
+        key.knee = std::max(kneeWidth_.load(std::memory_order_relaxed), T(0));
+        key.amount = amount_.load(std::memory_order_relaxed);
+        key.range = rangeDb_.load(std::memory_order_relaxed);
+        key.fastWeight = charFastWeight_;
+        key.window = rmsWindowMsAtomic_.load(std::memory_order_relaxed);
+        key.attack = rawAttCoeff_;
+        key.release = charRelCoeff_;
+        key.charge = charChargeCoeff_;
+        key.slowRelease = charSlowRelCoeff_;
+        key.hold = decHoldCoeff_;
+        key.charType = charType;
+        key.modeType = modeType;
+        key.detType = detType;
+        key.decoupled = decoupled;
+        key.loop = loop;
+        key.autoThreshold = autoThreshold_.load(std::memory_order_relaxed);
+        key.soft = softRange_.load(std::memory_order_relaxed);
+        key.valid = true;
+        if (!(key == makeupKey_))
+        {
+            makeupKey_ = key;
+            makeupModelDb_ = solveMakeupModel(key);
+        }
+        return makeupModelDb_;
+    }
+
+    /** @brief Target of the analytic makeup for the settings as they stand
+     *  (0 dB when another makeup mode is selected). */
+    [[nodiscard]] T analyticTarget() noexcept
+    {
+        if (autoMakeupMode_.load(std::memory_order_relaxed) != AutoMakeupMode::Analytic) return T(0);
+        const Character charType = character_.load(std::memory_order_relaxed);
+        const bool fet = charType == Character::FET;
+        const Topology topoEff = fet ? Topology::FeedBack : topology_.load(std::memory_order_relaxed);
+        const DetectorType detType = fet ? DetectorType::Peak : detectorType_.load(std::memory_order_relaxed);
+        return analyticMakeupDb(charType, mode_.load(std::memory_order_relaxed), detType,
+                                useDecoupled(charType, topoEff), topoEff == Topology::FeedBack);
+    }
+
+    /**
+     * @brief Where a branching follower rests over a set of weighted targets.
+     *
+     * Each sample it moves towards the target by a share of the distance:
+     * `attackRate` while the target is below it, `releaseRate` while it is
+     * above. Over targets that change much faster than it moves, it rests
+     * where the two pulls cancel: attackRate x mean distance to the targets
+     * below = releaseRate x mean distance to those above. That point (an
+     * expectile of the targets) is found by bisection.
+     *
+     * @param target      Gain changes (dB).
+     * @param weight      How often each one is met.
+     * @param count       How many there are.
+     * @param attackRate  1 - attack coefficient.
+     * @param releaseRate 1 - release coefficient.
+     */
+    [[nodiscard]] static double restingGain(const double* target, const double* weight, int count,
+                                            double attackRate, double releaseRate) noexcept
+    {
+        double lo = target[0], hi = target[0];
+        for (int i = 1; i < count; ++i)
+        {
+            lo = std::min(lo, target[i]);
+            hi = std::max(hi, target[i]);
+        }
+        for (int pass = 0; pass < 48 && hi - lo > 1e-6; ++pass)
+        {
+            const double at = 0.5 * (lo + hi);
+            double below = 0.0, above = 0.0;
+            for (int i = 0; i < count; ++i)
+            {
+                const double d = target[i] - at;
+                if (d < 0.0) below -= weight[i] * d;
+                else above += weight[i] * d;
+            }
+            if (attackRate * below > releaseRate * above) hi = at;
+            else lo = at;
+        }
+        return 0.5 * (lo + hi);
+    }
+
+    /**
+     * @brief Spread of what an RMS window reads over dense programme: the
+     *        standard deviation of its level, in dB.
+     *
+     * A fit to pink noise (equal power per octave), whose low end a short
+     * window cannot average: 1.6 dB for 10 ms, falling with the cube root of
+     * the length (measured 2.1, 1.6, 1.1, 0.7 and 0.5 dB at 3, 10, 30, 100
+     * and 300 ms).
+     */
+    [[nodiscard]] static double windowSpreadDb(double windowMs) noexcept
+    {
+        return 1.6 * std::cbrt(10.0 / std::clamp(windowMs, 1.0, 500.0));
+    }
+
+    /**
+     * @brief How far over the RMS of dense programme the reference of the
+     *        automatic threshold rests, for each detector (dB).
+     *
+     * Measured on pink noise with the reference's own law (it rises at once
+     * and falls 1 dB per second). The RMS window's rests about three of its
+     * spreads up while the window is short; a long window moves its level as
+     * slowly as the reference falls, and the reference then rests lower.
+     */
+    [[nodiscard]] static double referenceOverRmsDb(const MakeupModelKey& key) noexcept
+    {
+        switch (key.detType)
+        {
+            case DetectorType::Rms:
+            {
+                const double ms = std::clamp(static_cast<double>(key.window), 1.0, 500.0);
+                return windowSpreadDb(ms) * 3.2 / (1.0 + ms / 130.0);
+            }
+            case DetectorType::Hilbert:  return kEnvelopeReferenceDb;
+            case DetectorType::TruePeak: return kTruePeakReferenceDb;
+            default:                     return kPeakReferenceDb;
+        }
+    }
+
+    /**
+     * @brief The analytic makeup: minus the gain the ballistics settle on
+     *        over dense programme.
+     *
+     * The programme is a Gaussian signal as the detector reads it. For the
+     * detectors that rectify, the magnitudes of its samples (a half normal);
+     * for TruePeak the largest of kTruePeakSamples of them (the four points
+     * between samples are not independent); for Hilbert its envelope (a
+     * Rayleigh, kEnvelopeLiftDb higher since the detector also takes the
+     * rectified sample); for the RMS window a log-normal about the RMS with
+     * the spread of windowSpreadDb(). Each level gives a target on the static
+     * curve (with the range), and the followers rest among those targets as
+     * restingGain() says: the fast stage with attack and release, the memory
+     * stage of Opto and FET with its charge and its release, the decoupled
+     * hold with an attack of one sample. A feedback loop works against the
+     * lag of the memory stage with its own gain, w (R - 1), so there that
+     * stage only counts for (1 - w) / (1 + w (R - 1)). With the automatic
+     * threshold the levels count from the peak its reference rests on;
+     * without it the programme is at kNominalRmsDb.
+     */
+    [[nodiscard]] T solveMakeupModel(const MakeupModelKey& key) const noexcept
+    {
+        const double rmsDb = key.autoThreshold ? -referenceOverRmsDb(key) : kNominalRmsDb;
+        const bool window = key.detType == DetectorType::Rms;
+        const bool envelope = key.detType == DetectorType::Hilbert;
+        const bool between = key.detType == DetectorType::TruePeak;
+        const double spread = window ? windowSpreadDb(static_cast<double>(key.window)) : 0.0;
+        double target[kMakeupNodes], weight[kMakeupNodes];
+        T held = T(0);
+        int counter = 0;
+        for (int i = 0; i < kMakeupNodes; ++i)
+        {
+            double levelDb = rmsDb;
+            if (window)
+            {
+                // Equal steps of the level from -4 to +4 spreads; the mean of the squares stays the RMS.
+                const double z = ((static_cast<double>(i) + 0.5) / kMakeupNodes - 0.5) * 8.0;
+                weight[i] = std::exp(-0.5 * z * z);
+                levelDb += spread * z - 0.1151 * spread * spread;
+            }
+            else
+            {
+                // In units of the RMS: the middle of each of the equal steps up to kMakeupReach.
+                const double t = (static_cast<double>(i) + 0.5) * (kMakeupReach / kMakeupNodes);
+                weight[i] = std::exp(-0.5 * t * t);
+                if (envelope) weight[i] *= t;
+                if (between)
+                    weight[i] *= std::pow(std::erf(t * 0.70710678118654752), kTruePeakSamples - 1.0);
+                levelDb += 20.0 * std::log10(t) + (envelope ? kEnvelopeLiftDb : 0.0);
+            }
+            const T gain = computeGain(static_cast<T>(levelDb), key.thresh, key.ratio, key.knee, key.charType,
+                                       key.modeType, static_cast<T>(rmsDb + kSustainedOverRmsDb));
+            target[i] = static_cast<double>(holdAndRange(gain, key.range, 0, held, counter, key.soft));
+        }
+
+        const int count = kMakeupNodes;
+        double settled = 0.0;
+        if (key.decoupled)
+        {
+            settled = restingGain(target, weight, count, 1.0, 1.0 - key.hold);
+        }
+        else
+        {
+            settled = restingGain(target, weight, count, 1.0 - key.attack, 1.0 - key.release);
+            const double w = static_cast<double>(key.fastWeight);
+            if (w < 1.0)
+            {
+                const double memory = key.loop
+                    ? (1.0 - w) / (1.0 + w * (static_cast<double>(key.ratio) - 1.0)) : 1.0 - w;
+                settled = (1.0 - memory) * settled
+                        + memory * restingGain(target, weight, count, 1.0 - key.charge, 1.0 - key.slowRelease);
+            }
+        }
+        const double makeup = -static_cast<double>(key.amount) * settled;
+        return static_cast<T>(std::clamp(makeup, -kMakeupLimitDb, kMakeupLimitDb));
     }
 
     // ---- Sidechain HPF ----
@@ -2801,7 +3427,8 @@ protected:
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).
     std::array<T, kMaxChannels> fbLastOutput_ {};   ///< Feedback topology history buffer.
-    std::array<T, kMaxChannels> channelLevelDb_ {}; ///< Raw detected level buffer.
+    /// Detected level per channel and point of the frame (dB).
+    std::array<std::array<T, 4>, kMaxChannels> pointLevelDb_ {};
 
     std::array<RingBuffer<T>, kMaxChannels> lookaheadBuffers_ {}; ///< Lookahead delay lines.
     int lookaheadSamples_ = 0; ///< Active lookahead latency in samples.
@@ -2855,6 +3482,49 @@ protected:
     std::atomic<T> amount_ { T(1) };                ///< Share of the gain change that is applied, in dB.
     SmoothedValue<T> amountSmooth_;                 ///< De-zippered amount.
     std::atomic<bool> softRange_ { false };         ///< The gain change approaches the range without a corner.
+
+    // Precision of the control signal (setPrecision): the detector's points
+    // between samples, the history of the steps and their coefficients.
+    static constexpr int kSubsteps = 8;                 ///< Steps of the ballistics per sample at Precision::High.
+    static constexpr int kDetectorPoints = 4;           ///< Points the rectifying detectors read per sample there.
+    static constexpr int kInterpTaps = 16;              ///< Samples each point between samples is read from.
+    static constexpr int kDetectorDelay = kInterpTaps / 2 - 1; ///< Samples those points are late.
+    static constexpr double kInterpBeta = 6.5;          ///< Kaiser window of the interpolation.
+    static_assert(kDetectorPoints == 4 && kSubsteps % kDetectorPoints == 0, "the steps divide among the points");
+    /// History of the key of one channel, mirrored so its window is contiguous.
+    struct InterpHistory
+    {
+        T x[2 * kInterpTaps] = {}; ///< Each sample twice, kInterpTaps apart.
+        int at = 0;                ///< Where the next one goes.
+    };
+    std::atomic<Precision> precision_ { Precision::Standard }; ///< How finely the control signal is computed.
+    bool precisionActive_ = false;                      ///< The precise path ran last (audio thread).
+    T interpPhase_[kDetectorPoints - 1][kInterpTaps] = {};     ///< Interpolation phases (prepare()).
+    std::array<InterpHistory, kMaxChannels> interp_ {}; ///< Their history per channel.
+    std::array<double, kMaxChannels> precLevel_ {};     ///< Last level of the solved loop (dB).
+    std::array<double, kMaxChannels> precTarget_ {};    ///< Last gain target, after hold and range (dB).
+    double rawAttCoeff_ = 0.0;       ///< Attack coefficient as it is observed (before a loop's own speed).
+    double subAttCoeff_ = 0.0;       ///< Attack coefficient of an eighth of a sample.
+    double subRelCoeff_ = 0.0;       ///< Release coefficient of an eighth of a sample.
+    double subSlowRelCoeff_ = 0.0;   ///< Memory-stage release coefficient of an eighth of a sample.
+    double subChargeCoeff_ = 0.0;    ///< Memory-stage charge coefficient of an eighth of a sample.
+    double subDecHoldCoeff_ = 0.0;   ///< Decoupled hold coefficient of an eighth of a sample.
+    double subDecSmoothCoeff_ = 0.0; ///< Decoupled smoothing coefficient of an eighth of a sample.
+
+    // Analytic makeup: the programme it assumes and its cached result.
+    static constexpr int kMakeupNodes = 48;             ///< Levels of the programme that are weighed.
+    static constexpr double kMakeupReach = 4.8;         ///< They reach this many times its RMS.
+    static constexpr double kNominalRmsDb = -18.0;      ///< RMS the programme is taken at (dBFS).
+    static constexpr double kSustainedOverRmsDb = 10.0; ///< Its sustained level over the RMS (Upward guard, dB).
+    static constexpr double kPeakReferenceDb = 12.35;   ///< Automatic-threshold reference over the RMS, rectified.
+    static constexpr double kTruePeakReferenceDb = 12.5;///< The same for TruePeak.
+    static constexpr double kEnvelopeReferenceDb = 13.2;///< The same for the Hilbert detector.
+    static constexpr double kTruePeakSamples = 2.6;     ///< Independent samples the TruePeak reading is the largest of.
+    static constexpr double kEnvelopeLiftDb = 0.6;      ///< What the Hilbert detector reads over the envelope (dB).
+    static constexpr double kMakeupLimitDb = 40.0;      ///< Bound of the result (dB).
+    SmoothedValue<T> analyticSmooth_;                   ///< De-zippered analytic makeup (dB).
+    MakeupModelKey makeupKey_ {};                       ///< Settings of the cached result.
+    T makeupModelDb_ = T(0);                            ///< The cached result (dB).
 
     std::atomic<T> gainReductionDb_ { T(0) }; ///< Publicly readable Gain Reduction meter.
 };

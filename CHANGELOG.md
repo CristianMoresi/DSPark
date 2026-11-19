@@ -245,6 +245,43 @@ All notable user-facing changes to DSPark are documented here.
   to the audio of a compressor that never listened. It is a monitoring
   switch and is not part of the state. State keys `key<band>.shape`,
   `.freq`, `.gain`, `.q` and `.slope`.
+- `Compressor::Character::Smooth`: two layers in feed-forward. One levels,
+  with half the slope of the ratio from 6 dB under the threshold, eight
+  times the attack (30 ms at least) and six times the release; over it, one
+  on the knobs catches what rises, with the other half of the slope from
+  6 dB over the threshold. Far over the threshold the curve is the ratio's
+  own (at 4:1 and a threshold of -20 dB: 0.56 dB of reduction at -26 dBFS,
+  2.25 at -20, 4.78 at -14 and 9.0 at -8, where the Clean character gives
+  0, 0, 4.5 and 9.0), with a knee 18 dB wide or more. Both layers take
+  longer the farther they are from their target (twice as long 12 dB away
+  in attack, 6 dB away in release), so a reduction comes back at a steady
+  pace: with a 100 ms release, a fifth of a 15 dB reduction is back in the
+  first 100 ms and it is down to 1/e after 767 ms, where a one-pole gives
+  back 63 % and takes 101 ms; a step 12 dB over the threshold is 63 %
+  caught after 40 ms (5 ms attack; a one-pole, 5.3 ms) and settles on the
+  same 9.0 dB. Hold and range act on the sum of the layers. Topology and
+  `Precision::High` do not apply to it; in Upward mode it is one envelope
+  on the knobs. Cost 40 ns per frame against 18 for Clean.
+- `Compressor::setCharacterColor()` with the Varimu character: the gain is
+  applied by the curve of a push-pull pair of remote-cutoff stages biased
+  by it, so compression and colour come from one element. The harmonics are
+  odd (the even ones stay under -200 dBc), a small signal gets the gain
+  exactly, and they grow with the level and with the reduction: at 1.0 a
+  1 kHz tone at -6 dBFS carries its third harmonic at -61.5 dBc at rest,
+  -46.8 under 3 dB of reduction, -69.6 under 6 dB (the minimum of the
+  pair), -37.0 under 12 dB and -31.2 under 20 dB; at 0.5, -73.9, -58.3,
+  -80.8, -48.3 and -42.6. While it is on the block runs frame by frame:
+  66 ns per frame mono and 94 stereo against 19 and 21.
+- `Compressor::setGainSmoothing(ms)`: the gain change passes through two
+  equal one-pole sections after the ballistics and before it becomes gain
+  (0 to 50 ms; 0, the default, is off). A step of the gain reaches 63 % in
+  the time set (0.33 ms without it, 10.0 ms at 10), and the ripple a quick
+  release leaves on a low tone goes: a 100 Hz tone 14 dB over a 4:1
+  threshold with 1 ms of attack and 20 ms of release rides 0.75 dB of gain
+  ripple with its third harmonic at -31.9 dBc; at 5 ms, 0.07 dB and
+  -53.2 dBc; at 20 ms, 0.005 dB and -76.6 dBc, on the same mean depth. A
+  feedback loop reads the gain before the smoothing. State key
+  `gainSmoothing`. Cost 2.5 ns per frame.
 - `NoiseGate` and `Expander`: the same equalizer on the key and the same key
   listen as the compressor (`setSidechainBand()`, `getSidechainBand()`,
   `getSidechainResponse()`, `setSidechainListen()`), after their sidechain
@@ -926,6 +963,12 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Compressor`: the characters are data. What told Clean, Opto, FET and
+  Varimu apart (the limits of their knobs, the times and the weight of
+  their memory stage, the floor of their knee, the growth of their ratio,
+  whether they close their own loop) is one table of numbers read by one
+  engine, with the same arithmetic as before. `setCharacter()` now takes
+  five values; a state written by an earlier version reads the same.
 - `BeatTracker::analyze()` and the offline session, and `OfflineTempoAnalyzer`
   with them: the beat grid is laid in two passes, and the default tightness
   is 400 (was 25). A recursion loose enough to follow a tempo that moves is

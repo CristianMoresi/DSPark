@@ -119,10 +119,13 @@ inline EffectSlot makeEqualizer()
         std::snprintf(nm, sizeof(nm), "Band %d Q", b + 1);
         s.addSlider(nm, 0.1f, 10, 1, "");
         std::snprintf(nm, sizeof(nm), "Band %d Type", b + 1);
-        s.addChoice(nm, {"Peak","Low Shelf","High Shelf","Low Cut","High Cut",
-                         "Notch","Band Pass","Tilt"}, 0);
+        s.addChoice(nm, {"Peak","Low Shelf","High Shelf","Low Pass","High Pass",
+                         "Notch","Band Pass","Tilt","All Pass","Flat Tilt",
+                         "Low Pass Wall","High Pass Wall"}, 0);
         std::snprintf(nm, sizeof(nm), "Band %d Slope", b + 1);
-        s.addSlider(nm, 6, 48, 12, "dB/oct");   // cuts (Low/High Cut) only
+        // Cuts only. Whole steps of 6 from 6 to 48 with the cookbook engine;
+        // any value from 0 to 96 with Analog Response on.
+        s.addSlider(nm, 0, 96, 12, "dB/oct");
     }
     // Global controls (indices 20/21, appended so band indices stay stable):
     // Phase Mode switches the IIR cascade for the FFT overlap-save engine
@@ -131,20 +134,38 @@ inline EffectSlot makeEqualizer()
     // (audible on high-frequency bells; the curve follows).
     s.addChoice("Phase Mode", {"Minimum","Linear"}, 0);
     s.addToggle("Matched Bells", true);
+    // Analog Response (index 22): every band designed from its analog prototype
+    // (no shrinking towards Nyquist, in both phase modes), with glided changes.
+    // Band N Order (23..26): bells, shelves, notches, band-passes and all-passes
+    // of order 1 to 16 (flat top, steeper sides); above 1 the band runs with the
+    // analog response whatever the toggle says, as do the last four types.
+    s.addToggle("Analog Response", false);
+    for (int b = 0; b < 4; ++b) {
+        char nm[32];
+        std::snprintf(nm, sizeof(nm), "Band %d Order", b + 1);
+        s.addSlider(nm, 1, 16, 1, "");
+    }
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {
-        return static_cast<EQ::BandType>(std::clamp(static_cast<int>(v), 0, 7));
+        return static_cast<EQ::BandType>(std::clamp(static_cast<int>(v), 0, 11));
     };
-    auto toSlope = [](float v) {
-        return std::clamp((static_cast<int>(v) / 6) * 6, 6, 48);
-    };
+    auto toSlope = [](float v) { return std::clamp(v, 0.0f, 96.0f); };
+    auto toOrder = [](float v) { return std::clamp(static_cast<int>(v + 0.5f), 1, 16); };
     // Equalizer docs require prepare() BEFORE setNumBands() so bands
     // know the sample rate when auto-spacing frequencies.
     s.prepareFn = [p](auto& sp) { p->prepare(sp); p->setNumBands(4); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, toType, toSlope](int i, float v) {
+    s.setParamFn = [p, toType, toSlope, toOrder](int i, float v) {
+        if (i == 22) { p->setAnalogResponse(v > 0.5f); return; }
+        if (i >= 23 && i <= 26)
+        {
+            auto cfg = p->getBandConfig(i - 23);
+            cfg.order = toOrder(v);
+            p->setBand(i - 23, cfg);
+            return;
+        }
         if (i == 20)
         {
             p->setFilterMode(static_cast<int>(v) == 1 ? EQ::FilterMode::LinearPhase
@@ -165,10 +186,10 @@ inline EffectSlot makeEqualizer()
         }
         p->setBand(band, cfg);
     };
-    // Interactive response curve drawn from the band's REAL biquad cascade
-    // (buildBandStages), so shelves, cuts at any slope, notch and tilt all
-    // render exactly what the audio path applies. X=freq, Y=gain, wheel=Q.
-    s.magnitudeFn = [p, toType, toSlope](const float* f, float* mdb, int n, double sr, const float* v) {
+    // Interactive response curve drawn from the band's REAL sections
+    // (buildBandSections), so every type, slope and order renders exactly what
+    // the audio path applies in either engine. X=freq, Y=gain, wheel=Q.
+    s.magnitudeFn = [p, toType, toSlope, toOrder](const float* f, float* mdb, int n, double sr, const float* v) {
         for (int i = 0; i < n; ++i) {
             double mag = 1.0;
             for (int b = 0; b < 4; ++b) {
@@ -178,8 +199,9 @@ inline EffectSlot makeEqualizer()
                 cfg.q         = std::max(0.05f, v[b*5+2]);
                 cfg.type      = toType(v[b*5+3]);
                 cfg.slope     = toSlope(v[b*5+4]);
-                dspark::BiquadCoeffs stages[5];
-                const int ns = p->buildBandStages(cfg, stages);
+                cfg.order     = toOrder(v[23+b]);
+                dspark::BiquadCoeffs stages[16];
+                const int ns = p->buildBandSections(cfg, stages, 16);
                 for (int k = 0; k < ns; ++k)
                     mag *= stages[k].getMagnitude(static_cast<double>(f[i]), sr);
             }

@@ -900,10 +900,17 @@ inline EffectSlot makeChorus()
     s.addSlider("Feedback", -0.95f, 0.95f, 0, "");
     s.addToggle("Auto Depth", false);
     s.addSlider("Stereo Spread", 0, 1, 0.5f, "");
+    // The bucket-brigade model (indices 7 to 10). Orders MUST match
+    // dspark::Chorus<float>::Model and AnalogMode.
+    s.addSlider("Centre Delay", 1, 30, 7, "ms");                       // 7
+    s.addChoice("Model", {"Digital","Analog"}, 0);                      // 8
+    s.addChoice("Analog Mode", {"Slow","Fast","Vibrato"}, 0);           // 9
+    s.addSlider("Analog Hiss", -120, -50, -84, "dBFS");                 // 10
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p](int i, float v) {
+        using CH = dspark::Chorus<float>;
         switch(i) {
             case 0: p->setRate(v); break;
             case 1: p->setDepthMs(v); break;
@@ -912,7 +919,17 @@ inline EffectSlot makeChorus()
             case 4: p->setFeedback(v); break;
             case 5: p->setAutoDepth(v > 0.5f); break;
             case 6: p->setStereoSpread(v); break;
+            case 7: p->setCenterDelay(v); break;
+            case 8: p->setModel(static_cast<CH::Model>(static_cast<int>(v))); break;
+            case 9: p->setAnalogMode(static_cast<CH::AnalogMode>(static_cast<int>(v))); break;
+            case 10: p->setAnalogNoise(v); break;
         }
+    };
+    // A mode loads rate, depth and centre: show them.
+    s.readbackFn = [p](std::vector<float>& v) {
+        v[0] = static_cast<float>(p->getRate());
+        v[1] = static_cast<float>(p->getDepthMs());
+        v[7] = static_cast<float>(p->getCenterDelay());
     };
     return s;
 }
@@ -978,6 +995,10 @@ inline EffectSlot makeVibrato()
     s.addSlider("Depth", 0, 2, 0, "st");           // Default 0 = no pitch modulation (neutral)
     s.addSlider("Mod Rate", 0, 5, 0, "Hz");
     s.addSlider("Mod Depth", 0, 1, 0, "");
+    // The bucket-brigade model (indices 4 and 5). Order MUST match
+    // dspark::Vibrato<float>::Model.
+    s.addChoice("Model", {"Digital","Analog"}, 0);                // 4
+    s.addSlider("Analog Hiss", -120, -50, -84, "dBFS");           // 5
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -987,6 +1008,8 @@ inline EffectSlot makeVibrato()
             case 1: p->setDepth(v); break;
             case 2: p->setModRate(v); break;
             case 3: p->setModDepth(v); break;
+            case 4: p->setModel(static_cast<dspark::Vibrato<float>::Model>(static_cast<int>(v))); break;
+            case 5: p->setAnalogNoise(v); break;
         }
     };
     return s;
@@ -1051,6 +1074,10 @@ inline EffectSlot makeDelay()
     s.addSlider("Mix", 0, 1, 0, "");                              // 4 - default 0 = dry only
     // Order MUST match Delay::FeedbackMode (Clean=0, Analog=1).
     s.addChoice("Feedback Mode", {"Clean","Analog"}, 1);          // 5
+    // Order MUST match Delay::Character (Clean=0, Tape=1, Bucket=2).
+    s.addChoice("Character", {"Clean","Tape","Bucket"}, 0);       // 6
+    s.addSlider("Wow & Flutter", 0, 1, 0.5f, "");                 // 7 (tape)
+    s.addSlider("Character Hiss", -120, -50, -84, "dBFS");        // 8 (tape and bucket)
     // Insert use: the processor blends dry/wet itself (ramped mix) and
     // smooths delay-time changes; 4 s of capacity.
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
@@ -1064,6 +1091,9 @@ inline EffectSlot makeDelay()
             case 3: p->setFeedbackHpHz(v); break;
             case 4: p->setMix(v); break;
             case 5: p->setFeedbackMode(static_cast<DL::FeedbackMode>(static_cast<int>(v))); break;
+            case 6: p->setCharacter(static_cast<DL::Character>(static_cast<int>(v))); break;
+            case 7: p->setWowFlutter(v); break;
+            case 8: p->setCharacterNoise(v); break;
         }
     };
     return s;
@@ -1084,7 +1114,7 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("Mix", 0, 1, 0, "");                             // 2 - default 0 = dry only
     s.addSlider("Decay", 0.1f, 30, 0.5f, "s", true);             // 3 (mid-band T60)
     s.addSlider("Size", 0.01f, 1, 0.22f, "");                    // 4 (glides: automatable)
-    s.addSlider("Pre-Delay", 0, 200, 0, "ms");                   // 5
+    s.addSlider("Pre-Delay", 0, 500, 0, "ms");                   // 5
     s.addSlider("Damping", 0, 1, 0.6667f, "");                   // 6 (drives HF Decay)
     s.addSlider("HF Decay", 0.05f, 1, 0.40f, "x");               // 7 (HF T60 / mid T60)
     s.addSlider("HF Crossover", 1000, 16000, 5000, "Hz", true);  // 8
@@ -1099,10 +1129,69 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("Width", 0, 2, 1, "");                           // 17
     s.addSlider("Low Cut (min = off)", 10, 500, 10, "Hz", true);       // 18
     s.addSlider("High Cut (max = off)", 2000, 20000, 20000, "Hz", true); // 19
+    // Around the tank (indices 20 to 43). Every choice's order MUST match its
+    // enum in dspark::AlgorithmicReverb (or KeyEqualizer for the wet EQ).
+    s.addToggle("Freeze", false);                                      // 20
+    s.addSlider("Ducking", 0, 24, 0, "dB");                            // 21
+    s.addSlider("Gate (min = off)", -80, 0, -80, "dB");                // 22
+    s.addSlider("Gate Hold", 0, 1000, 100, "ms");                      // 23
+    s.addSlider("Gate Release", 5, 1000, 150, "ms", true);             // 24
+    s.addSlider("Distance", 0, 1, 0, "");                              // 25
+    s.addSlider("Thickness", 0, 1, 0, "");                             // 26
+    s.addToggle("Thickness Saturation", false);                        // 27
+    s.addSlider("Tempo", 40, 240, 120, "BPM");                         // 28
+    s.addChoice("Pre-Delay Note", {"Off","1/1","1/2","1/4","1/8","1/16","1/32"}, 0); // 29
+    s.addChoice("Note Feel", {"Straight","Dotted","Triplet"}, 0);      // 30
+    s.addSlider("Input Width", 0, 1, 1, "");                           // 31
+    s.addChoice("Width Law", {"Side","Power Kept"}, 0);                // 32
+    s.addChoice("Modulation Style", {"Smooth","Segments"}, 0);         // 33
+    s.addChoice("Layout", {"Prime","Geometric"}, 0);                   // 34
+    s.addSlider("Shimmer", 0, 1, 0, "");                               // 35
+    s.addChoice("Decay Band", {"Off","Bell","Low Shelf","High Shelf"}, 0); // 36
+    s.addSlider("Decay Band Freq", 20, 20000, 2000, "Hz", true);       // 37
+    s.addSlider("Decay Band Q", 0.1f, 10, 1, "", true);                // 38
+    s.addSlider("Decay Band Time", 0.1f, 4, 1, "x", true);             // 39
+    s.addChoice("Wet EQ", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 40
+    s.addSlider("Wet EQ Freq", 20, 20000, 1000, "Hz", true);           // 41
+    s.addSlider("Wet EQ Gain", -24, 24, 0, "dB");                      // 42
+    s.addSlider("Wet EQ Q", 0.1f, 10, 0.7071f, "", true);              // 43
+    auto decayBand = std::make_shared<ARV::DecayBand>();
+    auto wetBand = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
+    auto noteFeel = std::make_shared<std::array<int, 2>>(std::array<int, 2> { 0, 0 });
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, decayBand, wetBand, noteFeel](int i, float v) {
+        using KE = dspark::KeyEqualizer<float, 2>;
+        switch(i) {
+            case 20: p->setFreeze(v > 0.5f); return;
+            case 21: p->setDucking(v); return;
+            case 22: p->setGate(v <= -79.5f ? -200.0f : v); return;
+            case 23: p->setGateHold(v); return;
+            case 24: p->setGateRelease(v); return;
+            case 25: p->setDistance(v); return;
+            case 26: p->setThickness(v); return;
+            case 27: p->setThicknessSaturation(v > 0.5f); return;
+            case 28: p->setTempo(v); return;
+            case 29: (*noteFeel)[0] = static_cast<int>(v);
+                     p->setPreDelayNote(static_cast<ARV::NoteValue>((*noteFeel)[0]), static_cast<ARV::NoteFeel>((*noteFeel)[1])); return;
+            case 30: (*noteFeel)[1] = static_cast<int>(v);
+                     p->setPreDelayNote(static_cast<ARV::NoteValue>((*noteFeel)[0]), static_cast<ARV::NoteFeel>((*noteFeel)[1])); return;
+            case 31: p->setInputWidth(v); return;
+            case 32: p->setWidthLaw(static_cast<ARV::WidthLaw>(static_cast<int>(v))); return;
+            case 33: p->setModulationStyle(static_cast<ARV::ModulationStyle>(static_cast<int>(v))); return;
+            case 34: p->setSpaceLayout(static_cast<ARV::SpaceLayout>(static_cast<int>(v))); return;
+            case 35: p->setShimmer(v); return;
+            case 36: decayBand->shape = static_cast<ARV::DecayShape>(static_cast<int>(v)); p->setDecayBand(0, *decayBand); return;
+            case 37: decayBand->frequency = v; p->setDecayBand(0, *decayBand); return;
+            case 38: decayBand->q = v; p->setDecayBand(0, *decayBand); return;
+            case 39: decayBand->multiplier = v; p->setDecayBand(0, *decayBand); return;
+            case 40: wetBand->shape = static_cast<KE::Shape>(static_cast<int>(v)); p->setPostEqBand(0, *wetBand); return;
+            case 41: wetBand->frequency = v; p->setPostEqBand(0, *wetBand); return;
+            case 42: wetBand->gainDb = v; p->setPostEqBand(0, *wetBand); return;
+            case 43: wetBand->q = v; p->setPostEqBand(0, *wetBand); return;
+            default: break;
+        }
         switch(i) {
             case 0:  p->setType(static_cast<ARV::Type>(static_cast<int>(v))); break;
             case 1:  p->setQuality(v > 0.5f ? ARV::Quality::Eco : ARV::Quality::Full); break;
@@ -1477,6 +1566,10 @@ inline EffectSlot makeConvolutionReverb()
     s.addSlider("Mix", 0, 1, 0, "");               // 2 - default dry
     s.addSlider("Decay Scale", 0.25f, 2.0f, 1.0f, "x"); // 3 (reshapes loaded/synthetic IR)
     s.addSlider("Stretch", 0.5f, 2.0f, 1.0f, "x");      // 4 (tape-speed style)
+    s.addSlider("Ducking", 0, 24, 0, "dB");             // 5
+    s.addSlider("Gate (min = off)", -80, 0, -80, "dB"); // 6
+    s.addSlider("Gate Hold", 0, 1000, 100, "ms");       // 7
+    s.addSlider("Gate Release", 5, 1000, 150, "ms", true); // 8
     s.prepareFn = [p, sr, fileLoaded, regenIR](auto& sp) {
         *sr = sp.sampleRate; p->prepare(sp);
         if (!*fileLoaded) regenIR();   // keep a user-loaded IR across re-prepares
@@ -1490,6 +1583,10 @@ inline EffectSlot makeConvolutionReverb()
             case 2: p->setMix(v); break;
             case 3: p->setDecayScale(v); break;      // IR rebuild, atomic publish (safe live)
             case 4: p->setStretch(v); break;         // IR rebuild, atomic publish (safe live)
+            case 5: p->setDucking(v); break;
+            case 6: p->setGate(v <= -79.5f ? -200.0f : v); break;
+            case 7: p->setGateHold(v); break;
+            case 8: p->setGateRelease(v); break;
         }
     };
     // Load a real impulse response from a WAV (summed to mono, capped at 10 s).

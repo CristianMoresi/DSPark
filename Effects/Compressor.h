@@ -244,6 +244,8 @@ public:
         mixSmooth_.reset(mix_.load(std::memory_order_relaxed));
         colorSmooth_.prepare(sampleRate_, 30.0);
         colorSmooth_.reset(characterColor_.load(std::memory_order_relaxed));
+        amountSmooth_.prepare(sampleRate_, 30.0);
+        amountSmooth_.reset(amount_.load(std::memory_order_relaxed));
 
         // Pre-allocate and initialize per-channel instances. Capacity covers
         // the 10 ms user lookahead. Every channel slot gets a delay line, not just spec.numChannels:
@@ -253,11 +255,14 @@ public:
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             lookaheadBuffers_[ch].prepare(maxLaSamples);
+            gainDelay_[ch].prepare(maxLaSamples);
             hilbertDetectors_[ch].reset();
         }
         
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
+        latencySamples_ = std::max(lookaheadSamples_, static_cast<int>(fs * std::clamp(
+            maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000)));
 
         updateHpfCoefficients();
         scHpfDirty_.store(false, std::memory_order_relaxed);
@@ -346,11 +351,12 @@ public:
         kneeSmooth_.setTargetValue(std::max(kneeWidth_.load(std::memory_order_relaxed), T(0)));
         makeupSmooth_.setTargetValue(makeupGain_.load(std::memory_order_relaxed));
         colorSmooth_.setTargetValue(characterColor_.load(std::memory_order_relaxed));
+        amountSmooth_.setTargetValue(amount_.load(std::memory_order_relaxed));
 
         // Channel 0 advances the shared smoothers; advancing on every call
         // would scale their time constants with the caller's channel count.
         const bool advanceShared = (channel == 0);
-        T thresh, ratio, knee, makeupDb, colorAmt;
+        T thresh, ratio, knee, makeupDb, colorAmt, amount;
         if (advanceShared)
         {
             thresh   = thresholdSmooth_.getNextValue();
@@ -358,6 +364,7 @@ public:
             knee     = kneeSmooth_.getNextValue();
             makeupDb = makeupSmooth_.getNextValue();
             colorAmt = colorSmooth_.getNextValue();
+            amount   = amountSmooth_.getNextValue();
         }
         else
         {
@@ -366,6 +373,7 @@ public:
             knee     = kneeSmooth_.getCurrentValue();
             makeupDb = makeupSmooth_.getCurrentValue();
             colorAmt = colorSmooth_.getCurrentValue();
+            amount   = amountSmooth_.getCurrentValue();
         }
 
         auto detType   = detectorType_.load(std::memory_order_relaxed);
@@ -419,8 +427,22 @@ public:
         syncDecoupledState(decoupled);
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
                                    feedbackDetectorDelay(detTypeEff) };
-        const T smoothedGR_Db = gainPath(levelDb, channel, cfg, thresh, ratio, knee);
-        T smoothedGainLinear = decibelsToGain(smoothedGR_Db);
+        // The automatic threshold counts from the recent peak of what this
+        // channel's detector reads (of its input, in FeedBack).
+        T threshNow = thresh;
+        if (autoThreshold_.load(std::memory_order_relaxed))
+        {
+            const T heard = (topoEff == Topology::FeedBack) ? gainToDecibels(std::abs(detectorSafe(input))) : levelDb;
+            double& ref = autoRefDb_[static_cast<size_t>(channel)];
+            ref = std::max(static_cast<double>(heard), ref - autoRefFall_);
+            threshNow = thresh + static_cast<T>(ref);
+        }
+        T smoothedGR_Db = gainPath(levelDb, channel, cfg, threshNow, ratio, knee);
+        // The gain the loop reads back is the whole one; the amount scales
+        // what is heard (and metered).
+        const T loopGainLinear = decibelsToGain(smoothedGR_Db);
+        if (amount < T(1)) smoothedGR_Db *= amount;
+        T smoothedGainLinear = (amount < T(1)) ? decibelsToGain(smoothedGR_Db) : loopGainLinear;
 
         const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
         if (advanceShared)
@@ -453,7 +475,7 @@ public:
         // The feedback detector reads the compressed signal BEFORE makeup:
         // makeup is applied after the element, so feeding it back would shift
         // the static curve by the makeup (and run away with auto makeup).
-        fbLastOutput_[channel] = output;
+        fbLastOutput_[channel] = (amount < T(1)) ? input * loopGainLinear : output;
         output *= makeupToGain(makeup);
         gainReductionDb_.store(smoothedGR_Db, std::memory_order_relaxed);
         return output;
@@ -476,6 +498,8 @@ public:
             scHpfPrev_[ch] = T(0);
             channelLevelDb_[ch] = T(-200);
             lookaheadBuffers_[ch].reset();
+            gainDelay_[ch].reset();
+            autoRefDb_[ch] = -100.0;
             hilbertDetectors_[ch].reset();
         }
         for (auto& buf : rmsBuffers_)
@@ -498,6 +522,7 @@ public:
         makeupSmooth_.skip();
         mixSmooth_.skip();
         colorSmooth_.skip();
+        amountSmooth_.skip();
     }
 
     // =========================================================================
@@ -626,6 +651,76 @@ public:
         lookaheadMs_.store(std::clamp(ms, T(0), T(10)), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief Keeps a latency of its own for the lookahead, so the lookahead can move without the latency changing.
+     *
+     * With a maximum above 0 the audio is always that late (getLatency()
+     * reports it) and setLookahead() moves inside it: the gain is held back
+     * by the difference, so the lookahead can be automated while the host
+     * keeps one delay compensation. 0 (the default) is the behaviour of
+     * before: the latency is the lookahead. FeedBack runs without lookahead
+     * and without latency either way.
+     *
+     * @param ms Latency kept for the lookahead, 0 to 10 ms.
+     */
+    void setMaxLookahead(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        maxLookaheadMs_.store(std::clamp(ms, T(0), T(10)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief The latency kept for the lookahead, in ms (0: none; see setMaxLookahead()). */
+    [[nodiscard]] T getMaxLookahead() const noexcept { return maxLookaheadMs_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Makes the threshold count from the key's own recent peak instead of from full scale.
+     *
+     * A reference follows the level the detector reads: it rises at once
+     * and falls 1 dB per second, and the threshold is added to it. The
+     * compressor then acts the same on a take recorded 20 dB lower: what it
+     * hears is how far the level is from its own recent maximum. In
+     * FeedBack the reference follows the input. Off by default.
+     */
+    void setAutoThreshold(bool on) noexcept { autoThreshold_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the threshold counts from the key's recent peak (setAutoThreshold()). */
+    [[nodiscard]] bool isAutoThreshold() const noexcept { return autoThreshold_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Sets how much of the gain change is applied, as a scale of its decibels.
+     *
+     * 1 (the default) applies it all; 0.5 turns 8 dB of reduction into 4 at
+     * every instant, with the same timing. Unlike the parallel mix it does
+     * not add the unprocessed signal back, so there is nothing to cancel
+     * against: it is the same compressor at a gentler ratio. In FeedBack the
+     * loop keeps hearing the full reduction. Smoothed.
+     *
+     * @param amount Share of the gain change, 0 to 1.
+     */
+    void setAmount(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        amount_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief The share of the gain change that is applied (setAmount()). */
+    [[nodiscard]] T getAmount() const noexcept { return amount_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Makes the gain change approach the range without a corner.
+     *
+     * With it on, a target of g dB under a range of R becomes
+     * g / (1 + (g / R)^4)^(1/4): the same as g while it is small (1.5 % less
+     * at half the range), 16 % less at the range, and never more than the
+     * range. Off (the default) the target is cut at the range. The
+     * semi-implicit FeedBack loop (Peak detector) keeps the corner.
+     */
+    void setSoftRange(bool on) noexcept { softRange_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the gain change approaches the range without a corner (setSoftRange()). */
+    [[nodiscard]] bool isSoftRange() const noexcept { return softRange_.load(std::memory_order_relaxed); }
 
     /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, Hilbert). */
     void setDetector(DetectorType type) noexcept
@@ -814,7 +909,9 @@ public:
         // before the next block has consumed the coefficient-update flag.
         const int lookNow = static_cast<int>(static_cast<T>(sampleRate_) * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
-        return lookNow;
+        const int kept = static_cast<int>(static_cast<T>(sampleRate_) * std::clamp(
+            maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
+        return std::max(lookNow, kept);
     }
 
 
@@ -847,6 +944,10 @@ public:
         w.write("scHpf", scHpfEnabled_.load(std::memory_order_relaxed));
         w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
         w.write("rmsWindow", static_cast<float>(rmsWindowMsAtomic_.load(std::memory_order_relaxed)));
+        w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
+        w.write("maxLookahead", static_cast<float>(maxLookaheadMs_.load(std::memory_order_relaxed)));
+        w.write("amount", static_cast<float>(amount_.load(std::memory_order_relaxed)));
+        w.write("softRange", softRange_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -878,6 +979,10 @@ public:
         setMode(static_cast<Mode>(r.read("mode", 0)));
         setSidechainHPF(r.read("scHpf", false), static_cast<T>(r.read("scHpfFreq", 80.0f)));
         setRmsWindow(static_cast<T>(r.read("rmsWindow", 10.0f)));
+        setAutoThreshold(r.read("autoThreshold", false));
+        setMaxLookahead(static_cast<T>(r.read("maxLookahead", 0.0f)));
+        setAmount(static_cast<T>(r.read("amount", 1.0f)));
+        setSoftRange(r.read("softRange", false));
         return true;
     }
 
@@ -927,6 +1032,7 @@ protected:
         makeupSmooth_.setTargetValue(makeupGain_.load(std::memory_order_relaxed));
         mixSmooth_.setTargetValue(mix_.load(std::memory_order_relaxed));
         colorSmooth_.setTargetValue(characterColor_.load(std::memory_order_relaxed));
+        amountSmooth_.setTargetValue(amount_.load(std::memory_order_relaxed));
 
         if (timeConstantsDirty_.exchange(false, std::memory_order_acquire))
             updateTimeConstants(static_cast<T>(sampleRate_));
@@ -971,7 +1077,8 @@ protected:
 
         // Lookahead breaks causal logic in Feedback mode, so it is strictly
         // disabled there.
-        int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : lookaheadSamples_;
+        int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : latencySamples_;
+        const bool autoThr = autoThreshold_.load(std::memory_order_relaxed);
 
         // Fully linked channels share one gain computer: every channel reads
         // the same linked level into the same state, so computing it once per
@@ -985,13 +1092,15 @@ protected:
         // per sample (a settled smoother returns its target either way).
         const bool paramsMoving = thresholdSmooth_.isSmoothing() || ratioSmooth_.isSmoothing()
                                || kneeSmooth_.isSmoothing() || makeupSmooth_.isSmoothing()
-                               || mixSmooth_.isSmoothing() || colorSmooth_.isSmoothing();
+                               || mixSmooth_.isSmoothing() || colorSmooth_.isSmoothing()
+                               || amountSmooth_.isSmoothing();
         T thresh   = thresholdSmooth_.getCurrentValue();
         T ratio    = ratioSmooth_.getCurrentValue();
         T knee     = kneeSmooth_.getCurrentValue();
         T mkupBase = makeupSmooth_.getCurrentValue();
         T mixVal   = mixSmooth_.getCurrentValue();
         T colorAmt = colorSmooth_.getCurrentValue();
+        T amount   = amountSmooth_.getCurrentValue();
         const bool staticMakeup = autoMkup == AutoMakeupMode::Static && modeType == Mode::Downward;
         const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
         syncAdaptiveMakeup(adaptiveMakeup);
@@ -1010,8 +1119,8 @@ protected:
             const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
                                          activeLookahead, scHpf, shared, decoupled,
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
-                                         paramsMoving };
-            const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal, staticMakeupDb };
+                                         paramsMoving, autoThr, activeLookahead - lookaheadSamples_ };
+            const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal, staticMakeupDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
             return;
         }
@@ -1026,6 +1135,7 @@ protected:
                 mkupBase = makeupSmooth_.getNextValue();
                 mixVal   = mixSmooth_.getNextValue();
                 colorAmt = colorSmooth_.getNextValue();
+                amount   = amountSmooth_.getNextValue();
                 // Static auto makeup follows the smoothed curve parameters, so
                 // it stays click-free through threshold/ratio/knee automation.
                 if (staticMakeup)
@@ -1040,6 +1150,17 @@ protected:
             if (adaptiveMakeup)
                 makeupDb += -autoMakeupEnv_;
             const T makeupLin = makeupToGain(makeupDb);
+
+            // The automatic threshold: here (FeedBack) its reference follows
+            // the linked input, since the detector reads the output.
+            T threshNow = thresh;
+            if (autoThr)
+            {
+                T top = T(0);
+                for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(detectorSafe(audio.getChannel(ch)[i])));
+                autoRefDb_[0] = std::max(static_cast<double>(gainToDecibels(top)), autoRefDb_[0] - autoRefFall_);
+                threshNow = thresh + static_cast<T>(autoRefDb_[0]);
+            }
 
             // 1. Detection path (per channel: every detector keeps its own state)
             T linkedLin = T(0);
@@ -1074,12 +1195,15 @@ protected:
             T blockGR = T(0);
             if (shared)
             {
-                blockGR = gainPath(gainToDecibels(linkedLin), 0, cfg, thresh, ratio, knee);
+                blockGR = gainPath(gainToDecibels(linkedLin), 0, cfg, threshNow, ratio, knee);
                 // (0 dB is the common case below threshold: skip the exp.)
                 const T gainLin = (blockGR == T(0)) ? T(1) : decibelsToGain(blockGR);
+                // The amount scales what is applied; the loop keeps the whole.
+                if (amount < T(1)) blockGR *= amount;
+                const T outLin = (amount < T(1)) ? decibelsToGain(blockGR) : gainLin;
                 for (int ch = 0; ch < nCh; ++ch)
                     applyGain(audio, ch, i, gainLin, blockGR, activeLookahead, charType,
-                              colorAmt, makeupLin, mixVal);
+                              colorAmt, makeupLin, mixVal, outLin);
             }
             else
             {
@@ -1089,10 +1213,12 @@ protected:
                 {
                     const T chLevel = channelLevelDb_[ch];
                     const T inputDb = chLevel + sLink * (linkedLevel - chLevel);
-                    const T smoothedGR_Db = gainPath(inputDb, ch, cfg, thresh, ratio, knee);
+                    T smoothedGR_Db = gainPath(inputDb, ch, cfg, threshNow, ratio, knee);
                     const T gainLin = (smoothedGR_Db == T(0)) ? T(1) : decibelsToGain(smoothedGR_Db);
+                    if (amount < T(1)) smoothedGR_Db *= amount;
+                    const T outLin = (amount < T(1)) ? decibelsToGain(smoothedGR_Db) : gainLin;
                     applyGain(audio, ch, i, gainLin, smoothedGR_Db, activeLookahead, charType,
-                              colorAmt, makeupLin, mixVal);
+                              colorAmt, makeupLin, mixVal, outLin);
                     if (ch == 0 || smoothedGR_Db < blockGR)
                         blockGR = smoothedGR_Db; // Track worst-case GR for metering
                 }
@@ -1149,12 +1275,14 @@ protected:
         bool staticMakeup;
         bool adaptiveMakeup;
         bool paramsMoving;
+        bool autoThreshold;     ///< The threshold counts from the key's recent peak.
+        int gainDelay;          ///< Samples the gain is held back: the latency kept minus the lookahead.
     };
 
     /** @brief Parameter values of a block whose smoothers are settled. */
     struct ChunkParams
     {
-        T thresh, ratio, knee, makeup, mix, staticMakeup;
+        T thresh, ratio, knee, makeup, mix, staticMakeup, amount;
     };
 
     static constexpr int kChunk = 32; ///< Frames per pass of the feed-forward path.
@@ -1175,6 +1303,7 @@ protected:
                             const ChunkParams& constants) noexcept
     {
         T thr[kChunk], rat[kChunk], kn[kChunk], mk[kChunk], mixA[kChunk], stMk[kChunk];
+        T amt[kChunk], thrNow[kChunk];
         T mkLin[kChunk];
         T level[kMaxChannels][kChunk];   // linear level, then dB level, then linear gain
         T gain[kMaxChannels][kChunk];    // smoothed gain change (dB)
@@ -1189,6 +1318,7 @@ protected:
             std::fill_n(mk, kChunk, constants.makeup);
             std::fill_n(mixA, kChunk, constants.mix);
             std::fill_n(stMk, kChunk, constants.staticMakeup);
+            std::fill_n(amt, kChunk, constants.amount);
         }
 
         T lastGr = T(0);
@@ -1208,6 +1338,7 @@ protected:
                     mk[k]   = makeupSmooth_.getNextValue();
                     mixA[k] = mixSmooth_.getNextValue();
                     (void)colorSmooth_.getNextValue();
+                    amt[k]  = amountSmooth_.getNextValue();
                     stMk[k] = ff.staticMakeup
                         ? computeGain(T(0), thr[k], rat[k], kn[k], ff.charType, Mode::Downward, T(0)) * T(-0.5)
                         : T(0);
@@ -1276,6 +1407,23 @@ protected:
                 }
             }
 
+            // The automatic threshold: the reference follows the largest
+            // level the gain computers read, and the threshold counts from it.
+            const T* thrUse = thr;
+            if (ff.autoThreshold)
+            {
+                double ref = autoRefDb_[0];
+                for (int k = 0; k < m; ++k)
+                {
+                    T top = level[0][k];
+                    for (int g = 1; g < nGain; ++g) top = std::max(top, level[g][k]);
+                    ref = std::max(static_cast<double>(top), ref - autoRefFall_);
+                    thrNow[k] = thr[k] + static_cast<T>(ref);
+                }
+                autoRefDb_[0] = ref;
+                thrUse = thrNow;
+            }
+
             // D. Static curve, hold/range and ballistics: the serial part.
             //    SplitPolarity's level-adaptive release reads the previous
             //    frame's output, so its recursion also forms the linear gain
@@ -1283,8 +1431,32 @@ protected:
             for (int g = 0; g < nGain; ++g)
             {
                 const T* dryIn = (ff.lookahead > 0) ? delayed[g] : audio.getChannel(g) + o;
-                runGainRecursion(level[g], gain[g], m, g, ff, thr, rat, kn,
+                runGainRecursion(level[g], gain[g], m, g, ff, thrUse, rat, kn,
                                  ff.splitAdaptive ? dryIn : nullptr);
+            }
+
+            // What is heard of the gain: held back while the lookahead is
+            // shorter than the latency kept for it, and scaled by the amount.
+            const bool scaled = ff.paramsMoving || constants.amount < T(1);
+            if (ff.gainDelay > 0 || scaled)
+            {
+                for (int g = 0; g < nGain; ++g)
+                {
+                    T* gd = gain[g];
+                    if (ff.gainDelay > 0)
+                        for (int k = 0; k < m; ++k)
+                        {
+                            gainDelay_[g].push(gd[k]);
+                            gd[k] = gainDelay_[g].read(ff.gainDelay);
+                        }
+                    if (scaled)
+                        for (int k = 0; k < m; ++k)
+                            if (amt[k] < T(1)) gd[k] *= amt[k];
+                    // SplitPolarity formed its linear gain inside the recursion.
+                    if (ff.splitAdaptive)
+                        for (int k = 0; k < m; ++k)
+                            level[g][k] = (gd[k] == T(0)) ? T(1) : decibelsToGain(gd[k]);
+                }
             }
 
             // E. Metering, adaptive makeup (frame by frame, like the
@@ -1394,6 +1566,7 @@ protected:
         T held = heldGrDb_[ch];
         int counter = holdCounters_[ch];
         const T range = rangeDb_.load(std::memory_order_relaxed);
+        const bool soft = softRange_.load(std::memory_order_relaxed);
         const int holdN = holdSamples_;
         const bool upward = ff.modeType == Mode::Upward;
 
@@ -1421,7 +1594,7 @@ protected:
             T lastWet = fbLastOutput_[ch];
             for (int k = 0; k < m; ++k)
             {
-                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter);
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
                 const double lastOut = std::abs(static_cast<double>(lastWet));
                 const double outputLevel = (lastOut < 1.0) ? lastOut : 1.0;
                 double y;
@@ -1447,7 +1620,7 @@ protected:
         {
             for (int k = 0; k < m; ++k)
             {
-                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter);
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
                 const double y = ff.decoupled
                     ? decoupledStep(static_cast<double>(tgt), hold, fast, decHoldCoeff_)
                     : ballisticsStep(static_cast<double>(tgt), fast, slow, charAttCoeff_, charRelCoeff_);
@@ -1518,7 +1691,7 @@ protected:
      */
     void applyGain(AudioBufferView<T>& audio, int ch, int i, T gainLin, T grDb,
                    int activeLookahead, Character charType, T colorAmt, T makeupLin,
-                   T mixVal) noexcept
+                   T mixVal, T outLin) noexcept
     {
         T* data = audio.getChannel(ch);
         T input;
@@ -1532,7 +1705,9 @@ protected:
             input = data[i];
         }
 
-        T wet = input * gainLin;
+        // outLin is the gain that is heard (gainLin scaled by the amount);
+        // gainLin is the one the loop reads back.
+        T wet = input * outLin;
         if (colorAmt > T(0) && charType == Character::FET)
         {
             // 2nd-order FET channel modulation: the drain-source resistance
@@ -1549,7 +1724,7 @@ protected:
         // The feedback detector reads the compressed signal before makeup
         // (makeup sits after the element; feeding it back would shift the
         // static curve and run away with auto makeup).
-        fbLastOutput_[ch] = wet;
+        fbLastOutput_[ch] = (outLin == gainLin) ? wet : input * gainLin;
         wet *= makeupLin;
 
         // Parallel (New York) mix done inline: the dry reference is `input`,
@@ -1686,6 +1861,9 @@ protected:
 
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
+        latencySamples_ = std::max(lookaheadSamples_, static_cast<int>(fs * std::clamp(
+            maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000)));
+        autoRefFall_ = kAutoRefFallDb / static_cast<double>(fs);
 
         holdSamples_ = static_cast<int>(fs * holdMs_.load(std::memory_order_relaxed) / T(1000));
     }
@@ -1699,7 +1877,7 @@ protected:
     [[nodiscard]] T applyHoldAndRange(T targetGR_Db, int ch) noexcept
     {
         return holdAndRange(targetGR_Db, rangeDb_.load(std::memory_order_relaxed), holdSamples_,
-                            heldGrDb_[ch], holdCounters_[ch]);
+                            heldGrDb_[ch], holdCounters_[ch], softRange_.load(std::memory_order_relaxed));
     }
 
     /**
@@ -1709,11 +1887,21 @@ protected:
      * @param holdSamples Hold length in samples (0 = off).
      * @param held        Held gain change (state).
      * @param counter     Remaining hold samples (state).
+     * @param soft        True to approach the range without a corner (setSoftRange()).
      */
     [[nodiscard]] static T holdAndRange(T targetGR_Db, T range, int holdSamples,
-                                        T& held, int& counter) noexcept
+                                        T& held, int& counter, bool soft = false) noexcept
     {
-        targetGR_Db = std::clamp(targetGR_Db, -range, range);
+        if (soft && range > T(0))
+        {
+            // g / (1 + (g / R)^4)^(1/4): g while it is small, R at most.
+            const T x = targetGR_Db / range, x2 = x * x;
+            targetGR_Db /= std::sqrt(std::sqrt(T(1) + x2 * x2));
+        }
+        else
+        {
+            targetGR_Db = std::clamp(targetGR_Db, -range, range);
+        }
 
         if (holdSamples > 0)
         {
@@ -2655,6 +2843,18 @@ protected:
     int holdSamples_ = 0;
     std::array<int, kMaxChannels> holdCounters_ {};
     std::array<T, kMaxChannels> heldGrDb_ {};
+
+    // Automatic threshold, lookahead inside a fixed latency, amount, soft range.
+    static constexpr double kAutoRefFallDb = 1.0;   ///< dB per second the reference of the automatic threshold falls.
+    std::atomic<bool> autoThreshold_ { false };     ///< The threshold counts from the key's own recent peak.
+    std::array<double, kMaxChannels> autoRefDb_ {}; ///< That reference per channel (the linked one in slot 0), in dB.
+    double autoRefFall_ = 0.0;                      ///< Its fall per sample, in dB.
+    std::atomic<T> maxLookaheadMs_ { T(0) };        ///< Latency kept for the lookahead (0: the lookahead itself).
+    int latencySamples_ = 0;                        ///< Delay of the audio in feed-forward (audio thread).
+    std::array<RingBuffer<T>, kMaxChannels> gainDelay_ {}; ///< Holds the gain back while the lookahead is shorter than the latency.
+    std::atomic<T> amount_ { T(1) };                ///< Share of the gain change that is applied, in dB.
+    SmoothedValue<T> amountSmooth_;                 ///< De-zippered amount.
+    std::atomic<bool> softRange_ { false };         ///< The gain change approaches the range without a corner.
 
     std::atomic<T> gainReductionDb_ { T(0) }; ///< Publicly readable Gain Reduction meter.
 };

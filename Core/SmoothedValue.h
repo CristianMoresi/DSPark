@@ -46,6 +46,13 @@ namespace dspark {
  *   is the same at every sample rate. (It used to ignore rampTimeMs and
  *   always take 171 ms to 99%.)
  *
+ * **Step-dependent ramps (opt-in, Linear only).** setAdaptiveRamp() makes
+ * the duration of each linear ramp depend on the size of the step that starts
+ * it: a small move (fine automation, a knob nudged) glides over the slow time
+ * and hides its steps, a large jump (a preset, a switch) lands in the fast
+ * time. In between the duration follows a square law of how close the step
+ * is to nothing. An edit in mid ramp starts from the value already reached.
+ *
  * The recursion state is double regardless of T (the framework rule for
  * recursive state): in float the one-pole stalls hundreds of epsilons short
  * of the target when the per-sample increment rounds to zero, which would
@@ -142,6 +149,40 @@ public:
 
     /** @brief Returns the current smoothing algorithm. */
     [[nodiscard]] SmoothingType getSmoothingType() const noexcept { return type_; }
+
+    /**
+     * @brief Makes the duration of every Linear ramp depend on its step.
+     *
+     * A step of `span` or more takes `fastMs`; a step that tends to nothing
+     * takes `slowMs`; a step d in between takes
+     * fastMs + (slowMs - fastMs) * (1 - d / span)^2. The ramp stays linear and
+     * lands exactly on the target after that time. Only the Linear curve
+     * uses it; the ramp time given to prepare() then no longer applies to it.
+     *
+     * @param span   Step size, in the units of the value, from which a ramp
+     *               takes the fast time. Zero, negative or non-finite turns
+     *               the feature off (the default) and restores prepare()'s
+     *               ramp time.
+     * @param fastMs Duration of a ramp over `span` or more, in milliseconds.
+     * @param slowMs Duration towards which a vanishing step tends.
+     */
+    void setAdaptiveRamp(double span, double fastMs, double slowMs) noexcept
+    {
+        if (!(span > 0.0) || !std::isfinite(span) || !std::isfinite(fastMs) || !std::isfinite(slowMs))
+        {
+            adaptiveSpan_ = 0.0;
+        }
+        else
+        {
+            adaptiveSpan_ = span;
+            adaptiveFastMs_ = std::max(0.0, fastMs);
+            adaptiveSlowMs_ = std::max(0.0, slowMs);
+        }
+        updateLinearRate();
+    }
+
+    /** @brief Whether step-dependent ramps are on (see setAdaptiveRamp()). */
+    [[nodiscard]] bool hasAdaptiveRamp() const noexcept { return adaptiveSpan_ > 0.0; }
 
     /**
      * @brief Updates the target value. Safe to call continuously (e.g., from host automation).
@@ -336,7 +377,15 @@ private:
 
     void updateLinearRate() noexcept
     {
-        linearRate_ = std::abs(static_cast<double>(target_) - current_) / rampSamples_;
+        const double distance = std::abs(static_cast<double>(target_) - current_);
+        double samples = rampSamples_;
+        if (adaptiveSpan_ > 0.0)
+        {
+            const double closeness = std::max(0.0, 1.0 - distance / adaptiveSpan_);
+            const double ms = adaptiveFastMs_ + (adaptiveSlowMs_ - adaptiveFastMs_) * closeness * closeness;
+            samples = std::max(1.0, ms * sampleRate_ / 1000.0);
+        }
+        linearRate_ = distance / samples;
     }
 
     double current_{ 0.0 };
@@ -347,6 +396,11 @@ private:
     double expCoeff_{ 0.0 };
     double linearRate_{ 0.0 };
     double rampSamples_{ 882.0 };
+
+    // Step-dependent linear ramps (off while the span is zero)
+    double adaptiveSpan_{ 0.0 };
+    double adaptiveFastMs_{ 20.0 };
+    double adaptiveSlowMs_{ 150.0 };
 
     // Chase state & coefficients
     static constexpr double kChaseNaturalMs = 171.0;  ///< 99% time of the unstretched curve.

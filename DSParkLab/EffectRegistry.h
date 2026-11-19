@@ -27,6 +27,7 @@ inline EffectSlot makeFilterEngine()
     s.addSlider("Gain", -24, 24, 0, "dB");
     s.addSlider("Slope", 6, 48, 12, "dB/oct");
     s.addSlider("Nonlinearity", 0, 1, 0, "");
+    s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // 6: ladder = passive under fast modulation
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -63,6 +64,7 @@ inline EffectSlot makeFilterEngine()
                 break;
             }
             case 5: p->setNonlinearity(v); break;
+            case 6: p->setStructure(static_cast<dspark::FilterEngine<float>::Structure>(static_cast<int>(v))); break;
         }
     };
     // Interactive response curve. Reconstructs the exact cascade from the public
@@ -373,6 +375,7 @@ inline EffectSlot makeCompressor()
     // The gain smoothed after the ballistics (index 32).
     s.addSlider("Gain Smoothing", 0, 50, 0, "ms");
     s.addToggle("Delta Listen", false);   // 33: what the compression takes out
+    s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // 34: the pair read as its dominant component
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -429,6 +432,7 @@ inline EffectSlot makeCompressor()
             }
             case 32: p->setGainSmoothing(v); break;
             case 33: p->setDelta(v > 0.5f); break;
+            case 34: p->setLinkMode(static_cast<dspark::Compressor<float>::LinkMode>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -856,23 +860,34 @@ inline EffectSlot makeClipper()
     // A/B: second-order antiderivative antialiasing (opt-in; adds a few
     // samples of latency, matched on the dry path).
     s.addToggle("Antialiasing (2nd order)", false);                  // index 7
-    s.prepareFn = [p, spec, osWanted, osApplied](auto& sp) {
+    // Linear-phase (default) or minimum-phase oversampling filters; the
+    // dry copy of the mix follows the minimum-phase ones (index 8).
+    s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0);
+    auto filtWanted  = std::make_shared<std::atomic<int>>(0);
+    auto filtApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, spec, osWanted, osApplied, filtWanted, filtApplied](auto& sp) {
         *spec = sp;
         p->setOversampling(osWanted->load(std::memory_order_relaxed));
+        p->setOversamplingMode(static_cast<dspark::Clipper<float>::OversamplingMode>(filtWanted->load(std::memory_order_relaxed)));
         p->prepare(sp);
         osApplied->store(osWanted->load(std::memory_order_relaxed), std::memory_order_relaxed);
+        filtApplied->store(filtWanted->load(std::memory_order_relaxed), std::memory_order_relaxed);
     };
-    s.processFn = [p, spec, osWanted, osApplied](auto b) {
+    s.processFn = [p, spec, osWanted, osApplied, filtWanted, filtApplied](auto b) {
         const int want = osWanted->load(std::memory_order_relaxed);
-        if (want != osApplied->load(std::memory_order_relaxed) && spec->sampleRate > 0) {
+        const int filt = filtWanted->load(std::memory_order_relaxed);
+        if ((want != osApplied->load(std::memory_order_relaxed) || filt != filtApplied->load(std::memory_order_relaxed))
+            && spec->sampleRate > 0) {
             p->setOversampling(want);
+            p->setOversamplingMode(static_cast<dspark::Clipper<float>::OversamplingMode>(filt));
             p->prepare(*spec);          // rebuilds filters - safe here (audio thread)
             osApplied->store(want, std::memory_order_relaxed);
+            filtApplied->store(filt, std::memory_order_relaxed);
         }
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, osWanted](int i, float v) {
+    s.setParamFn = [p, osWanted, filtWanted](int i, float v) {
         switch(i) {
             case 0: p->setMode(static_cast<dspark::Clipper<float>::Mode>(static_cast<int>(v))); break;
             case 1: p->setCeiling(v); break;
@@ -882,6 +897,7 @@ inline EffectSlot makeClipper()
             case 5: p->setSlewLimit(v); break;
             case 6: { static constexpr int f[] = {1,2,4,8,16}; osWanted->store(f[std::clamp(static_cast<int>(v),0,4)], std::memory_order_relaxed); break; }
             case 7: p->setAntialiasing(v > 0.5f); break;
+            case 8: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -1417,6 +1433,7 @@ inline EffectSlot makeDynamicEQ()
     auto lastSpec = std::make_shared<dspark::AudioSpec>();
     s.addToggle("Linear Phase", false);
     s.addToggle("Delta Listen", false);   // what the bands take out
+    s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // stereo bands read the dominant component
     s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
         const bool want = linearWanted->load(std::memory_order_relaxed);
         p->setLinearPhase(want);
@@ -1442,6 +1459,7 @@ inline EffectSlot makeDynamicEQ()
         if (i == oldCount) { p->setMixedBands(v > 0.5f); return; }
         if (i == oldCount + 1 + 2 * 5) { linearWanted->store(v > 0.5f, std::memory_order_relaxed); return; }
         if (i == oldCount + 2 + 2 * 5) { p->setDelta(v > 0.5f); return; }
+        if (i == oldCount + 3 + 2 * 5) { p->setLinkMode(static_cast<dspark::DynamicEQ<float>::LinkMode>(static_cast<int>(v))); return; }
         int band = 0, prm = 0;
         if (i < oldCount) { band = i / 9; prm = i % 9; }
         else              { band = (i - oldCount - 1) / 5; prm = 9 + (i - oldCount - 1) % 5; }
@@ -1652,6 +1670,7 @@ inline EffectSlot makeTapeMachine()
     s.addSlider("Calibration", 0, 9, 0, "dB");                             // 21
     s.addChoice("Monitor", {"Repro","Sync","Input"}, 0);                   // 22
     s.addToggle("Auto Oversampling", false);                               // 23
+    s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0); // 24
     // setAutomaticOversampling() is a setup call (it re-prepares): the UI
     // records the wish and the audio thread applies it between blocks.
     auto autoWanted  = std::make_shared<std::atomic<int>>(0);
@@ -1659,23 +1678,33 @@ inline EffectSlot makeTapeMachine()
     auto hum = std::make_shared<std::atomic<float>>(-120.0f);
     auto mains = std::make_shared<std::atomic<int>>(0);
     auto align = std::make_shared<std::array<std::atomic<float>, 2>>();
-    s.prepareFn = [p, autoWanted, autoApplied](auto& sp) {
+    auto filtWanted  = std::make_shared<std::atomic<int>>(0);
+    auto filtApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, autoWanted, autoApplied, filtWanted, filtApplied](auto& sp) {
         const int want = autoWanted->load(std::memory_order_relaxed);
         p->setAutomaticOversampling(want != 0);
         autoApplied->store(want, std::memory_order_relaxed);
+        const int filt = filtWanted->load(std::memory_order_relaxed);
+        p->setOversamplingMode(static_cast<dspark::TapeMachine<float>::OversamplingMode>(filt));
+        filtApplied->store(filt, std::memory_order_relaxed);
         p->prepare(sp);
     };
-    s.processFn = [p, autoWanted, autoApplied](auto b) {
+    s.processFn = [p, autoWanted, autoApplied, filtWanted, filtApplied](auto b) {
         const int want = autoWanted->load(std::memory_order_relaxed);
         if (want != autoApplied->load(std::memory_order_relaxed)) {
             p->setAutomaticOversampling(want != 0);   // setup call - safe here (audio thread)
             if (want == 0) p->setOversampling(4);
             autoApplied->store(want, std::memory_order_relaxed);
         }
+        const int filt = filtWanted->load(std::memory_order_relaxed);
+        if (filt != filtApplied->load(std::memory_order_relaxed)) {
+            p->setOversamplingMode(static_cast<dspark::TapeMachine<float>::OversamplingMode>(filt));   // re-prepares - safe here
+            filtApplied->store(filt, std::memory_order_relaxed);
+        }
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, autoWanted, hum, mains, align](int i, float v) {
+    s.setParamFn = [p, autoWanted, filtWanted, hum, mains, align](int i, float v) {
         using TM = dspark::TapeMachine<float>;
         switch (i) {
             case 0: p->setDrive(v); break;
@@ -1702,6 +1731,7 @@ inline EffectSlot makeTapeMachine()
             case 21: p->setCalibrationLevel(v); break;
             case 22: p->setMonitor(static_cast<TM::Monitor>(static_cast<int>(v))); break;
             case 23: autoWanted->store(v > 0.5f ? 1 : 0, std::memory_order_relaxed); break;
+            case 24: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
     return s;
@@ -1734,22 +1764,33 @@ inline EffectSlot makeTubePreamp()
     s.addSlider("Cab Size", 0, 1, 0.5f, "");
     s.addSlider("Cab Brightness", 0, 1, 0.5f, "");
     s.addSlider("Cab Mic Distance", 0, 1, 0.3f, "");
-    s.prepareFn = [p, gridWanted, gridApplied](auto& sp) {
+    s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0);   // index 13
+    auto filtWanted  = std::make_shared<std::atomic<int>>(0);
+    auto filtApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, gridWanted, gridApplied, filtWanted, filtApplied](auto& sp) {
         const int want = gridWanted->load(std::memory_order_relaxed);
         p->setGridModel(static_cast<TP::GridModel>(want));
         gridApplied->store(want, std::memory_order_relaxed);
+        const int filt = filtWanted->load(std::memory_order_relaxed);
+        p->setOversamplingMode(static_cast<TP::OversamplingMode>(filt));
+        filtApplied->store(filt, std::memory_order_relaxed);
         p->prepare(sp);
     };
-    s.processFn = [p, gridWanted, gridApplied](auto b) {
+    s.processFn = [p, gridWanted, gridApplied, filtWanted, filtApplied](auto b) {
         const int want = gridWanted->load(std::memory_order_relaxed);
         if (want != gridApplied->load(std::memory_order_relaxed)) {
             p->setGridModel(static_cast<TP::GridModel>(want));   // setup call - safe here (audio thread)
             gridApplied->store(want, std::memory_order_relaxed);
         }
+        const int filt = filtWanted->load(std::memory_order_relaxed);
+        if (filt != filtApplied->load(std::memory_order_relaxed)) {
+            p->setOversamplingMode(static_cast<TP::OversamplingMode>(filt));   // re-prepares - safe here (audio thread)
+            filtApplied->store(filt, std::memory_order_relaxed);
+        }
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, gridWanted](int i, float v) {
+    s.setParamFn = [p, gridWanted, filtWanted](int i, float v) {
         switch (i) {
             case 0: p->setDrive(v); break;
             case 1: p->setStages(static_cast<int>(v) + 1); break;
@@ -1764,6 +1805,7 @@ inline EffectSlot makeTubePreamp()
             case 10: p->getCabinet().setSize(v); break;
             case 11: p->getCabinet().setBrightness(v); break;
             case 12: p->getCabinet().setDistance(v); break;
+            case 13: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
     return s;

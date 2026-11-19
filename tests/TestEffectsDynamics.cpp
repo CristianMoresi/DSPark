@@ -5371,6 +5371,145 @@ DSPARK_TEST(Compressor_key_listen_plays_what_the_detector_hears)
     EXPECT_FALSE(b.isSidechainListen());
 }
 
+// New: the gate and the expander shape their key with the same equalizer.
+// A hum that holds them open stops doing so once a low cut takes it out of
+// the key; the audio is the one of an external key shaped by the same
+// filter; key listen plays what the detector hears while they keep working;
+// and the bands are part of the state.
+DSPARK_TEST(Gate_and_expander_shape_and_play_their_key)
+{
+    const int n = 24000;
+    const Vec hum = makeSine(60.0, 0.3, 48000.0, n);
+    Vec other(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        other[static_cast<size_t>(i)] = static_cast<float>(0.2 * std::sin(2.0 * kPiD * 90.0 * i / 48000.0));
+    CompKeyEq::Band cut;
+    cut.shape = CompKeyEq::Shape::LowCut;
+    cut.frequency = 500.0f;
+    cut.slope = 24.0f;
+    const auto shape = [&](CompKeyEq& eq) { eq.setBand(1, cut); };
+    const Vec heardHum = compShapedKey(hum, shape), heardOther = compShapedKey(other, shape);
+    const auto rmsOfTail = [&](const Vec& v) {
+        double sum = 0.0;
+        for (int i = n / 2; i < n; ++i) sum += static_cast<double>(v[static_cast<size_t>(i)]) * v[static_cast<size_t>(i)];
+        return std::sqrt(sum / (n / 2));
+    };
+    const double humRms = rmsOfTail(hum);
+
+    // One processor over the two channels, keyed by itself or by `key`.
+    const auto render = [&](auto& p, const std::vector<Vec>* key) {
+        std::vector<Vec> x { hum, other };
+        std::vector<Vec> k = key ? *key : std::vector<Vec>();
+        int at = 0;
+        processInBlocks(x, 256, [&](AudioBufferView<float> b) {
+            if (key)
+            {
+                float* ptr[2] = { k[0].data() + at, k[1].data() + at };
+                AudioBufferView<float> side(ptr, 2, b.getNumSamples());
+                p.processBlock(b, side);
+            }
+            else
+            {
+                p.processBlock(b);
+            }
+            at += b.getNumSamples();
+        });
+        return x;
+    };
+
+    // The gate.
+    {
+        using G = NoiseGate<float>;
+        const auto make = [&](bool shaped, bool listen) {
+            auto g = std::make_unique<G>();
+            g->setThreshold(-30.0f);
+            g->setHold(5.0f);
+            g->setRelease(20.0f);
+            if (shaped) g->setSidechainBand(1, cut);
+            g->setSidechainListen(listen);
+            g->prepare(48000.0, 2);
+            return g;
+        };
+        auto open = make(false, false);
+        const auto plain = render(*open, nullptr);
+        EXPECT_GT(rmsOfTail(plain[0]), humRms * 0.9);            // the hum holds it open
+        auto closed = make(true, false);
+        const auto shaped = render(*closed, nullptr);
+        EXPECT_LT(rmsOfTail(shaped[0]), humRms * 0.001);         // out of the key, it closes
+
+        // An external key through the same filter.
+        const std::vector<Vec> key { heardHum, heardOther };
+        auto outside = make(false, false);
+        const auto keyed = render(*outside, &key);
+        EXPECT_LT(compFarthest(shaped[0], keyed[0]), 1e-5);
+        EXPECT_LT(compFarthest(shaped[1], keyed[1]), 1e-5);
+
+        // Key listen, in the block path and one sample at a time.
+        auto listening = make(true, true);
+        const auto heard = render(*listening, nullptr);
+        EXPECT_LT(compFarthest(heard[0], heardHum), 1e-6);
+        EXPECT_LT(compFarthest(heard[1], heardOther), 1e-6);
+        auto single = make(true, true);
+        Vec y = hum;
+        for (auto& s : y) s = single->processSample(s);
+        EXPECT_LT(compFarthest(y, heardHum), 1e-6);
+
+        const auto blob = closed->getState();
+        G other2;
+        EXPECT_TRUE(other2.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(other2.getSidechainBand(1).shape == G::KeyShape::LowCut);
+        EXPECT_EQ(other2.getSidechainBand(1).frequency, 500.0f);
+        EXPECT_TRUE(other2.getState() == blob);
+        const auto listenBlob = listening->getState();
+        EXPECT_TRUE(other2.setState(listenBlob.data(), listenBlob.size()));
+        EXPECT_FALSE(other2.isSidechainListen());
+        other2.prepare(48000.0, 2);
+        EXPECT_LT(other2.getSidechainResponse().magnitudeDb(60.0), -60.0);
+    }
+
+    // The expander.
+    {
+        using E = Expander<float>;
+        const auto make = [&](bool shaped, bool listen) {
+            auto e = std::make_unique<E>();
+            e->setThreshold(-30.0f);
+            e->setRatio(4.0f);
+            e->setHold(5.0f);
+            if (shaped) e->setSidechainBand(1, cut);
+            e->setSidechainListen(listen);
+            e->prepare(48000.0, 2);
+            return e;
+        };
+        auto open = make(false, false);
+        const auto plain = render(*open, nullptr);
+        EXPECT_GT(rmsOfTail(plain[0]), humRms * 0.9);
+        auto closed = make(true, false);
+        const auto shaped = render(*closed, nullptr);
+        EXPECT_LT(rmsOfTail(shaped[0]), humRms * 0.1);
+
+        const std::vector<Vec> key { heardHum, heardOther };
+        auto outside = make(false, false);
+        const auto keyed = render(*outside, &key);
+        EXPECT_LT(compFarthest(shaped[0], keyed[0]), 1e-5);
+        EXPECT_LT(compFarthest(shaped[1], keyed[1]), 1e-5);
+
+        auto listening = make(true, true);
+        const auto heard = render(*listening, nullptr);
+        EXPECT_LT(compFarthest(heard[0], heardHum), 1e-6);
+        EXPECT_LT(compFarthest(heard[1], heardOther), 1e-6);
+
+        const auto blob = closed->getState();
+        E other2;
+        EXPECT_TRUE(other2.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(other2.getSidechainBand(1).shape == E::KeyShape::LowCut);
+        EXPECT_EQ(other2.getSidechainBand(1).slope, 24.0f);
+        EXPECT_TRUE(other2.getState() == blob);
+        const auto listenBlob = listening->getState();
+        EXPECT_TRUE(other2.setState(listenBlob.data(), listenBlob.size()));
+        EXPECT_FALSE(other2.isSidechainListen());
+    }
+}
+
 // ============================================================================
 // Limiter: a latency kept for the lookahead
 // ============================================================================

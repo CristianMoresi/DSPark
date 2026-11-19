@@ -6,6 +6,7 @@
 
 #include "../Core/Biquad.h"
 #include "../Core/BiquadCascade.h"
+#include "../Core/FilterDesign.h"
 #include "../Core/NormalizedLadder.h"
 #include "../Core/StateVariableFilter.h"
 #include "../Core/LadderFilter.h"
@@ -3396,4 +3397,714 @@ DSPARK_TEST(BiquadCascade_low_corners_at_high_rates_stay_clean)
     }
     EXPECT_LT(worst, 1e-8);
     EXPECT_LT(std::abs(mean), 1e-9);
+}
+
+// ============================================================================
+// FilterDesign: digital sections that follow their analog prototypes, and the
+// cascades of an equalizer
+// ============================================================================
+
+namespace {
+
+struct DesignError { double all = 0.0, heard = 0.0; };
+
+// Worst distance in decibels between a biquad and its prototype from 20 Hz to
+// 20 kHz: wherever either is above -100 dB, and where the prototype is above
+// -60 dB.
+DesignError designError(const AnalogSection& h, const BiquadCoeffs& c, double fs)
+{
+    const double top = std::min(20000.0, 0.499 * fs);
+    DesignError e;
+    for (int i = 0; i < 240; ++i)
+    {
+        const double f = 20.0 * std::pow(top / 20.0, i / 239.0);
+        const double a = h.magnitudeDb(f);
+        const double d = 20.0 * std::log10(std::max(c.getMagnitude(f, fs), 1e-15));
+        if (a < -100.0 && d < -100.0) continue;
+        e.all = std::max(e.all, std::abs(a - d));
+        if (a >= -60.0) e.heard = std::max(e.heard, std::abs(a - d));
+    }
+    return e;
+}
+
+bool designStable(const BiquadCoeffs& c)
+{
+    return std::isfinite(c.b0) && std::isfinite(c.b1) && std::isfinite(c.b2)
+        && std::abs(c.a2) < 1.0 && std::abs(c.a1) < 1.0 + c.a2;
+}
+
+// A cascade as biquads against its prototype where the prototype is above -60 dB.
+double cascadeError(const AnalogCascade& c, double fs, int* unstable = nullptr)
+{
+    BiquadCoeffs sections[AnalogCascade::kMaxSections];
+    const int n = FilterDesign::digital(c, fs, sections, AnalogCascade::kMaxSections);
+    if (unstable != nullptr)
+        for (int i = 0; i < n; ++i) *unstable += designStable(sections[i]) ? 0 : 1;
+    const double top = std::min(20000.0, 0.499 * fs);
+    double worst = 0.0;
+    for (int k = 0; k <= 400; ++k)
+    {
+        const double hz = 20.0 * std::pow(top / 20.0, k / 400.0);
+        const double want = c.magnitudeDb(hz);
+        if (want > -60.0) worst = std::max(worst, std::abs(FilterDesign::magnitudeDb(sections, n, hz, fs) - want));
+    }
+    return worst;
+}
+
+// The curve a cut of a real order follows (corner at 1): Butterworth from
+// order 1 up, the fraction of a pole under it.
+double idealCutDb(double order, double w)
+{
+    if (order < 1.0) return -10.0 * order * std::log10(1.0 + w * w);
+    return -10.0 * std::log10(1.0 + std::pow(w, 2.0 * order));
+}
+
+} // namespace
+
+// The gap this closes: a biquad from the bilinear transform squeezes its
+// prototype under Nyquist, and the closed-form matched designs still leave
+// decibels near the top of the band (a bell at 12 kHz of Q 2 and +24 dB:
+// 2.9 dB at 48 kHz). digital() stays within tenths over the same grid.
+DSPARK_TEST(FilterDesign_sections_follow_the_analog_magnitude_up_to_nyquist)
+{
+    const double freqs[] = { 30, 100, 300, 1000, 3000, 5000, 8000, 10000, 12000, 15000, 18000, 20000 };
+    const double qs[] = { 0.3, 0.5, 0.7071, 1, 2, 4, 8, 16 };
+    const double gains[] = { -24, -18, -6, -1, -0.1, 0.1, 1, 6, 18, 24 };
+    const double slopes[] = { 0.3, 0.5, 1.0 };
+
+    struct Worst { double bell = 0, shelf = 0, lowPass = 0, highPass = 0, bandPass = 0, notch = 0, first = 0; };
+    // What each rate allows digital(): measured, with room for another compiler.
+    struct Allowed { double fs; Worst now; };
+    const Allowed allowed[] = {
+        { 44100.0, { 0.62, 0.24, 0.42, 2.40, 0.80, 3.20, 0.50 } },
+        { 48000.0, { 0.30, 0.13, 0.20, 1.50, 0.45, 0.50, 0.33 } },
+        { 96000.0, { 0.03, 0.03, 0.02, 0.09, 0.04, 0.04, 0.04 } },
+    };
+    for (const Allowed& rate : allowed)
+    {
+        const double fs = rate.fs;
+        const FilterDesign::Band band(fs);
+        Worst now, closed, plain;      // digital(), the closed-form matched designs, the bilinear transform
+        int unstable = 0;
+        const auto design = [&](const AnalogSection& h) {
+            const BiquadCoeffs c = FilterDesign::digital(h, band);
+            if (!designStable(c)) ++unstable;
+            return c;
+        };
+        for (const double f : freqs)
+        {
+            if (f > 0.46 * fs) continue;
+            for (const double q : qs)
+            {
+                for (const double g : gains)
+                {
+                    const AnalogSection h = AnalogSection::peak(f, q, g);
+                    now.bell = std::max(now.bell, designError(h, design(h), fs).all);
+                    closed.bell = std::max(closed.bell, designError(h, BiquadCoeffs::makePeakMatched(fs, f, q, g), fs).all);
+                    plain.bell = std::max(plain.bell, designError(h, FilterDesign::bilinear(h, fs, f), fs).all);
+                }
+                AnalogSection h = AnalogSection::lowPass(f, q);
+                now.lowPass = std::max(now.lowPass, designError(h, design(h), fs).heard);
+                closed.lowPass = std::max(closed.lowPass, designError(h, BiquadCoeffs::makeLowPassMatched(fs, f, q), fs).heard);
+                h = AnalogSection::highPass(f, q);
+                now.highPass = std::max(now.highPass, designError(h, design(h), fs).all);
+                closed.highPass = std::max(closed.highPass, designError(h, BiquadCoeffs::makeHighPassMatched(fs, f, q), fs).all);
+                h = AnalogSection::bandPass(f, q);
+                now.bandPass = std::max(now.bandPass, designError(h, design(h), fs).all);
+                closed.bandPass = std::max(closed.bandPass, designError(h, BiquadCoeffs::makeBandPassMatched(fs, f, q), fs).all);
+                h = AnalogSection::notch(f, q);
+                now.notch = std::max(now.notch, designError(h, design(h), fs).all);
+                plain.notch = std::max(plain.notch, designError(h, FilterDesign::bilinear(h, fs, f), fs).all);
+            }
+            for (const double g : gains)
+            {
+                for (const double slope : slopes)
+                {
+                    AnalogSection h = AnalogSection::lowShelf(f, g, slope);
+                    now.shelf = std::max(now.shelf, designError(h, design(h), fs).all);
+                    h = AnalogSection::highShelf(f, g, slope);
+                    now.shelf = std::max(now.shelf, designError(h, design(h), fs).all);
+                }
+                closed.shelf = std::max(closed.shelf, designError(AnalogSection::lowShelf(f, g), BiquadCoeffs::makeLowShelfMatched(fs, f, g), fs).all);
+                closed.shelf = std::max(closed.shelf, designError(AnalogSection::highShelf(f, g), BiquadCoeffs::makeHighShelfMatched(fs, f, g), fs).all);
+                AnalogSection h = AnalogSection::firstOrderLowShelf(f, g);
+                now.first = std::max(now.first, designError(h, design(h), fs).all);
+                h = AnalogSection::firstOrderHighShelf(f, g);
+                now.first = std::max(now.first, designError(h, design(h), fs).all);
+                h = AnalogSection::tilt(f, g);
+                now.first = std::max(now.first, designError(h, design(h), fs).all);
+            }
+            AnalogSection h = AnalogSection::firstOrderLowPass(f);
+            now.first = std::max(now.first, designError(h, design(h), fs).all);
+            h = AnalogSection::firstOrderHighPass(f);
+            now.first = std::max(now.first, designError(h, design(h), fs).all);
+        }
+        EXPECT_EQ(unstable, 0);
+        EXPECT_LT(now.bell, rate.now.bell);
+        EXPECT_LT(now.shelf, rate.now.shelf);
+        EXPECT_LT(now.lowPass, rate.now.lowPass);
+        EXPECT_LT(now.highPass, rate.now.highPass);
+        EXPECT_LT(now.bandPass, rate.now.bandPass);
+        EXPECT_LT(now.notch, rate.now.notch);
+        EXPECT_LT(now.first, rate.now.first);
+
+        // Ahead of the closed forms in every shape that has one, and far from the plain transform.
+        EXPECT_LT(4.0 * now.bell, closed.bell);
+        EXPECT_LT(2.0 * now.shelf, closed.shelf);
+        EXPECT_LT(2.0 * now.lowPass, closed.lowPass);
+        EXPECT_LT(2.0 * now.highPass, closed.highPass);
+        EXPECT_LT(2.0 * now.bandPass, closed.bandPass);
+        EXPECT_LT(4.0 * now.bell, plain.bell);
+        EXPECT_LT(2.0 * now.notch, plain.notch);
+    }
+}
+
+// Zeros a prototype has at zero frequency or on the frequency axis stay there,
+// an all-pass stays an all-pass, and nothing that is not a filter comes back
+// as numbers that are not numbers.
+DSPARK_TEST(FilterDesign_sections_keep_what_defines_them)
+{
+    for (const double fs : { 44100.0, 96000.0 })
+    {
+        const FilterDesign::Band band(fs);
+        for (const double f : { 40.0, 1000.0, 9000.0, 17000.0 })
+            for (const double q : { 0.4, 0.7071, 6.0 })
+            {
+                // Two zeros at DC, exactly.
+                BiquadCoeffs c = FilterDesign::digital(AnalogSection::highPass(f, q), band);
+                EXPECT_TRUE(c.b1 == -2.0 * c.b0 && c.b2 == c.b0 && c.b0 > 0.0);
+                // One zero at DC.
+                c = FilterDesign::digital(AnalogSection::bandPass(f, q), band);
+                EXPECT_LT(std::abs(c.b0 + c.b1 + c.b2), 1e-12 * (std::abs(c.b0) + std::abs(c.b1) + std::abs(c.b2)));
+                c = FilterDesign::digital(AnalogSection::firstOrderHighPass(f), band);
+                EXPECT_TRUE(c.b1 == -c.b0 && c.b2 == 0.0 && c.a2 == 0.0);
+                // The null of a notch at its frequency, and 0 dB at DC.
+                c = FilterDesign::digital(AnalogSection::notch(f, q), band);
+                EXPECT_TRUE(c.b2 == c.b0);
+                EXPECT_NEAR(c.b1 / c.b0, -2.0 * std::cos(2.0 * 3.14159265358979323846 * f / fs), 1e-12);
+                EXPECT_NEAR((c.b0 + c.b1 + c.b2) / (1.0 + c.a1 + c.a2), 1.0, 1e-9);
+                // An all-pass keeps the poles of its prototype and a magnitude of 1.
+                c = FilterDesign::digital(AnalogSection::allPass(f, q), band);
+                EXPECT_TRUE(c.b0 == c.a2 && c.b1 == c.a1 && c.b2 == 1.0);
+                EXPECT_TRUE(designStable(c));
+                for (const double probe : { 30.0, 700.0, 5000.0, 19000.0 })
+                    EXPECT_NEAR(c.getMagnitude(probe, fs), 1.0, 1e-9);
+                // A first-order section stays first order.
+                c = FilterDesign::digital(AnalogSection::firstOrderLowShelf(f, 9.0), band);
+                EXPECT_TRUE(c.b2 == 0.0 && c.a2 == 0.0 && designStable(c));
+            }
+    }
+
+    // Prototypes that are not filters.
+    const FilterDesign::Band band(48000.0);
+    const double nan = std::numeric_limits<double>::quiet_NaN(), inf = std::numeric_limits<double>::infinity();
+    for (const double bad : { nan, inf, -inf })
+    {
+        AnalogSection h = AnalogSection::peak(1000.0, 1.0, 6.0);
+        h.a1 = bad;
+        BiquadCoeffs c = FilterDesign::digital(h, band);
+        EXPECT_TRUE(c.b0 == 1.0 && c.b1 == 0.0 && c.b2 == 0.0 && c.a1 == 0.0 && c.a2 == 0.0);
+        h = AnalogSection::peak(1000.0, 1.0, 6.0);
+        h.b0 = bad;
+        c = FilterDesign::digital(h, band);
+        EXPECT_TRUE(c.b0 == 1.0 && c.b1 == 0.0 && c.b2 == 0.0 && c.a1 == 0.0 && c.a2 == 0.0);
+    }
+    // A section with nothing in its numerator, and extreme but valid ones: finite and stable.
+    for (const AnalogSection& h : { AnalogSection::make(0, 0, 0, 1, 1000.0, 1e6),
+                                    AnalogSection::peak(1e-3, 1e-3, 120.0), AnalogSection::peak(1e6, 1e3, -120.0),
+                                    AnalogSection::lowPass(23999.0, 100.0), AnalogSection::highPass(0.5, 0.01),
+                                    AnalogSection::notch(23990.0, 30.0), AnalogSection::lowShelf(30000.0, 24.0, 0.01) })
+    {
+        const BiquadCoeffs c = FilterDesign::digital(h, band);
+        EXPECT_TRUE(std::isfinite(c.b0) && std::isfinite(c.b1) && std::isfinite(c.b2));
+        EXPECT_TRUE(std::isfinite(c.a1) && std::isfinite(c.a2));
+        EXPECT_TRUE(std::abs(c.a2) <= 1.0 && std::abs(c.a1) <= 1.0 + c.a2);
+    }
+}
+
+// A design is a function of its parameters with no jumps: a small step of gain,
+// of frequency or of Q moves the response by little, at any point of the band.
+// (An earlier form of the fit, which took or refused steps by their result,
+// jumped by decibels.)
+DSPARK_TEST(FilterDesign_sections_move_smoothly_with_their_parameters)
+{
+    const double fs = 48000.0;
+    const FilterDesign::Band band(fs);
+    const auto distance = [&](const BiquadCoeffs& a, const BiquadCoeffs& b) {
+        double d = 0.0;
+        for (int i = 0; i < 90; ++i)
+        {
+            const double f = 20.0 * std::pow(1000.0, i / 89.0);
+            d = std::max(d, std::abs(20.0 * std::log10(std::max(a.getMagnitude(f, fs), 1e-15))
+                                     - 20.0 * std::log10(std::max(b.getMagnitude(f, fs), 1e-15))));
+        }
+        return d;
+    };
+    double byGain = 0.0, byFrequency = 0.0, byQ = 0.0;
+    for (const double f : { 3000.0, 14000.0, 19000.0 })
+        for (const double q : { 0.5, 8.0 })
+        {
+            BiquadCoeffs last = FilterDesign::digital(AnalogSection::peak(f, q, -24.0), band);
+            for (int i = 1; i <= 2400; ++i)
+            {
+                const BiquadCoeffs now = FilterDesign::digital(AnalogSection::peak(f, q, -24.0 + 0.02 * i), band);
+                byGain = std::max(byGain, distance(last, now));
+                last = now;
+            }
+            last = FilterDesign::digital(AnalogSection::peak(f * 0.5, q, 12.0), band);
+            for (int i = 1; i <= 750; ++i)
+            {
+                const double hz = std::min(f * 0.5 * std::pow(2.0, 0.002 * i), 22000.0);
+                const BiquadCoeffs now = FilterDesign::digital(AnalogSection::peak(hz, q, 12.0), band);
+                byFrequency = std::max(byFrequency, distance(last, now));
+                last = now;
+            }
+            last = FilterDesign::digital(AnalogSection::peak(f, 0.3, 12.0), band);
+            for (int i = 1; i <= 1500; ++i)
+            {
+                const BiquadCoeffs now = FilterDesign::digital(AnalogSection::peak(f, 0.3 * std::pow(2.0, 0.004 * i), 12.0), band);
+                byQ = std::max(byQ, distance(last, now));
+                last = now;
+            }
+        }
+    EXPECT_LT(byGain, 0.08);         // a step of 0.02 dB of gain
+    EXPECT_LT(byFrequency, 0.30);    // a step of 0.002 octaves at Q 8 and 12 dB: the bell itself moves that much
+    EXPECT_LT(byQ, 0.04);            // a step of 0.004 octaves of Q
+}
+
+DSPARK_TEST(FilterDesign_band_and_one_off_designs_agree_at_every_rate)
+{
+    FilterDesign::Band band;
+    EXPECT_EQ(band.getSampleRate(), 48000.0);
+    band.prepare(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_EQ(band.getSampleRate(), 48000.0);
+    band.prepare(-1.0);
+    EXPECT_EQ(band.getSampleRate(), 48000.0);
+
+    for (const double fs : { 8000.0, 22050.0, 44100.0, 192000.0, 768000.0 })
+    {
+        band.prepare(fs);
+        EXPECT_EQ(band.getSampleRate(), fs);
+        EXPECT_TRUE(band.getLowHz() > 0.0 && band.getLowHz() <= 20.0);
+        EXPECT_TRUE(band.getHighHz() <= 0.4537 * fs && band.getHighHz() >= std::min(20000.0, 0.42 * fs));
+        for (const AnalogSection& h : { AnalogSection::peak(0.2 * fs, 3.0, 9.0), AnalogSection::lowPass(0.1 * fs, 1.2),
+                                        AnalogSection::highShelf(0.3 * fs, -12.0), AnalogSection::notch(0.05 * fs, 4.0),
+                                        AnalogSection::peak(25.0, 0.7, -6.0), AnalogSection::firstOrderLowPass(0.02 * fs) })
+        {
+            const BiquadCoeffs a = FilterDesign::digital(h, band), b = FilterDesign::digital(h, fs);
+            EXPECT_TRUE(a.b0 == b.b0 && a.b1 == b.b1 && a.b2 == b.b2 && a.a1 == b.a1 && a.a2 == b.a2);
+            EXPECT_TRUE(designStable(a));
+            // Within half a decibel of the prototype over the band of the fit.
+            double worst = 0.0;
+            for (int i = 0; i <= 60; ++i)
+            {
+                const double f = band.getLowHz() * std::pow(std::min(band.getHighHz(), 20000.0) / band.getLowHz(), i / 60.0);
+                const double want = h.magnitudeDb(f);
+                if (want > -60.0) worst = std::max(worst, std::abs(20.0 * std::log10(std::max(a.getMagnitude(f, fs), 1e-15)) - want));
+            }
+            EXPECT_LT(worst, 0.5);
+        }
+        // The gain at DC is held (a low corner at 768 kHz leaves seven digits to tell it by).
+        for (const AnalogSection& h : { AnalogSection::peak(25.0, 0.7, -6.0), AnalogSection::lowPass(0.1 * fs, 1.2), AnalogSection::highShelf(0.3 * fs, -12.0),
+                                        AnalogSection::lowShelf(0.02 * fs, 9.0, 0.5), AnalogSection::firstOrderLowShelf(0.2 * fs, -6.0) })
+        {
+            const BiquadCoeffs c = FilterDesign::digital(h, band);
+            EXPECT_NEAR((c.b0 + c.b1 + c.b2) / (1.0 + c.a1 + c.a2), std::abs(h.b0 / h.a0), 1e-6 * std::abs(h.b0 / h.a0));
+        }
+    }
+
+    // The cascade overloads write what fits and say how many.
+    const AnalogCascade wall = FilterDesign::ellipticHighCut(5000.0);
+    BiquadCoeffs some[4], all[AnalogCascade::kMaxSections];
+    EXPECT_EQ(FilterDesign::digital(wall, 48000.0, some, 4), 4);
+    EXPECT_EQ(FilterDesign::digital(wall, FilterDesign::Band(48000.0), all, AnalogCascade::kMaxSections), 6);
+    for (int i = 0; i < 4; ++i) EXPECT_TRUE(some[i].b0 == all[i].b0 && some[i].a1 == all[i].a1 && some[i].a2 == all[i].a2);
+    EXPECT_EQ(FilterDesign::digital(AnalogCascade {}, 48000.0, all, AnalogCascade::kMaxSections), 0);
+}
+
+// Whole slopes are Butterworth filters, to rounding, at every order up to 16;
+// the low cut is the high cut mirrored; q is the resonance of the sharpest pair.
+DSPARK_TEST(FilterDesign_cut_of_a_whole_order_is_a_butterworth_filter)
+{
+    for (int order = 1; order <= 16; ++order)
+    {
+        const AnalogCascade high = FilterDesign::highCut(1000.0, 6.0 * order), low = FilterDesign::lowCut(1000.0, 6.0 * order);
+        EXPECT_EQ(high.count, (order + 1) / 2);
+        EXPECT_EQ(low.count, (order + 1) / 2);
+        double worst = 0.0, mirror = 0.0;
+        for (int i = 0; i <= 200; ++i)
+        {
+            const double w = std::pow(10.0, -2.0 + 3.0 * i / 200.0);
+            const double ideal = idealCutDb(order, w);
+            if (ideal > -200.0) worst = std::max(worst, std::abs(high.magnitudeDb(1000.0 * w) - ideal));
+            if (ideal > -200.0) mirror = std::max(mirror, std::abs(low.magnitudeDb(1000.0 / w) - high.magnitudeDb(1000.0 * w)));
+        }
+        EXPECT_LT(worst, 1e-8);
+        EXPECT_LT(mirror, 1e-8);
+    }
+    // The gain at the corner is q for every even order (the other pairs make 1 between them).
+    for (const double slope : { 12.0, 24.0, 48.0, 96.0 })
+    {
+        EXPECT_NEAR(FilterDesign::highCut(1000.0, slope, 4.0).magnitudeDb(1000.0), 20.0 * std::log10(4.0), 1e-9);
+        EXPECT_NEAR(FilterDesign::lowCut(1000.0, slope, 0.5).magnitudeDb(1000.0), 20.0 * std::log10(0.5), 1e-9);
+    }
+    // Up to 6 dB per octave there is no pair for it to act on.
+    EXPECT_NEAR(FilterDesign::highCut(1000.0, 6.0, 4.0).magnitudeDb(1000.0), -10.0 * std::log10(2.0), 1e-9);
+    EXPECT_NEAR(FilterDesign::highCut(1000.0, 3.0, 4.0).magnitudeDb(1000.0), FilterDesign::highCut(1000.0, 3.0).magnitudeDb(1000.0), 1e-12);
+    // No slope, no filter; a slope that is not a number, none either; past the steepest, the steepest.
+    EXPECT_EQ(FilterDesign::highCut(1000.0, 0.0).count, 0);
+    EXPECT_EQ(FilterDesign::lowCut(1000.0, -3.0).count, 0);
+    EXPECT_EQ(FilterDesign::highCut(1000.0, std::numeric_limits<double>::quiet_NaN()).count, 0);
+    EXPECT_NEAR(FilterDesign::highCut(1000.0, 500.0).magnitudeDb(2000.0), FilterDesign::highCut(1000.0, 96.0).magnitudeDb(2000.0), 1e-9);
+}
+
+// Between whole slopes the cut keeps its corner at -3 dB and follows the curve
+// of its real order down to -36 dB, and it moves without a jump as the slope
+// does. Under 6 dB per octave it is the fraction of a pole.
+DSPARK_TEST(FilterDesign_cut_of_a_real_order_follows_its_ideal_curve)
+{
+    struct Case { double slope, allowed; };
+    const Case cases[] = { { 7.5, 1.0 }, { 9.0, 1.0 }, { 10.5, 0.6 }, { 15.0, 0.7 }, { 21.0, 0.1 }, { 27.0, 0.15 },
+                           { 44.0, 0.02 }, { 70.0, 0.02 }, { 93.0, 0.02 } };
+    for (const Case& item : cases)
+    {
+        const double order = item.slope / 6.0;
+        const AnalogCascade c = FilterDesign::highCut(1000.0, item.slope);
+        EXPECT_NEAR(c.magnitudeDb(1000.0), -10.0 * std::log10(2.0), 1e-9);
+        // On the curve where it has fallen 36 dB.
+        const double deep = std::pow(std::pow(10.0, 3.6) - 1.0, 0.5 / order);
+        EXPECT_NEAR(c.magnitudeDb(1000.0 * deep), -36.0, 1e-6);
+        double worst = 0.0;
+        for (int i = 0; i <= 600; ++i)
+        {
+            const double w = std::pow(10.0, -2.0 + 5.0 * i / 600.0);
+            const double ideal = idealCutDb(order, w);
+            if (ideal > -36.0) worst = std::max(worst, std::abs(c.magnitudeDb(1000.0 * w) - ideal));
+        }
+        EXPECT_LT(worst, item.allowed);
+    }
+
+    // Under 6 dB per octave: (1 + w^2)^(-order) within two tenths over five decades.
+    for (const double slope : { 0.6, 1.5, 3.0, 4.5, 5.7 })
+    {
+        const double order = slope / 6.0;
+        const AnalogCascade c = FilterDesign::highCut(1000.0, slope);
+        EXPECT_EQ(c.count, 3);
+        double worst = 0.0;
+        for (int i = 0; i <= 500; ++i)
+        {
+            const double w = std::pow(10.0, -2.0 + 5.0 * i / 500.0);
+            worst = std::max(worst, std::abs(c.magnitudeDb(1000.0 * w) - idealCutDb(order, w)));
+        }
+        EXPECT_LT(worst, 0.2);
+    }
+
+    // No jump anywhere from 0 to 96 dB per octave, across every whole order, and a cut that never
+    // comes back up by more than a few hundredths of a decibel (whole orders: not at all).
+    double worst = 0.0, rise = 0.0;
+    AnalogCascade last = FilterDesign::highCut(1000.0, 0.01);
+    for (int i = 2; i <= 9600; ++i)
+    {
+        const AnalogCascade now = FilterDesign::highCut(1000.0, 0.01 * i);
+        for (int k = 0; k <= 60; ++k)
+        {
+            const double hz = 20.0 * std::pow(1000.0, k / 60.0);
+            const double a = last.magnitudeDb(hz);
+            if (a > -60.0) worst = std::max(worst, std::abs(a - now.magnitudeDb(hz)));
+        }
+        double lowest = 1e9;
+        for (int k = 0; k <= 120; ++k)
+        {
+            const double level = now.magnitudeDb(10.0 * std::pow(10.0, 4.0 * k / 120.0));
+            rise = std::max(rise, level - lowest);
+            lowest = std::min(lowest, level);
+        }
+        last = now;
+    }
+    EXPECT_LT(worst, 0.2);      // a step of 0.01 dB per octave; the steepest cuts move 0.1 dB with it
+    EXPECT_LT(rise, 0.05);
+    for (int order = 1; order <= 16; ++order)
+    {
+        const AnalogCascade c = FilterDesign::highCut(1000.0, 6.0 * order);
+        double before = c.magnitudeDb(10.0);
+        bool rises = false;
+        for (int k = 1; k <= 400; ++k)
+        {
+            const double level = c.magnitudeDb(10.0 * std::pow(10.0, 4.0 * k / 400.0));
+            rises = rises || level > before + 1e-9;
+            before = level;
+        }
+        EXPECT_FALSE(rises);
+    }
+}
+
+// Bells and shelves of any order: the gain asked at the centre (or beyond the
+// corner), half of it in decibels at the edges (or at the corner) whatever
+// the order, never more than asked, and a cut that undoes the boost exactly.
+DSPARK_TEST(FilterDesign_bells_and_shelves_of_any_order_keep_their_gains)
+{
+    for (const int order : { 1, 2, 3, 4, 7, 8, 16 })
+        for (const double gain : { 12.0, -12.0, 3.0 })
+        {
+            const AnalogCascade low = FilterDesign::lowShelf(1000.0, gain, order), high = FilterDesign::highShelf(1000.0, gain, order);
+            const AnalogCascade undo = FilterDesign::lowShelf(1000.0, -gain, order);
+            EXPECT_EQ(low.count, (order + 1) / 2);
+            EXPECT_NEAR(low.magnitudeDb(0.01), gain, 1e-6);
+            EXPECT_NEAR(low.magnitudeDb(1000.0), 0.5 * gain, 1e-9);
+            EXPECT_NEAR(low.magnitudeDb(1e7), 0.0, 1e-6);
+            EXPECT_NEAR(high.magnitudeDb(0.01), 0.0, 1e-6);
+            EXPECT_NEAR(high.magnitudeDb(1000.0), 0.5 * gain, 1e-9);
+            EXPECT_NEAR(high.magnitudeDb(1e7), gain, 1e-6);
+            double inverse = 0.0, beyond = 0.0, mirror = 0.0;
+            for (int k = 0; k <= 200; ++k)
+            {
+                const double ratio = std::pow(10.0, -2.0 + 4.0 * k / 200.0);
+                const double level = low.magnitudeDb(1000.0 * ratio);
+                inverse = std::max(inverse, std::abs(level + undo.magnitudeDb(1000.0 * ratio)));
+                beyond = std::max(beyond, gain > 0.0 ? std::max(level - gain, -level) : std::max(gain - level, level));
+                mirror = std::max(mirror, std::abs(level - high.magnitudeDb(1000.0 / ratio)));
+            }
+            EXPECT_LT(inverse, 1e-9);
+            EXPECT_LT(beyond, 1e-9);
+            EXPECT_LT(mirror, 1e-9);
+        }
+    // The transition gets steeper with the order: an octave under the corner a 12 dB shelf has reached...
+    EXPECT_NEAR(FilterDesign::lowShelf(1000.0, 12.0, 1).magnitudeDb(500.0), 9.264, 0.01);
+    EXPECT_NEAR(FilterDesign::lowShelf(1000.0, 12.0, 4).magnitudeDb(500.0), 11.937, 0.01);
+    EXPECT_GT(FilterDesign::lowShelf(1000.0, 12.0, 8).magnitudeDb(500.0), 11.999);
+
+    double flatBefore = 0.0;
+    for (const int order : { 1, 2, 4, 8, 16 })
+        for (const double q : { 0.5, 2.0, 8.0 })
+        {
+            const AnalogCascade up = FilterDesign::bell(1000.0, q, 12.0, order), down = FilterDesign::bell(1000.0, q, -12.0, order);
+            const double half = 0.5 / q, root = std::sqrt(1.0 + half * half);
+            EXPECT_EQ(up.count, order);
+            EXPECT_NEAR(up.magnitudeDb(1000.0), 12.0, 1e-9);
+            EXPECT_NEAR(up.magnitudeDb(1000.0 * (root - half)), 6.0, 1e-9);
+            EXPECT_NEAR(up.magnitudeDb(1000.0 * (root + half)), 6.0, 1e-9);
+            const AnalogSection one = AnalogSection::peak(1000.0, q, 12.0);
+            double inverse = 0.0, top = -1e9, flat = 0.0, single = 0.0;
+            for (int k = 0; k <= 1000; ++k)
+            {
+                const double hz = 10.0 * std::pow(10000.0, k / 1000.0);
+                const double level = up.magnitudeDb(hz);
+                inverse = std::max(inverse, std::abs(level + down.magnitudeDb(hz)));
+                top = std::max(top, level);
+                if (level > 11.9) flat = std::max(flat, std::abs(std::log2(hz / 1000.0)));
+                single = std::max(single, std::abs(level - one.magnitudeDb(hz)));
+            }
+            EXPECT_LT(inverse, 1e-9);
+            EXPECT_LT(top, 12.0 + 1e-9);
+            if (order == 1) EXPECT_LT(single, 1e-9);        // the bell of order 1 is the usual one
+            // The top widens with the order: the share of the half width within a tenth of a decibel of it.
+            const double share = flat / std::log2(root + half);
+            if (q == 2.0)
+            {
+                EXPECT_GT(share, flatBefore);
+                flatBefore = share;
+                if (order == 1) EXPECT_LT(share, 0.1);
+                if (order == 16) EXPECT_GT(share, 0.8);
+            }
+        }
+}
+
+DSPARK_TEST(FilterDesign_band_filters_and_all_pass_of_any_order)
+{
+    const double q = 2.0, half = 0.5 / q, root = std::sqrt(1.0 + half * half);
+    for (const int order : { 1, 2, 3, 4, 8, 16 })
+    {
+        const AnalogCascade pass = FilterDesign::bandPass(1000.0, q, order), stop = FilterDesign::bandStop(1000.0, q, order);
+        EXPECT_EQ(pass.count, order);
+        EXPECT_EQ(stop.count, order);
+        EXPECT_NEAR(pass.magnitudeDb(1000.0), 0.0, 1e-9);
+        EXPECT_NEAR(pass.magnitudeDb(1000.0 * (root - half)), -10.0 * std::log10(2.0), 1e-9);
+        EXPECT_NEAR(pass.magnitudeDb(1000.0 * (root + half)), -10.0 * std::log10(2.0), 1e-9);
+        // Two octaves out the skirt has fallen 17.5 dB per order, the same on both sides.
+        EXPECT_NEAR(pass.magnitudeDb(250.0), -17.5 * order, 0.1 * order);
+        EXPECT_NEAR(pass.magnitudeDb(4000.0), pass.magnitudeDb(250.0), 1e-9);
+        EXPECT_LT(stop.magnitudeDb(1000.0), -250.0);
+        EXPECT_NEAR(stop.magnitudeDb(1000.0 * (root - half)), -10.0 * std::log10(2.0), 1e-9);
+        EXPECT_NEAR(stop.magnitudeDb(1000.0 * (root + half)), -10.0 * std::log10(2.0), 1e-9);
+        EXPECT_NEAR(stop.magnitudeDb(0.01), 0.0, 1e-6);
+        EXPECT_NEAR(stop.magnitudeDb(1e7), 0.0, 1e-6);
+
+        // An all-pass stays at 0 dB as a prototype and as biquads, and turns 180 degrees per order.
+        const AnalogCascade all = FilterDesign::allPass(1000.0, 2.0, order);
+        EXPECT_EQ(all.count, (order + 1) / 2);
+        BiquadCoeffs sections[AnalogCascade::kMaxSections];
+        const int n = FilterDesign::digital(all, 48000.0, sections, AnalogCascade::kMaxSections);
+        EXPECT_EQ(n, all.count);
+        double turn = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            EXPECT_TRUE(designStable(sections[i]));
+            // Each section goes from +1 at DC to -1 (first order) or back to +1 (second) at Nyquist.
+            const double atDc = (sections[i].b0 + sections[i].b1 + sections[i].b2) / (1.0 + sections[i].a1 + sections[i].a2);
+            const double atNyquist = (sections[i].b0 - sections[i].b1 + sections[i].b2) / (1.0 - sections[i].a1 + sections[i].a2);
+            EXPECT_NEAR(atDc, 1.0, 1e-9);
+            EXPECT_NEAR(std::abs(atNyquist), 1.0, 1e-9);
+            turn += sections[i].a2 == 0.0 ? 1.0 : 2.0;
+            EXPECT_NEAR(atNyquist, sections[i].a2 == 0.0 ? -1.0 : 1.0, 1e-9);
+        }
+        EXPECT_EQ(turn, static_cast<double>(order));
+        for (const double hz : { 20.0, 300.0, 1000.0, 4000.0, 20000.0 })
+        {
+            EXPECT_NEAR(all.magnitudeDb(hz), 0.0, 1e-9);
+            EXPECT_NEAR(FilterDesign::magnitudeDb(sections, n, hz, 48000.0), 0.0, 1e-9);
+        }
+    }
+    // Order 2 with a Q is the usual all-pass.
+    const AnalogSection usual = AnalogSection::allPass(1000.0, 3.0);
+    const AnalogCascade two = FilterDesign::allPass(1000.0, 3.0, 2);
+    EXPECT_NEAR(two.sections[0].a1, usual.a1, 1e-9 * usual.a1);
+    EXPECT_NEAR(two.sections[0].a0, usual.a0, 1e-9 * usual.a0);
+}
+
+// The tilt is a straight line in decibels against octaves across the whole
+// band, through 0 dB at its pivot. (A first-order tilt is only straight near
+// its pivot.)
+DSPARK_TEST(FilterDesign_tilt_is_a_straight_line_across_the_band)
+{
+    for (const double slope : { -6.0, -4.5, -3.0, -1.5, -0.3, 0.3, 1.5, 3.0, 4.5, 6.0 })
+        for (const double pivot : { 100.0, 1000.0, 6000.0 })
+        {
+            const AnalogCascade c = FilterDesign::tilt(pivot, slope);
+            EXPECT_EQ(c.count, 4);
+            EXPECT_NEAR(c.magnitudeDb(pivot), 0.0, 1e-9);
+            double worst = 0.0;
+            for (int k = 0; k <= 300; ++k)
+            {
+                const double hz = 20.0 * std::pow(1000.0, k / 300.0);
+                worst = std::max(worst, std::abs(c.magnitudeDb(hz) - slope * std::log2(hz / pivot)));
+            }
+            EXPECT_LT(worst, 0.03 + 0.02 * std::abs(slope));
+        }
+    // What a single first-order tilt of the same end-to-end size does: a decibel and more off the line.
+    const AnalogSection single = AnalogSection::tilt(632.4555, 30.0);
+    double off = 0.0;
+    for (int k = 0; k <= 300; ++k)
+    {
+        const double hz = 20.0 * std::pow(1000.0, k / 300.0);
+        off = std::max(off, std::abs(single.magnitudeDb(hz) - 3.0103 * std::log2(hz / 632.4555)));
+    }
+    EXPECT_GT(off, 1.0);
+    EXPECT_EQ(FilterDesign::tilt(1000.0, 0.0).count, 0);
+    EXPECT_EQ(FilterDesign::tilt(1000.0, std::numeric_limits<double>::infinity()).count, 0);
+    // Past 6 dB per octave it stays at one zero and one pole.
+    EXPECT_NEAR(FilterDesign::tilt(1000.0, 40.0).magnitudeDb(4000.0), FilterDesign::tilt(1000.0, 6.0206).magnitudeDb(4000.0), 1e-3);
+    // As biquads at 48 kHz it stays on its prototype; the plain transform bends it by decibels.
+    int unstable = 0;
+    EXPECT_LT(cascadeError(FilterDesign::tilt(1000.0, 3.0), 48000.0, &unstable), 0.06);
+    EXPECT_LT(cascadeError(FilterDesign::tilt(1000.0, -6.0), 48000.0, &unstable), 0.15);
+    EXPECT_EQ(unstable, 0);
+}
+
+// The elliptic cut: within its ripple up to the corner, at or under its stop
+// level from the ratio it reports on, for every order.
+DSPARK_TEST(FilterDesign_elliptic_wall_holds_its_ripple_and_its_floor)
+{
+    for (const int order : { 1, 2, 3, 5, 8, 12, 16 })
+        for (const double stopDb : { 60.0, 100.0 })
+        {
+            const double ripple = 0.05;
+            const AnalogCascade c = FilterDesign::ellipticHighCut(1000.0, order, ripple, stopDb);
+            const double ratio = FilterDesign::ellipticStopRatio(order, ripple, stopDb);
+            EXPECT_EQ(c.count, (order + 1) / 2);
+            EXPECT_GT(ratio, 1.0);
+            double low = 1e9, high = -1e9, floor = -1e9;
+            for (int k = 0; k <= 4000; ++k)
+            {
+                const double level = c.magnitudeDb(1000.0 * k / 4000.0 + 1e-6);
+                low = std::min(low, level);
+                high = std::max(high, level);
+            }
+            for (int k = 0; k <= 4000; ++k)
+                floor = std::max(floor, c.magnitudeDb(1000.0 * ratio * std::pow(100.0, k / 4000.0)));
+            EXPECT_GT(low, -ripple - 1e-6);
+            EXPECT_LT(high, 1e-6);
+            EXPECT_LT(floor, -stopDb + 1e-4);
+            EXPECT_NEAR(c.magnitudeDb(1000.0), -ripple, 1e-6);      // the end of the pass band
+
+            // The low cut is its mirror.
+            const AnalogCascade mirror = FilterDesign::ellipticLowCut(1000.0, order, ripple, stopDb);
+            for (const double w : { 0.3, 0.9, 1.0, 1.02, ratio, 3.0 })
+                EXPECT_NEAR(mirror.magnitudeDb(1000.0 / w), std::max(c.magnitudeDb(1000.0 * w), -300.0), 1e-6);
+        }
+    // The default wall (order 12, 0.05 dB, 100 dB) reaches its floor a quarter of an octave past the corner.
+    EXPECT_LT(FilterDesign::ellipticStopRatio(), 1.18);
+    EXPECT_GT(FilterDesign::ellipticStopRatio(), 1.16);
+    // A higher order or a shallower floor narrows the transition.
+    EXPECT_LT(FilterDesign::ellipticStopRatio(16), FilterDesign::ellipticStopRatio(12));
+    EXPECT_LT(FilterDesign::ellipticStopRatio(12, 0.05, 60.0), FilterDesign::ellipticStopRatio(12, 0.05, 100.0));
+    EXPECT_LT(FilterDesign::ellipticStopRatio(12, 1.0, 100.0), FilterDesign::ellipticStopRatio(12, 0.05, 100.0));
+
+    // As biquads at 48 kHz: on the prototype through the pass band, and the floor stays down.
+    BiquadCoeffs sections[AnalogCascade::kMaxSections];
+    const AnalogCascade wall = FilterDesign::ellipticHighCut(10000.0);
+    const int n = FilterDesign::digital(wall, 48000.0, sections, AnalogCascade::kMaxSections);
+    EXPECT_EQ(n, 6);
+    double pass = 0.0, floor = -1e9;
+    for (int k = 0; k <= 600; ++k)
+    {
+        const double hz = 20.0 + (10000.0 - 20.0) * k / 600.0;
+        pass = std::max(pass, std::abs(FilterDesign::magnitudeDb(sections, n, hz, 48000.0) - wall.magnitudeDb(hz)));
+    }
+    for (int k = 0; k <= 600; ++k)
+        floor = std::max(floor, FilterDesign::magnitudeDb(sections, n, 10000.0 * FilterDesign::ellipticStopRatio() * std::pow(2.0, k / 600.0), 48000.0));
+    EXPECT_LT(pass, 0.6);
+    EXPECT_LT(floor, -90.0);
+}
+
+// Cascades as biquads stay on their prototypes where a section by section
+// bilinear transform is off by tens of decibels.
+DSPARK_TEST(FilterDesign_cascades_as_biquads_follow_their_prototypes)
+{
+    struct Case { AnalogCascade c; double at48, at44; };
+    const Case cases[] = {
+        { FilterDesign::highCut(1000.0, 18.0), 0.06, 0.10 },
+        { FilterDesign::highCut(12000.0, 30.0), 0.20, 0.55 },
+        { FilterDesign::highCut(16000.0, 96.0), 0.50, 0.90 },
+        { FilterDesign::highCut(5000.0, 4.5), 0.04, 0.05 },
+        { FilterDesign::highCut(8000.0, 15.0, 3.0), 0.35, 0.60 },
+        { FilterDesign::lowCut(80.0, 45.0), 0.01, 0.01 },
+        { FilterDesign::lowCut(30.0, 96.0), 0.01, 0.01 },
+        { FilterDesign::lowCut(6000.0, 3.0), 0.04, 0.05 },
+        { FilterDesign::bell(8000.0, 2.0, 12.0, 4), 0.04, 0.05 },
+        { FilterDesign::bell(14000.0, 4.0, -18.0, 8), 0.15, 0.22 },
+        { FilterDesign::bell(200.0, 1.0, 9.0, 16), 0.01, 0.01 },
+        { FilterDesign::highShelf(10000.0, 9.0, 4), 0.05, 0.13 },
+        { FilterDesign::lowShelf(150.0, -12.0, 8), 0.01, 0.01 },
+        { FilterDesign::bandPass(3000.0, 1.5, 4), 1.20, 1.80 },
+        { FilterDesign::bandStop(5000.0, 4.0, 3), 0.02, 0.02 },
+        { FilterDesign::ellipticHighCut(18000.0), 3.40, 3.60 },
+        { FilterDesign::ellipticLowCut(60.0), 0.01, 0.01 },
+    };
+    int unstable = 0;
+    for (const Case& item : cases)
+    {
+        EXPECT_LT(cascadeError(item.c, 48000.0, &unstable), item.at48);
+        EXPECT_LT(cascadeError(item.c, 44100.0, &unstable), item.at44);
+        EXPECT_LT(cascadeError(item.c, 96000.0, &unstable), 0.6 * item.at48 + 0.02);
+    }
+    EXPECT_EQ(unstable, 0);
+
+    // The same cascades through the bilinear transform, section by section.
+    const auto plain = [](const AnalogCascade& c, double fs) {
+        BiquadCoeffs sections[AnalogCascade::kMaxSections];
+        for (int i = 0; i < c.count; ++i)
+            sections[i] = FilterDesign::bilinear(c.sections[static_cast<size_t>(i)], fs, c.sections[static_cast<size_t>(i)].poleFrequency());
+        double worst = 0.0;
+        for (int k = 0; k <= 400; ++k)
+        {
+            const double hz = 20.0 * std::pow(1000.0, k / 400.0);
+            const double want = c.magnitudeDb(hz);
+            if (want > -60.0) worst = std::max(worst, std::abs(FilterDesign::magnitudeDb(sections, c.count, hz, fs) - want));
+        }
+        return worst;
+    };
+    EXPECT_GT(plain(FilterDesign::highCut(12000.0, 30.0), 48000.0), 30.0);
+    EXPECT_GT(plain(FilterDesign::highCut(16000.0, 96.0), 48000.0), 60.0);
+    EXPECT_GT(plain(FilterDesign::bell(14000.0, 4.0, -18.0, 8), 48000.0), 6.0);
+    EXPECT_GT(plain(FilterDesign::ellipticHighCut(18000.0), 48000.0), 100.0);
 }

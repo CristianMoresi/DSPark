@@ -28,8 +28,9 @@
  *
  * Threading: setBand(), getBand(), getResponse(), writeState() and
  * readState() from any thread. prepare() on the setup thread (it allocates
- * the cascade). sync(), isActive(), processSample(), advance() and reset()
- * on the audio thread.
+ * the cascade and never throws: without memory the equalizer stays out of
+ * the path). sync(), isActive(), processSample(), advance() and reset() on
+ * the audio thread.
  *
  * Dependencies: Biquad.h, BiquadCascade.h, DspMath.h, FilterDesign.h,
  *               StateBlob.h.
@@ -48,6 +49,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <new>
 
 namespace dspark {
 
@@ -120,10 +122,11 @@ public:
      *
      * @param sampleRate Sample rate in hertz.
      */
-    void prepare(double sampleRate)
+    void prepare(double sampleRate) noexcept
     {
         if (!std::isfinite(sampleRate) || !(sampleRate > 0.0)) return;
-        if (!cascade_) cascade_ = std::make_unique<Cascade>();
+        if (!cascade_) cascade_.reset(new (std::nothrow) Cascade());
+        if (!cascade_) return;
         cascade_->setNumSections(kSections);
         for (int s = 0; s < kSections; ++s)
         {

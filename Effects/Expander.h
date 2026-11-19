@@ -42,7 +42,7 @@
  * detector state); they still pass to the output for that sample.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
- *               Hilbert.h, RingBuffer.h, StateBlob.h.
+ *               Hilbert.h, KeyEqualizer.h, RingBuffer.h, StateBlob.h.
  */
 
 #include "../Core/DspMath.h"
@@ -50,6 +50,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Hilbert.h"
+#include "../Core/KeyEqualizer.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/StateBlob.h"
 
@@ -95,6 +96,7 @@ public:
         maxLookaheadSamples_ = static_cast<int>(std::ceil(sampleRate * kMaxLookaheadMs / 1000.0));
         for (int ch = 0; ch < lookaheadChannels_; ++ch)
             lookahead_[static_cast<size_t>(ch)].prepare(maxLookaheadSamples_ + 1);
+        keyEq_.prepare(sampleRate);
         updateCoefficients();
         // Re-derive the hold counter for the (possibly new) rate: it used to
         // be computed only inside setHold() with the rate of that moment, so
@@ -249,6 +251,45 @@ public:
         updateCoefficients();
     }
 
+    /** @brief The equalizer of the key (see setSidechainBand()). */
+    using KeyEq = KeyEqualizer<T, 16>;
+    /** @brief The settings of one band of the key equalizer. */
+    using KeyBand = typename KeyEq::Band;
+    /** @brief What a band of the key equalizer does. */
+    using KeyShape = typename KeyEq::Shape;
+
+    /**
+     * @brief Sets a band of the equalizer of the key.
+     *
+     * Six bands (cuts from 6 to 48 dB per octave, bells, shelves, a tilt)
+     * shape what the detector weighs, after the sidechain high-pass, on the
+     * programme or on the external key, and never on the audio. A change
+     * glides over 20 ms; a band that is Off costs nothing.
+     *
+     * @param band     Band index in [0, KeyEq::kBands); others are ignored.
+     * @param settings Shape, frequency, gain, q and slope of the band.
+     */
+    void setSidechainBand(int band, const KeyBand& settings) noexcept { keyEq_.setBand(band, settings); }
+
+    /** @brief The settings of a band of the key equalizer. */
+    [[nodiscard]] KeyBand getSidechainBand(int band) const noexcept { return keyEq_.getBand(band); }
+
+    /** @brief The curve of the key equalizer, for a display. */
+    [[nodiscard]] typename KeyEq::Response getSidechainResponse() const noexcept { return keyEq_.getResponse(); }
+
+    /**
+     * @brief Plays the key instead of the expanded audio.
+     *
+     * Each channel puts out what the detector hears of it (the key after the
+     * high-pass and the equalizer; the last key channel where it has none),
+     * not delayed by the lookahead, while the expander keeps working
+     * underneath. A monitoring switch: it is not part of the state.
+     */
+    void setSidechainListen(bool on) noexcept { scListen_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the key is being played instead of the audio. */
+    [[nodiscard]] bool isSidechainListen() const noexcept { return scListen_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Sets the lookahead: the audio is delayed so the gain moves ahead
      *        of it. 0 (default) is latency-free.
@@ -330,6 +371,7 @@ public:
 
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
         std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
+        keyEq_.reset();
         for (auto& line : lookahead_) line.reset();
         for (auto& a : analytic_) a.reset();
     }
@@ -352,6 +394,7 @@ public:
         w.write("scHpfFreq", static_cast<float>(scHpfFreqHz_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
+        keyEq_.writeState(w, "key");
         return w.blob();
     }
 
@@ -371,6 +414,7 @@ public:
                         static_cast<double>(r.read("scHpfFreq", 80.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setAutoThreshold(r.read("autoThreshold", false));
+        keyEq_.readState(r, "key");
         return true;
     }
 
@@ -391,6 +435,8 @@ protected:
         cachedLookahead_    = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed));
         cachedAutoThreshold_ = autoThreshold_.load(std::memory_order_relaxed);
         autoRefFall_ = kAutoRefFallDb / sampleRate_;
+        keyOn_ = keyEq_.sync();
+        listen_ = scListen_.load(std::memory_order_relaxed);
     }
 
     /** Lookahead in samples for a ms value (shared by cacheParams() and getLatency()). */
@@ -442,6 +488,8 @@ protected:
                     scHpfState_[ch] = output;
                     input = output;
                 }
+                if (keyOn_) input = keyEq_.processSample(input, ch);
+                if (listen_) heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)] = input;
                 detIn_[static_cast<size_t>(j)] = static_cast<double>(input);
             }
             analytic_[static_cast<size_t>(ch)].magnitudeBlock(detIn_.data(), detMag_.data(), m);
@@ -452,6 +500,7 @@ protected:
                 if (level > detLevel_[static_cast<size_t>(j)]) detLevel_[static_cast<size_t>(j)] = level;
             }
         }
+        if (keyOn_) keyEq_.advance(m);
 
         for (int j = 0; j < m; ++j)
         {
@@ -494,6 +543,9 @@ protected:
                     x = line.read(cachedLookahead_);
                 }
                 x *= gain;
+                // Key listen: what the detector heard goes out instead.
+                if (listen_)
+                    x = heard_[static_cast<size_t>(std::min(ch, detCh - 1))][static_cast<size_t>(j)];
             }
         }
         }
@@ -617,6 +669,10 @@ protected:
     static constexpr int MAX_CHANNELS = 16;
     std::array<T, MAX_CHANNELS> scHpfState_{};
     std::array<T, MAX_CHANNELS> scHpfPrev_{};
+    KeyEq keyEq_;                               ///< Equalizer of the key, after the high-pass.
+    std::atomic<bool> scListen_ { false };      ///< The key goes out instead of the audio.
+    bool keyOn_ = false;                        ///< The equalizer has bands in the path (audio thread).
+    bool listen_ = false;                       ///< scListen_ as the audio thread took it.
 
     // Lookahead (audio delayed; detection runs on the undelayed signal).
     static constexpr double kMaxLookaheadMs = 10.0;
@@ -667,6 +723,7 @@ protected:
     std::array<double, kDetChunk> detIn_ {};
     std::array<double, kDetChunk> detMag_ {};
     std::array<T, kDetChunk> detLevel_ {};
+    std::array<std::array<T, kDetChunk>, MAX_CHANNELS> heard_ {};   ///< The key of each channel in this chunk.
 };
 
 } // namespace dspark

@@ -38,7 +38,7 @@
  * sidechain shorter than the audio block falls back to the internal key.
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
- *               RingBuffer.h, StateBlob.h.
+ *               KeyEqualizer.h, RingBuffer.h, StateBlob.h.
  *
  * @code
  *   dspark::NoiseGate<float> gate;
@@ -58,6 +58,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/KeyEqualizer.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/StateBlob.h"
 
@@ -119,6 +120,7 @@ public:
         maxLookaheadSamples_ = static_cast<int>(std::ceil(sampleRate * kMaxLookaheadMs / 1000.0));
         for (int ch = 0; ch < lookaheadChannels_; ++ch)
             lookahead_[static_cast<size_t>(ch)].prepare(maxLookaheadSamples_ + 1);
+        keyEq_.prepare(sampleRate);
         syncParams();
         reset();
     }
@@ -162,9 +164,15 @@ public:
                 T s = detectorSafe(buffer.getChannel(ch)[i]);
                 if (cachedScHpfEnabled_ && ch < kMaxScChannels)
                     s = applyScHpf(s, ch);
+                if (ch < kMaxScChannels)
+                {
+                    if (keyOn_) s = keyEq_.processSample(s, ch);
+                    heard_[static_cast<size_t>(ch)] = s;
+                }
                 if (ch == 0) det0 = s;
                 level = std::max(level, std::abs(s));
             }
+            if (keyOn_) keyEq_.advance(1);
 
             // Zero-crossing runs on the same (filtered) signal the detector
             // sees, exactly like the per-sample path.
@@ -182,6 +190,8 @@ public:
                 // kMaxChannels; any extra channels fall back to amplitude gating.
                 d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(x, ch)
                                                        : x * gain;
+                // Key listen: what the detector heard goes out instead.
+                if (listen_ && ch < kMaxScChannels) d[i] = heard_[static_cast<size_t>(ch)];
             }
         }
     }
@@ -237,10 +247,16 @@ public:
                     T s = detectorSafe(sidechain.getChannel(c)[i]);
                     if (cachedScHpfEnabled_ && c < kMaxScChannels)
                         s = applyScHpf(s, c);
+                    if (c < kMaxScChannels)
+                    {
+                        if (keyOn_) s = keyEq_.processSample(s, c);
+                        heard_[static_cast<size_t>(c)] = s;
+                    }
                     if (c == 0) det0 = s;
                     T a = std::abs(s);
                     if (a > scMax) scMax = a;
                 }
+                if (keyOn_) keyEq_.advance(1);
 
                 if (cachedAdaptiveHold_) updateZeroCrossing(det0);
 
@@ -254,6 +270,9 @@ public:
                     const T x = delayed(d[i], ch);
                     d[i] = (freqMode && ch < kMaxChannels) ? applyFrequencyGate(x, ch)
                                                            : x * gain;
+                    // Key listen: each channel plays its key (the last one when it has none).
+                    if (listen_)
+                        d[i] = heard_[static_cast<size_t>(std::min({ ch, scCh - 1, kMaxScChannels - 1 }))];
                 }
             }
         }
@@ -410,6 +429,46 @@ public:
         paramsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief The equalizer of the key (see setSidechainBand()). */
+    using KeyEq = KeyEqualizer<T, 16>;
+    /** @brief The settings of one band of the key equalizer. */
+    using KeyBand = typename KeyEq::Band;
+    /** @brief What a band of the key equalizer does. */
+    using KeyShape = typename KeyEq::Shape;
+
+    /**
+     * @brief Sets a band of the equalizer of the key.
+     *
+     * Six bands (cuts from 6 to 48 dB per octave, bells, shelves, a tilt)
+     * shape what the detector weighs, after the sidechain high-pass, on the
+     * programme or on the external key, and never on the audio. A change
+     * glides over 20 ms; a band that is Off costs nothing. Key channels
+     * beyond 16 are read unshaped.
+     *
+     * @param band     Band index in [0, KeyEq::kBands); others are ignored.
+     * @param settings Shape, frequency, gain, q and slope of the band.
+     */
+    void setSidechainBand(int band, const KeyBand& settings) noexcept { keyEq_.setBand(band, settings); }
+
+    /** @brief The settings of a band of the key equalizer. */
+    [[nodiscard]] KeyBand getSidechainBand(int band) const noexcept { return keyEq_.getBand(band); }
+
+    /** @brief The curve of the key equalizer, for a display. */
+    [[nodiscard]] typename KeyEq::Response getSidechainResponse() const noexcept { return keyEq_.getResponse(); }
+
+    /**
+     * @brief Plays the key instead of the gated audio.
+     *
+     * Each channel puts out what the detector hears of it (the key after the
+     * high-pass and the equalizer), not delayed by the lookahead, while the
+     * gate keeps working underneath. A monitoring switch: it is not part of
+     * the state.
+     */
+    void setSidechainListen(bool on) noexcept { scListen_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the key is being played instead of the audio. */
+    [[nodiscard]] bool isSidechainListen() const noexcept { return scListen_.load(std::memory_order_relaxed); }
+
     // -- Single Sample Processing -------------------------------------------------
 
     /**
@@ -453,6 +512,7 @@ public:
         autoRef_ = kAutoRefFloor;
         scHpfState_.fill(T(0));
         scHpfPrev_.fill(T(0));
+        keyEq_.reset();
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             freqLpState_[ch] = T(0);
@@ -486,6 +546,7 @@ public:
         w.write("scHpfFreq", static_cast<float>(scHpfFreq_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
+        keyEq_.writeState(w, "key");
         return w.blob();
     }
 
@@ -507,6 +568,7 @@ public:
                         static_cast<double>(r.read("scHpfFreq", 80.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setAutoThreshold(r.read("autoThreshold", false));
+        keyEq_.readState(r, "key");
         return true;
     }
 
@@ -520,6 +582,9 @@ protected:
         if (paramsDirty_.load(std::memory_order_acquire)
             && paramsDirty_.exchange(false, std::memory_order_acquire))
             syncParams();
+        // The equalizer of the key takes its settings here too.
+        keyOn_ = keyEq_.sync();
+        listen_ = scListen_.load(std::memory_order_relaxed);
     }
 
     void syncParams() noexcept
@@ -735,6 +800,11 @@ protected:
         sidechain = detectorSafe(sidechain);
         if (cachedScHpfEnabled_ && ch < kMaxScChannels)
             sidechain = applyScHpf(sidechain, ch);
+        if (keyOn_ && ch < kMaxScChannels)
+        {
+            sidechain = keyEq_.processSample(sidechain, ch);
+            keyEq_.advance(1);
+        }
 
         T rawLevel = std::abs(sidechain);
 
@@ -748,10 +818,12 @@ protected:
         if (cachedGateMode_ == GateMode::Frequency)
         {
             (void)getCurrentGain();
-            return applyFrequencyGate(input, ch);
+            const T shaped = applyFrequencyGate(input, ch);
+            return listen_ ? sidechain : shaped;
         }
 
-        return input * getCurrentGain();
+        const T gated = input * getCurrentGain();
+        return listen_ ? sidechain : gated;
     }
 
     double sampleRate_ = 48000.0;
@@ -795,6 +867,11 @@ protected:
     T scHpfA0_ = T(0.9975);
     std::array<T, kMaxScChannels> scHpfState_ {};
     std::array<T, kMaxScChannels> scHpfPrev_ {};
+    KeyEq keyEq_;                               ///< Equalizer of the key, after the high-pass.
+    std::atomic<bool> scListen_ { false };      ///< The key goes out instead of the audio.
+    bool keyOn_ = false;                        ///< The equalizer has bands in the path (audio thread).
+    bool listen_ = false;                       ///< scListen_ as the audio thread took it.
+    std::array<T, kMaxScChannels> heard_ {};    ///< The key of each channel in this frame.
 
     T attackCoeff_ = T(0);
     T releaseCoeff_ = T(0);

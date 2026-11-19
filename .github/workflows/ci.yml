@@ -54,13 +54,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install documentation tools
+        shell: bash
         run: |
-          # A download the mirror drops is tried again, three times in all.
-          for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18; then break; fi
-            if [ "$attempt" = 3 ]; then exit 1; fi
-            sleep 20
+          # Each attempt refreshes the index and installs, both bounded in time. The
+          # attempts alternate between the runner's own mirror list and Ubuntu's
+          # archive: either has stalled or answered 503 for minutes at a time.
+          mirrors=/etc/apt/apt-mirrors.txt
+          if [[ -f "$mirrors" ]]; then sudo cp "$mirrors" "$RUNNER_TEMP/apt-mirrors.runner"; fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          installed=no
+          for attempt in 1 2 3 4; do
+            if [[ -f "$mirrors" ]]; then
+              sudo cp "$RUNNER_TEMP/apt-mirrors.runner" "$mirrors"
+              if (( attempt % 2 == 0 )); then
+                sudo sed -i -E 's#https?://(azure|[a-z0-9-]+[.]ec2)[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' "$mirrors"
+              fi
+            fi
+            if sudo timeout --kill-after=10s 120s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q; then
+              if sudo timeout --kill-after=10s 240s apt-get "${apt_options[@]}" install -y -q doxygen graphviz g++-13 clang-18; then
+                installed=yes
+                break
+              fi
+            fi
+            echo "package attempt $attempt failed"
+            sleep $((15 * attempt))
           done
+          [[ "$installed" == yes ]]
       - name: Check the closed public-text policy and correction contract
         run: |
           python3 tools/check_public_text.py
@@ -313,33 +332,35 @@ jobs:
 
       - name: X11 WebView editor smoke (Linux)
         if: matrix.name == 'Linux GCC x64'
-        timeout-minutes: 25
+        timeout-minutes: 35
         shell: bash
         run: |
-          # The runner's regional mirror (Azure, or the EC2 one of its region)
-          # has stalled before the editor test began, three attempts in a row.
-          # Use Ubuntu's archive for those entries and bound package operations.
-          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i -E 's#https?://(azure|[a-z0-9-]+[.]ec2)[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/apt-mirrors.txt
-          fi
+          # Each attempt refreshes the index and installs, both bounded in time. The
+          # attempts alternate between the runner's own mirror list and Ubuntu's
+          # archive: either has stalled or answered 503 for minutes at a time.
+          mirrors=/etc/apt/apt-mirrors.txt
+          if [[ -f "$mirrors" ]]; then sudo cp "$mirrors" "$RUNNER_TEMP/apt-mirrors.runner"; fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-          sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q
-          # The older runtime is the fallback only where the release does not
-          # carry the newer one. A download the mirror drops is not that: it
-          # is tried again on a fresh index, three times in all, because the
-          # release that carries the newer runtime does not carry the older
-          # one and falling back to it there can only fail.
-          webkit=libwebkit2gtk-4.1-0
-          apt-cache show "$webkit" > /dev/null 2>&1 || webkit=libwebkit2gtk-4.0-37
           installed=no
-          for attempt in 1 2 3; do
-            if sudo timeout --kill-after=10s 180s apt-get "${apt_options[@]}" install -y -q xvfb "$webkit"; then
-              installed=yes
-              break
+          for attempt in 1 2 3 4; do
+            if [[ -f "$mirrors" ]]; then
+              sudo cp "$RUNNER_TEMP/apt-mirrors.runner" "$mirrors"
+              if (( attempt % 2 == 0 )); then
+                sudo sed -i -E 's#https?://(azure|[a-z0-9-]+[.]ec2)[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' "$mirrors"
+              fi
             fi
-            echo "package install attempt $attempt failed"
-            sleep 20
-            sudo timeout --kill-after=10s 120s apt-get "${apt_options[@]}" update -q || true
+            if sudo timeout --kill-after=10s 120s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q; then
+              # The older runtime only where the release does not carry the newer
+              # one, read from an index that has just been refreshed.
+              webkit=libwebkit2gtk-4.1-0
+              apt-cache show "$webkit" > /dev/null 2>&1 || webkit=libwebkit2gtk-4.0-37
+              if sudo timeout --kill-after=10s 240s apt-get "${apt_options[@]}" install -y -q xvfb "$webkit"; then
+                installed=yes
+                break
+              fi
+            fi
+            echo "package attempt $attempt failed"
+            sleep $((15 * attempt))
           done
           [[ "$installed" == yes ]]
           g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I . tools/x11_editor_smoke.cpp \
@@ -420,12 +441,30 @@ jobs:
             Windows) PV_PAT="*Windows*"; CV_PAT="*windows*" ;;
             macOS)   PV_PAT="*macOS*";   CV_PAT="*macos*" ;;
             *)       PV_PAT="*Linux*";   CV_PAT="*ubuntu*"
-                     # A download the mirror drops is tried again, three times in all.
-                     for attempt in 1 2 3; do
-                       if sudo apt-get update -q && sudo apt-get install -y -q xvfb; then break; fi
-                       if [ "$attempt" = 3 ]; then exit 1; fi
-                       sleep 20
-                     done ;;
+                     # Each attempt refreshes the index and installs, both bounded in time. The
+                     # attempts alternate between the runner's own mirror list and Ubuntu's
+                     # archive: either has stalled or answered 503 for minutes at a time.
+                     mirrors=/etc/apt/apt-mirrors.txt
+                     if [[ -f "$mirrors" ]]; then sudo cp "$mirrors" "$RUNNER_TEMP/apt-mirrors.runner"; fi
+                     apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+                     installed=no
+                     for attempt in 1 2 3 4; do
+                       if [[ -f "$mirrors" ]]; then
+                         sudo cp "$RUNNER_TEMP/apt-mirrors.runner" "$mirrors"
+                         if (( attempt % 2 == 0 )); then
+                           sudo sed -i -E 's#https?://(azure|[a-z0-9-]+[.]ec2)[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' "$mirrors"
+                         fi
+                       fi
+                       if sudo timeout --kill-after=10s 120s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q; then
+                         if sudo timeout --kill-after=10s 240s apt-get "${apt_options[@]}" install -y -q xvfb; then
+                           installed=yes
+                           break
+                         fi
+                       fi
+                       echo "package attempt $attempt failed"
+                       sleep $((15 * attempt))
+                     done
+                     [[ "$installed" == yes ]] ;;
           esac
           # Validator versions are PINNED so a third-party release cannot turn
           # this gate red on its own. clap-validator's "0.4.1" (2026-07-22) is a

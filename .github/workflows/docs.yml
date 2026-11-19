@@ -27,13 +27,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Doxygen
+        shell: bash
         run: |
-          # A download the mirror drops is tried again, three times in all.
-          for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y doxygen graphviz g++-13 clang-18; then break; fi
-            if [ "$attempt" = 3 ]; then exit 1; fi
-            sleep 20
+          # Each attempt refreshes the index and installs, both bounded in time. The
+          # attempts alternate between the runner's own mirror list and Ubuntu's
+          # archive: either has stalled or answered 503 for minutes at a time.
+          mirrors=/etc/apt/apt-mirrors.txt
+          if [[ -f "$mirrors" ]]; then sudo cp "$mirrors" "$RUNNER_TEMP/apt-mirrors.runner"; fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          installed=no
+          for attempt in 1 2 3 4; do
+            if [[ -f "$mirrors" ]]; then
+              sudo cp "$RUNNER_TEMP/apt-mirrors.runner" "$mirrors"
+              if (( attempt % 2 == 0 )); then
+                sudo sed -i -E 's#https?://(azure|[a-z0-9-]+[.]ec2)[.]archive[.]ubuntu[.]com/ubuntu#https://archive.ubuntu.com/ubuntu#g' "$mirrors"
+              fi
+            fi
+            if sudo timeout --kill-after=10s 120s apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -q; then
+              if sudo timeout --kill-after=10s 240s apt-get "${apt_options[@]}" install -y -q doxygen graphviz g++-13 clang-18; then
+                installed=yes
+                break
+              fi
+            fi
+            echo "package attempt $attempt failed"
+            sleep $((15 * attempt))
           done
+          [[ "$installed" == yes ]]
       - name: Check the closed public-text policy and correction contract
         run: |
           python3 tools/check_public_text.py

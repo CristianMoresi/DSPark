@@ -181,6 +181,29 @@ struct WindowFunctions
         }
     }
 
+    /**
+     * @brief Asymmetric window for low-latency analysis: the rising half of a
+     *        Hann window over the first size - fall samples and its falling
+     *        half over the last `fall`, so the weight sits on the most recent
+     *        samples (the peak is `fall` samples from the end).
+     * @param output Destination buffer.
+     * @param size   Number of samples.
+     * @param fall   Length of the falling part, 1 to size - 1 (clamped).
+     */
+    static void asymmetricHann(T* output, int size, int fall) noexcept
+    {
+        assert(output != nullptr);
+        if (size <= 0) return;
+        if (size == 1) { output[0] = T(1); return; }
+        const int f = std::clamp(fall, 1, size - 1);
+        const int rise = size - f;
+        constexpr double kPi = 3.14159265358979323846;
+        for (int i = 0; i < rise; ++i)
+            output[i] = static_cast<T>(0.5 - 0.5 * std::cos(kPi * static_cast<double>(i) / static_cast<double>(rise)));
+        for (int i = 0; i < f; ++i)
+            output[rise + i] = static_cast<T>(0.5 + 0.5 * std::cos(kPi * static_cast<double>(i) / static_cast<double>(f)));
+    }
+
     // -- Utility methods -------------------------------------------------------
 
     /**

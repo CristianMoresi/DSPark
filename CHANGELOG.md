@@ -224,8 +224,8 @@ All notable user-facing changes to DSPark are documented here.
   speed and deeper at slower speeds; the delay is held at the head distance
   over the speed and read through a four-point Lagrange interpolator, and a
   change of `setSpeed()` glides the speed (0.45 s up, 0.7 s down). A 3 kHz
-  tone at full depth moves by 0.65, 0.46 and 0.35 % peak to peak at 7.5, 15
-  and 30 ips (0.07 % at the default depth at 15 ips); switching from 15 to
+  tone at full depth moves by 0.69, 0.54 and 0.38 % peak to peak at 7.5, 15
+  and 30 ips (0.08 % at the default depth at 15 ips); switching from 15 to
   7.5 ips moves its pitch by 0.09 % at most.
   `setHum(dBFS, mains)` adds mains hum after the tape (50 or 60 Hz with its
   second harmonic 6 dB down, in phase on every channel).
@@ -268,6 +268,132 @@ All notable user-facing changes to DSPark are documented here.
   State keys `transport`, `humDb`, `mains`, `crosstalk`, `asymmetry`,
   `transformer`, `headModel`, `electronics`, `alignHf`, `alignLf`,
   `formulation`, `trackFormat`, `calibrationLevel` and `monitor`.
+- `AlgorithmicReverb`, around the tank, all off by default; the defaults and
+  every earlier control give the same output as before, to the bit (Room,
+  Hall, Plate, Spring and Cathedral in Eco):
+  `setDecayBand(index, band)`, six bands of a parametric equalizer of the
+  decay time (bell, low shelf, high shelf, each a frequency, a Q and a
+  multiplier of the decay there): each line carries the band as a filter in
+  its loop whose gain is -60 x (round trip / T60) x (1 / multiplier - 1) dB,
+  and bands that lengthen the decay are scaled down together until no loop
+  passes 0.9995. A 1.5 s hall measures 2.71 s at 2 kHz with a bell there at
+  x2 (1.48 without), 0.78 s at 8 kHz with a high shelf at 4 kHz at x0.5
+  (1.47) and 2.58 s at 125 Hz with a low shelf at 250 Hz at x2 (1.63).
+  `setFreeze(true)` fades the tank's input and the early field out over
+  20 ms while every loop's absorption and decay band fade to unity: the tail
+  holds its level within 0.01 dB from one second to six and the balance of
+  its 6 kHz and 500 Hz thirds of an octave within 0.8 dB.
+  `setDucking(dB)`, `setGate(threshold)`, `setGateHold()` and
+  `setGateRelease()` shape the wet signal from the dry one (`TailShaper`):
+  the tail ducks by the amount set while noise plays (-6.00, -11.99 and
+  -23.98 dB at 6, 12 and 24) and comes back over a second and a half (-0.13,
+  -0.27 and -0.53 dB 1.5 s after the noise stops); the gate closes once the
+  dry signal has stayed under its recent peak by the threshold for the hold
+  time (a 2 s hall under -70 dBFS 0.44 s after the noise stops, with -30 dB,
+  50 ms and 40 ms).
+  `setDistance(0..1)` moves the balance from the early reflections to the
+  tail, shortens the pre-delay, adds input diffusion and darkens the wet
+  signal: the first 80 ms of a hall against the rest go from +0.72 to
+  -3.71 dB and 8 kHz against 500 Hz from -7.5 to -22.8 dB.
+  `setThickness(0..1)` compresses the tank's input (ratio up to 4 over
+  -30 dBFS, a 24 dB knee, gain compensated at -18 dBFS): at 1 a quiet
+  passage at -40 dBFS feeds a tail 8.7 dB louder and a loud one at -12 dBFS
+  one 2.0 dB quieter; `setThicknessSaturation(true)` adds a soft saturation
+  after it.
+  `setTempo()`, `setPreDelayNote()` and `setGateHoldNote()` set the
+  pre-delay (up to 500 ms) and the gate hold (up to 4 s) as note values,
+  straight, dotted or triplet (a sixteenth at 120 BPM is 125 ms).
+  `setInputWidth(0..1)` narrows the input before the tank (an inverted
+  stereo pair is more than 60 dB quieter at 0), and
+  `setWidthLaw(WidthLaw::PowerKept)` raises the middle as `setWidth()`
+  lowers the side: the tail keeps its power within 0.2 dB from a width of 0
+  to 1.41, where the side law loses 1.1 dB at 0.
+  `setPostEqBand(index, band)`: six bands of a parametric equalizer of the
+  wet signal (cuts of 6 to 48 dB per octave, bells, shelves, tilt; 20 ms
+  ramps).
+  `setModulationStyle(ModulationStyle::Segments)` moves every other line in
+  straight segments toward random positions at random speeds instead of the
+  smooth random modulation.
+  `setSpaceLayout(SpaceLayout::Geometric)` spaces the line lengths evenly in
+  log over the same range (about 6.6 per octave, the two sides interleaved),
+  then to the nearest prime; the lengths glide to the new layout.
+  `setShimmer(0..1)` pitches the tail up an octave with two read heads of
+  random window length (30 to 60 ms) and feeds it back into the tank: a
+  500 Hz tone's octave sits 85 dB under it without, 47.5, 41.5 and 35.5 dB
+  under it at 0.25, 0.5 and 1, and the tail stays bounded over 20 s.
+  The bands of the decay equalizer cost 3 % each (six: 17 %), the others up to
+  11 % of the tank. Processing the tank in blocks was tried and dropped on
+  measurement (blocks of 64 cost 7 % more than sample by sample). State keys
+  `db0.shape` to `db5.mult`, `freeze`, `ducking`, `gate`, `gateHold`,
+  `gateRelease`, `distance`, `thickness`, `thickSat`, `tempo`, `preNote`,
+  `preFeel`, `gateNote`, `gateFeel`, `inWidth`, `widthLaw`, `modStyle`,
+  `layout`, `shimmer` and the wet equalizer's bands.
+- `Reverb` (convolution): `setDucking()`, `setGate()`, `setGateHold()` and
+  `setGateRelease()`, the same shaping of the wet signal from the dry one.
+  State keys `ducking`, `gate`, `gateHold` and `gateRelease`.
+- `TailShaper` (new, `Core/TailShaper.h`): ducking and a relative gate for a
+  wet signal, driven by the dry one. Each follower's reference is the peak
+  of its own envelope (the ducking's falls over ten seconds), so the
+  ducking and the threshold are relative to the programme's own level; the
+  ducking's gain is exp(-depth x min(1, level / reference)) with a 30 ms
+  attack and a 400 ms release, the gate's gain is smoothed twice, with a
+  hold.
+- `BucketBrigade` (new, `Core/BucketBrigade.h`): a bucket-brigade delay
+  line of 64 to 8192 stages whose clock the delay sets (delay = stages /
+  (2 clock)), modelled at the host's rate: the clock is a phase that
+  advances by clock / rate per sample; at each tick the input, interpolated
+  to the tick's time, enters the chain and the oldest bucket leaves it; the
+  output is the last bucket held and averaged over each host sample (so the
+  steps' images do not fold back when the clock is faster than the host),
+  between fourth-order Butterworth anti-alias and reconstruction filters at
+  a corner the caller sets.
+- `Chorus::setModel(Model::Analog)` (off by default): the channels summed to
+  mono, high-passed at 5 Hz, into two bucket-brigade lines of 512 stages
+  whose clocks a slightly asymmetric triangle moves in opposition (in phase
+  in the Vibrato mode), with the device's filters at a fifth of the slowest
+  clock and the line's hiss (`setAnalogNoise()`, -84 dBFS by default), which
+  grows with the delay; the dry signal keeps its stereo. `setAnalogMode()`
+  loads three presets of rate, depth and centre (Slow 0.5 Hz, Fast 0.85 Hz,
+  Vibrato 7 Hz in phase). From 176.4 kHz the engine runs at half the rate.
+  Other lines in the band stay 81 to 90 dB under a 1 kHz input at 48 kHz
+  and 99 to 104 dB at 96 and 192 kHz; a 9 kHz input leaves no other line
+  within 73 dB of it. It costs 56 ns per stereo frame against 81 for the
+  digital model. The digital model gives the same output as before, to the
+  bit. State keys `model`, `analogMode` and `analogNoise`.
+- `Vibrato::setModel(Model::Analog)` (off by default): each channel through
+  a bucket-brigade line of 1024 stages whose clock the sweep moves, with the
+  filters at a fifth of the slowest clock of the sweep and the line's hiss
+  (`setAnalogNoise()`). At the defaults a 500 Hz tone keeps its level and
+  no other line comes within 114 dB of it; a deep slow sweep (4 semitones
+  at 1 Hz, a 74 ms peak delay) is darker, as on the hardware: 52 dB under
+  the digital model at 3 kHz. It costs 131 ns per stereo frame against 35.
+  The digital model gives the same output as before, to the bit. State keys
+  `model` and `analogNoise`.
+- `Delay::setCharacter()` (Clean by default, the same output as before, to
+  the bit): `Character::Tape` moves the read point with a tape transport
+  (`TapeTransport`): a change of the delay is a change of tape speed reached
+  with the motor's inertia, so the pitch bends while it glides (300 to
+  150 ms: the pitch 1.43 times up 0.1 s later, 1.08 at 0.5 s, within 0.4 %
+  at 1.2 s),
+  wow and flutter of the capstan (`setWowFlutter(0..1)`, 0.5 by default:
+  0.14 % peak to peak on 0.1 s windows), the playback head's loss and the
+  tape's hiss. `Character::Bucket` runs the line through a bucket-brigade
+  device of 4096 stages, with its filters at 0.3 of the clock, so a longer
+  echo is darker (2 kHz is 0.4 dB down at 150 ms, 6.6 dB at 300 ms and 52 dB
+  at 600 ms; 4 kHz 0.4 dB down at 50 ms), and its hiss; the feedback goes
+  round the device (echoes at 300.5 and 601.1 ms with a 300 ms delay) and
+  the clock's images stay 68 dB under a 1 kHz tone at 300 ms.
+  `setCharacterNoise()` sets the hiss of both (-84 dBFS by default). A
+  stereo frame costs 171 ns with Tape and 80 with Bucket against 53. State
+  keys `character`, `wowFlutter` and `charNoise`.
+- `TapeTransport` (new, `Core/TapeTransport.h`): a tape transport as a speed
+  state, the one `TapeMachine` and `Delay` use: the speed glides with
+  inertia (one time constant up, another down), deviates by a smoothed
+  noise, the capstan's rotation and the reel's at rates that follow the
+  speed, and a scrape band; the delay is held at the head distance over the
+  speed. `setTargetDelay()` sets a delay as a speed (the head distance
+  stays). `TapeMachine`'s speed model now runs on it (its own random
+  sequence: the figures above are of this version).
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it

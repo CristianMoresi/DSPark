@@ -451,11 +451,14 @@
  * | `Biquad<T>`              | Core/Biquad.h             | Single biquad filter with 9 coefficient types     |
  * | `BiquadCoeffs`           | Core/Biquad.h             | Filter coefficient calculator (Audio EQ Cookbook)  |
  * | `BiquadCascade<T>`       | Core/BiquadCascade.h      | Sections in series in one pass: coefficient ramps, click-free bypass |
+ * | `BucketBrigade<T>`       | Core/BucketBrigade.h      | A bucket-brigade delay line: buckets moved by a clock whose rate sets the delay |
  * | `NormalizedLadder<T>`    | Core/NormalizedLadder.h   | Second-order section that stays passive under any modulation |
  * | `FilterDesign`           | Core/FilterDesign.h       | Biquads that follow their analog prototypes to Nyquist; cuts of any slope, high-order bells and shelves, tilt, elliptic wall |
  * | `FirBank<T>`             | Core/FirBank.h            | Many long FIR kernels over shared inputs, by one partitioned convolution; kernels replaced with a crossfade |
  * | `KeyEqualizer<T>`        | Core/KeyEqualizer.h       | Six bands of cuts, bells, shelves and tilts over the key of a dynamics processor |
  * | `CabinetModel<T>`        | Core/CabinetModel.h       | A loudspeaker cabinet with no latency: colour filters, sparse reflections, two diffusers |
+ * | `TailShaper<T>`          | Core/TailShaper.h         | Ducking and a relative gate for a wet signal, driven by the dry one |
+ * | `TapeTransport<T>`       | Core/TapeTransport.h      | A tape transport as a speed state: the delay of a moving tape, with inertia, wow and flutter |
  * | `FFTReal<T>`             | Core/FFT.h                | Real FFT by vector lanes, SIMD (SSE2/AVX/NEON)    |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
@@ -695,11 +698,14 @@
 #include "Core/SpscQueue.h"
 #include "Core/Biquad.h"
 #include "Core/BiquadCascade.h"
+#include "Core/BucketBrigade.h"
 #include "Core/NormalizedLadder.h"
 #include "Core/FilterDesign.h"
 #include "Core/FirBank.h"
 #include "Core/KeyEqualizer.h"
 #include "Core/CabinetModel.h"
+#include "Core/TailShaper.h"
+#include "Core/TapeTransport.h"
 #include "Core/DryWetMixer.h"
 #include "Core/Smoothers.h"
 #include "Core/AnalogRandom.h"

@@ -4312,3 +4312,244 @@ DSPARK_TEST(Equalizer_analog_per_sample_form_and_state)
     EXPECT_EQ(other.getBandConfig(3).order, 1);
     EXPECT_EQ(static_cast<double>(other.getBandConfig(3).slope), 96.0);
 }
+
+// ============================================================================
+// Equalizer: where in the stereo pair a band acts
+// ============================================================================
+
+namespace {
+
+struct EqStereo { std::vector<double> l, r; };
+
+EqStereo eqStereoNoise(int n, uint32_t seed)
+{
+    EqStereo x;
+    x.l.resize(static_cast<size_t>(n));
+    x.r.resize(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u; x.l[static_cast<size_t>(i)] = (static_cast<double>(seed >> 8) / 8388608.0 - 1.0) * 0.4;
+        seed = seed * 1664525u + 1013904223u; x.r[static_cast<size_t>(i)] = (static_cast<double>(seed >> 8) / 8388608.0 - 1.0) * 0.4;
+    }
+    return x;
+}
+
+void eqRunStereo(AnalogEq& eq, EqStereo& x, int block = 256)
+{
+    const int total = static_cast<int>(x.l.size());
+    for (int off = 0; off < total; off += block)
+    {
+        double* ch[2] = { x.l.data() + off, x.r.data() + off };
+        eq.processBlock(AudioBufferView<double>(ch, 2, std::min(block, total - off)));
+    }
+}
+
+double eqWorstDiff(const std::vector<double>& a, const std::vector<double>& b)
+{
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::abs(a[i] - b[i]));
+    return worst;
+}
+
+AnalogEq::BandConfig eqPlaced(AnalogEq::BandConfig cfg, AnalogEq::Placement where)
+{
+    cfg.placement = where;
+    return cfg;
+}
+
+} // namespace
+
+// A band placed on the left, the right, the middle or the sides acts there and
+// nowhere else, in both engines: the same samples as running the band on that
+// signal alone.
+DSPARK_TEST(Equalizer_band_placement_acts_where_it_is_placed)
+{
+    using Type = AnalogEq::BandType;
+    using Place = AnalogEq::Placement;
+    const AnalogEq::BandConfig bell = eqBand(Type::Peak, 1000.0, 12.0, 1.5);
+    const AnalogEq::BandConfig shelf = eqBand(Type::HighShelf, 5000.0, -9.0, 0.7071);
+    for (const bool analog : { false, true })
+    {
+        const EqStereo in = eqStereoNoise(4096, 11u);
+        // What one band does to one signal.
+        const auto alone = [&](const AnalogEq::BandConfig& cfg, std::vector<double> x) {
+            AnalogEq eq;
+            eq.setAnalogResponse(analog);
+            eq.setBand(0, cfg);
+            eq.prepare({ 48000.0, 256, 1 });
+            eqRun(eq, x);
+            return x;
+        };
+        const auto placed = [&](std::initializer_list<AnalogEq::BandConfig> bands) {
+            AnalogEq eq;
+            eq.setAnalogResponse(analog);
+            int index = 0;
+            for (const AnalogEq::BandConfig& cfg : bands) eq.setBand(index++, cfg);
+            eq.prepare({ 48000.0, 256, 2 });
+            EqStereo x = in;
+            eqRunStereo(eq, x);
+            return x;
+        };
+        std::vector<double> mid(in.l.size()), side(in.l.size());
+        for (size_t i = 0; i < mid.size(); ++i) { mid[i] = 0.5 * (in.l[i] + in.r[i]); side[i] = 0.5 * (in.l[i] - in.r[i]); }
+
+        EqStereo out = placed({ eqPlaced(bell, Place::Left) });
+        EXPECT_LT(eqWorstDiff(out.l, alone(bell, in.l)), 1e-12);
+        EXPECT_TRUE(out.r == in.r);
+
+        out = placed({ eqPlaced(bell, Place::Right) });
+        EXPECT_TRUE(out.l == in.l);
+        EXPECT_LT(eqWorstDiff(out.r, alone(bell, in.r)), 1e-12);
+
+        out = placed({ eqPlaced(bell, Place::Mid) });
+        {
+            const std::vector<double> m = alone(bell, mid);
+            double worst = 0.0;
+            for (size_t i = 0; i < m.size(); ++i)
+                worst = std::max({ worst, std::abs(out.l[i] - (m[i] + side[i])), std::abs(out.r[i] - (m[i] - side[i])) });
+            EXPECT_LT(worst, 1e-12);
+        }
+        out = placed({ eqPlaced(bell, Place::Side) });
+        {
+            const std::vector<double> s = alone(bell, side);
+            double worst = 0.0;
+            for (size_t i = 0; i < s.size(); ++i)
+                worst = std::max({ worst, std::abs(out.l[i] - (mid[i] + s[i])), std::abs(out.r[i] - (mid[i] - s[i])) });
+            EXPECT_LT(worst, 1e-12);
+        }
+        // Left and stereo bands first, then the middle and the sides.
+        out = placed({ eqPlaced(bell, Place::Mid), eqPlaced(shelf, Place::Left), eqPlaced(shelf, Place::Side) });
+        {
+            const std::vector<double> left = alone(shelf, in.l);
+            std::vector<double> m(left.size()), s(left.size());
+            for (size_t i = 0; i < m.size(); ++i) { m[i] = 0.5 * (left[i] + in.r[i]); s[i] = 0.5 * (left[i] - in.r[i]); }
+            m = alone(bell, m);
+            s = alone(shelf, s);
+            double worst = 0.0;
+            for (size_t i = 0; i < m.size(); ++i)
+                worst = std::max({ worst, std::abs(out.l[i] - (m[i] + s[i])), std::abs(out.r[i] - (m[i] - s[i])) });
+            EXPECT_LT(worst, 1e-12);
+        }
+
+        // One channel: the left and middle bands act on it, the right and side bands do nothing.
+        AnalogEq mono;
+        mono.setAnalogResponse(analog);
+        mono.setBand(0, eqPlaced(bell, Place::Mid));
+        mono.setBand(1, eqPlaced(shelf, Place::Right));
+        mono.setBand(2, eqPlaced(shelf, Place::Side));
+        mono.prepare({ 48000.0, 256, 1 });
+        std::vector<double> x = in.l;
+        eqRun(mono, x);
+        EXPECT_LT(eqWorstDiff(x, alone(bell, in.l)), 1e-12);
+
+        // The per-sample form runs the left and right bands on their channels (the middle and the
+        // sides need whole frames).
+        AnalogEq block, single;
+        for (AnalogEq* eq : { &block, &single })
+        {
+            eq->setAnalogResponse(analog);
+            eq->setBand(0, eqPlaced(bell, Place::Left));
+            eq->setBand(1, eqPlaced(shelf, Place::Right));
+            eq->setBand(2, eqBand(Type::Peak, 300.0, 4.0, 2.0));
+            eq->prepare({ 48000.0, 256, 2 });
+        }
+        EqStereo viaBlock = in;
+        eqRunStereo(block, viaBlock);
+        double worst = 0.0;
+        for (size_t i = 0; i < in.l.size(); ++i)
+        {
+            worst = std::max(worst, std::abs(single.processSample(in.l[i], 0) - viaBlock.l[i]));
+            worst = std::max(worst, std::abs(single.processSample(in.r[i], 1) - viaBlock.r[i]));
+        }
+        EXPECT_LT(worst, analog ? 1e-9 : 1e-4);      // the cookbook engine smooths its parameters by block
+    }
+}
+
+// In LinearPhase the placement is one matrix of kernels: the latency is the
+// same, and each kernel has the response the two steps would give.
+DSPARK_TEST(Equalizer_band_placement_in_linear_phase_is_one_matrix)
+{
+    using Type = AnalogEq::BandType;
+    using Place = AnalogEq::Placement;
+    const double fs = 48000.0;
+    const auto make = [&](std::initializer_list<AnalogEq::BandConfig> bands, AnalogEq& eq) {
+        eq.setFilterMode(AnalogEq::FilterMode::LinearPhase);
+        int index = 0;
+        for (const AnalogEq::BandConfig& cfg : bands) eq.setBand(index++, cfg);
+        eq.prepare({ fs, 512, 2 });
+    };
+    AnalogEq plain, placed;
+    make({ eqBand(Type::Peak, 1000.0, 12.0, 1.0) }, plain);
+    make({ eqPlaced(eqBand(Type::Peak, 1000.0, 12.0, 1.0), Place::Mid),
+           eqPlaced(eqBand(Type::HighShelf, 6000.0, -6.0, 0.7071), Place::Left) }, placed);
+    EXPECT_EQ(placed.getLatency(), plain.getLatency());
+
+    // An impulse on the left alone: what reaches each channel.
+    const int length = 3 * 32768;
+    EqStereo x;
+    x.l.assign(static_cast<size_t>(length), 0.0);
+    x.r.assign(static_cast<size_t>(length), 0.0);
+    x.l[0] = 1.0;
+    eqRunStereo(placed, x, 512);
+    // The bell is 12 dB at 1 kHz in the middle and nothing at the sides: half the sum reaches the
+    // left and half the difference crosses to the right. The shelf (-6 dB above 6 kHz) is on the left.
+    const double m = std::pow(10.0, 12.0 / 20.0);
+    EXPECT_NEAR(eqLevelDb(x.l, 1000.0, fs), 20.0 * std::log10(0.5 * (m + 1.0)), 0.05);
+    EXPECT_NEAR(eqLevelDb(x.r, 1000.0, fs), 20.0 * std::log10(0.5 * (m - 1.0)), 0.05);
+    EXPECT_NEAR(eqLevelDb(x.l, 60.0, fs), 0.0, 0.05);
+    EXPECT_LT(eqLevelDb(x.r, 60.0, fs), -40.0);
+    EXPECT_NEAR(eqLevelDb(x.l, 16000.0, fs), -6.0, 0.1);
+    EXPECT_LT(eqLevelDb(x.r, 16000.0, fs), -40.0);
+
+    // The same signal on both channels is all middle: the bell at full height on both. Opposite
+    // signals are all sides: the bell does not touch them.
+    for (const double sign : { 1.0, -1.0 })
+    {
+        AnalogEq eq;
+        make({ eqPlaced(eqBand(Type::Peak, 1000.0, 12.0, 1.0), Place::Mid) }, eq);
+        EqStereo y;
+        y.l.assign(static_cast<size_t>(length), 0.0);
+        y.r.assign(static_cast<size_t>(length), 0.0);
+        y.l[0] = 1.0;
+        y.r[0] = sign;
+        eqRunStereo(eq, y, 512);
+        EXPECT_NEAR(eqLevelDb(y.l, 1000.0, fs), sign > 0.0 ? 12.0 : 0.0, 0.05);
+        EXPECT_NEAR(eqLevelDb(y.r, 1000.0, fs), sign > 0.0 ? 12.0 : 0.0, 0.05);
+    }
+}
+
+DSPARK_TEST(Equalizer_band_placement_state_and_curves)
+{
+    using Type = AnalogEq::BandType;
+    using Place = AnalogEq::Placement;
+    AnalogEq eq;
+    eq.setBand(0, eqPlaced(eqBand(Type::Peak, 1000.0, 6.0, 1.0), Place::Side));
+    eq.setBand(1, eqPlaced(eqBand(Type::Peak, 1000.0, -4.0, 1.0), Place::Left));
+    eq.setBand(2, eqBand(Type::Peak, 1000.0, 3.0, 1.0));
+    eq.prepare({ 48000.0, 256, 2 });
+    AnalogEq other;
+    const std::vector<uint8_t> blob = eq.getState();
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.getBandConfig(0).placement == Place::Side);
+    EXPECT_TRUE(other.getBandConfig(1).placement == Place::Left);
+    EXPECT_TRUE(other.getBandConfig(2).placement == Place::Stereo);
+    EXPECT_TRUE(other.getState() == blob);
+
+    // A placement that is not one keeps the band's own.
+    AnalogEq::BandConfig wild = eq.getBandConfig(0);
+    wild.placement = static_cast<Place>(42);
+    eq.setBand(0, wild);
+    EXPECT_TRUE(eq.getBandConfig(0).placement == Place::Side);
+
+    // The curve of each place: the stereo bands and the ones placed there.
+    const double hz[1] = { 1000.0 };
+    double level[1];
+    eq.getMagnitudeForFrequencyArray(hz, level, 1, Place::Side);
+    EXPECT_NEAR(20.0 * std::log10(level[0]), 9.0, 0.05);
+    eq.getMagnitudeForFrequencyArray(hz, level, 1, Place::Left);
+    EXPECT_NEAR(20.0 * std::log10(level[0]), -1.0, 0.05);
+    eq.getMagnitudeForFrequencyArray(hz, level, 1, Place::Mid);
+    EXPECT_NEAR(20.0 * std::log10(level[0]), 3.0, 0.05);
+    eq.getMagnitudeForFrequencyArray(hz, level, 1);
+    EXPECT_NEAR(20.0 * std::log10(level[0]), 5.0, 0.05);
+}

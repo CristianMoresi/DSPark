@@ -102,7 +102,7 @@ public:
         const int before = numSections_;
         numSections_ = clamped;
         rebuildRoute();
-        for (int s = before; s < numSections_; ++s)
+        for (int s = std::max(before, 0); s < clamped; ++s)
             if (enabled_[static_cast<size_t>(s)]) seedFromInput(s);
     }
 

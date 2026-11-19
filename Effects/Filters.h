@@ -588,7 +588,7 @@ public:
                     lastShelfSlope_ = ssl;
                 }
 
-                const int ns = numStages_.load(std::memory_order_relaxed);
+                const int ns = activeStages();
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T* channelData = buffer.getChannel(ch);
@@ -661,7 +661,7 @@ public:
 
                 // Coefficient path of this segment: sample k uses
                 // from + (rampPos_ + k + 1) / kChunkSize * (to - from).
-                const int ns = numStages_.load(std::memory_order_relaxed);
+                const int ns = activeStages();
                 const bool ramping = rampPos_ < kChunkSize;
                 std::array<BiquadCoeffs, kMaxStages> c0 {}, step {};
                 for (int s = 0; s < ns; ++s)
@@ -729,7 +729,7 @@ public:
     {
         if (channel < 0 || channel >= MaxChannels) return input;
         double sample = static_cast<double>(input);
-        const int ns = numStages_.load(std::memory_order_relaxed);
+        const int ns = activeStages();
         for (int s = 0; s < ns; ++s)
             sample = stages_[s].processSampleCore(sample, channel);
         return static_cast<T>(sample);
@@ -829,6 +829,12 @@ protected:
     static constexpr int kMaxStages = 4;
     static constexpr int kChunkSize = 16;   ///< Samples between coefficient designs in the dynamic path.
     static constexpr int kMaxOrder = 8; 
+
+    /** @brief Stages in use; bounded here so every loop over them is seen to stay inside the stage arrays. */
+    [[nodiscard]] int activeStages() const noexcept
+    {
+        return std::min(numStages_.load(std::memory_order_relaxed), kMaxStages);
+    }
 
     struct ButterworthCascade
     {

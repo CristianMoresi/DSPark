@@ -5,6 +5,8 @@
 #include "TestSignals.h"
 
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
+#include "../Core/NormalizedLadder.h"
 #include "../Core/StateVariableFilter.h"
 #include "../Core/LadderFilter.h"
 #include "../Core/FIRFilter.h"
@@ -2865,4 +2867,533 @@ DSPARK_TEST(WDF_diode_pair_extreme_drive_converges)
         EXPECT_TRUE(std::isfinite(v));
         EXPECT_LT(std::fabs(v), 5.0);   // diode conduction clamps far below drive
     }
+}
+
+// ============================================================================
+// BiquadCascade: sections in one pass, ramps, bypass
+// ============================================================================
+
+namespace {
+
+// A varied cascade: bells, shelves and cuts across the band.
+BiquadCoeffs cascadeSection(int index, double rate)
+{
+    switch (index % 6)
+    {
+        case 0:  return BiquadCoeffs::makePeak(rate, 120.0 + 37.0 * index, 1.4, 6.0);
+        case 1:  return BiquadCoeffs::makeHighShelf(rate, 6000.0, -4.5);
+        case 2:  return BiquadCoeffs::makePeak(rate, 2500.0 + 311.0 * index, 4.0, -9.0);
+        case 3:  return BiquadCoeffs::makeHighPass(rate, 40.0, 0.9);
+        case 4:  return BiquadCoeffs::makeLowShelf(rate, 200.0, 3.0);
+        default: return BiquadCoeffs::makeLowPass(rate, 15000.0, 0.6);
+    }
+}
+
+double cascadeNoise(uint32_t& state)
+{
+    state = state * 1664525u + 1013904223u;
+    return (static_cast<double>(state >> 8) / 8388608.0) - 1.0;
+}
+
+} // namespace
+
+DSPARK_TEST(BiquadCascade_matches_a_chain_of_biquads)
+{
+    constexpr double kRate = 48000.0;
+    constexpr int kChannels = 3;     // a pair in one register and a channel on its own
+    constexpr int kTotal = 6000;
+    for (const int sections : { 1, 2, 3, 4, 5, 7, 8 })
+    {
+        BiquadCascade<double, 8, 4> cascade;
+        cascade.setNumSections(sections);
+        std::array<Biquad<double, 4>, 8> chain;
+        for (int s = 0; s < sections; ++s)
+        {
+            const BiquadCoeffs c = cascadeSection(s, kRate);
+            cascade.setCoeffs(s, c);
+            chain[static_cast<size_t>(s)].setCoeffsNow(c);
+        }
+        EXPECT_EQ(cascade.getNumSections(), sections);
+
+        AudioBuffer<double> block;
+        block.resize(kChannels, 512);
+        uint32_t seed = 12345u + static_cast<uint32_t>(sections);
+        double worst = 0.0, peak = 0.0;
+        int done = 0, turn = 0;
+        while (done < kTotal)
+        {
+            // Lengths that cross the internal chunks every way.
+            static constexpr int kLengths[] = { 1, 63, 64, 65, 200, 7, 512 };
+            const int length = std::min(kLengths[turn++ % 7], kTotal - done);
+            std::array<std::vector<double>, kChannels> expected;
+            for (int ch = 0; ch < kChannels; ++ch)
+            {
+                expected[static_cast<size_t>(ch)].resize(static_cast<size_t>(length));
+                for (int i = 0; i < length; ++i)
+                {
+                    const double x = 0.5 * cascadeNoise(seed);
+                    block.getChannel(ch)[i] = x;
+                    double y = x;
+                    for (int s = 0; s < sections; ++s)
+                        y = chain[static_cast<size_t>(s)].processSampleCore(y, ch);
+                    expected[static_cast<size_t>(ch)][static_cast<size_t>(i)] = y;
+                }
+            }
+            cascade.processBlock(block.toView().getSubView(0, length));
+            for (int ch = 0; ch < kChannels; ++ch)
+                for (int i = 0; i < length; ++i)
+                {
+                    const double want = expected[static_cast<size_t>(ch)][static_cast<size_t>(i)];
+                    worst = std::max(worst, std::abs(block.getChannel(ch)[i] - want));
+                    peak = std::max(peak, std::abs(want));
+                }
+            done += length;
+        }
+        // Two realisations of the same transfer function: they differ by rounding.
+        EXPECT_GT(peak, 0.05);
+        EXPECT_LT(worst, 1e-9);
+    }
+}
+
+DSPARK_TEST(BiquadCascade_is_exact_across_block_partitions_and_sample_form)
+{
+    constexpr double kRate = 48000.0;
+    constexpr int kTotal = 3000;
+    std::vector<double> input(kTotal);
+    uint32_t seed = 99u;
+    for (double& v : input) v = 0.5 * cascadeNoise(seed);
+
+    const auto render = [&](int blockLength, bool withRamp) {
+        BiquadCascade<double, 8, 2> cascade;
+        cascade.setNumSections(7);
+        for (int s = 0; s < 7; ++s) cascade.setCoeffs(s, cascadeSection(s, kRate));
+        std::vector<double> out(input);
+        AudioBuffer<double> block;
+        block.resize(1, blockLength);
+        int pos = 0;
+        while (pos < kTotal)
+        {
+            const int length = std::min(blockLength, kTotal - pos);
+            if (withRamp && pos <= 1000 && pos + length > 1000)
+            {
+                // The ramp starts at a block edge in every partition used here.
+                cascade.rampCoeffs(2, BiquadCoeffs::makePeak(kRate, 900.0, 2.0, 9.0), 700);
+            }
+            std::copy_n(input.data() + pos, length, block.getChannel(0));
+            cascade.processBlock(block.toView().getSubView(0, length));
+            std::copy_n(block.getChannel(0), length, out.data() + pos);
+            pos += length;
+        }
+        return out;
+    };
+
+    // The stream does not depend on how it is cut (same lane form throughout).
+    const auto whole = render(3000, false);
+    for (const int blockLength : { 1, 50, 64, 250 })
+    {
+        const auto cut = render(blockLength, false);
+        bool same = true;
+        for (int i = 0; i < kTotal; ++i) same = same && cut[static_cast<size_t>(i)] == whole[static_cast<size_t>(i)];
+        EXPECT_TRUE(same);
+    }
+    // Nor does it with a ramp in flight (block edges at sample 1000 in each).
+    const auto rampWhole = render(1000, true);
+    for (const int blockLength : { 50, 250, 500 })
+    {
+        const auto cut = render(blockLength, true);
+        bool same = true;
+        for (int i = 0; i < kTotal; ++i) same = same && cut[static_cast<size_t>(i)] == rampWhole[static_cast<size_t>(i)];
+        EXPECT_TRUE(same);
+    }
+    bool rampHeard = false;
+    for (int i = 1000; i < kTotal; ++i)
+        rampHeard = rampHeard || std::abs(rampWhole[static_cast<size_t>(i)] - whole[static_cast<size_t>(i)]) > 1e-3;
+    EXPECT_TRUE(rampHeard);
+
+    // The per-sample form walks the same ramp and gives the same samples to rounding.
+    {
+        BiquadCascade<double, 8, 2> blockForm, sampleForm;
+        for (auto* each : { &blockForm, &sampleForm })
+        {
+            each->setNumSections(5);
+            for (int s = 0; s < 5; ++s) each->setCoeffs(s, cascadeSection(s, kRate));
+        }
+        const BiquadCoeffs target = BiquadCoeffs::makePeak(kRate, 3000.0, 3.0, -12.0);
+        blockForm.rampCoeffs(4, target, 333);
+        sampleForm.rampCoeffs(4, target, 333);
+        EXPECT_TRUE(blockForm.isRamping());
+        EXPECT_TRUE(blockForm.isRamping(4));
+        EXPECT_FALSE(blockForm.isRamping(0));
+
+        AudioBuffer<double> block;
+        block.resize(1, 1000);
+        std::copy_n(input.data(), 1000, block.getChannel(0));
+        blockForm.processBlock(block.toView());
+        double worst = 0.0;
+        for (int i = 0; i < 1000; ++i)
+        {
+            sampleForm.advanceRamps(1);
+            worst = std::max(worst, std::abs(sampleForm.processSample(input[static_cast<size_t>(i)], 0) - block.getChannel(0)[i]));
+        }
+        EXPECT_LT(worst, 1e-9);
+
+        // Both ramps landed exactly on the target.
+        for (auto* each : { &blockForm, &sampleForm })
+        {
+            EXPECT_FALSE(each->isRamping());
+            const BiquadCoeffs& c = each->getCoeffs(4);
+            EXPECT_TRUE(c.b0 == target.b0 && c.b1 == target.b1 && c.b2 == target.b2
+                        && c.a1 == target.a1 && c.a2 == target.a2);
+        }
+    }
+}
+
+DSPARK_TEST(BiquadCascade_bypass_leaves_and_returns_without_a_click)
+{
+    constexpr double kRate = 48000.0;
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr int kBlock = 4800;
+    const BiquadCoeffs bell = BiquadCoeffs::makePeak(kRate, 1000.0, 4.0, 12.0);
+    const auto tone = [](int64_t n) { return 0.2 * std::sin(2.0 * kPi * 1000.0 * static_cast<double>(n) / kRate); };
+
+    // The transparent set has the bell's poles and a flat response.
+    const BiquadCoeffs flat = bell.bypassed();
+    EXPECT_TRUE(flat.a1 == bell.a1 && flat.a2 == bell.a2 && flat.b0 == 1.0 && flat.b1 == bell.a1 && flat.b2 == bell.a2);
+    EXPECT_NEAR(flat.getMagnitude(1000.0, kRate), 1.0, 1e-12);
+    EXPECT_NEAR(flat.getMagnitude(15000.0, kRate), 1.0, 1e-12);
+
+    BiquadCascade<double, 4, 2> cascade;
+    cascade.setNumSections(1);
+    cascade.setCoeffs(0, bell);
+
+    AudioBuffer<double> block;
+    block.resize(1, kBlock);
+    int64_t n = 0;
+    const auto run = [&]() {
+        for (int i = 0; i < kBlock; ++i) block.getChannel(0)[i] = tone(n + i);
+        cascade.processBlock(block.toView());
+        n += kBlock;
+    };
+    const auto largestStep = [&](double previous) {
+        double step = 0.0;
+        for (int i = 0; i < kBlock; ++i)
+        {
+            step = std::max(step, std::abs(block.getChannel(0)[i] - previous));
+            previous = block.getChannel(0)[i];
+        }
+        return step;
+    };
+
+    run();
+    run();                                     // settled: the tone 12 dB up
+    double last = block.getChannel(0)[kBlock - 1];
+    const double boostedStep = largestStep(block.getChannel(0)[0]);
+    EXPECT_NEAR(boostedStep, 0.2 * 3.981 * 2.0 * std::sin(kPi * 1000.0 / kRate), 0.01);
+
+    // Out: the largest step between samples never exceeds what the boosted
+    // tone itself was doing, and the output ends on the input.
+    cascade.rampToBypass(0, 96);
+    run();
+    EXPECT_LT(largestStep(last), boostedStep * 1.02);
+    run();
+    double residue = 0.0;
+    for (int i = 0; i < kBlock; ++i)
+        residue = std::max(residue, std::abs(block.getChannel(0)[i] - tone(n - kBlock + i)));
+    EXPECT_LT(residue, 1e-12);
+
+    // Transparent, it is switched off: the input goes through untouched.
+    cascade.setSectionEnabled(0, false);
+    EXPECT_FALSE(cascade.isSectionEnabled(0));
+    run();
+    bool untouched = true;
+    for (int i = 0; i < kBlock; ++i) untouched = untouched && block.getChannel(0)[i] == tone(n - kBlock + i);
+    EXPECT_TRUE(untouched);
+    last = block.getChannel(0)[kBlock - 1];
+
+    // Back in: enabled it starts from its input's history, and the bell comes
+    // up along the ramp with no step larger than the boosted tone's.
+    cascade.setSectionEnabled(0, true);
+    cascade.rampCoeffs(0, bell, 96);
+    run();
+    EXPECT_LT(largestStep(last), boostedStep * 1.02);
+    run();
+    double peak = 0.0;
+    for (int i = 0; i < kBlock; ++i) peak = std::max(peak, std::abs(block.getChannel(0)[i]));
+    EXPECT_NEAR(peak, 0.2 * 3.981, 0.005);
+
+}
+
+DSPARK_TEST(BiquadCascade_sections_enter_leave_and_recover)
+{
+    constexpr double kRate = 48000.0;
+    BiquadCascade<float, 6, 2> cascade;
+    cascade.setNumSections(4);
+    for (int s = 0; s < 6; ++s) cascade.setCoeffs(s, cascadeSection(s, kRate));
+
+    // Out-of-range arguments are ignored or clamped.
+    cascade.setCoeffs(-1, BiquadCoeffs {});
+    cascade.setCoeffs(6, BiquadCoeffs {});
+    cascade.rampCoeffs(99, BiquadCoeffs {}, 10);
+    cascade.setSectionEnabled(17, false);
+    EXPECT_FALSE(cascade.isSectionEnabled(17));
+    cascade.setNumSections(99);
+    EXPECT_EQ(cascade.getNumSections(), 6);
+    cascade.setNumSections(-3);
+    EXPECT_EQ(cascade.getNumSections(), 0);
+
+    // No sections: the block is left as it is.
+    auto block = makeStereoBuffer(256);
+    block.fillNoise(0.5f);
+    std::vector<float> before(block.ch(0), block.ch(0) + 256);
+    cascade.processBlock(block.view());
+    bool same = true;
+    for (int i = 0; i < 256; ++i) same = same && block.ch(0)[i] == before[static_cast<size_t>(i)];
+    EXPECT_TRUE(same);
+
+    // A transparent section that enters the path changes nothing audible.
+    cascade.setNumSections(1);
+    cascade.setCoeffs(0, cascadeSection(0, kRate).bypassed());
+    block.fillNoise(0.5f, 77u);
+    before.assign(block.ch(0), block.ch(0) + 256);
+    cascade.processBlock(block.view());
+    float worst = 0.0f;
+    for (int i = 0; i < 256; ++i) worst = std::max(worst, std::abs(block.ch(0)[i] - before[static_cast<size_t>(i)]));
+    EXPECT_LT(worst, 1e-6f);
+
+    // A sample that is not finite does not stay in the memory past its block.
+    cascade.setNumSections(4);
+    for (int s = 0; s < 4; ++s) cascade.setCoeffs(s, cascadeSection(s, kRate));
+    block.fillNoise(0.5f, 5u);
+    block.ch(0)[10] = std::numeric_limits<float>::quiet_NaN();
+    block.ch(1)[20] = std::numeric_limits<float>::infinity();
+    cascade.processBlock(block.view());
+    block.fillNoise(0.5f, 6u);
+    cascade.processBlock(block.view());
+    EXPECT_FALSE(hasNaN(block.ch(0), 256));
+    EXPECT_FALSE(hasNaN(block.ch(1), 256));
+    EXPECT_GT(measureRMS(block.ch(0), 256), 0.01f);
+
+    // reset() clears the memory: silence in, exact silence out.
+    cascade.reset();
+    block.fillSilence();
+    cascade.processBlock(block.view());
+    bool silent = true;
+    for (int i = 0; i < 256; ++i) silent = silent && block.ch(0)[i] == 0.0f && block.ch(1)[i] == 0.0f;
+    EXPECT_TRUE(silent);
+}
+
+// ============================================================================
+// NormalizedLadder: rotations and taps
+// ============================================================================
+
+DSPARK_TEST(NormalizedLadder_realises_every_biquad)
+{
+    constexpr double kRate = 48000.0;
+    const BiquadCoeffs sets[] = {
+        BiquadCoeffs::makeLowPass(kRate, 1000.0, 0.707),
+        BiquadCoeffs::makeLowPass(kRate, 80.0, 12.0),
+        BiquadCoeffs::makeHighPass(kRate, 40.0, 0.9),
+        BiquadCoeffs::makeBandPass(kRate, 3000.0, 5.0),
+        BiquadCoeffs::makeNotch(kRate, 1000.0, 8.0),
+        BiquadCoeffs::makeAllPass(kRate, 500.0, 0.7),
+        BiquadCoeffs::makePeak(kRate, 1000.0, 4.0, 12.0),
+        BiquadCoeffs::makePeak(kRate, 9000.0, 0.5, -18.0),
+        BiquadCoeffs::makeLowShelf(kRate, 200.0, 6.0),
+        BiquadCoeffs::makeHighShelf(kRate, 8000.0, -9.0),
+        BiquadCoeffs {},   // the identity
+    };
+    for (const BiquadCoeffs& c : sets)
+    {
+        // The rotations are rotations and the round trip gives the biquad back.
+        const auto ladder = NormalizedLadder<double, 1>::fromBiquad(c);
+        EXPECT_NEAR(ladder.c1 * ladder.c1 + ladder.s1 * ladder.s1, 1.0, 1e-14);
+        EXPECT_NEAR(ladder.c2 * ladder.c2 + ladder.s2 * ladder.s2, 1.0, 1e-14);
+        const BiquadCoeffs back = NormalizedLadder<double, 1>::toBiquad(ladder);
+        EXPECT_NEAR(back.b0, c.b0, 1e-12);
+        EXPECT_NEAR(back.b1, c.b1, 1e-12);
+        EXPECT_NEAR(back.b2, c.b2, 1e-12);
+        EXPECT_NEAR(back.a1, c.a1, 1e-12);
+        EXPECT_NEAR(back.a2, c.a2, 1e-12);
+
+        // The same samples as the transposed form, to rounding.
+        NormalizedLadder<double, 1> filter;
+        filter.setCoeffs(c);
+        Biquad<double, 1> reference;
+        reference.setCoeffsNow(c);
+        uint32_t seed = 4242u;
+        double worst = 0.0, peak = 0.0;
+        for (int i = 0; i < 6000; ++i)
+        {
+            const double x = 0.5 * cascadeNoise(seed);
+            const double want = reference.processSampleCore(x, 0);
+            worst = std::max(worst, std::abs(filter.processSample(x, 0) - want));
+            peak = std::max(peak, std::abs(want));
+        }
+        EXPECT_GT(peak, 0.01);
+        EXPECT_LT(worst, 1e-9);
+    }
+
+    // A set with poles outside the circle is brought inside: the section stays bounded.
+    BiquadCoeffs wild;
+    wild.b0 = 1.0; wild.a1 = -2.5; wild.a2 = 1.7;
+    NormalizedLadder<double, 1> safe;
+    safe.setCoeffs(wild);
+    double largest = 0.0;
+    uint32_t seed = 1u;
+    for (int i = 0; i < 20000; ++i)
+        largest = std::max(largest, std::abs(safe.processSample(i < 100 ? cascadeNoise(seed) : 0.0, 0)));
+    EXPECT_TRUE(std::isfinite(largest));
+    EXPECT_LT(safe.getStateEnergy(0), 1e6);
+}
+
+DSPARK_TEST(NormalizedLadder_never_adds_energy_to_its_memory)
+{
+    constexpr double kRate = 48000.0;
+    constexpr double kPi = 3.14159265358979323846;
+    NormalizedLadder<double, 1> filter;
+    filter.setCoeffs(BiquadCoeffs::makeLowPass(kRate, 300.0, 20.0));
+    uint32_t seed = 31u;
+    for (int i = 0; i < 4000; ++i) (void)filter.processSample(0.5 * cascadeNoise(seed), 0);
+    double energy = filter.getStateEnergy(0);
+    EXPECT_GT(energy, 1e-3);
+
+    // No input, and a different stable set of poles every sample: the energy
+    // in the memory never rises, whatever the jumps.
+    bool rose = false;
+    for (int i = 0; i < 20000; ++i)
+    {
+        const double radius = 0.5 + 0.4999 * (0.5 * cascadeNoise(seed) + 0.5);
+        const double angle = kPi * (0.5 * cascadeNoise(seed) + 0.5);
+        BiquadCoeffs c;
+        c.b0 = 1.0;
+        c.a1 = -2.0 * radius * std::cos(angle);
+        c.a2 = radius * radius;
+        filter.setCoeffs(c);
+        (void)filter.processSample(0.0, 0);
+        const double now = filter.getStateEnergy(0);
+        rose = rose || now > energy * (1.0 + 1e-12) + 1e-300;
+        energy = now;
+    }
+    EXPECT_FALSE(rose);
+
+    // Nor along a ramp between two distant settings.
+    filter.setCoeffs(BiquadCoeffs::makeLowPass(kRate, 150.0, 30.0));
+    for (int i = 0; i < 4000; ++i) (void)filter.processSample(0.5 * cascadeNoise(seed), 0);
+    energy = filter.getStateEnergy(0);
+    filter.rampCoeffs(BiquadCoeffs::makeLowPass(kRate, 12000.0, 0.5), 300);
+    rose = false;
+    for (int i = 0; i < 300; ++i)
+    {
+        filter.advanceRamp(1);
+        const auto& l = filter.getLadder();
+        // Linear interpolation keeps each rotation on or inside the circle.
+        rose = rose || l.c1 * l.c1 + l.s1 * l.s1 > 1.0 + 1e-12 || l.c2 * l.c2 + l.s2 * l.s2 > 1.0 + 1e-12;
+        (void)filter.processSample(0.0, 0);
+        const double now = filter.getStateEnergy(0);
+        rose = rose || now > energy * (1.0 + 1e-12) + 1e-300;
+        energy = now;
+    }
+    EXPECT_FALSE(rose);
+    EXPECT_FALSE(filter.isRamping());
+}
+
+DSPARK_TEST(NormalizedLadder_ramp_lands_exactly_and_block_matches_sample_form)
+{
+    constexpr double kRate = 48000.0;
+    const BiquadCoeffs from = BiquadCoeffs::makePeak(kRate, 700.0, 2.0, 6.0);
+    const BiquadCoeffs to = BiquadCoeffs::makePeak(kRate, 2500.0, 3.0, -9.0);
+    NormalizedLadder<float, 2> blockForm;
+    NormalizedLadder<float, 2> sampleForm;
+    blockForm.setCoeffs(from);
+    sampleForm.setCoeffs(from);
+    blockForm.rampCoeffs(to, 700);
+    sampleForm.rampCoeffs(to, 700);
+    EXPECT_TRUE(blockForm.isRamping());
+
+    auto block = makeStereoBuffer(512);
+    double worst = 0.0;
+    for (int pass = 0; pass < 3; ++pass)
+    {
+        block.fillNoise(0.5f, 100u + static_cast<uint32_t>(pass));
+        std::vector<float> left(block.ch(0), block.ch(0) + 512), right(block.ch(1), block.ch(1) + 512);
+        blockForm.processBlock(block.view());
+        for (int i = 0; i < 512; ++i)
+        {
+            sampleForm.advanceRamp(1);
+            const double l = sampleForm.processSample(static_cast<double>(left[static_cast<size_t>(i)]), 0);
+            const double r = sampleForm.processSample(static_cast<double>(right[static_cast<size_t>(i)]), 1);
+            worst = std::max(worst, std::abs(l - static_cast<double>(block.ch(0)[i])));
+            worst = std::max(worst, std::abs(r - static_cast<double>(block.ch(1)[i])));
+        }
+    }
+    EXPECT_LT(worst, 1e-6);   // the block form writes float samples
+
+    // Both landed exactly on the target's rotations and taps.
+    const auto target = NormalizedLadder<float, 2>::fromBiquad(to);
+    for (const auto* each : { &blockForm, &sampleForm })
+    {
+        EXPECT_FALSE(each->isRamping());
+        const auto& l = each->getLadder();
+        EXPECT_TRUE(l.c1 == target.c1 && l.s1 == target.s1 && l.c2 == target.c2 && l.s2 == target.s2
+                    && l.v0 == target.v0 && l.v1 == target.v1 && l.v2 == target.v2);
+    }
+
+    // The transparent set of a bell: its poles with a flat response.
+    NormalizedLadder<double, 1> bypassed;
+    bypassed.setCoeffs(from);
+    uint32_t seed = 8u;
+    for (int i = 0; i < 2000; ++i) (void)bypassed.processSample(0.5 * cascadeNoise(seed), 0);
+    bypassed.setCoeffs(from.bypassed());
+    const auto& flat = bypassed.getLadder();
+    EXPECT_NEAR(flat.v0, flat.c1 * flat.c2, 1e-14);
+    EXPECT_NEAR(flat.v1, flat.s1 * flat.c2, 1e-14);
+    EXPECT_NEAR(flat.v2, flat.s2, 1e-14);
+    for (int i = 0; i < 4000; ++i) (void)bypassed.processSample(0.5 * cascadeNoise(seed), 0);
+    double residue = 0.0;
+    for (int i = 0; i < 1000; ++i)
+    {
+        const double x = 0.5 * cascadeNoise(seed);
+        residue = std::max(residue, std::abs(bypassed.processSample(x, 0) - x));
+    }
+    EXPECT_LT(residue, 1e-12);
+
+    // A non-finite sample does not stay in the memory past its block.
+    block.fillNoise(0.5f, 3u);
+    block.ch(0)[7] = std::numeric_limits<float>::quiet_NaN();
+    blockForm.processBlock(block.view());
+    block.fillNoise(0.5f, 4u);
+    blockForm.processBlock(block.view());
+    EXPECT_FALSE(hasNaN(block.ch(0), 512));
+    EXPECT_FALSE(hasNaN(block.ch(1), 512));
+}
+
+DSPARK_TEST(BiquadCascade_low_corners_at_high_rates_stay_clean)
+{
+    // 768 kHz: a 20 Hz high-pass and a 30 Hz bell of a tenth of a decibel,
+    // corners four orders of magnitude under the rate.
+    constexpr double kRate = 768000.0;
+    constexpr double kPi = 3.14159265358979323846;
+    const BiquadCoeffs highPass = BiquadCoeffs::makeHighPass(kRate, 20.0, 0.7071067811865476);
+    const BiquadCoeffs bell = BiquadCoeffs::makePeak(kRate, 30.0, 1.0, 0.1);
+    BiquadCascade<double, 2, 1> cascade;
+    cascade.setNumSections(2);
+    cascade.setCoeffs(0, highPass);
+    cascade.setCoeffs(1, bell);
+    Biquad<double, 1> first, second;
+    first.setCoeffsNow(highPass);
+    second.setCoeffsNow(bell);
+
+    constexpr int kTotal = 1152000;   // a second and a half
+    double worst = 0.0, mean = 0.0;
+    for (int n = 0; n < kTotal; ++n)
+    {
+        // A constant level under a 1 kHz tone: the level must not come through.
+        const double x = 0.25 + 0.25 * std::sin(2.0 * kPi * 1000.0 * static_cast<double>(n) / kRate);
+        const double y = cascade.processSample(x, 0);
+        const double want = second.processSampleCore(first.processSampleCore(x, 0), 0);
+        if (n > kTotal / 2) worst = std::max(worst, std::abs(y - want));
+        if (n >= kTotal - 768) mean += y / 768.0;   // one whole period of the tone
+    }
+    EXPECT_LT(worst, 1e-8);
+    EXPECT_LT(std::abs(mean), 1e-9);
 }

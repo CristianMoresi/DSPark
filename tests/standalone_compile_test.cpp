@@ -36,6 +36,8 @@ void instantiate()
     LadderFilter<T> ladder;
     ModulationRouter<T> modRouter;
     Oscillator<T> osc;
+    BiquadCascade<T> cascade;
+    NormalizedLadder<T> normalizedLadder;
     Oversampling<T> ov(2);
     OversamplingDryPath<T> ovDry;
     [[maybe_unused]] const int ovFactor = Oversampling<T>::factorForRate(48000.0);

@@ -214,6 +214,60 @@ All notable user-facing changes to DSPark are documented here.
   average over three sorted values is not the average along the waveform;
   and the eight steps alone, with the target on a line between samples,
   gave 10 to 30 dB up to 5 kHz and nothing at 18 kHz. State key `precision`.
+- `TapeMachine`, the machine around the tape, all off or at the classic
+  setting by default; the defaults and every earlier control give the same
+  output as before, to the bit:
+  `setTransport(Transport::Speed)` keeps the tape speed as a state: the
+  reproduce pitch is the speed of the moment, whose deviation is a smoothed
+  noise, the capstan's rotation (5 Hz at 15 ips, with a third of its second
+  harmonic) and the reel's (0.6 Hz at 15 ips), at rates that follow the
+  speed and deeper at slower speeds; the delay is held at the head distance
+  over the speed and read through a four-point Lagrange interpolator, and a
+  change of `setSpeed()` glides the speed (0.45 s up, 0.7 s down). A 3 kHz
+  tone at full depth moves by 0.65, 0.46 and 0.35 % peak to peak at 7.5, 15
+  and 30 ips (0.07 % at the default depth at 15 ips); switching from 15 to
+  7.5 ips moves its pitch by 0.09 % at most.
+  `setHum(dBFS, mains)` adds mains hum after the tape (50 or 60 Hz with its
+  second harmonic 6 dB down, in phase on every channel).
+  `setCrosstalk(dB)` leaks each channel of a pair into the other through a
+  first-order high-pass at 10 kHz: -50 dB at 1 kHz is -70.0 at 100 Hz, -40.6
+  at 3 kHz and -31.6 at 10 kHz.
+  `setAsymmetry(0..1)` adds an even term before the tape: a 1 kHz tone at
+  -12 dBFS carries its second harmonic at -40.3 and -34.3 dBc at 0.5 and 1
+  (-118 without), 12 dB lower at -24 dBFS.
+  `setTransformer(0..1)` adds an output transformer as a parallel branch (a
+  one-pole low-pass at 60 Hz, a curve with an even and an odd term, the
+  inverse filter capped at 4 kHz): at 1, a 40 Hz tone at -6 dBFS carries
+  its second harmonic at -41 dBc (-116 without) and its third at -28.7
+  (-33.4), while a 1 kHz tone keeps its level and its third harmonic within
+  0.01 dB.
+  `setHeadModel(HeadModel::Contour)` makes the reproduce head's low end a
+  chain of four resonances, the bump and three ripples above it, each
+  designed on its analog prototype.
+  `setElectronics(Electronics::Circuit)` runs the record and reproduce
+  networks from their analog transfer functions at the internal rate, as
+  normalized ladders, with a record amplifier limit at 45 kHz and a
+  reproduce amplifier pole at 50 kHz (a fifth-order reproduce chain with the
+  output coupling): within 0.01 dB of the ideal electronics at 1 kHz and
+  0.5 dB lower at 20 kHz.
+  `setAlignment(hfDb, lfDb)` trims the reproduce equalization as a machine's
+  HF and LF adjustments: +3 dB moves 16 kHz by 2.99 dB, -3 dB moves 31.5 Hz
+  by -2.80 dB (NAB).
+  `setFormulation()` (Classic, HighOutput, Vintage) changes the material: a
+  1 kHz tone at -12 dBFS carries 0.16, 0.07 and 0.25 % THD, and the hiss
+  moves by 0, -1.5 and +3 dB; the bias keeps 0.5 as the optimum of each.
+  `setTrackFormat()` (Half, Full, Quarter) moves the hiss by 0, -5.0 and
+  +3.0 dB (the track width).
+  `setCalibrationLevel(0..9 dB)` drives the tape harder at the same output
+  level: at -12 dBFS the THD is 0.16, 0.31, 0.60 and 1.14 % at 0, 3, 6 and
+  9 dB (6 dB gives the 0.4 to 0.8 % tape machines are specified at their
+  reference level), and the hiss falls by as much.
+  `setMonitor()` (Repro, Sync, Input): Sync reads through the record head
+  (0.66 dB lower at 16 kHz), Input is the input delayed like the tape path,
+  to the bit. With everything on the machine costs 6 % more.
+  State keys `transport`, `humDb`, `mains`, `crosstalk`, `asymmetry`,
+  `transformer`, `headModel`, `electronics`, `alignHf`, `alignLf`,
+  `formulation`, `trackFormat`, `calibrationLevel` and `monitor`.
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it
@@ -1062,6 +1116,11 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `TapeMachine::setNoise()`: the hiss is laid on the tape, before the
+  reproduce head and the de-emphasis, so it takes the colour of the speed and
+  the standard (at NAB 15 ips the band from 5 to 15 kHz is 11 dB under the
+  band from 100 Hz to 1 kHz; it was white), at the level set (within
+  0.5 dB), on independent channels, and its level glides over 50 ms.
 - `Compressor`: the characters are data. What told Clean, Opto, FET and
   Varimu apart (the limits of their knobs, the times and the weight of
   their memory stage, the floor of their knee, the growth of their ratio,

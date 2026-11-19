@@ -7,6 +7,7 @@
 #include "EffectSlot.h"
 
 #include <array>
+#include <string>
 #include <memory>
 
 namespace dsplab {
@@ -651,10 +652,10 @@ inline EffectSlot makeSaturation()
     s.name = "Saturation"; s.category = "Distortion";
     // Algorithm indices MUST match dspark::Saturation<float>::Algorithm enum order.
     // Enum: Tube=0, Tape=1, Transformer=2, SoftClip=3, HardClip=4,
-    //       Exciter=5, Wavefolder=6, Bitcrusher=7, Downsample=8, MultiStage=9
+    //       Exciter=5, Wavefolder=6, Bitcrusher=7, Downsample=8, MultiStage=9, Curve=10
     s.addChoice("Algorithm",
                 {"Tube","Tape","Transformer","SoftClip","HardClip",
-                 "Exciter","Wavefolder","Bitcrusher","Downsample","MultiStage"},
+                 "Exciter","Wavefolder","Bitcrusher","Downsample","MultiStage","Curve"},
                 3);  // Default: SoftClip (cleanest, matches framework default)
     s.addSlider("Drive", 0, 40, 0, "dB");   // Default 0 dB = neutral (no saturation)
     s.addSlider("Mix", 0, 1, 1, "");
@@ -665,21 +666,57 @@ inline EffectSlot makeSaturation()
     // A/B: antiderivative antialiasing. Order MUST match
     // dspark::Saturation<float>::Antialiasing (Off=0, FirstOrder=1, SecondOrder=2).
     s.addChoice("Antialiasing", {"Off","1st order","2nd order"}, 0); // index 7
-    s.prepareFn = [p, osApplied](auto& sp) {
+    // The Curve algorithm's three controls (indices 8 to 10), then the stages
+    // around any curve (11 to 17) and the filters of the oversampler (18).
+    s.addSlider("Curve Hardness", 0, 0.95f, 0, "");
+    s.addSlider("Curve Curvature", 0.5f, 4, 1, "");
+    s.addSlider("Curve Asymmetry", -1, 1, 0, "");
+    s.addSlider("Asymmetry", -1, 1, 0, "");
+    s.addSlider("Program Noise", -120, -20, -120, "dB");
+    s.addSlider("Dynamics", -1, 1, 0, "");
+    s.addSlider("Dynamics Focus", 0, 2000, 0, "Hz");
+    s.addSlider("Feedback", -0.95f, 0.95f, 0, "");
+    s.addSlider("Feedback Freq", 20, 2000, 200, "Hz");
+    s.addToggle("Drive Compensation", false);
+    s.addChoice("Oversampling Mode", {"Linear phase","Minimum phase"}, 0);
+    auto shape = std::make_shared<std::array<std::atomic<float>, 4>>();
+    (*shape)[0] = 0.0f; (*shape)[1] = 1.0f; (*shape)[2] = 0.0f; (*shape)[3] = 200.0f;
+    auto modeWanted  = std::make_shared<std::atomic<int>>(0);
+    auto modeApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, osApplied, modeApplied](auto& sp) {
         p->setOversampling(osApplied->load(std::memory_order_relaxed));
+        p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(modeApplied->load(std::memory_order_relaxed)));
         p->prepare(sp);
     };
-    s.processFn = [p, osWanted, osApplied](auto b) {
+    s.processFn = [p, osWanted, osApplied, modeWanted, modeApplied](auto b) {
         const int want = osWanted->load(std::memory_order_relaxed);
         if (want != osApplied->load(std::memory_order_relaxed)) {
             p->setOversampling(want);   // reallocates - safe here (audio thread, no concurrent process)
             osApplied->store(want, std::memory_order_relaxed);
         }
+        const int mode = modeWanted->load(std::memory_order_relaxed);
+        if (mode != modeApplied->load(std::memory_order_relaxed)) {
+            p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(mode));   // reallocates too
+            modeApplied->store(mode, std::memory_order_relaxed);
+        }
         p->process(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, osWanted](int i, float v) {
+    s.setParamFn = [p, osWanted, shape, modeWanted](int i, float v) {
+        auto& k = *shape;
         switch(i) {
+            case 8: case 9: case 10:
+                k[static_cast<size_t>(i - 8)] = v;
+                p->setCurveShape(k[0].load(), k[1].load(), k[2].load());
+                break;
+            case 11: p->setAsymmetry(v); break;
+            case 12: p->setProgramNoise(v); break;
+            case 13: p->setDynamics(v); break;
+            case 14: p->setDynamicsFocus(v); break;
+            case 15: p->setFeedback(v, k[3].load()); break;
+            case 16: k[3] = v; p->setFeedback(p->getFeedback(), v); break;
+            case 17: p->setDriveCompensation(v > 0.5f); break;
+            case 18: modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); break;
             case 0: p->setAlgorithm(static_cast<typename dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); break;
             case 1: p->setDrive(v); break;
             case 2: p->setMix(v); break;
@@ -691,6 +728,106 @@ inline EffectSlot makeSaturation()
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
+    return s;
+}
+
+inline EffectSlot makeMultibandSaturation()
+{
+    using MbSat = dspark::MultibandSaturation<float>;
+    auto p = std::make_shared<MbSat>();
+    auto splits = std::make_shared<std::array<std::atomic<float>, 3>>();
+    (*splits)[0] = 200.0f; (*splits)[1] = 1500.0f; (*splits)[2] = 6000.0f;
+    auto bands = std::make_shared<std::atomic<int>>(3);
+    // The filters of the oversampler reallocate: applied on the audio thread.
+    auto modeWanted  = std::make_shared<std::atomic<int>>(0);
+    auto modeApplied = std::make_shared<std::atomic<int>>(0);
+    p->setNumBands(3);
+    for (int i = 0; i < 2; ++i) p->setCrossoverFrequency(i, (*splits)[static_cast<size_t>(i)].load());
+    EffectSlot s;
+    s.name = "Multiband Saturation"; s.category = "Distortion";
+    s.addSlider("Bands", 2, 4, 3, "");                               // index 0
+    s.addSlider("Split 1", 40, 2000, 200, "Hz");
+    s.addSlider("Split 2", 200, 8000, 1500, "Hz");
+    s.addSlider("Split 3", 1000, 16000, 6000, "Hz");
+    // Order MUST match dspark::Saturation<float>::Algorithm (applied to every band).
+    s.addChoice("Algorithm",
+                {"Tube","Tape","Transformer","SoftClip","HardClip",
+                 "Exciter","Wavefolder","Bitcrusher","Downsample","MultiStage","Curve"}, 3);  // index 4
+    s.addChoice("Oversampling Mode", {"Linear phase","Minimum phase"}, 0);                   // index 5
+    // Per band (indices 6 + 5 * band): drive, level, pan, mute, solo.
+    for (int b = 1; b <= 4; ++b)
+    {
+        const std::string n = "B" + std::to_string(b) + " ";
+        s.addSlider((n + "Drive").c_str(), 0, 40, 0, "dB");
+        s.addSlider((n + "Level").c_str(), -24, 12, 0, "dB");
+        s.addSlider((n + "Pan").c_str(), -1, 1, 0, "");
+        s.addToggle((n + "Mute").c_str(), false);
+        s.addToggle((n + "Solo").c_str(), false);
+    }
+    s.prepareFn = [p, modeApplied](auto& sp) {
+        p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(modeApplied->load(std::memory_order_relaxed)));
+        p->prepare(sp);
+    };
+    s.processFn = [p, modeWanted, modeApplied](auto b) {
+        const int mode = modeWanted->load(std::memory_order_relaxed);
+        if (mode != modeApplied->load(std::memory_order_relaxed)) {
+            p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(mode));
+            modeApplied->store(mode, std::memory_order_relaxed);
+        }
+        p->processBlock(b);
+    };
+    s.resetFn = [p]() { p->reset(); };
+    s.setParamFn = [p, splits, bands, modeWanted](int i, float v) {
+        auto& k = *splits;
+        const auto placeSplits = [&]() {
+            for (int x = 0; x < bands->load() - 1; ++x) p->setCrossoverFrequency(x, k[static_cast<size_t>(x)].load());
+        };
+        if (i == 0) { bands->store(static_cast<int>(v + 0.5f)); p->setNumBands(bands->load()); placeSplits(); return; }
+        if (i >= 1 && i <= 3) { k[static_cast<size_t>(i - 1)] = v; placeSplits(); return; }
+        if (i == 4) { for (int b = 0; b < 4; ++b) p->setBandAlgorithm(b, static_cast<dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); return; }
+        if (i == 5) { modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); return; }
+        const int band = (i - 6) / 5, field = (i - 6) % 5;
+        switch (field) {
+            case 0: p->setBandDrive(band, v); break;
+            case 1: p->setBandLevel(band, v); break;
+            case 2: p->setBandPan(band, v); break;
+            case 3: p->setBandMute(band, v > 0.5f); break;
+            case 4: p->setBandSolo(band, v > 0.5f); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeLoFi()
+{
+    auto p = std::make_shared<dspark::LoFi<float>>();
+    EffectSlot s;
+    s.name = "Lo-Fi"; s.category = "Distortion";
+    s.addSlider("Smear", 0, 1, 0, "");
+    s.addSlider("Pitch", -24, 12, 0, "st");
+    s.addSlider("Fold", 0, 36, 0, "dB");
+    s.addSlider("Rate", 500, 48000, 48000, "Hz", true);
+    s.addToggle("Rate Filter", false);
+    s.addSlider("Bits", 1, 24, 24, "");
+    s.addToggle("Dither", false);
+    s.addSlider("Mix", 0, 1, 1, "");
+    s.addSlider("Output", -24, 12, 0, "dB");
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p](int i, float v) {
+        switch (i) {
+            case 0: p->setSmear(v); break;
+            case 1: p->setPitch(v); break;
+            case 2: p->setFold(v); break;
+            case 3: p->setRate(v >= 47999.0f ? 1e9f : v); break;
+            case 4: p->setRateFilter(v > 0.5f); break;
+            case 5: p->setBits(v); break;
+            case 6: p->setDither(v > 0.5f); break;
+            case 7: p->setMix(v); break;
+            case 8: p->setOutput(v); break;
+        }
+    };
     return s;
 }
 
@@ -1435,6 +1572,11 @@ inline EffectSlot makeTubePreamp()
     // A/B: Clamp (default) or Conduction (opt-in) grid model. Order MUST
     // match dspark::TubePreamp<float>::GridModel (Clamp=0, Conduction=1).
     s.addChoice("Grid Model", {"Clamp","Conduction"}, 0);            // index 8
+    // The cabinet stage (indices 9 to 12).
+    s.addToggle("Cabinet", false);
+    s.addSlider("Cab Size", 0, 1, 0.5f, "");
+    s.addSlider("Cab Brightness", 0, 1, 0.5f, "");
+    s.addSlider("Cab Mic Distance", 0, 1, 0.3f, "");
     s.prepareFn = [p, gridWanted, gridApplied](auto& sp) {
         const int want = gridWanted->load(std::memory_order_relaxed);
         p->setGridModel(static_cast<TP::GridModel>(want));
@@ -1461,6 +1603,10 @@ inline EffectSlot makeTubePreamp()
             case 6: p->setOutput(v); break;
             case 7: p->setMix(v); break;
             case 8: gridWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
+            case 9: p->setCabinet(v > 0.5f); break;
+            case 10: p->getCabinet().setSize(v); break;
+            case 11: p->getCabinet().setBrightness(v); break;
+            case 12: p->getCabinet().setDistance(v); break;
         }
     };
     return s;
@@ -1648,6 +1794,8 @@ inline std::vector<EffectSlot> createAllEffects()
         makeMultibandCompressor(),
         // Distortion
         makeSaturation(),
+        makeMultibandSaturation(),
+        makeLoFi(),
         makeClipper(),
         // Analog (physical models)
         makeTapeMachine(),

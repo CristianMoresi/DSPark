@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 319,
+    "first_party_ascii_text": 327,
     "third_party_utf8_exact": 84,
-    "total": 587
+    "total": 595
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -165,6 +165,10 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Core/AuditoryBands.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Core/Biquad.h"
     },
     {
@@ -221,6 +225,10 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Core/GraphicBank.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Core/Hilbert.h"
     },
     {
@@ -238,6 +246,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Core/LadderFilter.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/LaneCascade.h"
     },
     {
       "kind": "first_party_ascii_text",
@@ -310,6 +322,14 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Core/Smoothers.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SpectralEnvelope.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/SpectralFilter.h"
     },
     {
       "kind": "first_party_ascii_text",
@@ -740,6 +760,10 @@
     },
     {
       "kind": "first_party_ascii_text",
+      "path": "Effects/ResonanceSuppressor.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
       "path": "Effects/Reverb.h"
     },
     {
@@ -753,6 +777,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Effects/SpectralDenoiser.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/SpectralDynamicEQ.h"
     },
     {
       "kind": "first_party_ascii_text",
@@ -773,6 +801,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Effects/TimeStretch.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Effects/TonalBalance.h"
     },
     {
       "kind": "first_party_ascii_text",

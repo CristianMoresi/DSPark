@@ -382,6 +382,9 @@
  * | `GranularProcessor<T>`   | Effects/GranularProcessor.h | Granular clouds/freeze: per-grain pitch, jitter, stereo spread |
  * | `SpectralFreeze<T>`      | Effects/SpectralFreeze.h | Tonal or diffuse STFT magnitude hold with deterministic transitions |
  * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral noise reduction (Wiener, decision-directed) |
+ * | `TonalBalance<T>`        | Effects/TonalBalance.h   | Adaptive equalizer toward a balanced loudness shape (auditory model, graphic bank) |
+ * | `ResonanceSuppressor<T>` | Effects/ResonanceSuppressor.h | Dynamic suppression of resonances over the spectral envelope, minimum phase |
+ * | `SpectralDynamicEQ<T>`   | Effects/SpectralDynamicEQ.h | Dynamic bands with a level per cell inside each band, minimum phase |
  * | `PitchCorrector<T>`      | Effects/PitchCorrector.h | Monophonic scale-aware retune: detect, quantize, shift, with formant preservation |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Multirate note chroma + template chord recognition with confidence |
  * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |
@@ -459,6 +462,11 @@
  * | `CabinetModel<T>`        | Core/CabinetModel.h       | A loudspeaker cabinet with no latency: colour filters, sparse reflections, two diffusers |
  * | `TailShaper<T>`          | Core/TailShaper.h         | Ducking and a relative gate for a wet signal, driven by the dry one |
  * | `TapeTransport<T>`       | Core/TapeTransport.h      | A tape transport as a speed state: the delay of a moving tape, with inertia, wow and flutter |
+ * | `AuditoryBands<T>`       | Core/AuditoryBands.h      | Bands uniform in Bark over a power spectrum, the loudness law, the dominant level of a pair |
+ * | `SpectralEnvelope<T>`    | Core/SpectralEnvelope.h   | The envelope of a spectrum by a smoothing proportional to frequency; resonances over it |
+ * | `SpectralFilter<T>`      | Core/SpectralFilter.h     | A gain curve per frame applied as a minimum-phase FIR (no time aliasing, no pre-echo) |
+ * | `LaneCascade<T, L>`      | Core/LaneCascade.h        | A long cascade of biquads on the lanes of a vector, L - 1 samples late |
+ * | `GraphicBank<T, L>`      | Core/GraphicBank.h        | A graphic equalizer whose bands do not interact (least-squares section gains) |
  * | `FFTReal<T>`             | Core/FFT.h                | Real FFT by vector lanes, SIMD (SSE2/AVX/NEON)    |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
@@ -706,6 +714,11 @@
 #include "Core/CabinetModel.h"
 #include "Core/TailShaper.h"
 #include "Core/TapeTransport.h"
+#include "Core/AuditoryBands.h"
+#include "Core/SpectralEnvelope.h"
+#include "Core/SpectralFilter.h"
+#include "Core/LaneCascade.h"
+#include "Core/GraphicBank.h"
 #include "Core/DryWetMixer.h"
 #include "Core/Smoothers.h"
 #include "Core/AnalogRandom.h"
@@ -796,6 +809,9 @@
 #include "Effects/GranularProcessor.h"
 #include "Effects/SpectralFreeze.h"
 #include "Effects/SpectralDenoiser.h"
+#include "Effects/TonalBalance.h"
+#include "Effects/ResonanceSuppressor.h"
+#include "Effects/SpectralDynamicEQ.h"
 #include "Effects/PitchCorrector.h"
 
 // === Analysis ===============================================================

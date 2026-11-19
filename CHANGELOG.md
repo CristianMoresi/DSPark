@@ -394,6 +394,102 @@ All notable user-facing changes to DSPark are documented here.
   speed. `setTargetDelay()` sets a delay as a speed (the head distance
   stays). `TapeMachine`'s speed model now runs on it (its own random
   sequence: the figures above are of this version).
+- `AuditoryBands` (new, `Core/AuditoryBands.h`) and `AuditoryScale`: the
+  published formulas of the ear's scale (Bark after Traunmuller, critical
+  bandwidth after Zwicker and Terhardt, threshold in quiet after Terhardt,
+  specific loudness as a power law over the threshold with an exponent that
+  rises where the threshold is high), bands uniform in Bark over a power
+  spectrum (each bin feeds the two bands around it with weights that sum to
+  one; a band narrower than a bin reads the density at its centre), a
+  smoothing across bands in both directions, total loudness, and
+  `dominantPower()`: the level of the dominant component of a stereo pair,
+  the larger eigenvalue of the channels' covariance.
+- `SpectralEnvelope` (new, `Core/SpectralEnvelope.h`): the envelope of a
+  spectrum by a one-pole run both ways whose width follows frequency (a
+  fraction of an octave), and the resonances as what stands over it.
+- `SpectralFilter` (new, `Core/SpectralFilter.h`): a time-varying filter
+  designed every hop from a gain curve and applied as a minimum-phase FIR:
+  the frame is analysed with a Hann window and zero-padded (2, 4 or 8
+  times), the gain curve becomes a minimum-phase filter by the real
+  cepstrum, cut to the room the padding leaves, and the frame is filtered
+  by it (a linear convolution) before the overlap-add. A gain of one is the
+  input late by the window; the energy that comes out before an impulse
+  through a cut is more than 300 dB under the total (no pre-echo); a key
+  can replace the power the design reads; one filter can serve linked
+  channels; setDelta() applies one minus the filter.
+- `LaneCascade` (new, `Core/LaneCascade.h`): a long cascade of biquads on
+  one channel spread over the lanes of a vector, each lane running its own
+  stretch one sample behind the lane before it: the serial cascade, late by
+  lanes - 1 samples, with coefficients that ramp per sample. In mono it costs
+  0.82 to 0.92 of the serial cascade; on two channels the serial cascade,
+  which already fills a vector with the pair, stays the faster (0.55 of it).
+- `GraphicBank` (new, `Core/GraphicBank.h`): a graphic equalizer whose bands
+  do not interact: the gains asked of the bands become the gains of
+  overlapping sections (a bell per band, a shelf at each end, with the
+  critical bandwidth as their width) by weighted, regularized least squares
+  on the centres and the points between them, with refining steps on the
+  real response kept only when they bring it nearer. Bands uniform in Bark
+  meet the gains asked within 0.15 dB at their centres (0.22 dB for 72
+  bands), where the plain sections would pile their skirts up; it runs on
+  a LaneCascade in mono and on a BiquadCascade with more channels (no
+  latency).
+- `TonalBalance` (new, `Effects/TonalBalance.h`): an adaptive equalizer
+  driven by an auditory model. Every hop (128 samples at 48 kHz, a
+  transform of 2048 with an asymmetric window weighted toward the recent
+  samples, both scaling by octaves with the rate) the programme's power is
+  smoothed across frequency, read in 72 bands uniform in Bark, its stereo
+  covariance smoothed in time (longer in the low end) and read as the power
+  of the dominant component, and turned into specific loudness. A broad
+  trend across the bands is compared with a reference shape (a tilt) and
+  each band with the trend; soft-knee curves with a slope on each side turn
+  those deviations into corrections (`setBalance()`, `setBoost()`,
+  `setTame()`, `setRange()`, `setKnee()`, `setFrequencyRange()` with edges
+  one Bark wide, 40 Hz to 16 kHz by default), offset so the total loudness
+  stays, and drive a GraphicBank. `setLevelCompensation()` converts loudness
+  to decibels with each band's exponent. A key can drive it (with a fade).
+  On pink noise with a peak at 3 kHz the peak comes down 3.2 dB, 300 Hz
+  moves 0.9 dB and the level 1.2 dB (what is kept is the loudness); the
+  latency is 16.2 ms at 48 kHz; it costs 780 to 1060 ns per stereo frame.
+- `ResonanceSuppressor` (new, `Effects/ResonanceSuppressor.h`): it finds
+  what stands over the envelope of the spectrum (in decibels or in
+  amplitude), frame by frame, and lowers it over a threshold by a share of
+  the excess, limited, weighted by a sensitivity curve of six bands, with an
+  attack and a release per bin that are slower in the low end, smoothed
+  across bins and applied by a SpectralFilter (no pre-echo). The window is
+  about 46 ms at any rate; stereo per bin with a link (one detector and one
+  filter at full link) or mid and side with a balance; a key can drive it;
+  delta and band solo listening; an offline quality (eight times padding,
+  sixteen frames per window). A 2 kHz line in white noise comes down 11.2 dB
+  while the noise at 600 Hz moves 0.2 dB; it costs 270 ns per stereo frame.
+- `SpectralDynamicEQ` (new, `Effects/SpectralDynamicEQ.h`): four dynamic
+  bands (bell or shelves) that act cell by cell inside themselves: a band
+  is cut into up to 128 cells evenly in log frequency, each cell's level is
+  the largest power of the key in it weighted by the band's shape, the
+  threshold is relative to the band's recent peak, each cell has an attack
+  and a release (faster in the upper cells), and the actions are projected
+  onto the bins with the band's shape, between its flat and its full
+  response, and applied as a minimum-phase filter. A loud tone at 2.5 kHz in
+  a bell at 2 kHz comes down 6.5 dB while a quiet one at 1.5 kHz in the
+  same bell does not move; it costs 190 ns per stereo frame.
+- `SpectralDenoiser`: options, all off by default (the output is then the
+  same as before, to the bit): `setSpectralSmoothing()` across bins,
+  `setGainRelease()` per bin (slower in the low end), a sensitivity curve
+  (`setSensitivityBand()`) weighting the reduction, `setDelta()`,
+  `setFilterMode()` (the gains applied as a minimum-phase filter, the same
+  latency, the same reduction of learned noise: -18.0 dB, as the STFT)
+  with `setLink()` between channels, and `prepare(spec, 0)` choosing the
+  transform size by the rate. State keys `smoothing`, `release`,
+  `filterMode`, `link` and the sensitivity bands (`sens*`).
+- Delta listening (`setDelta()`, a monitoring control outside the state):
+  `Compressor` (the aligned input minus the compressed signal before the
+  makeup gain), `DeEsser` and `DynamicEQ` (the input late by the latency
+  minus the output).
+- `PhaseCorrelation::getDominantLevelDb()`: the level of the dominant
+  component of the pair (0 dB for a full-scale sine in both channels in or
+  out of phase, -3 dB in one channel).
+  `SpectrumAnalyzer::toAuditoryBands()`: a spectrum read in bands of the
+  ear's scale. `WindowFunctions::asymmetricHann()`: a window for low-latency
+  analysis.
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it

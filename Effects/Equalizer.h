@@ -25,6 +25,14 @@
  * band-passes of order 1 to 16. The all-pass, flat tilt and wall bands, and
  * any band of order above 1, always run this way.
  *
+ * Placement (BandConfig::placement): a band acts on every channel, on the
+ * left or the right one alone, or on the middle or the sides of the first
+ * pair. The left, right and stereo bands run first, then the pair is turned
+ * into middle and sides for the bands placed there, and back. In LinearPhase
+ * the same is one matrix of four kernels between the two channels, so the
+ * latency does not change. With a single channel the left and middle bands
+ * act on it and the right and side bands do nothing.
+ *
  * LinearPhase: one zero-phase FIR of a fixed length, independent of the host
  * block (setLinearPhaseKernelLength(); default 32768 taps at 44.1/48 kHz,
  * scaled with the sample rate to the nearest power of two), run by a
@@ -67,12 +75,13 @@
  * - Processing thread only: getBandFilter(), which returns a reference to a
  *   band's live FilterEngine (its contract, not the equalizer's).
  *
- * Dependencies: Filters.h (FilterEngine), AudioSpec.h, AudioBuffer.h,
+ * Dependencies: Filters.h (FilterEngine), MidSide.h, AudioSpec.h, AudioBuffer.h,
  *               Biquad.h, BiquadCascade.h, DenormalGuard.h, DspMath.h, FFT.h,
  *               FilterDesign.h, StateBlob.h.
  */
 
 #include "Filters.h"
+#include "MidSide.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/Biquad.h"
@@ -134,6 +143,16 @@ public:
         HighPassWall  ///< Elliptic cut below frequency.
     };
 
+    /** @brief Where in a stereo pair a band acts. */
+    enum class Placement
+    {
+        Stereo, ///< Every channel. Default.
+        Left,   ///< The first channel only.
+        Right,  ///< The second channel only.
+        Mid,    ///< The middle of the first two channels: what they share.
+        Side    ///< Their sides: what sets them apart.
+    };
+
     /**
      * @brief Full configuration for a single EQ band.
      */
@@ -146,6 +165,7 @@ public:
         T slope         = T(12);            ///< Slope in dB/oct (LP/HP only): 6 to 48 in steps of 6, or any value from 0 to 96 with the analog response.
         int order       = 1;                ///< Order of a bell, shelf, notch, band-pass or all-pass (1 to 16; 6 dB/oct each). Above 1 the band runs with the analog response.
         bool enabled    = true;             ///< False to bypass this band.
+        Placement placement = Placement::Stereo;   ///< The channels the band acts on.
     };
 
     static_assert(std::atomic<T>::is_always_lock_free,
@@ -189,6 +209,7 @@ public:
         {
             const BandConfig cfg = staged_[i].read();
             bandAnalog_[static_cast<size_t>(i)] = usesAnalog(cfg);
+            bandPlacement_[static_cast<size_t>(i)] = static_cast<int>(cfg.placement);
             if (bandAnalog_[static_cast<size_t>(i)]) designAnalogBand(i, cfg, true);
         }
 
@@ -201,6 +222,7 @@ public:
         lpPartition_ = 0;
         lpPartitions_ = 0;
         lpChannels_ = spec.numChannels;
+        lpSlots_ = lpChannels_ >= 2 ? (lpChannels_ > 2 ? 5 : 4) : 1;
 
         const int kernel = resolveKernelLength(spec.sampleRate);
         const int part = std::max(kLpMinPartition, kernel / kLpPartitionCount);
@@ -209,7 +231,7 @@ public:
         const size_t channels = static_cast<size_t>(lpChannels_);
 
         for (auto& set : lpKernelSet_)
-            set.assign(static_cast<size_t>(parts) * specLen, T(0));
+            set.assign(static_cast<size_t>(lpSlots_) * static_cast<size_t>(parts) * specLen, T(0));
         lpFdl_.assign(channels * static_cast<size_t>(parts) * specLen, T(0));
         lpInput_.assign(channels * static_cast<size_t>(2 * part), T(0));
         lpOutput_.assign(channels * static_cast<size_t>(part), T(0));
@@ -227,7 +249,8 @@ public:
             lpWindow_[static_cast<size_t>(i)] = static_cast<T>(
                 0.35875 - 0.48829 * std::cos(t) + 0.14128 * std::cos(2.0 * t) - 0.01168 * std::cos(3.0 * t));
         }
-        lpMag_.assign(static_cast<size_t>(kernel + 1), T(1));
+        lpMag_.assign(static_cast<size_t>(lpSlots_) * static_cast<size_t>(kernel + 1), T(1));
+        lpPlaced_[0] = lpPlaced_[1] = false;
         lpDesignSpec_.assign(static_cast<size_t>(design + 2), T(0));
         lpDesignTime_.assign(static_cast<size_t>(design), T(0));
         lpKernelTime_.assign(static_cast<size_t>(kernel), T(0));
@@ -320,6 +343,10 @@ public:
      * the block path's parameter smoothing), so per-sample streams that never
      * call processBlock() still pick up setBand() and friends.
      *
+     * A band placed on the left or the right acts on channel 0 or 1 alone.
+     * The bands of the middle and the sides need both channels of a frame
+     * and only run in processBlock().
+     *
      * @param input   Input sample.
      * @param channel Channel index (out-of-range channels pass through).
      * @return EQ'd output sample.
@@ -344,21 +371,29 @@ public:
         for (int i = 0; i < activeBands; ++i)
         {
             if (!bandEnabled_[i].load(std::memory_order_relaxed)) continue;
+            // A band of one channel keeps its memory in the first slot of its
+            // engine, as in the block form. Middle and sides need both
+            // channels of a frame: those bands only run in processBlock().
+            const int placement = bandPlacement_[static_cast<size_t>(i)];
+            if (placement >= static_cast<int>(Placement::Mid)) continue;
+            if (placement != static_cast<int>(Placement::Stereo)
+                && channel != (placement == static_cast<int>(Placement::Left) ? 0 : 1)) continue;
+            const int slot = placement == static_cast<int>(Placement::Stereo) ? channel : 0;
             if (bandAnalog_[static_cast<size_t>(i)] && analog_)
             {
-                // Ramps move once per frame, on channel 0.
+                // Ramps move once per frame, on the first channel the band plays.
                 AnalogBand& band = (*analog_)[static_cast<size_t>(i)];
-                if (channel == 0)
+                if (slot == 0)
                 {
                     band.cascade.advanceRamps(1);
                     settleAnalogBand(band);
                 }
-                if (channel >= 0 && channel < kEngineChannels && !band.idle)
-                    sample = static_cast<T>(band.cascade.processSample(static_cast<double>(sample), channel));
+                if (slot >= 0 && slot < kEngineChannels && !band.idle)
+                    sample = static_cast<T>(band.cascade.processSample(static_cast<double>(sample), slot));
             }
             else
             {
-                sample = bands_[i].processSample(sample, channel);
+                sample = bands_[i].processSample(sample, slot);
             }
         }
         return sample;
@@ -437,6 +472,8 @@ public:
         if (!std::isfinite(cfg.slope))     cfg.slope     = prev.slope;
         if (static_cast<int>(cfg.type) < 0 || static_cast<int>(cfg.type) > static_cast<int>(BandType::HighPassWall))
             cfg.type = prev.type;
+        if (static_cast<int>(cfg.placement) < 0 || static_cast<int>(cfg.placement) > static_cast<int>(Placement::Side))
+            cfg.placement = prev.placement;
         cfg.slope = std::clamp(cfg.slope, T(0), T(96));
         cfg.order = std::clamp(cfg.order, 1, kMaxBandSections);
 
@@ -681,6 +718,27 @@ public:
      */
     void getMagnitudeForFrequencyArray(const T* frequencies, T* magnitudes, int numPoints) const noexcept
     {
+        magnitudeOfBands(frequencies, magnitudes, numPoints, -1);
+    }
+
+    /**
+     * @brief The magnitude response at one place of the stereo pair: the
+     *        stereo bands and the bands placed there.
+     *
+     * @param frequencies Array of frequencies in Hz.
+     * @param magnitudes  Output array (same size, linear scale).
+     * @param numPoints   Number of frequency points.
+     * @param where       Left, Right, Mid or Side (Stereo gives the stereo bands alone).
+     */
+    void getMagnitudeForFrequencyArray(const T* frequencies, T* magnitudes, int numPoints, Placement where) const noexcept
+    {
+        magnitudeOfBands(frequencies, magnitudes, numPoints, static_cast<int>(where));
+    }
+
+protected:
+    /** @brief The product of the enabled bands: all of them (where < 0), or the stereo ones and those placed at `where`. */
+    void magnitudeOfBands(const T* frequencies, T* magnitudes, int numPoints, int where) const noexcept
+    {
         for (int i = 0; i < numPoints; ++i)
             magnitudes[i] = T(1);
 
@@ -689,6 +747,7 @@ public:
         {
             const BandConfig cfg = staged_[b].read();
             if (!cfg.enabled) continue;
+            if (where >= 0 && cfg.placement != Placement::Stereo && static_cast<int>(cfg.placement) != where) continue;
 
             BiquadCoeffs st[kMaxBandSections];
             const int ns = buildBandSections(cfg, st, kMaxBandSections);
@@ -702,6 +761,8 @@ public:
             }
         }
     }
+
+public:
 
     /**
      * @brief Direct access to a band's underlying FilterEngine.
@@ -759,6 +820,8 @@ public:
             w.write(key, static_cast<int32_t>(cfg.order));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             w.write(key, cfg.enabled);
+            std::snprintf(key, sizeof(key), "b%d.place", i);
+            w.write(key, static_cast<int32_t>(cfg.placement));
         }
         return w.blob();
     }
@@ -796,6 +859,8 @@ public:
             cfg.order = r.read(key, 1);
             std::snprintf(key, sizeof(key), "b%d.on", i);
             cfg.enabled = r.read(key, true);
+            std::snprintf(key, sizeof(key), "b%d.place", i);
+            cfg.placement = static_cast<Placement>(r.read(key, 0));
             setBand(i, cfg);
         }
         numBands_.store(n, std::memory_order_relaxed);
@@ -852,6 +917,13 @@ protected:
                 // and pick the publication up on a later call.
                 configDirty_.store(true, std::memory_order_release);
                 continue;
+            }
+
+            // A band that moves to other channels comes in through the band fade.
+            if (static_cast<int>(cfg.placement) != bandPlacement_[static_cast<size_t>(i)])
+            {
+                bandPlacement_[static_cast<size_t>(i)] = static_cast<int>(cfg.placement);
+                bandMix_[static_cast<size_t>(i)] = T(0);
             }
 
             // A band of the analog response runs in its cascade; one that
@@ -1270,45 +1342,87 @@ protected:
         const int activeBands = numBands_.load(std::memory_order_relaxed);
         const int total = buffer.getNumSamples();
         const int slice = bandDryStride_ > 0 ? bandDryStride_ : std::max(total, 1);
+        const bool pair = buffer.getNumChannels() >= 2;
+        const int firstOfThePair = static_cast<int>(Placement::Mid);
+
+        // Whether a band of the middle or the sides plays, or is still fading out.
+        bool second = false;
+        for (int i = 0; i < MaxBands; ++i)
+            if (bandPlacement_[static_cast<size_t>(i)] >= firstOfThePair
+                && ((i < activeBands && bandEnabled_[i].load(std::memory_order_relaxed))
+                    || bandMix_[static_cast<size_t>(i)] != T(0)))
+                second = true;
 
         for (int offset = 0; offset < total; offset += slice)
         {
             const int n = std::min(slice, total - offset);
             AudioBufferView<T> view = buffer.getSubView(offset, n);
             for (int i = 0; i < MaxBands; ++i)
+                if (bandPlacement_[static_cast<size_t>(i)] < firstOfThePair) processBandSlice(i, view, n, activeBands);
+            if (second)
             {
-                const bool on = i < activeBands && bandEnabled_[i].load(std::memory_order_relaxed);
-                const T target = on ? T(1) : T(0);
-                T& mix = bandMix_[static_cast<size_t>(i)];
-                if (bandSnap_ || bandDry_.empty()) mix = target;
-                if (mix == target)
-                {
-                    if (on) runBand(i, view);
-                    continue;
-                }
-
-                if (mix == T(0)) resetBand(i);   // re-entering band: clean state
-
-                const int nCh = std::min(view.getNumChannels(), bandDryChannels_);
-                for (int ch = 0; ch < nCh; ++ch)
-                    std::copy_n(view.getChannel(ch), n,
-                                bandDry_.data() + static_cast<size_t>(ch) * static_cast<size_t>(bandDryStride_));
-                runBand(i, view);
-                const T start = mix;
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    T* wet = view.getChannel(ch);
-                    const T* dry = bandDry_.data() + static_cast<size_t>(ch) * static_cast<size_t>(bandDryStride_);
-                    for (int k = 0; k < n; ++k)
-                    {
-                        const T m = moveTowards(start, target, bandFadeStep_ * static_cast<T>(k + 1));
-                        wet[k] = dry[k] + (wet[k] - dry[k]) * m;
-                    }
-                }
-                mix = moveTowards(start, target, bandFadeStep_ * static_cast<T>(n));
+                if (pair) MidSide<T>::encode(view);
+                for (int i = 0; i < MaxBands; ++i)
+                    if (bandPlacement_[static_cast<size_t>(i)] >= firstOfThePair) processBandSlice(i, view, n, activeBands);
+                if (pair) MidSide<T>::decode(view);
             }
             bandSnap_ = false;
         }
+    }
+
+    /**
+     * @brief One band over one slice, on the channels of its placement, with
+     *        its on/off fade. For a band of the middle or the sides the view
+     *        is already in that form.
+     */
+    void processBandSlice(int i, AudioBufferView<T> view, int n, int activeBands) noexcept
+    {
+        const bool on = i < activeBands && bandEnabled_[i].load(std::memory_order_relaxed);
+        const T target = on ? T(1) : T(0);
+        T& mix = bandMix_[static_cast<size_t>(i)];
+        if (bandSnap_ || bandDry_.empty()) mix = target;
+
+        T* single[1] = { nullptr };
+        AudioBufferView<T> where = view;
+        const int placement = bandPlacement_[static_cast<size_t>(i)];
+        if (placement != static_cast<int>(Placement::Stereo))
+        {
+            const int channel = (placement == static_cast<int>(Placement::Left)
+                                 || placement == static_cast<int>(Placement::Mid)) ? 0 : 1;
+            if (channel >= view.getNumChannels())
+            {
+                mix = target;      // nothing to act on: a single channel has no right and no sides
+                return;
+            }
+            single[0] = view.getChannel(channel);
+            where = AudioBufferView<T>(single, 1, n);
+        }
+
+        if (mix == target)
+        {
+            if (on) runBand(i, where);
+            return;
+        }
+
+        if (mix == T(0)) resetBand(i);   // re-entering band: clean state
+
+        const int nCh = std::min(where.getNumChannels(), bandDryChannels_);
+        for (int ch = 0; ch < nCh; ++ch)
+            std::copy_n(where.getChannel(ch), n,
+                        bandDry_.data() + static_cast<size_t>(ch) * static_cast<size_t>(bandDryStride_));
+        runBand(i, where);
+        const T start = mix;
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* wet = where.getChannel(ch);
+            const T* dry = bandDry_.data() + static_cast<size_t>(ch) * static_cast<size_t>(bandDryStride_);
+            for (int k = 0; k < n; ++k)
+            {
+                const T m = moveTowards(start, target, bandFadeStep_ * static_cast<T>(k + 1));
+                wet[k] = dry[k] + (wet[k] - dry[k]) * m;
+            }
+        }
+        mix = moveTowards(start, target, bandFadeStep_ * static_cast<T>(n));
     }
 
     // -- Linear-phase engine ----------------------------------------------------
@@ -1397,7 +1511,16 @@ protected:
                     }
                     lpStageCount_[static_cast<size_t>(b)] = 0;
                     lpAnalogCount_[static_cast<size_t>(b)] = 0;
+                    lpBandGroup_[static_cast<size_t>(b)] = 0;
                     if (!cfg.enabled) continue;
+                    if (lpSlots_ > 1)
+                    {
+                        lpBandGroup_[static_cast<size_t>(b)] = static_cast<int>(cfg.placement);
+                    }
+                    else if (cfg.placement == Placement::Right || cfg.placement == Placement::Side)
+                    {
+                        continue;       // a single channel has no right and no sides
+                    }
                     if (usesAnalog(cfg))
                     {
                         // The magnitude of the prototype itself: nothing to shrink.
@@ -1415,6 +1538,12 @@ protected:
                 lpDesignStages_ = 0;
                 for (int b = 0; b < activeBands; ++b)
                     lpDesignStages_ += lpStageCount_[static_cast<size_t>(b)] + lpAnalogCount_[static_cast<size_t>(b)];
+                lpDesignPlaced_ = false;
+                for (int b = 0; b < activeBands; ++b)
+                    if (lpBandGroup_[static_cast<size_t>(b)] != 0
+                        && lpStageCount_[static_cast<size_t>(b)] + lpAnalogCount_[static_cast<size_t>(b)] > 0)
+                        lpDesignPlaced_ = true;
+                lpSlot_ = 0;
                 lpStep_ = 0;
                 lpStage_ = LpStage::Magnitude;
             }
@@ -1440,9 +1569,11 @@ protected:
                 {
                     const double c2 = 2.0 * c1 * c1 - 1.0;
                     const double s2 = 2.0 * s1 * c1;
-                    double power = 1.0;
+                    // One product per place of the pair (all in the first when no band is placed).
+                    double powers[5] = { 1.0, 1.0, 1.0, 1.0, 1.0 };
                     for (int b = 0; b < lpDesignBands_; ++b)
                     {
+                        double& power = powers[lpDesignPlaced_ ? lpBandGroup_[static_cast<size_t>(b)] : 0];
                         const BiquadCoeffs* st = lpStages_.data() + static_cast<size_t>(b) * 5;
                         for (int s = 0; s < lpStageCount_[static_cast<size_t>(b)]; ++s)
                         {
@@ -1459,7 +1590,24 @@ protected:
                         for (int s = 0; s < lpAnalogCount_[static_cast<size_t>(b)]; ++s)
                             power *= proto[s].magnitudeSquared(omega);
                     }
-                    lpMag_[static_cast<size_t>(k)] = static_cast<T>(std::sqrt(power));
+                    if (!lpDesignPlaced_)
+                    {
+                        lpMag_[static_cast<size_t>(k)] = static_cast<T>(std::sqrt(powers[0]));
+                    }
+                    else
+                    {
+                        // Left and right bands, then middle and sides, then back, as one matrix:
+                        // each output is its own channel times one response plus the other times another.
+                        const double both = std::sqrt(powers[0]), left = std::sqrt(powers[1]), right = std::sqrt(powers[2]);
+                        const double sum = 0.5 * (std::sqrt(powers[3]) + std::sqrt(powers[4]));
+                        const double difference = 0.5 * (std::sqrt(powers[3]) - std::sqrt(powers[4]));
+                        const size_t stride = static_cast<size_t>(kernel + 1), at = static_cast<size_t>(k);
+                        lpMag_[at] = static_cast<T>(both * left * sum);                          // left to left
+                        lpMag_[stride + at] = static_cast<T>(both * right * sum);                // right to right
+                        lpMag_[2 * stride + at] = static_cast<T>(both * right * difference);     // right to left
+                        lpMag_[3 * stride + at] = static_cast<T>(both * left * difference);      // left to right
+                        if (lpSlots_ > 4) lpMag_[4 * stride + at] = static_cast<T>(both);        // further channels
+                    }
                     const double cn = c1 * rc - s1 * rs;
                     s1 = s1 * rc + c1 * rs;
                     c1 = cn;
@@ -1473,8 +1621,9 @@ protected:
             {
                 // Zero-phase spectrum -> impulse centred on t = 0 (circular).
                 std::fill(lpDesignSpec_.begin(), lpDesignSpec_.end(), T(0));
+                const T* response = lpMag_.data() + static_cast<size_t>(lpSlot_) * static_cast<size_t>(kernel + 1);
                 for (int k = 0; k <= kernel; ++k)
-                    lpDesignSpec_[static_cast<size_t>(2 * k)] = lpMag_[static_cast<size_t>(k)];
+                    lpDesignSpec_[static_cast<size_t>(2 * k)] = response[static_cast<size_t>(k)];
                 lpDesignFft_->inverse(lpDesignSpec_.data(), lpDesignTime_.data());
 
                 // Centre at kernel/2 and window. Tap 0 pairs with the absent
@@ -1506,10 +1655,18 @@ protected:
                     std::copy_n(lpKernelTime_.data() + static_cast<size_t>(p) * static_cast<size_t>(part),
                                 part, lpBlockTime_.data());
                     std::fill(lpBlockTime_.begin() + part, lpBlockTime_.end(), T(0));
-                    lpFft_->forward(lpBlockTime_.data(), set.data() + static_cast<size_t>(p) * specLen);
+                    lpFft_->forward(lpBlockTime_.data(),
+                                    set.data() + static_cast<size_t>(lpSlot_ * lpPartitions_ + p) * specLen);
                 }
-                if (last >= lpPartitions_)
+                if (last >= lpPartitions_ && lpDesignPlaced_ && lpSlot_ + 1 < lpSlots_)
                 {
+                    // The next kernel of the matrix.
+                    ++lpSlot_;
+                    lpStage_ = LpStage::Transform;
+                }
+                else if (last >= lpPartitions_)
+                {
+                    lpPlaced_[static_cast<size_t>(1 - lpActive_)] = lpDesignPlaced_;
                     lpSwapPending_ = true;
                     lpStage_ = lpRestartPending_ ? LpStage::Snapshot : LpStage::Idle;
                     lpRestartPending_ = false;
@@ -1572,23 +1729,36 @@ protected:
         const int newSet = crossfade ? 1 - lpActive_ : lpActive_;
         const T invPart = T(1) / static_cast<T>(part);
 
+        // Every channel's block into its delay line first: a matrix of
+        // kernels reads the other channel's too.
+        const size_t lineLen = static_cast<size_t>(parts) * specLen;
+        for (int ch = 0; ch < lpChannels_; ++ch)
+            lpFft_->forward(lpInput_.data() + static_cast<size_t>(ch) * static_cast<size_t>(2 * part),
+                            lpFdl_.data() + static_cast<size_t>(ch) * lineLen + static_cast<size_t>(lpFdlPos_) * specLen);
+
         for (int ch = 0; ch < lpChannels_; ++ch)
         {
             T* input = lpInput_.data() + static_cast<size_t>(ch) * static_cast<size_t>(2 * part);
             T* output = lpOutput_.data() + static_cast<size_t>(ch) * static_cast<size_t>(part);
-            T* fdl = lpFdl_.data() + static_cast<size_t>(ch) * static_cast<size_t>(parts) * specLen;
-
-            lpFft_->forward(input, fdl + static_cast<size_t>(lpFdlPos_) * specLen);
 
             auto convolve = [&](int setIndex, T* time) noexcept {
                 std::fill(lpAccum_.begin(), lpAccum_.end(), T(0));
-                const T* kernel = lpKernelSet_[static_cast<size_t>(setIndex)].data();
-                for (int p = 0; p < parts; ++p)
-                {
-                    const int slot = (lpFdlPos_ - p + parts) % parts;
-                    simd::complexMulAccum(lpAccum_.data(), fdl + static_cast<size_t>(slot) * specLen,
-                                          kernel + static_cast<size_t>(p) * specLen, bins);
-                }
+                const bool placed = lpPlaced_[static_cast<size_t>(setIndex)];
+                const T* kernels = lpKernelSet_[static_cast<size_t>(setIndex)].data();
+                const auto add = [&](int slot, int from) noexcept {
+                    const T* kernel = kernels + static_cast<size_t>(slot) * lineLen;
+                    const T* line = lpFdl_.data() + static_cast<size_t>(from) * lineLen;
+                    for (int p = 0; p < parts; ++p)
+                    {
+                        const int at = (lpFdlPos_ - p + parts) % parts;
+                        simd::complexMulAccum(lpAccum_.data(), line + static_cast<size_t>(at) * specLen,
+                                              kernel + static_cast<size_t>(p) * specLen, bins);
+                    }
+                };
+                // Its own channel through its own kernel; with placed bands, the
+                // other channel of the pair through the kernel that crosses.
+                add(!placed ? 0 : (ch == 0 ? 0 : (ch == 1 ? 1 : 4)), ch);
+                if (placed && ch < 2) add(ch == 0 ? 2 : 3, 1 - ch);
                 lpFft_->inverse(lpAccum_.data(), time);
             };
 
@@ -1692,6 +1862,7 @@ protected:
         std::atomic<T>    slope     { BandConfig{}.slope };
         std::atomic<int>  order     { BandConfig{}.order };
         std::atomic<bool> enabled   { BandConfig{}.enabled };
+        std::atomic<int>  placement { static_cast<int>(BandConfig{}.placement) };
         std::atomic<unsigned> seq   { 0 };
 
         /**
@@ -1717,6 +1888,7 @@ protected:
             slope.store(c.slope, std::memory_order_relaxed);
             order.store(c.order, std::memory_order_relaxed);
             enabled.store(c.enabled, std::memory_order_relaxed);
+            placement.store(static_cast<int>(c.placement), std::memory_order_relaxed);
             seq.fetch_add(1, std::memory_order_release);   // -> even
         }
 
@@ -1742,6 +1914,7 @@ protected:
             c.slope     = slope.load(std::memory_order_relaxed);
             c.order     = order.load(std::memory_order_relaxed);
             c.enabled   = enabled.load(std::memory_order_relaxed);
+            c.placement = static_cast<Placement>(placement.load(std::memory_order_relaxed));
         }
 
         /**
@@ -1836,6 +2009,7 @@ protected:
     std::unique_ptr<std::array<AnalogBand, MaxBands>> analog_;
     FilterDesign::Band designBand_;
     std::array<bool, MaxBands> bandAnalog_ {};   ///< Which engine runs each band.
+    std::array<int, MaxBands> bandPlacement_ {}; ///< Where each band acts (audio thread's copy).
 
     // Linear-phase state
     std::atomic<FilterMode> filterMode_ { FilterMode::MinimumPhase };
@@ -1880,6 +2054,11 @@ protected:
     std::array<int, MaxBands> lpStageCount_ {};
     std::array<AnalogSection, MaxBands * AnalogCascade::kMaxSections> lpAnalog_ {};   ///< Prototypes of the analog bands.
     std::array<int, MaxBands> lpAnalogCount_ {};
+    std::array<int, MaxBands> lpBandGroup_ {};   ///< Where each band of the design acts (0 when it acts on every channel).
+    int lpSlots_ = 1;                            ///< Kernels a set holds: 1, or the matrix of a pair (and one more for further channels).
+    int lpSlot_ = 0;                             ///< Kernel of the design being transformed.
+    bool lpDesignPlaced_ = false;                ///< The design in flight is a matrix.
+    std::array<bool, 2> lpPlaced_ {};            ///< Whether each kernel set is one.
     std::vector<T> lpWindow_, lpMag_;
     std::vector<T> lpDesignSpec_, lpDesignTime_, lpKernelTime_;
 };

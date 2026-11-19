@@ -432,6 +432,11 @@ std::vector<std::uint8_t> makeReverbState(float mix, float preDelay,
     writer.write("preDelay", preDelay);
     writer.write("decayScale", decayScale);
     writer.write("stretch", stretch);
+    // The shaping of the wet signal, at rest (getState() writes every key).
+    writer.write("ducking", 0.0f);
+    writer.write("gate", -200.0f);
+    writer.write("gateHold", 100.0f);
+    writer.write("gateRelease", 150.0f);
     return writer.blob();
 }
 

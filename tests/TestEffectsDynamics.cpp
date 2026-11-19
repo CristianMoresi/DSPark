@@ -4241,6 +4241,768 @@ DSPARK_TEST(Compressor_new_controls_sample_path_and_state)
 }
 
 // ============================================================================
+// Compressor: analytic makeup, precision of the control signal, slow followers
+// ============================================================================
+
+namespace {
+
+// Gaussian noise with equal power per octave, at an RMS level in dBFS.
+Vec compPinkNoise(int n, double rmsDb, uint32_t seed)
+{
+    std::vector<double> v(static_cast<size_t>(n));
+    uint32_t s = seed;
+    auto uni = [&]() { s = s * 1664525u + 1013904223u; return (static_cast<double>(s >> 8) + 0.5) / 16777216.0; };
+    double b0 = 0.0, b1 = 0.0, b2 = 0.0, sum = 0.0;
+    for (auto& x : v)
+    {
+        const double g = std::sqrt(-2.0 * std::log(uni())) * std::cos(2.0 * kPiD * uni());
+        b0 = 0.99765 * b0 + g * 0.0990460;
+        b1 = 0.96300 * b1 + g * 0.2965164;
+        b2 = 0.57000 * b2 + g * 1.0526913;
+        x = b0 + b1 + b2 + g * 0.1848;
+        sum += x * x;
+    }
+    const double scale = std::pow(10.0, rmsDb / 20.0) / std::sqrt(sum / n);
+    Vec out(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)] = static_cast<float>(v[static_cast<size_t>(i)] * scale);
+    return out;
+}
+
+// Level a compressor leaves over the input's, in dB, past the first quarter of the signal.
+template <class Setup>
+double compLevelChange(const Vec& in, Setup&& setup)
+{
+    auto c = std::make_unique<Compressor<float>>();
+    setup(*c);
+    c->prepare(AudioSpec{ 48000.0, 512, 1 });
+    std::vector<Vec> x { in };
+    processInBlocks(x, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+    double before = 0.0, after = 0.0;
+    for (size_t i = in.size() / 4; i < in.size(); ++i)
+    {
+        before += static_cast<double>(in[i]) * in[i];
+        after += static_cast<double>(x[0][i]) * x[0][i];
+    }
+    return 10.0 * std::log10(after / before);
+}
+
+// The largest line of a compressor's steady output that is no harmonic of the tone it is fed, and
+// the gain of the tone, in dB. The tone sits on bin `bin` of a 32768-point transform.
+struct CompLines
+{
+    double gainDb = 0.0, worstDb = 0.0;
+};
+
+template <class Setup>
+CompLines compLines(int bin, double amplitude, Setup&& setup)
+{
+    constexpr int n = 32768;
+    auto c = std::make_unique<Compressor<double>>();
+    setup(*c);
+    c->prepare(AudioSpec{ 48000.0, 512, 1 });
+    std::vector<double> x(static_cast<size_t>(n) * 6);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = amplitude * std::sin(2.0 * kPiD * bin * static_cast<double>(i % static_cast<size_t>(n)) / n);
+    for (size_t off = 0; off < x.size(); off += 512)
+    {
+        double* p = x.data() + off;
+        AudioBufferView<double> v(&p, 1, 512);
+        c->processBlock(v);
+    }
+    FFTReal<double> fft(static_cast<size_t>(n));
+    std::vector<double> spec(static_cast<size_t>(n) + 2);
+    fft.forward(x.data() + (x.size() - static_cast<size_t>(n)), spec.data());
+    auto power = [&](int k) {
+        const double re = spec[static_cast<size_t>(2 * k)], im = spec[static_cast<size_t>(2 * k + 1)];
+        return re * re + im * im;
+    };
+    double worst = 0.0;
+    for (int k = 1; k <= n / 2; ++k)
+        if (k % bin != 0) worst = std::max(worst, power(k));
+    CompLines r;
+    r.gainDb = 10.0 * std::log10(power(bin)) - 20.0 * std::log10(amplitude * n / 2.0);
+    r.worstDb = 10.0 * std::log10(std::max(worst / power(bin), 1e-30));
+    return r;
+}
+
+} // namespace
+
+// New: a makeup worked out from the settings. Over dense programme at the
+// level it assumes, it leaves the output where the input was, whatever the
+// curve, the times, the detector or the character; the constant half of the
+// reduction of a full-scale signal (Static) misses by several dB as soon as
+// the attack is slow.
+DSPARK_TEST(Compressor_analytic_makeup_leaves_the_level_of_dense_programme)
+{
+    using C = Compressor<float>;
+    using D = C::DetectorType;
+    using K = C::Character;
+    using T = C::Topology;
+    const Vec pink = compPinkNoise(48000 * 8, -18.0, 7u);
+    struct Case
+    {
+        const char* name;
+        D det; K character; T topology; bool decoupled;
+        float threshold, ratio, knee, attack, release;
+        bool upward;
+        double least;       // level change with no makeup, at least this far from 0
+        double tolerance;   // level left with the analytic makeup
+    };
+    const Case cases[] = {
+        { "peak 5/100 -20 4:1",          D::Peak,     K::Clean,  T::FeedForward, false, -20, 4, 0, 5, 100, false, 3.5, 0.3 },
+        { "peak 5/100 -30 4:1",          D::Peak,     K::Clean,  T::FeedForward, false, -30, 4, 0, 5, 100, false, 9.0, 0.3 },
+        { "peak 0.5/100 -20 4:1",        D::Peak,     K::Clean,  T::FeedForward, false, -20, 4, 0, 0.5f, 100, false, 5.0, 0.3 },
+        { "peak 100/100 -20 4:1",        D::Peak,     K::Clean,  T::FeedForward, false, -20, 4, 0, 100, 100, false, 0.8, 0.3 },
+        { "peak 5/1000 -20 4:1 knee 12", D::Peak,     K::Clean,  T::FeedForward, false, -20, 4, 12, 5, 1000, false, 5.0, 0.3 },
+        { "peak decoupled 5/100",        D::Peak,     K::Clean,  T::FeedForward, true,  -20, 4, 0, 5, 100, false, 7.0, 0.6 },
+        { "peak feedback 5/100",         D::Peak,     K::Clean,  T::FeedBack,    false, -20, 4, 0, 5, 100, false, 3.5, 0.5 },
+        { "rms 30/300 -30 3:1",          D::Rms,      K::Clean,  T::FeedForward, false, -30, 3, 6, 30, 300, false, 7.0, 0.6 },
+        { "hilbert 5/100 -20 4:1",       D::Hilbert,  K::Clean,  T::FeedForward, false, -20, 4, 0, 5, 100, false, 5.0, 0.5 },
+        { "true peak 5/100 -20 4:1",     D::TruePeak, K::Clean,  T::FeedForward, false, -20, 4, 0, 5, 100, false, 4.5, 0.6 },
+        { "opto 10/100 -25 4:1",         D::Peak,     K::Opto,   T::FeedForward, false, -25, 4, 0, 10, 100, false, 5.0, 0.4 },
+        { "fet 0.2/200 -20 4:1",         D::Peak,     K::FET,    T::FeedBack,    false, -20, 4, 0, 0.2f, 200, false, 6.0, 0.7 },
+        { "varimu 10/300 -25 3:1",       D::Peak,     K::Varimu, T::FeedForward, false, -25, 3, 0, 10, 300, false, 7.0, 0.4 },
+        { "upward 5/100 -10 2:1",        D::Peak,     K::Clean,  T::FeedForward, false, -10, 2, 0, 5, 100, true,  2.0, 0.3 },
+    };
+    for (const auto& k : cases)
+    {
+        const auto with = [&](C::AutoMakeupMode mode) {
+            return compLevelChange(pink, [&](C& c) {
+                c.setDetector(k.det);
+                c.setCharacter(k.character);
+                c.setTopology(k.topology);
+                c.setCleanBallistics(k.decoupled ? C::CleanBallistics::Decoupled : C::CleanBallistics::Branching);
+                c.setThreshold(k.threshold);
+                c.setRatio(k.ratio);
+                c.setKnee(k.knee);
+                c.setAttack(k.attack);
+                c.setRelease(k.release);
+                c.setMode(k.upward ? C::Mode::Upward : C::Mode::Downward);
+                c.setAutoMakeup(mode);
+            });
+        };
+        const double none = with(C::AutoMakeupMode::Off);
+        const double analytic = with(C::AutoMakeupMode::Analytic);
+        std::cout << "  " << k.name << ": " << none << " dB with no makeup, " << analytic << " dB with the analytic one\n";
+        EXPECT_GT(std::abs(none), k.least);
+        EXPECT_LT(std::abs(analytic), k.tolerance);
+    }
+
+    // The constant of the Static mode does not know the times.
+    const auto slow = [&](C::AutoMakeupMode mode) {
+        return compLevelChange(pink, [&](C& c) {
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(100.0f);
+            c.setRelease(100.0f);
+            c.setAutoMakeup(mode);
+        });
+    };
+    EXPECT_GT(slow(C::AutoMakeupMode::Static), 5.0);
+    EXPECT_LT(std::abs(slow(C::AutoMakeupMode::Analytic)), 0.3);
+
+    // It follows the amount, and a change of setting moves it without a step.
+    const double half = compLevelChange(pink, [&](C& c) {
+        c.setThreshold(-30.0f);
+        c.setRatio(4.0f);
+        c.setAmount(0.5f);
+        c.setAutoMakeup(C::AutoMakeupMode::Analytic);
+    });
+    EXPECT_LT(std::abs(half), 0.4);
+
+    C moving;
+    moving.setThreshold(-10.0f);
+    moving.setRatio(4.0f);
+    moving.setAutoMakeup(C::AutoMakeupMode::Analytic);
+    moving.prepare(AudioSpec{ 48000.0, 512, 1 });
+    std::vector<Vec> quiet { makeSine(1000.0, 0.001, 48000.0, 48000) };
+    float last = 0.0f, largestStep = 0.0f;
+    bool first = true;
+    int block = 0;
+    processInBlocks(quiet, 512, [&](AudioBufferView<float> b) {
+        if (block++ == 20) moving.setThreshold(-40.0f);   // the makeup grows by several dB
+        moving.processBlock(b);
+    });
+    for (int i = 12; i < 48000; i += 48)                   // the crests of the tone
+    {
+        const float crest = std::abs(quiet[0][static_cast<size_t>(i)]);
+        if (!first) largestStep = std::max(largestStep, std::abs(crest - last) / std::max(last, 1e-9f));
+        last = crest;
+        first = false;
+    }
+    EXPECT_GT(std::abs(quiet[0][47964]) / std::abs(quiet[0][12]), 1.5f);   // it did move
+    EXPECT_LT(largestStep, 0.15f);                                          // 1 ms at a time, never a step
+}
+
+// With the automatic threshold the analytic makeup knows where the programme
+// sits against the threshold: the same result 30 dB lower.
+DSPARK_TEST(Compressor_analytic_makeup_with_automatic_threshold_holds_at_any_level)
+{
+    using C = Compressor<float>;
+    double left[2] = {}, lost[2] = {};
+    const double levels[2] = { -36.0, -6.0 };
+    for (int which = 0; which < 2; ++which)
+    {
+        const Vec pink = compPinkNoise(48000 * 8, levels[which], 7u);
+        const auto with = [&](C::AutoMakeupMode mode) {
+            return compLevelChange(pink, [&](C& c) {
+                c.setThreshold(-20.0f);
+                c.setRatio(3.0f);
+                c.setKnee(6.0f);
+                c.setAttack(20.0f);
+                c.setRelease(200.0f);
+                c.setAutoThreshold(true);
+                c.setAutoMakeup(mode);
+            });
+        };
+        lost[which] = with(C::AutoMakeupMode::Off);
+        left[which] = with(C::AutoMakeupMode::Analytic);
+        std::cout << "  programme at " << levels[which] << " dBFS: " << lost[which] << " dB, " << left[which]
+                  << " dB with the analytic makeup\n";
+        EXPECT_LT(lost[which], -5.0);
+        EXPECT_LT(std::abs(left[which]), 0.4);
+    }
+    EXPECT_NEAR(left[0], left[1], 0.1);
+}
+
+// Defect: an envelope within 1e-4 dB of zero was put back on zero whatever
+// its target. Leaving zero in steps shorter than that (a slow attack, a
+// shallow target), each step was undone and the gain never moved: at 96 kHz,
+// 200 ms of attack ignored a 0.3 dB target for good. And the memory stage of
+// Opto, which charges over two seconds with a release of 500 ms, never
+// charged under 9.6 dB of reduction at 48 kHz, so the long tail that makes
+// the character was missing on light compression.
+DSPARK_TEST(Compressor_slow_followers_leave_zero)
+{
+    using C = Compressor<float>;
+    for (double rate : { 48000.0, 96000.0 })
+    {
+        C c;
+        c.setDetector(C::DetectorType::Rms);
+        c.setThreshold(-20.0f);
+        c.setRatio(2.0f);
+        c.setAttack(200.0f);
+        c.setRelease(200.0f);
+        c.prepare(AudioSpec{ rate, 512, 1 });
+        // RMS 0.6 dB over the threshold: the curve asks for 0.3 dB.
+        const double amplitude = std::pow(10.0, -19.4 / 20.0) * std::sqrt(2.0);
+        std::vector<Vec> x { makeSine(1000.0, amplitude, rate, static_cast<int>(rate * 4.0)) };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+        EXPECT_NEAR(static_cast<double>(c.getGainReductionDb()), -0.30, 0.02);
+    }
+
+    C opto;
+    opto.setCharacter(C::Character::Opto);
+    opto.setDetector(C::DetectorType::Rms);
+    opto.setThreshold(-20.0f);
+    opto.setRatio(2.0f);
+    opto.setRelease(500.0f);
+    opto.prepare(AudioSpec{ 48000.0, 512, 1 });
+    const double amplitude = std::pow(10.0, -14.0 / 20.0) * std::sqrt(2.0);     // 6 dB over
+    std::vector<Vec> passage { makeSine(1000.0, amplitude, 48000.0, 48000 * 10) };
+    processInBlocks(passage, 512, [&](AudioBufferView<float> b) { opto.processBlock(b); });
+    EXPECT_NEAR(static_cast<double>(opto.getGainReductionDb()), -3.0, 0.1);
+    std::vector<Vec> pause { Vec(48000, 0.0f) };
+    processInBlocks(pause, 512, [&](AudioBufferView<float> b) { opto.processBlock(b); });
+    // One second on, the fast stage is back (0.07 dB left of it); what holds is the memory.
+    EXPECT_LT(static_cast<double>(opto.getGainReductionDb()), -0.7);
+    EXPECT_GT(static_cast<double>(opto.getGainReductionDb()), -1.5);
+}
+
+// New: Precision::High works the control signal out between the samples. The
+// lines it leaves that are no harmonics of the tone fall by tens of dB, most
+// where the rectifier folds hardest (a tone near the top of the band), and
+// the level the detector reads stays where it was. An average of the
+// rectifier over consecutive samples, tried first, read such a tone up to
+// 10 dB low.
+DSPARK_TEST(Compressor_high_precision_lowers_the_lines_that_are_no_harmonics)
+{
+    using C = Compressor<double>;
+    const double amplitude = std::pow(10.0, -8.0 / 20.0);
+    struct Case { const char* name; bool fet; double threshold, ratio, attack; };
+    const Case cases[] = {
+        { "peak, 0.1 ms, 4:1, 12 dB over", false, -20.0, 4.0, 0.1 },
+        { "FET, 20 us, 20:1, 30 dB over",  true,  -38.0, 20.0, 0.02 },
+    };
+    for (const auto& k : cases)
+    {
+        for (int bin : { 683, 12289 })                       // 1.0 and 18.0 kHz
+        {
+            const auto at = [&](C::Precision precision) {
+                return compLines(bin, amplitude, [&](C& c) {
+                    if (k.fet) c.setCharacter(C::Character::FET);
+                    c.setThreshold(k.threshold);
+                    c.setRatio(k.ratio);
+                    c.setAttack(k.attack);
+                    c.setRelease(50.0);
+                    c.setPrecision(precision);
+                });
+            };
+            const CompLines standard = at(C::Precision::Standard);
+            const CompLines high = at(C::Precision::High);
+            std::cout << "  " << k.name << ", " << 48000.0 * bin / 32768.0 << " Hz: " << standard.worstDb << " -> "
+                      << high.worstDb << " dBc, gain " << standard.gainDb << " -> " << high.gainDb << " dB\n";
+            EXPECT_LT(high.worstDb, standard.worstDb - 15.0);
+            EXPECT_LT(high.worstDb, -60.0);
+            EXPECT_NEAR(high.gainDb, standard.gainDb, 0.15);
+        }
+    }
+
+    // The detectors whose reading is already smooth keep one level per sample and gain the steps.
+    const auto hilbert = [&](C::Precision precision) {
+        return compLines(683, amplitude, [&](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0);
+            c.setAttack(0.1);
+            c.setRelease(50.0);
+            c.setPrecision(precision);
+        });
+    };
+    const CompLines smooth = hilbert(C::Precision::Standard), smoother = hilbert(C::Precision::High);
+    EXPECT_LT(smoother.worstDb, smooth.worstDb - 10.0);
+    EXPECT_NEAR(smoother.gainDb, smooth.gainDb, 0.01);
+}
+
+// The detectors read between the samples seven samples late, and the audio
+// waits for them: the latency reported is the delay measured, with and
+// without lookahead, in feed-forward and with the FET character; the
+// detectors that keep one level per sample add none.
+DSPARK_TEST(Compressor_high_precision_latency_paths_and_state)
+{
+    using C = Compressor<float>;
+    // Where the impulse comes out (-1: nowhere) and how many other samples are not silence.
+    const auto impulseAt = [](C& c, int channels) {
+        c.setThreshold(0.0f);
+        c.setPrecision(C::Precision::High);
+        c.prepare(AudioSpec{ 48000.0, 512, channels });
+        std::vector<Vec> x(static_cast<size_t>(channels), Vec(2048, 0.0f));
+        for (auto& ch : x) ch[100] = 0.5f;
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+        int found = -1;
+        for (int i = 0; i < 2048; ++i)
+        {
+            if (x[0][static_cast<size_t>(i)] == 0.5f) found = i - 100;
+            else if (x[0][static_cast<size_t>(i)] != 0.0f) return -2;
+        }
+        return found;
+    };
+    {
+        C c;
+        EXPECT_EQ(impulseAt(c, 1), 7);
+        EXPECT_EQ(c.getLatency(), 7);
+    }
+    {
+        C c;
+        c.setLookahead(2.0f);
+        EXPECT_EQ(impulseAt(c, 2), 96 + 7);
+        EXPECT_EQ(c.getLatency(), 96 + 7);
+    }
+    {
+        C c;
+        c.setMaxLookahead(5.0f);
+        c.setLookahead(1.0f);
+        EXPECT_EQ(impulseAt(c, 1), 240 + 7);
+        EXPECT_EQ(c.getLatency(), 240 + 7);
+    }
+    {
+        C c;
+        c.setCharacter(C::Character::FET);
+        EXPECT_EQ(impulseAt(c, 1), 7);
+        EXPECT_EQ(c.getLatency(), 7);
+    }
+    {
+        C c;
+        c.setDetector(C::DetectorType::TruePeak);
+        EXPECT_EQ(impulseAt(c, 1), 7);
+        EXPECT_EQ(c.getLatency(), 7);
+    }
+    for (auto det : { C::DetectorType::Hilbert, C::DetectorType::Rms, C::DetectorType::SplitPolarity })
+    {
+        C c;
+        c.setDetector(det);
+        EXPECT_EQ(impulseAt(c, 1), 0);
+        EXPECT_EQ(c.getLatency(), 0);
+    }
+    {
+        C c;                                    // a feedback loop that is not solved against the input
+        c.setTopology(C::Topology::FeedBack);
+        c.setDetector(C::DetectorType::Rms);
+        EXPECT_EQ(impulseAt(c, 1), 0);
+        EXPECT_EQ(c.getLatency(), 0);
+    }
+
+    // Linked channels share one gain; unlinked, a channel under the threshold is left alone.
+    const int n = 24000;
+    const auto stereo = [&](float link, std::vector<Vec>& x) {
+        C c;
+        c.setThreshold(-20.0f);
+        c.setRatio(4.0f);
+        c.setAttack(1.0f);
+        c.setRelease(50.0f);
+        c.setStereoLink(link);
+        c.setPrecision(C::Precision::High);
+        c.prepare(AudioSpec{ 48000.0, 512, 2 });
+        x = { makeSine(1000.0, 0.5, 48000.0, n), makeSine(700.0, 0.01, 48000.0, n) };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+    };
+    std::vector<Vec> linked, apart;
+    stereo(1.0f, linked);
+    stereo(0.0f, apart);
+    const Vec quiet = makeSine(700.0, 0.01, 48000.0, n);
+    double touched = 0.0, alone = 0.0;
+    for (int i = 12000; i < n; ++i)
+    {
+        touched = std::max(touched, std::abs(static_cast<double>(linked[1][static_cast<size_t>(i)])));
+        alone = std::max(alone, std::abs(static_cast<double>(apart[1][static_cast<size_t>(i)])
+                                         - quiet[static_cast<size_t>(i - 7)]));
+    }
+    EXPECT_LT(touched, 0.006);                  // the loud channel's reduction, on the quiet one
+    EXPECT_GT(touched, 0.003);
+    EXPECT_LT(alone, 1e-6);                     // itself, seven samples late
+    double same = 0.0;
+    for (int i = 12000; i < n; ++i)
+        same = std::max(same, std::abs(static_cast<double>(linked[0][static_cast<size_t>(i)])
+                                       - apart[0][static_cast<size_t>(i)]));
+    EXPECT_LT(same, 1e-4);                      // the loud channel drives both ways
+
+    // processSample() stays at Standard: there is no delay line for the audio there.
+    C single, plain;
+    for (C* c : { &single, &plain })
+    {
+        c->setThreshold(-20.0f);
+        c->setAttack(0.5f);
+        c->prepare(AudioSpec{ 48000.0, 512, 1 });
+    }
+    single.setPrecision(C::Precision::High);
+    const Vec tone = makeSine(3000.0, 0.5, 48000.0, 4800);
+    double apartBy = 0.0;
+    for (float s : tone)
+        apartBy = std::max(apartBy, std::abs(static_cast<double>(single.processSample(s, 0)) - plain.processSample(s, 0)));
+    EXPECT_EQ(apartBy, 0.0);
+
+    // State and wild values.
+    C c;
+    c.setPrecision(C::Precision::High);
+    c.setAutoMakeup(C::AutoMakeupMode::Analytic);
+    const auto blob = c.getState();
+    C other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.getPrecision() == C::Precision::High);
+    EXPECT_TRUE(other.getState() == blob);
+    other.setPrecision(static_cast<C::Precision>(99));
+    EXPECT_TRUE(other.getPrecision() == C::Precision::High);
+    other.setAutoMakeup(static_cast<C::AutoMakeupMode>(99));
+    C third;
+    const auto wild = other.getState();
+    EXPECT_TRUE(third.setState(wild.data(), wild.size()));
+    EXPECT_TRUE(third.getState() == wild);
+}
+
+// ============================================================================
+// Limiter: a latency kept for the lookahead
+// ============================================================================
+
+// New: setMaxLookahead() fixes the latency and lets the lookahead move under
+// it. The output is the one of the same lookahead with no latency kept, later
+// by the difference and to the bit; the ceiling holds wherever the lookahead
+// sits; and the per-sample path is the block path.
+DSPARK_TEST(Limiter_lookahead_moves_inside_a_latency_of_its_own)
+{
+    using L = Limiter<float>;
+    const int n = 48000;
+    Vec in(static_cast<size_t>(n));
+    uint32_t seed = 5u;
+    for (int i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double t = i / 48000.0;
+        const double burst = 0.2 + 1.3 * std::exp(-std::fmod(t, 0.25) * 30.0);
+        in[static_cast<size_t>(i)] = static_cast<float>(burst * (0.7 * std::sin(2.0 * kPiD * 220.0 * t)
+                                   + 0.3 * (static_cast<double>(seed) / 4294967296.0 - 0.5)));
+    }
+    const auto run = [&](float lookMs, float maxMs, int& latency) {
+        L lim;
+        lim.setCeiling(-6.0f);
+        lim.setRelease(50.0f);
+        lim.setLookahead(lookMs);
+        lim.setMaxLookahead(maxMs);
+        lim.prepare(AudioSpec{ 48000.0, 512, 1 });
+        latency = lim.getLatency();
+        std::vector<Vec> x { in };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { lim.processBlock(b); });
+        return x[0];
+    };
+    int plainLatency = 0, keptLatency = 0;
+    const Vec plain = run(2.0f, 0.0f, plainLatency);
+    const Vec kept = run(2.0f, 5.0f, keptLatency);
+    EXPECT_EQ(plainLatency, 96);
+    EXPECT_EQ(keptLatency, 240);
+    int differ = 0;
+    for (int i = 144; i < n; ++i)
+        if (kept[static_cast<size_t>(i)] != plain[static_cast<size_t>(i - 144)]) ++differ;
+    EXPECT_EQ(differ, 0);
+    for (int i = 0; i < 240; ++i) EXPECT_EQ(kept[static_cast<size_t>(i)], 0.0f);
+
+    const float ceiling = std::pow(10.0f, -6.0f / 20.0f);
+    for (float look : { 0.5f, 1.0f, 3.0f, 5.0f })
+    {
+        int latency = 0;
+        const Vec y = run(look, 5.0f, latency);
+        EXPECT_EQ(latency, 240);
+        float peak = 0.0f;
+        for (float s : y) peak = std::max(peak, std::abs(s));
+        EXPECT_LT(peak, ceiling * 1.0001f);
+        EXPECT_GT(peak, ceiling * 0.9f);
+    }
+    int under = 0;
+    (void)run(5.0f, 2.0f, under);              // a maximum under the lookahead changes nothing
+    EXPECT_EQ(under, 240);
+
+    // The per-sample path, and the state.
+    L block, single;
+    for (L* lim : { &block, &single })
+    {
+        lim->setCeiling(-6.0f);
+        lim->setLookahead(1.0f);
+        lim->setMaxLookahead(4.0f);
+        lim->prepare(AudioSpec{ 48000.0, 512, 1 });
+    }
+    std::vector<Vec> x { in };
+    processInBlocks(x, 512, [&](AudioBufferView<float> b) { block.processBlock(b); });
+    int apart = 0;
+    for (int i = 0; i < n; ++i)
+        if (single.processSample(in[static_cast<size_t>(i)], 0) != x[0][static_cast<size_t>(i)]) ++apart;
+    EXPECT_EQ(apart, 0);
+
+    const auto blob = block.getState();
+    L other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(other.getMaxLookahead()), 4.0, 1e-6);
+    EXPECT_TRUE(other.getState() == blob);
+    other.setMaxLookahead(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(static_cast<double>(other.getMaxLookahead()), 4.0, 1e-6);
+}
+
+// ============================================================================
+// Expander, NoiseGate, DeEsser: a threshold counted from the programme
+// ============================================================================
+
+namespace {
+
+// A second of a tone and a second of the same tone 25 dB lower, twice over.
+Vec dynLoudAndQuiet(double scale)
+{
+    const int n = 48000 * 4;
+    Vec v(static_cast<size_t>(n));
+    const double low = std::pow(10.0, -25.0 / 20.0);
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = i / 48000.0;
+        const double amp = 0.3 * scale * (std::fmod(t, 2.0) < 1.0 ? 1.0 : low);
+        v[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * kPiD * 440.0 * t));
+    }
+    return v;
+}
+
+double dynRms(const Vec& v, int from, int to)
+{
+    double s = 0.0;
+    for (int i = from; i < to; ++i) s += static_cast<double>(v[static_cast<size_t>(i)]) * v[static_cast<size_t>(i)];
+    return std::sqrt(s / (to - from));
+}
+
+// Runs a mono processor over a signal at two levels 30.5 dB apart and returns how far the two outputs
+// are from being one the other scaled (relative to the output's peak), and the gain of the quiet and
+// of the loud passage at the higher level, in dB.
+struct DynScaled
+{
+    double apart = 0.0, quietDb = 0.0, loudDb = 0.0;
+};
+
+template <class Make>
+DynScaled dynScaled(Make&& make)
+{
+    const double scale = 0.03;
+    const Vec loudIn = dynLoudAndQuiet(1.0), softIn = dynLoudAndQuiet(scale);
+    std::vector<Vec> loud { loudIn }, soft { softIn };
+    {
+        auto p = make();
+        processInBlocks(loud, 512, [&](AudioBufferView<float> b) { p->processBlock(b); });
+    }
+    {
+        auto p = make();
+        processInBlocks(soft, 512, [&](AudioBufferView<float> b) { p->processBlock(b); });
+    }
+    DynScaled r;
+    double peak = 0.0;
+    for (size_t i = 0; i < loudIn.size(); ++i)
+    {
+        peak = std::max(peak, std::abs(static_cast<double>(loud[0][i])));
+        r.apart = std::max(r.apart, std::abs(static_cast<double>(loud[0][i]) - soft[0][i] / scale));
+    }
+    r.apart /= peak;
+    r.quietDb = toDb(dynRms(loud[0], 48000 * 3 + 24000, 48000 * 4) / dynRms(loudIn, 48000 * 3 + 24000, 48000 * 4));
+    r.loudDb = toDb(dynRms(loud[0], 48000 * 2 + 24000, 48000 * 3) / dynRms(loudIn, 48000 * 2 + 24000, 48000 * 3));
+    return r;
+}
+
+} // namespace
+
+// New: with the automatic threshold the expander and the gate act on how far
+// under the programme's recent peaks a passage lies, so the output of a
+// signal 30 dB lower is the same output 30 dB lower. With the threshold in
+// dBFS the quieter signal is treated otherwise.
+DSPARK_TEST(Expander_and_gate_automatic_threshold_act_the_same_at_any_level)
+{
+    for (bool automatic : { true, false })
+    {
+        const DynScaled expander = dynScaled([&] {
+            auto e = std::make_unique<Expander<float>>();
+            e->setThreshold(-15.0f);
+            e->setRatio(4.0f);
+            e->setAttack(1.0f);
+            e->setHold(10.0f);
+            e->setRelease(50.0f);
+            e->setRange(-60.0f);
+            e->setAutoThreshold(automatic);
+            e->prepare(AudioSpec{ 48000.0, 512, 1 });
+            return e;
+        });
+        const DynScaled gate = dynScaled([&] {
+            auto g = std::make_unique<NoiseGate<float>>();
+            g->setThreshold(-15.0f);
+            g->setAttack(0.5f);
+            g->setHold(20.0f);
+            g->setRelease(50.0f);
+            g->setRange(-60.0f);
+            g->setAutoThreshold(automatic);
+            g->prepare(48000.0, 1);
+            return g;
+        });
+        std::cout << "  automatic " << automatic << ": expander apart " << expander.apart << ", quiet " << expander.quietDb
+                  << " dB, loud " << expander.loudDb << " dB; gate apart " << gate.apart << ", quiet " << gate.quietDb
+                  << " dB, loud " << gate.loudDb << " dB\n";
+        if (automatic)
+        {
+            EXPECT_LT(expander.apart, 1e-5);
+            EXPECT_LT(gate.apart, 1e-5);
+            EXPECT_LT(expander.quietDb, -20.0);     // 25 dB under the peaks, 10 under the threshold
+            EXPECT_GT(expander.loudDb, -0.5);
+            EXPECT_LT(gate.quietDb, -40.0);
+            EXPECT_GT(gate.loudDb, -0.5);
+        }
+        else
+        {
+            EXPECT_GT(expander.apart, 0.1);         // the lower signal lies under -15 dBFS throughout
+            EXPECT_GT(gate.apart, 0.1);
+        }
+    }
+}
+
+// The reference falls 1 dB per second while the programme sounds and a
+// quarter as fast under the closing threshold: a floor 45 dB under the peaks
+// stays closed under a -40 dB threshold for some twenty seconds, and is let
+// through once the reference has come down to it.
+DSPARK_TEST(Expander_and_gate_automatic_threshold_come_down_slowly_in_a_pause)
+{
+    const int rate = 48000;
+    Vec in(static_cast<size_t>(rate) * 36);
+    const double floorLevel = 0.3 * std::pow(10.0, -45.0 / 20.0);
+    for (size_t i = 0; i < in.size(); ++i)
+        in[i] = static_cast<float>((i < static_cast<size_t>(rate) ? 0.3 : floorLevel)
+                                   * std::sin(2.0 * kPiD * 440.0 * static_cast<double>(i) / rate));
+    const auto gainAt = [&](const Vec& out, int second) {
+        return toDb(dynRms(out, rate * second, rate * second + 4800) / dynRms(in, rate * second, rate * second + 4800));
+    };
+
+    Expander<float> e;
+    e.setThreshold(-40.0f);
+    e.setRatio(8.0f);
+    e.setHysteresis(2.0f);
+    e.setRange(-60.0f);
+    e.setAutoThreshold(true);
+    e.prepare(AudioSpec{ 48000.0, 512, 1 });
+    std::vector<Vec> x { in };
+    processInBlocks(x, 512, [&](AudioBufferView<float> b) { e.processBlock(b); });
+    EXPECT_LT(gainAt(x[0], 5), -20.0);       // 4 s into the pause: the threshold came down 1 dB
+    EXPECT_GT(gainAt(x[0], 34), -1.0);       // 33 s in: 8 dB, past the floor
+
+    NoiseGate<float> g;
+    g.setThreshold(-40.0f);
+    g.setHysteresis(2.0f);
+    g.setRange(-60.0f);
+    g.setAutoThreshold(true);
+    g.prepare(48000.0, 1);
+    std::vector<Vec> y { in };
+    processInBlocks(y, 512, [&](AudioBufferView<float> b) { g.processBlock(b); });
+    EXPECT_LT(gainAt(y[0], 5), -50.0);
+    EXPECT_GT(gainAt(y[0], 34), -1.0);
+
+    // State.
+    const auto eb = e.getState();
+    Expander<float> e2;
+    EXPECT_TRUE(e2.setState(eb.data(), eb.size()));
+    EXPECT_TRUE(e2.isAutoThreshold());
+    const auto gb = g.getState();
+    NoiseGate<float> g2;
+    EXPECT_TRUE(g2.setState(gb.data(), gb.size()));
+    EXPECT_TRUE(g2.isAutoThreshold());
+}
+
+// New: the de-esser's threshold counted from the level of the whole input.
+// It then acts on how loud the sibilance is against the voice: the same
+// reduction 26 dB lower, where a threshold in dBFS no longer acts at all.
+DSPARK_TEST(DeEsser_automatic_threshold_follows_the_voice)
+{
+    const int n = 48000 * 3;
+    const auto voiceAt = [&](double scale) {
+        Vec v(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = i / 48000.0;
+            const double hiss = (std::fmod(t, 1.0) >= 0.5) ? 0.1 * std::sin(2.0 * kPiD * 7000.0 * t) : 0.0;
+            v[static_cast<size_t>(i)] = static_cast<float>(scale * (0.3 * std::sin(2.0 * kPiD * 300.0 * t) + hiss));
+        }
+        return v;
+    };
+    const auto run = [&](double scale, bool automatic, float& reduction) {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->prepare(AudioSpec{ 48000.0, 512, 1 });
+        d->setFrequency(7000.0f);
+        d->setBandwidth(1.0f);
+        d->setThreshold(-20.0f);
+        d->setReduction(12.0f);
+        d->setAutoThreshold(automatic);
+        std::vector<Vec> x { voiceAt(scale) };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { d->processBlock(b); });
+        reduction = d->getGainReductionDb();
+        return x[0];
+    };
+    float loudReduction = 0.0f, softReduction = 0.0f, fixedReduction = 0.0f;
+    const double scale = 0.05;
+    const Vec loud = run(1.0, true, loudReduction);
+    const Vec soft = run(scale, true, softReduction);
+    (void)run(scale, false, fixedReduction);
+    double apart = 0.0;
+    for (int i = 0; i < n; ++i)
+        apart = std::max(apart, std::abs(static_cast<double>(loud[static_cast<size_t>(i)])
+                                         - soft[static_cast<size_t>(i)] / scale));
+    std::cout << "  reduction " << loudReduction << " dB, " << softReduction << " dB 26 dB lower, "
+              << fixedReduction << " dB there with the threshold in dBFS; outputs apart " << apart << "\n";
+    EXPECT_GT(loudReduction, 3.0f);
+    EXPECT_NEAR(softReduction, loudReduction, 0.05f);
+    EXPECT_LT(apart, 1e-5);
+    EXPECT_EQ(fixedReduction, 0.0f);
+
+    DeEsser<float> d;
+    d.setAutoThreshold(true);
+    const auto blob = d.getState();
+    DeEsser<float> other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.isAutoThreshold());
+}
+
+// ============================================================================
 // DeEsser
 // ============================================================================
 

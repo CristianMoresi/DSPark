@@ -77,25 +77,31 @@ DSPARK_TEST(State_roundtrip_dynamics)
         c.setCharacter(Compressor<float>::Character::FET);
         c.setCharacterColor(0.65f);
         c.setCleanBallistics(Compressor<float>::CleanBallistics::Decoupled);
+        c.setAutoMakeup(Compressor<float>::AutoMakeupMode::Analytic);
+        c.setPrecision(Compressor<float>::Precision::High);
     })));
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);
         l.setAdaptiveRelease(true); l.setLookahead(7.5f);
         l.setHold(25.0f); l.setHoldMode(Limiter<float>::HoldMode::EveryPeak);
         l.setTruePeakPrecision(Limiter<float>::TruePeakPrecision::High);
+        l.setMaxLookahead(9.0f);
     })));
     EXPECT_TRUE((roundTrip<NoiseGate<float>>([](auto& g) {
         g.setThreshold(-52.0f); g.setHold(80.0f); g.setDuckMode(true);
+        g.setAutoThreshold(true);
         g.setGateMode(NoiseGate<float>::GateMode::Frequency);
         g.setSidechainHPF(true, 150.0);
     })));
     EXPECT_TRUE((roundTrip<Expander<float>>([](auto& e) {
         e.setThreshold(-46.0f); e.setRatio(2.5f); e.setRange(-60.0f);
+        e.setAutoThreshold(true);
     })));
     EXPECT_TRUE((roundTrip<DeEsser<float>>([](auto& d) {
         d.setFrequency(6200.0f); d.setThreshold(-25.0f); d.setReduction(9.0f);
         d.setBandwidth(1.5f); d.setAttack(2.0f); d.setRelease(80.0f);
         d.setDetectionMode(DeEsser<float>::DetectionMode::Derivative);
+        d.setAutoThreshold(true);
     })));
     EXPECT_TRUE((roundTrip<TransientDesigner<float>>([](auto& t) {
         t.setAttack(40.0f); t.setSustain(-30.0f);   // percent units

@@ -248,6 +248,14 @@ DSPARK_TEST(State_roundtrip_new_effects)
     EXPECT_TRUE((roundTrip<TapeMachine<float>>([](auto& t) {
         t.setDrive(5.0f); t.setBias(0.35f); t.setWowFlutter(0.25f);
     })));
+    using TM = TapeMachine<float>;
+    EXPECT_TRUE((roundTrip<TM>([](auto& t) {
+        t.setTransport(TM::Transport::Speed); t.setHum(-70.0f, TM::Mains::Hz60); t.setCrosstalk(-55.0f);
+        t.setAsymmetry(0.3f); t.setTransformer(0.6f); t.setHeadModel(TM::HeadModel::Contour);
+        t.setElectronics(TM::Electronics::Circuit); t.setAlignment(1.5f, -2.0f);
+        t.setFormulation(TM::Formulation::HighOutput); t.setTrackFormat(TM::TrackFormat::Full);
+        t.setCalibrationLevel(6.0f); t.setMonitor(TM::Monitor::Sync);
+    })));
     EXPECT_TRUE((roundTrip<TubePreamp<float>>([](auto& t) {
         t.setDrive(8.0f); t.setTreble(0.7f); t.setBass(0.4f);
         t.setStages(2);

@@ -30,6 +30,7 @@
 #include <functional>
 #include <numbers>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace dspark;
@@ -3593,6 +3594,336 @@ DSPARK_TEST(TapeMachine_survives_nonfinite_input)
     }
     EXPECT_TRUE(finite);
     EXPECT_GT(energy, 1e-3);   // recovered signal, not stuck silence
+}
+
+// ============================================================================
+// TapeMachine: the machine around the tape
+// ============================================================================
+
+namespace {
+
+using Tape10 = TapeMachine<float>;
+
+std::vector<float> l10Tone(double hz, double amp, int n)
+{
+    std::vector<float> v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        v[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * hz * i / 48000.0));
+    return v;
+}
+
+std::pair<std::vector<float>, std::vector<float>> l10Render(Tape10& tape, const std::vector<float>& left,
+                                                            const std::vector<float>& right)
+{
+    std::vector<float> l = left, r = right;
+    for (size_t off = 0; off < l.size(); off += 512)
+    {
+        const int n = static_cast<int>(std::min<size_t>(512, l.size() - off));
+        float* p[2] = { l.data() + off, r.data() + off };
+        tape.processBlock(AudioBufferView<float>(p, 2, n));
+    }
+    return { l, r };
+}
+
+template <class Setup>
+std::pair<std::vector<float>, std::vector<float>> l10Run(Setup&& setup, const std::vector<float>& left,
+                                                         const std::vector<float>& right)
+{
+    auto tape = std::make_unique<Tape10>();
+    setup(*tape);
+    tape->prepare(spec(48000.0, 512, 2));
+    return l10Render(*tape, left, right);
+}
+
+// Level of a frequency over the second half, Hann window, in dB.
+double l10Line(const std::vector<float>& v, double hz)
+{
+    const size_t from = v.size() / 2, n = v.size() - from;
+    double re = 0.0, im = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double ph = 2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0;
+        const double w = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * static_cast<double>(i) / static_cast<double>(n));
+        re += w * static_cast<double>(v[from + i]) * std::cos(ph);
+        im += w * static_cast<double>(v[from + i]) * std::sin(ph);
+    }
+    return 20.0 * std::log10(std::max(4.0 * std::sqrt(re * re + im * im) / static_cast<double>(n), 1e-15));
+}
+
+// Mean level of a noise between two frequencies (lines on a grid), in dB.
+double l10Band(const std::vector<float>& v, double lo, double hi)
+{
+    double sum = 0.0;
+    int count = 0;
+    for (double f = lo; f <= hi; f *= 1.05, ++count) sum += std::pow(10.0, l10Line(v, f) / 10.0);
+    return 10.0 * std::log10(sum / count);
+}
+
+double l10RmsDb(const std::vector<float>& v)
+{
+    double s = 0.0;
+    for (size_t i = v.size() / 2; i < v.size(); ++i) s += static_cast<double>(v[i]) * v[i];
+    return 10.0 * std::log10(std::max(s / static_cast<double>(v.size() - v.size() / 2), 1e-30));
+}
+
+// Largest minus smallest period of a tone over its nominal, second half.
+double l10PitchSpread(const std::vector<float>& v, double hz)
+{
+    double prev = -1.0, lo = 1e9, hi = 0.0;
+    for (size_t i = v.size() / 2; i + 1 < v.size(); ++i)
+        if (v[i] <= 0.0f && v[i + 1] > 0.0f)
+        {
+            const double t = static_cast<double>(i) + static_cast<double>(v[i]) / (static_cast<double>(v[i]) - v[i + 1]);
+            if (prev >= 0.0) { lo = std::min(lo, t - prev); hi = std::max(hi, t - prev); }
+            prev = t;
+        }
+    return (hi - lo) / (48000.0 / hz);
+}
+
+// THD of a 1 kHz tone (harmonics 2 to 5), as a ratio.
+double l10Thd(const std::vector<float>& v)
+{
+    const double f = l10Line(v, 1000.0);
+    double sum = 0.0;
+    for (int k = 2; k <= 5; ++k) sum += std::pow(10.0, (l10Line(v, 1000.0 * k) - f) / 10.0);
+    return std::sqrt(sum);
+}
+
+} // namespace
+
+// New: the speed transport. The reproduce pitch follows a speed state whose
+// deviation scales with the depth and grows at slower speeds; with no depth it
+// is steady, and a change of speed glides with no jump of pitch.
+DSPARK_TEST(TapeMachine_speed_transport_follows_the_speed)
+{
+    const auto in = l10Tone(3000.0, 0.1, 48000 * 6);
+    const auto spread = [&](Tape10::Speed sp, float depth) {
+        return l10PitchSpread(l10Run([=](Tape10& t) {
+            t.setTransport(Tape10::Transport::Speed);
+            t.setSpeed(sp);
+            t.setWowFlutter(depth);
+            t.setLossEffects(0.0f);
+        }, in, in).first, 3000.0);
+    };
+    EXPECT_LT(spread(Tape10::Speed::IPS_15, 0.0f), 1e-4);
+    const double at15 = spread(Tape10::Speed::IPS_15, 1.0f);
+    const double at75 = spread(Tape10::Speed::IPS_7_5, 1.0f);
+    EXPECT_GT(at15, 0.0015);
+    EXPECT_LT(at15, 0.015);
+    EXPECT_GT(at75, 1.2 * at15);
+
+    auto tape = std::make_unique<Tape10>();
+    tape->setTransport(Tape10::Transport::Speed);
+    tape->setWowFlutter(0.0f);
+    tape->prepare(spec(48000.0, 512, 2));
+    EXPECT_TRUE(tape->getTransport() == Tape10::Transport::Speed);
+    std::vector<float> l = l10Tone(3000.0, 0.1, 48000 * 4), r = l;
+    for (size_t off = 0; off < l.size(); off += 512)
+    {
+        if (off == 512 * 94) tape->setSpeed(Tape10::Speed::IPS_7_5);
+        float* p[2] = { l.data() + off, r.data() + off };
+        tape->processBlock(AudioBufferView<float>(p, 2, static_cast<int>(std::min<size_t>(512, l.size() - off))));
+    }
+    for (float x : l) EXPECT_TRUE(std::isfinite(x));
+    EXPECT_LT(l10PitchSpread(l, 3000.0), 0.01);
+}
+
+// New: the hiss is laid on the tape, so it comes out through the reproduce
+// head and the de-emphasis (darker than white noise), at the level set, on
+// independent channels, and moved by the track width and the operating level;
+// the hum comes after the tape, in phase, with its second harmonic 6 dB down.
+DSPARK_TEST(TapeMachine_hiss_is_read_off_the_tape_and_hum_comes_after)
+{
+    const std::vector<float> silence(96000, 0.0f);
+    const auto hiss = [&](auto&& setup) {
+        return l10Run([&](Tape10& t) { t.setNoise(-50.0f); setup(t); }, silence, silence);
+    };
+    const auto plain = hiss([](Tape10&) {});
+    EXPECT_NEAR(l10RmsDb(plain.first), -50.0, 1.0);
+    EXPECT_GT(l10Band(plain.first, 200.0, 1000.0) - l10Band(plain.first, 6000.0, 14000.0), 4.0);
+    double ab = 0.0, aa = 0.0, bb = 0.0;
+    for (size_t i = 48000; i < 96000; ++i)
+    {
+        ab += static_cast<double>(plain.first[i]) * plain.second[i];
+        aa += static_cast<double>(plain.first[i]) * plain.first[i];
+        bb += static_cast<double>(plain.second[i]) * plain.second[i];
+    }
+    EXPECT_LT(std::abs(ab / std::sqrt(aa * bb)), 0.1);
+    EXPECT_NEAR(l10RmsDb(hiss([](Tape10& t) { t.setTrackFormat(Tape10::TrackFormat::Full); }).first) - l10RmsDb(plain.first), -5.0, 0.7);
+    EXPECT_NEAR(l10RmsDb(hiss([](Tape10& t) { t.setTrackFormat(Tape10::TrackFormat::Quarter); }).first) - l10RmsDb(plain.first), 3.0, 0.7);
+    EXPECT_NEAR(l10RmsDb(hiss([](Tape10& t) { t.setCalibrationLevel(6.0f); }).first) - l10RmsDb(plain.first), -6.0, 0.7);
+
+    for (int m = 0; m < 2; ++m)
+    {
+        const auto hum = l10Run([=](Tape10& t) { t.setHum(-60.0f, static_cast<Tape10::Mains>(m)); }, silence, silence);
+        const double f = m ? 60.0 : 50.0;
+        EXPECT_NEAR(l10RmsDb(hum.first), -60.0, 0.3);
+        EXPECT_NEAR(l10Line(hum.first, f) - l10Line(hum.first, 2.0 * f), 6.02, 0.3);
+        double worst = 0.0;
+        for (size_t i = 0; i < silence.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(hum.first[i] - hum.second[i])));
+        EXPECT_EQ(worst, 0.0);
+    }
+}
+
+// New: crosstalk leaks each channel of a pair into the other at the level set
+// at 1 kHz, rising 6 dB per octave up to 10 kHz; off, nothing leaks.
+DSPARK_TEST(TapeMachine_crosstalk_rises_with_frequency)
+{
+    const std::vector<float> silence(72000, 0.0f);
+    const auto leak = [&](double hz, bool on) {
+        const auto out = l10Run([=](Tape10& t) { if (on) t.setCrosstalk(-50.0f); }, l10Tone(hz, 0.25, 72000), silence);
+        return l10Line(out.second, hz) - l10Line(out.first, hz);
+    };
+    EXPECT_NEAR(leak(1000.0, true), -50.0, 1.0);
+    EXPECT_NEAR(leak(10000.0, true), -50.0 + 18.39, 1.0);   // the high-pass corner kept at 10 kHz
+    EXPECT_LT(leak(1000.0, false), -110.0);
+}
+
+// New: the even asymmetry raises the second harmonic in proportion to its
+// amount; the transformer saturates the low end and leaves 1 kHz alone, and
+// once its share has glided back to 0 the output is that of a machine that
+// never had it.
+DSPARK_TEST(TapeMachine_asymmetry_and_transformer_add_their_harmonics)
+{
+    const auto tone = l10Tone(1000.0, 0.25, 72000);
+    const auto h2 = [&](float a) {
+        const auto out = l10Run([=](Tape10& t) { t.setAsymmetry(a); }, tone, tone).first;
+        return l10Line(out, 2000.0) - l10Line(out, 1000.0);
+    };
+    const double none = h2(0.0f), half = h2(0.5f), full = h2(1.0f);
+    EXPECT_GT(full, none + 20.0);
+    EXPECT_NEAR(full - half, 6.02, 1.5);
+
+    // The tape cancels its own even orders, so the transformer's second
+    // harmonic stands out at 40 Hz (measured -116 -> -41 dBc at -6 dBFS) and
+    // stays 20 dB lower at 1 kHz, where the fundamental and the third are left
+    // as they were.
+    const auto h2Of = [&](double hz, float a) {
+        const auto in = l10Tone(hz, 0.5, 96000);
+        const auto out = l10Run([=](Tape10& t) { t.setTransformer(a); }, in, in).first;
+        return l10Line(out, 2.0 * hz) - l10Line(out, hz);
+    };
+    EXPECT_GT(h2Of(40.0, 1.0f), h2Of(40.0, 0.0f) + 40.0);
+    EXPECT_GT(h2Of(40.0, 1.0f), h2Of(1000.0, 1.0f) + 15.0);
+    const auto mid = l10Tone(1000.0, 0.5, 72000);
+    const auto plainMid = l10Run([](Tape10&) {}, mid, mid).first;
+    const auto bentMid = l10Run([](Tape10& t) { t.setTransformer(1.0f); }, mid, mid).first;
+    EXPECT_NEAR(l10Line(bentMid, 1000.0), l10Line(plainMid, 1000.0), 0.1);
+    EXPECT_NEAR(l10Line(bentMid, 3000.0), l10Line(plainMid, 3000.0), 0.5);
+
+    auto a = std::make_unique<Tape10>(), b = std::make_unique<Tape10>();
+    a->setTransformer(1.0f);
+    a->prepare(spec(48000.0, 512, 2));
+    b->prepare(spec(48000.0, 512, 2));
+    std::vector<float> la = l10Tone(60.0, 0.4, 96000), ra = la, lb = la, rb = la;
+    for (size_t off = 0; off < la.size(); off += 512)
+    {
+        if (off == 512 * 40) a->setTransformer(0.0f);
+        float* pa[2] = { la.data() + off, ra.data() + off };
+        float* pb[2] = { lb.data() + off, rb.data() + off };
+        a->processBlock(AudioBufferView<float>(pa, 2, static_cast<int>(std::min<size_t>(512, la.size() - off))));
+        b->processBlock(AudioBufferView<float>(pb, 2, static_cast<int>(std::min<size_t>(512, lb.size() - off))));
+    }
+    double worst = 0.0;
+    for (size_t i = 48000; i < la.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(la[i] - lb[i])));
+    EXPECT_EQ(worst, 0.0);
+}
+
+// New: the head contour, the circuit electronics and the alignment trims,
+// at low level: the contour dips where the plain bump does not, the circuit
+// matches the ideal electronics in the band and rolls off a little at the top,
+// and the trims move the high and low ends by about their amount.
+DSPARK_TEST(TapeMachine_head_contour_circuit_and_trims)
+{
+    const auto response = [](auto&& setup, double hz) {
+        const auto in = l10Tone(hz, 0.0316, 36000);
+        return l10Line(l10Run(setup, in, in).first, hz) - l10Line(in, hz);
+    };
+    const auto bump = [](Tape10& t) { t.setHeadBump(1.0f); };
+    const auto contour = [](Tape10& t) { t.setHeadBump(1.0f); t.setHeadModel(Tape10::HeadModel::Contour); };
+    EXPECT_LT(response(contour, 130.0) - response(bump, 130.0), -0.5);
+    EXPECT_NEAR(response(contour, 1000.0), response(bump, 1000.0), 0.1);
+
+    const auto ideal = [](Tape10&) {};
+    const auto circuit = [](Tape10& t) { t.setElectronics(Tape10::Electronics::Circuit); };
+    EXPECT_NEAR(response(circuit, 1000.0), response(ideal, 1000.0), 0.3);
+    EXPECT_NEAR(response(circuit, 100.0), response(ideal, 100.0), 0.5);
+    EXPECT_LT(response(circuit, 20000.0), response(ideal, 20000.0) - 0.2);
+
+    const double hfTrim = response([](Tape10& t) { t.setAlignment(3.0f, 0.0f); }, 16000.0) - response(ideal, 16000.0);
+    const double lfTrim = response([](Tape10& t) { t.setAlignment(0.0f, -3.0f); }, 31.5) - response(ideal, 31.5);
+    EXPECT_GT(hfTrim, 2.4);
+    EXPECT_LT(hfTrim, 3.3);
+    EXPECT_GT(lfTrim, -3.3);
+    EXPECT_LT(lfTrim, -2.2);
+}
+
+// New: the operating level drives the tape harder at the same output level
+// (more distortion at -12 dBFS), the formulations move the distortion the way
+// their headroom says, the input monitor is the input delayed like the tape,
+// and the sync head loses more of the top end than the reproduce head.
+DSPARK_TEST(TapeMachine_calibration_formulation_and_monitor)
+{
+    const auto tone = l10Tone(1000.0, 0.25, 72000);
+    const auto plain = l10Run([](Tape10&) {}, tone, tone).first;
+    const auto hot = l10Run([](Tape10& t) { t.setCalibrationLevel(6.0f); }, tone, tone).first;
+    EXPECT_GT(l10Thd(hot), 2.5 * l10Thd(plain));
+    EXPECT_NEAR(l10Line(hot, 1000.0), l10Line(plain, 1000.0), 0.5);
+    const auto high = l10Run([](Tape10& t) { t.setFormulation(Tape10::Formulation::HighOutput); }, tone, tone).first;
+    const auto vintage = l10Run([](Tape10& t) { t.setFormulation(Tape10::Formulation::Vintage); }, tone, tone).first;
+    EXPECT_LT(l10Thd(high), l10Thd(plain));
+    EXPECT_GT(l10Thd(vintage), l10Thd(plain));
+
+    std::vector<float> prog(48000);
+    uint32_t seed = 5u;
+    for (auto& x : prog) { seed = seed * 1664525u + 1013904223u; x = 0.2f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
+    auto input = std::make_unique<Tape10>();
+    input->setMonitor(Tape10::Monitor::Input);
+    input->prepare(spec(48000.0, 512, 2));
+    const auto monitored = l10Render(*input, prog, prog).first;
+    const size_t lat = static_cast<size_t>(input->getLatency());
+    double worst = 0.0;
+    for (size_t i = lat; i < prog.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(monitored[i] - prog[i - lat])));
+    EXPECT_LT(worst, 1e-6);
+
+    const auto top = [](auto&& setup) {
+        const auto in = l10Tone(15000.0, 0.0316, 36000);
+        return l10Line(l10Run(setup, in, in).first, 15000.0);
+    };
+    EXPECT_LT(top([](Tape10& t) { t.setMonitor(Tape10::Monitor::Sync); }), top([](Tape10&) {}) - 0.3);
+}
+
+// New: the controls of the machine around the tape clamp what is out of range
+// and ignore what is not finite.
+DSPARK_TEST(TapeMachine_machine_controls_clamp_and_ignore_invalid_values)
+{
+    Tape10 t;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    t.setHum(nan);
+    t.setCrosstalk(std::numeric_limits<float>::infinity());
+    t.setAsymmetry(nan);
+    t.setTransformer(-1.0f);
+    t.setAlignment(nan, 2.0f);
+    t.setCalibrationLevel(20.0f);
+    t.setTransport(static_cast<Tape10::Transport>(7));
+    t.setMonitor(static_cast<Tape10::Monitor>(-3));
+    t.setFormulation(static_cast<Tape10::Formulation>(9));
+    t.setTrackFormat(static_cast<Tape10::TrackFormat>(5));
+    t.setHeadModel(static_cast<Tape10::HeadModel>(4));
+    t.setElectronics(static_cast<Tape10::Electronics>(-1));
+    EXPECT_EQ(t.getHum(), -200.0f);
+    EXPECT_EQ(t.getCrosstalk(), -200.0f);
+    EXPECT_EQ(t.getAsymmetry(), 0.0f);
+    EXPECT_EQ(t.getTransformer(), 0.0f);
+    EXPECT_EQ(t.getAlignmentHf(), 0.0f);
+    EXPECT_EQ(t.getAlignmentLf(), 0.0f);
+    EXPECT_EQ(t.getCalibrationLevel(), 9.0f);
+    EXPECT_TRUE(t.getTransport() == Tape10::Transport::Speed);
+    EXPECT_TRUE(t.getMonitor() == Tape10::Monitor::Repro);
+    EXPECT_TRUE(t.getFormulation() == Tape10::Formulation::Vintage);
+    EXPECT_TRUE(t.getTrackFormat() == Tape10::TrackFormat::Quarter);
+    EXPECT_TRUE(t.getHeadModel() == Tape10::HeadModel::Contour);
+    EXPECT_TRUE(t.getElectronics() == Tape10::Electronics::Ideal);
 }
 
 // A transient NaN/Inf input must not poison TubePreamp forever (the

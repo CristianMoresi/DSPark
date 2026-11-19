@@ -17,13 +17,26 @@
  * - Fully independent channel write indices for safe interleaved or sequential processing.
  * - Zero-allocation, lock-free, cache-friendly architecture.
  *
+ * setCharacter() (Clean by default) colours the line: Character::Tape moves
+ * the read point with a tape transport (Core/TapeTransport.h): a delay
+ * change is a change of tape speed reached with the motor's inertia (the
+ * pitch bends while it glides), wow and flutter of the capstan
+ * (setWowFlutter()), the playback head's loss and the tape's hiss.
+ * Character::Bucket runs the line through a bucket-brigade device of 4096
+ * stages (Core/BucketBrigade.h) whose clock the delay sets, with its filters
+ * at 0.3 of the clock (so a longer delay is darker: about 2 kHz at 300 ms)
+ * and its hiss; the feedback goes round the device, and the shortest delay
+ * is 32 samples. setCharacterNoise() sets the hiss of both. The characters
+ * do not crossfade: a switch to Bucket starts the device empty.
+ *
  * The delay time is kept in milliseconds: prepare() at a new rate, or a state
  * blob from another rate, keeps the echo time. A time set in samples before
  * prepare() is read at the prepared rate. The first block after prepare() or
  * reset() starts on the set time (no glide from zero).
  *
- * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/DspMath.h,
- * Core/Interpolation.h, Core/Smoothers.h, Core/StateBlob.h.
+ * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/BucketBrigade.h,
+ * Core/DspMath.h, Core/Interpolation.h, Core/Smoothers.h, Core/StateBlob.h,
+ * Core/TapeTransport.h.
  *
  * Two ways to use it:
  * - As an insert, like every other effect: prepare(spec), set the delay,
@@ -44,10 +57,12 @@
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/BucketBrigade.h"
 #include "../Core/DspMath.h"
 #include "../Core/Interpolation.h"
 #include "../Core/Smoothers.h"
 #include "../Core/StateBlob.h"
+#include "../Core/TapeTransport.h"
 
 #include <algorithm>
 #include <array>
@@ -114,6 +129,48 @@ public:
         return interpolation_.load(std::memory_order_relaxed);
     }
 
+    /** @brief Colour of the line (see the file comment). */
+    enum class Character
+    {
+        Clean,   ///< An interpolated delay line (default).
+        Tape,    ///< A tape loop: speed transport, wow and flutter, head loss, hiss.
+        Bucket   ///< A bucket-brigade device of 4096 stages.
+    };
+
+    /** @brief Selects the character. Thread-safe; out-of-range values are clamped. */
+    void setCharacter(Character c) noexcept
+    {
+        const int v = std::clamp(static_cast<int>(c), 0, static_cast<int>(Character::Bucket));
+        character_.store(static_cast<Character>(v), std::memory_order_relaxed);
+    }
+    /** @return The character. */
+    [[nodiscard]] Character getCharacter() const noexcept { return character_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Wow and flutter of the tape character.
+     * @param amount 0 (a steady transport) to 1, clamped; non-finite values are ignored.
+     */
+    void setWowFlutter(SampleType amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        wowFlutter_.store(std::clamp(amount, SampleType(0), SampleType(1)), std::memory_order_relaxed);
+    }
+    /** @return The wow and flutter amount. */
+    [[nodiscard]] SampleType getWowFlutter() const noexcept { return wowFlutter_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Hiss of the tape and bucket characters.
+     * @param dbfs RMS level in dBFS, clamped to [-140, -40]; -120 or less is
+     *             silent. Non-finite values are ignored.
+     */
+    void setCharacterNoise(SampleType dbfs) noexcept
+    {
+        if (!std::isfinite(dbfs)) return;
+        characterNoiseDb_.store(std::clamp(dbfs, SampleType(-140), SampleType(-40)), std::memory_order_relaxed);
+    }
+    /** @return The hiss level of the characters in dBFS. */
+    [[nodiscard]] SampleType getCharacterNoise() const noexcept { return characterNoiseDb_.load(std::memory_order_relaxed); }
+
     // -- Lifecycle -----------------------------------------------------------
 
     /**
@@ -174,6 +231,29 @@ public:
             writeIndices_[ch] = 0;
         }
 
+        // The characters' engines: the tape transport (its nominal speed puts
+        // a 300 ms delay at 7.5 ips) and the bucket-brigade line.
+        tape_.resize(static_cast<size_t>(numChannels_));
+        bbd_.resize(static_cast<size_t>(numChannels_));
+        {
+            typename TapeTransport<SampleType>::Settings echo;
+            echo.speedUpSeconds = 0.25;
+            echo.slowDownSeconds = 0.4;
+            echo.restoreSeconds = 0.1;
+            echo.maxStep = 0.5;
+            echo.reel = 0.0;
+            echo.capstan = 0.0008;
+            echo.noise = 0.0006;
+            echo.scrape = 0.002;
+            for (auto& t : tape_)
+            {
+                t.prepare(spec.sampleRate, 0.3 * spec.sampleRate, 7.5, echo);
+                t.setLimits(3.0, static_cast<double>(maxDelaySamples_ - 1));
+            }
+        }
+        for (auto& b : bbd_) b.prepare(spec.sampleRate, kBucketStages, 0.45 * spec.sampleRate);
+        headCoeff_ = 1.0 - std::exp(-2.0 * 3.141592653589793 * std::min(kHeadLossHz, 0.45 * spec.sampleRate) / spec.sampleRate);
+
         mixSmoother_.reset(spec.sampleRate, timeMs, 1.0f);
         insertMixMaxStep_ = static_cast<SampleType>(1.0 / std::max(1.0, spec.sampleRate * 0.02));
         reset();
@@ -203,6 +283,17 @@ public:
             writeIndices_[ch] = 0;
             resetChannelState(states_[ch]);
         }
+        for (auto& t : tape_) t.reset();
+        for (auto& b : bbd_) b.reset();
+        tapeSeeded_.fill(false);
+        bucketCornerFor_.fill(-1.0);
+        bucketHissCoeff_.fill(0.5);
+        hissDbFor_.fill(1.0);   // not a level: the first hiss sample computes its gain
+        headLp_.fill(0.0);
+        hissLp_.fill(0.0);
+        for (int ch = 0; ch < kMaxChannels; ++ch)
+            hissRng_[static_cast<size_t>(ch)] = 0x3C6EF372u + 0x9E3779B9u * static_cast<uint32_t>(ch);
+        lastCharacter_ = character_.load(std::memory_order_relaxed);
         mixSmoother_.skip();
         insertMix_ = mix_.load(std::memory_order_relaxed); // no fade-in on start
         snapNext_ = true;   // the next call starts on the set delay, no glide
@@ -672,6 +763,9 @@ public:
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("pingPong", static_cast<int32_t>(pingPong_.load(std::memory_order_relaxed) ? 1 : 0));
         w.write("interp", static_cast<int32_t>(interpolation_.load(std::memory_order_relaxed)));
+        w.write("character", static_cast<int32_t>(character_.load(std::memory_order_relaxed)));
+        w.write("wowFlutter", static_cast<float>(wowFlutter_.load(std::memory_order_relaxed)));
+        w.write("charNoise", static_cast<float>(characterNoiseDb_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -699,6 +793,9 @@ public:
         setMix(static_cast<SampleType>(r.read("mix", 0.3f)));
         setPingPong(r.read("pingPong", 0) != 0);
         setInterpolation(r.read("interp", 0) == 1 ? Interpolation::Sinc : Interpolation::Hermite);
+        setCharacter(static_cast<Character>(std::clamp(r.read("character", 0), 0, static_cast<int>(Character::Bucket))));
+        setWowFlutter(static_cast<SampleType>(r.read("wowFlutter", 0.5f)));
+        setCharacterNoise(static_cast<SampleType>(r.read("charNoise", -84.0f)));
         return true;
     }
 
@@ -932,6 +1029,27 @@ private:
         delaySamples = std::clamp(delaySamples, minDelay,
                                   static_cast<SampleType>(maxDelaySamples_ - 1));
 
+        const Character chr = character_.load(std::memory_order_relaxed);
+        if (chr != lastCharacter_) [[unlikely]] switchCharacter(chr);
+        if (chr == Character::Tape)
+        {
+            // The tape reaches the set delay as a speed, with the motor's
+            // inertia, and wanders by its wow and flutter.
+            auto& tp = tape_[static_cast<size_t>(ch)];
+            const double target = static_cast<double>(delaySamples);
+            if (!tapeSeeded_[static_cast<size_t>(ch)])
+            {
+                tp.setTargetDelayNow(target);
+                tapeSeeded_[static_cast<size_t>(ch)] = true;
+            }
+            else
+            {
+                tp.setTargetDelay(target);
+            }
+            delaySamples = std::clamp(static_cast<SampleType>(tp.next(static_cast<double>(wowFlutter_.load(std::memory_order_relaxed)))),
+                                      minDelay, static_cast<SampleType>(maxDelaySamples_ - 1));
+        }
+
         SampleType* data = delayBuffer_.getChannel(ch);
         int writeIdx = writeIndices_[ch];
 
@@ -941,6 +1059,13 @@ private:
         // the position fell a hair below 0, which masked the index to 0 while
         // the "fraction" became `size` (a Hermite blow-up, heard as random
         // zips on moving Haas/binaural delays).
+        SampleType delayed;
+        if (chr == Character::Bucket)
+        {
+            delayed = bucketRead(ch, input + s.lastFeedback, delaySamples);
+        }
+        else
+        {
         const int dInt = static_cast<int>(delaySamples);            // >= 3
         const SampleType dFrac = delaySamples - static_cast<SampleType>(dInt);
         int idx0;
@@ -956,7 +1081,6 @@ private:
             frac = SampleType(0);
         }
 
-        SampleType delayed;
         if (sinc)
         {
             delayed = sinc_->readRing(data, static_cast<int64_t>(bufferMask_),
@@ -983,6 +1107,8 @@ private:
         SampleType b = w + a;
         delayed = ((((a * frac) - b) * frac + c) * frac + y0);
         }
+        }
+        if (chr != Character::Clean) delayed = colour(ch, delayed, chr);
 
         // Feedback processing. The filters run on every sample of the straight
         // path, silence and zero feedback included: skipping them froze their
@@ -1024,6 +1150,68 @@ private:
         
         out -= SampleType(1e-18);
         return out;
+    }
+
+    /** @brief A character switch: the tape starts from where the read point is; the bucket line empty. */
+    void switchCharacter(Character chr) noexcept
+    {
+        lastCharacter_ = chr;
+        tapeSeeded_.fill(false);
+        if (chr == Character::Bucket)
+            for (auto& b : bbd_) b.reset();
+    }
+
+    /** @brief One sample through the bucket-brigade line, its filters at 0.3 of the clock. */
+    SampleType bucketRead(int ch, SampleType in, SampleType delaySamples) noexcept
+    {
+        const auto c = static_cast<size_t>(ch);
+        auto& b = bbd_[c];
+        const double fs = static_cast<double>(sampleRate_);
+        const double d = static_cast<double>(delaySamples);
+        if (std::abs(d - bucketCornerFor_[c]) > 0.02 * d)
+        {
+            b.setCorner(std::min(0.3 * b.clockFor(d / fs), 0.45 * fs));
+            bucketHissCoeff_[c] = 1.0 - std::exp(-2.0 * 3.141592653589793 * b.getCorner() / fs);
+            bucketCornerFor_[c] = d;
+        }
+        return b.processSample(in, d / fs);
+    }
+
+    /**
+     * @brief The character's colour on the delayed sample: the playback
+     *        head's loss (tape) and the hiss, white noise through a one-pole
+     *        at the head's corner or the device's, scaled by that filter's gain.
+     */
+    SampleType colour(int ch, SampleType delayed, Character chr) noexcept
+    {
+        const auto c = static_cast<size_t>(ch);
+        double y = static_cast<double>(delayed);
+        double hissCoeff = headCoeff_;
+        if (chr == Character::Tape)
+        {
+            headLp_[c] += headCoeff_ * (y - headLp_[c]);
+            y = headLp_[c];
+        }
+        else
+        {
+            hissCoeff = bucketHissCoeff_[c];
+        }
+        const double noiseDb = static_cast<double>(characterNoiseDb_.load(std::memory_order_relaxed));
+        if (noiseDb > -120.0)
+        {
+            if (noiseDb != hissDbFor_[c] || hissCoeff != hissCoeffFor_[c]) [[unlikely]]
+            {
+                hissAmp_[c] = std::pow(10.0, noiseDb / 20.0) * 1.7320508075688772
+                            / std::sqrt(std::max(1e-9, hissCoeff / (2.0 - hissCoeff)));
+                hissDbFor_[c] = noiseDb;
+                hissCoeffFor_[c] = hissCoeff;
+            }
+            hissRng_[c] = hissRng_[c] * 1664525u + 1013904223u;
+            const double n = static_cast<double>(hissRng_[c] >> 8) / 8388608.0 - 1.0;
+            hissLp_[c] += hissCoeff * (n - hissLp_[c]);
+            y += hissAmp_[c] * hissLp_[c];
+        }
+        return static_cast<SampleType>(y);
     }
 
     /** @brief One-pole coefficient shared by the feedback LP and HP filters. */
@@ -1072,6 +1260,22 @@ private:
     std::atomic<bool> pingPong_ { false };                          ///< Insert path cross-feeds L and R.
     SampleType insertMix_ = SampleType(0.3);                     ///< Audio-thread ramp state.
     SampleType insertMixMaxStep_ = SampleType(1.0 / 960.0);      ///< Full scale per 20 ms.
+
+    // Characters.
+    static constexpr int kBucketStages = 4096;
+    static constexpr double kHeadLossHz = 7000.0;   ///< Playback head loss of the tape echo.
+    std::atomic<Character> character_ { Character::Clean };
+    std::atomic<SampleType> wowFlutter_ { SampleType(0.5) };
+    std::atomic<SampleType> characterNoiseDb_ { SampleType(-84) };
+    Character lastCharacter_ = Character::Clean;               ///< Audio thread.
+    std::vector<TapeTransport<SampleType>> tape_;
+    std::vector<BucketBrigade<SampleType>> bbd_;
+    std::array<bool, kMaxChannels> tapeSeeded_ {};
+    std::array<double, kMaxChannels> bucketCornerFor_ {};
+    std::array<double, kMaxChannels> headLp_ {}, hissLp_ {}, bucketHissCoeff_ {};
+    std::array<double, kMaxChannels> hissAmp_ {}, hissDbFor_ {}, hissCoeffFor_ {};
+    std::array<uint32_t, kMaxChannels> hissRng_ {};
+    double headCoeff_ = 0.5;
 };
 
 } // namespace dspark

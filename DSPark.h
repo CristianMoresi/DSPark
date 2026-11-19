@@ -451,6 +451,7 @@
  * | `NormalizedLadder<T>`    | Core/NormalizedLadder.h   | Second-order section that stays passive under any modulation |
  * | `FilterDesign`           | Core/FilterDesign.h       | Biquads that follow their analog prototypes to Nyquist; cuts of any slope, high-order bells and shelves, tilt, elliptic wall |
  * | `FirBank<T>`             | Core/FirBank.h            | Many long FIR kernels over shared inputs, by one partitioned convolution; kernels replaced with a crossfade |
+ * | `KeyEqualizer<T>`        | Core/KeyEqualizer.h       | Six bands of cuts, bells, shelves and tilts over the key of a dynamics processor |
  * | `FFTReal<T>`             | Core/FFT.h                | Real FFT by vector lanes, SIMD (SSE2/AVX/NEON)    |
  * | `FIRFilter<T>`           | Core/FIRFilter.h          | FIR filter with windowed-sinc design              |
  * | `Convolver<T>`           | Core/Convolver.h          | Partitioned overlap-save FFT convolution          |
@@ -693,6 +694,7 @@
 #include "Core/NormalizedLadder.h"
 #include "Core/FilterDesign.h"
 #include "Core/FirBank.h"
+#include "Core/KeyEqualizer.h"
 #include "Core/DryWetMixer.h"
 #include "Core/Smoothers.h"
 #include "Core/AnalogRandom.h"

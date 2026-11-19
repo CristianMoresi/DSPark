@@ -214,6 +214,37 @@ All notable user-facing changes to DSPark are documented here.
   average over three sorted values is not the average along the waveform;
   and the eight steps alone, with the target on a line between samples,
   gave 10 to 30 dB up to 5 kHz and nothing at 18 kHz. State key `precision`.
+- `KeyEqualizer` (new, `Core/KeyEqualizer.h`): a parametric equalizer for the
+  key of a dynamics processor, the signal its detector reacts to. Six bands,
+  each a low or a high cut from 6 to 48 dB per octave, a bell, a low or a
+  high shelf (6 to 24 dB per octave of transition) or a tilt (up to 6 dB per
+  octave about a pivot), designed from their analog prototypes with
+  `FilterDesign` and run together in one `BiquadCascade`. `setBand()`
+  publishes a band from any thread; the audio thread designs it in `sync()`
+  and moves the coefficients there over 20 ms. A band that is Off, or a bell
+  or a shelf at 0 dB, leaves through its own poles and is then no longer
+  computed; with no band in the path `processSample()` hands the sample
+  back. A 24 dB per octave low cut reads -3.0 dB at its corner and -48.2 dB
+  two octaves under it, a 48 dB per octave high cut -48.2 dB one octave
+  over, a bell its gain at the centre and half of it at the edges
+  frequency / q apart, and six bands together play the curve
+  `getResponse()` reports to 0.05 dB. `writeState()` and `readState()` keep
+  the bands under a key prefix.
+- `Compressor`: an equalizer on the key, and key listen.
+  `setSidechainBand(band, settings)` sets one of the six bands of a
+  `KeyEqualizer` that runs after the sidechain high-pass on whatever the
+  detector reads (the programme, the external key or, in feedback, the
+  compressed output), in `processBlock()`, in `processSample()` and at
+  `Precision::High`; the audio is the one of an external key shaped by the
+  same filter. With a 60 Hz tone 20 dB over a quiet 3 kHz one, a 24 dB per
+  octave low cut at 500 Hz on the key takes the reduction from some 7 dB to
+  none. `getSidechainResponse()` gives the curve for a display.
+  `setSidechainListen(true)` plays what each detector hears instead of the
+  compressed audio, ahead of the lookahead, while the compressor keeps
+  working underneath: the meter still reads, and switching it off returns
+  to the audio of a compressor that never listened. It is a monitoring
+  switch and is not part of the state. State keys `key<band>.shape`,
+  `.freq`, `.gain`, `.q` and `.slope`.
 - `Compressor`, timing that follows the programme: four weights, all 0 by
   default, on the Clean and Varimu characters in feed-forward with Branching
   ballistics, in `processBlock()`, `processSample()` and at

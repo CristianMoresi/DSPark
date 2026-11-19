@@ -1063,17 +1063,36 @@ inline EffectSlot makeDynamicEQ()
         s.addChoice(nm("Timing"), {"Manual","Program"}, 0);
         s.addToggle(nm("Relative Thr"), false);
     }
-    s.prepareFn = [p, ui, buildCfg](auto& sp) {
+    // Linear phase (control 29) is a setup call: the UI records the wish and
+    // the audio thread prepares the processor again between blocks.
+    auto linearWanted  = std::make_shared<std::atomic<bool>>(false);
+    auto linearApplied = std::make_shared<std::atomic<bool>>(false);
+    auto lastSpec = std::make_shared<dspark::AudioSpec>();
+    s.addToggle("Linear Phase", false);
+    s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
+        const bool want = linearWanted->load(std::memory_order_relaxed);
+        p->setLinearPhase(want);
+        linearApplied->store(want, std::memory_order_relaxed);
+        *lastSpec = sp;
         p->prepare(sp);
         p->setNumBands(2);
         p->setBand(0, buildCfg((*ui)[0]));
         p->setBand(1, buildCfg((*ui)[1]));
     };
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.processFn = [p, linearWanted, linearApplied, lastSpec](auto b) {
+        const bool want = linearWanted->load(std::memory_order_relaxed);
+        if (want != linearApplied->load(std::memory_order_relaxed)) {
+            p->setLinearPhase(want);            // setup call - safe here (audio thread)
+            p->prepare(*lastSpec);
+            linearApplied->store(want, std::memory_order_relaxed);
+        }
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, ui, buildCfg](int i, float v) {
+    s.setParamFn = [p, ui, buildCfg, linearWanted](int i, float v) {
         const int oldCount = 2 * 9;
         if (i == oldCount) { p->setMixedBands(v > 0.5f); return; }
+        if (i == oldCount + 1 + 2 * 5) { linearWanted->store(v > 0.5f, std::memory_order_relaxed); return; }
         int band = 0, prm = 0;
         if (i < oldCount) { band = i / 9; prm = i % 9; }
         else              { band = (i - oldCount - 1) / 5; prm = 9 + (i - oldCount - 1) % 5; }

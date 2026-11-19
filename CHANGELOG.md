@@ -56,6 +56,41 @@ All notable user-facing changes to DSPark are documented here.
   transform is off by tens of decibels: a 30 dB per octave cut at 12 kHz
   0.12 dB (35), a 96 dB per octave cut at 16 kHz 0.36 (76), a bell of
   order 8 at 14 kHz 0.10 (6.9), the wall at 10 kHz 0.45 (40).
+- `Equalizer::setAnalogResponse(true)` (off by default): every band is
+  designed from its analog prototype by `FilterDesign` and runs in a
+  `BiquadCascade` whose coefficients are ramped. The curve of a band no
+  longer shrinks towards Nyquist in any type. Worst distance to the analog
+  curve from 20 Hz to 20 kHz at 48 kHz, as played (cookbook; default;
+  analog response, in decibels): a bell at 12 kHz, Q 2, +12 dB 3.04; 0.35;
+  0.10. A bell at 15 kHz, Q 1, -18 dB 8.13; 2.14; 0.15. A high shelf of
+  +12 dB at 12 kHz 1.88; 1.88; 0.03. A 24 dB per octave low-pass at 10 kHz
+  30.9; 30.9; 0.17. A notch at 14 kHz 5.6; 5.6; 0.11. A band-pass at 9 kHz
+  9.4; 9.4; 0.21. At 44.1 kHz the same bands stay within 0.43 dB (the
+  default: up to 47.6), at 96 kHz within 0.01. In LinearPhase the kernel is
+  built from the magnitude of the prototypes themselves: 0.00 dB in every
+  case above (the default kernel: up to 5.6). The engine is also the cheaper
+  one: eight bands on a stereo block cost 22 to 26 ns per frame against 77
+  to 143 with the cookbook engine on three compiler and machine pairs (mono:
+  14 to 20 against 39 to 67). A change of a band glides instead of stepping:
+  40 ms for a small move, 10 ms for a jump, with nothing depending on how
+  the host cuts the stream; a block that takes a moved bell costs 2 us more,
+  one that takes a bell of order 16, 23 us. A gain band within 0.05 dB of
+  0 dB leaves the path (the samples pass untouched and it costs nothing)
+  and comes back without a step. With the analog response the slope of a
+  cut is any value from 0 to 96 dB per octave (`BandConfig::slope` is now a
+  real number; the cookbook engine keeps running whole slopes from 6 to
+  48), and a bell, shelf, notch or band-pass takes an order from 1 to 16
+  (`BandConfig::order`: flat top and 6 dB per octave of side per order).
+  Four band types are new and always run this way: `AllPass` (180 degrees
+  per order), `FlatTilt` (gain in dB per octave, a straight line across the
+  band), `LowPassWall` and `HighPassWall` (elliptic, order 12: within
+  0.05 dB up to the corner and 100 dB down from 1.17 times it; as biquads
+  they go through the bilinear transform with the corner held, which keeps
+  ripple and floor exact). `buildBandSections()` gives an interface the
+  sections of a band in either engine (up to 16). The state carries
+  `analog`, and `order` and `slopeDb` per band; older states load as before.
+  A band type that is not one now keeps the band's own type instead of
+  clamping to the last.
 - `BiquadCascade<T, MaxSections, MaxChannels>` (new,
   `Core/BiquadCascade.h`): second-order sections in series, run up to four
   at a time inside one loop over the samples, in direct form I with the node

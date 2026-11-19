@@ -171,10 +171,22 @@ public:
                   ///< harmonics, calibrated at 1.0 to the 1176 THD spec (< 0.5%
                   ///< while limiting).
 
-        Varimu    ///< Variable-mu tube lineage (Fairchild). The effective ratio grows
+        Varimu,   ///< Variable-mu tube lineage (Fairchild). The effective ratio grows
                   ///< with level above the threshold and the knee has a 10 dB floor
                   ///< (a remote-cutoff tube cannot produce a hard corner). Log-domain
-                  ///< ballistics with the user's time constants.
+                  ///< ballistics with the user's time constants. setCharacterColor()
+                  ///< applies the gain through the curve of a push-pull pair biased
+                  ///< by it, so the harmonics grow with the reduction.
+
+        Smooth    ///< Two layers in feed-forward (Topology is ignored): one that levels,
+                  ///< with half the slope of the ratio from 6 dB under the threshold and
+                  ///< times several times the knobs', under one that catches what rises
+                  ///< over it, with the other half from 6 dB over the threshold and the
+                  ///< knobs' times. Far over the threshold the curve is the ratio's own;
+                  ///< around it, a knee 18 dB wide or more. Both layers take longer the
+                  ///< farther they are from their target, so a deep reduction comes back
+                  ///< at a steady pace instead of rushing. In Upward mode it is one
+                  ///< envelope on the knobs, like Clean; Precision::High does not apply.
     };
 
     /** @brief Processing direction. */
@@ -443,8 +455,9 @@ public:
         // The FET character is a feedback design like the 1176 it models: it
         // always detects on the compressed output with the hardware's peak
         // rectifier, whatever Topology and Detector say.
-        const Topology topoEff = (charType == Character::FET) ? Topology::FeedBack : topo;
-        const DetectorType detTypeEff = (charType == Character::FET) ? DetectorType::Peak : detType;
+        const CharacterProfile& profile = profileOf(charType);
+        const Topology topoEff = topologyFor(profile, topo);
+        const DetectorType detTypeEff = detectorFor(profile, detType);
         const bool fbImplicit = topoEff == Topology::FeedBack
                              && modeType == Mode::Downward
                              && detTypeEff == DetectorType::Peak;
@@ -470,7 +483,9 @@ public:
         if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
         detectorIn = keyEq_.processSample(detectorIn, channel);
 
-        const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
+        const bool layered = isLayered(profile, modeType);
+        syncLayerState(layered);
+        const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity && !layered;
         const bool decoupled = useDecoupled(charType, topoEff);
         syncDecoupledState(decoupled);
         // Programme-dependent timing: the settings are taken on channel 0,
@@ -490,7 +505,7 @@ public:
         T levelDb = detectLevel(detectorIn, channel, detTypeEff);
 
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
-                                   feedbackDetectorDelay(detTypeEff), program_.active };
+                                   feedbackDetectorDelay(detTypeEff), program_.active, layered };
         // The automatic threshold counts from the recent peak of what this
         // channel's detector reads (of its input, in FeedBack).
         T threshNow = thresh;
@@ -506,7 +521,11 @@ public:
         // what is heard (and metered).
         const T loopGainLinear = decibelsToGain(smoothedGR_Db);
         if (amount < T(1)) smoothedGR_Db *= amount;
-        T smoothedGainLinear = (amount < T(1)) ? decibelsToGain(smoothedGR_Db) : loopGainLinear;
+        const bool gainSmooth = gainSmoothRate_ > 0.0;
+        if (advanceShared) syncGainSmoothing(gainSmooth);
+        if (gainSmooth) smoothedGR_Db = smoothedGain(smoothedGR_Db, channel);
+        const bool heardApart = amount < T(1) || gainSmooth;
+        T smoothedGainLinear = heardApart ? decibelsToGain(smoothedGR_Db) : loopGainLinear;
 
         const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
         if (advanceShared)
@@ -539,8 +558,10 @@ public:
             makeup += analyticSmooth_.getCurrentValue();
         }
 
-        T output = input * smoothedGainLinear;
-        if (colorAmt > T(0) && charType == Character::FET)
+        T output = (colorAmt > T(0) && profile.colour == Colour::PushPull)
+                 ? pushPullElement(input, smoothedGainLinear, colorAmt)
+                 : input * smoothedGainLinear;
+        if (colorAmt > T(0) && profile.colour == Colour::SecondOrder)
         {
             // Same 2nd-order FET channel modulation as the block path.
             const T sq = output * output;
@@ -552,7 +573,7 @@ public:
         // The feedback detector reads the compressed signal BEFORE makeup:
         // makeup is applied after the element, so feeding it back would shift
         // the static curve by the makeup (and run away with auto makeup).
-        fbLastOutput_[channel] = (amount < T(1)) ? input * loopGainLinear : output;
+        fbLastOutput_[channel] = heardApart ? input * loopGainLinear : output;
         output *= makeupToGain(makeup);
         gainReductionDb_.store(smoothedGR_Db, std::memory_order_relaxed);
         // Key listen: what the detector heard goes out instead.
@@ -580,6 +601,10 @@ public:
             precTarget_[ch] = 0.0;
             interp_[ch] = {};
             programState_[ch] = {};
+            layerLevelDb_[ch] = 0.0;
+            layerPeakDb_[ch] = 0.0;
+            gainSmoothA_[ch] = 0.0;
+            gainSmoothB_[ch] = 0.0;
             balanceBands_[ch] = {};
             hybridMeanSq_[ch] = 0.0;
             lookaheadBuffers_[ch].reset();
@@ -1025,7 +1050,7 @@ public:
     /** @brief Changes ballistics and envelope behavior character. */
     void setCharacter(Character type) noexcept
     {
-        character_.store(clampEnum(type, Character::Varimu), std::memory_order_relaxed);
+        character_.store(clampEnum(type, Character::Smooth), std::memory_order_relaxed);
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
@@ -1038,16 +1063,49 @@ public:
      * like the hardware's output stage. At 1.0 it is calibrated to the
      * published 1176 THD spec (< 0.5% while limiting, measured at -6 dBFS
      * program level); it only distorts while the FET conducts, so no gain
-     * reduction means no added colour. Other characters ignore it for now.
-     * Default 0 (clean). The squared term doubles the signal bandwidth: on
-     * synthetic full-scale HF material wrap the compressor in an oversampled
-     * section (see docs/cookbook.md) if the folded 2nd harmonic matters.
+     * reduction means no added colour. The squared term doubles the signal
+     * bandwidth: on synthetic full-scale HF material wrap the compressor in
+     * an oversampled section (see docs/cookbook.md) if the folded 2nd
+     * harmonic matters.
+     *
+     * With the Varimu character the gain is applied by the curve of a
+     * push-pull pair of remote-cutoff stages: the bias that sets the gain
+     * also bends the curve, so compression and colour come from the same
+     * element. The harmonics are odd, grow with the level and with the
+     * reduction (through a minimum near 6 dB of it), and at 1.0 a tone at
+     * -6 dBFS carries 0.08 % of them at rest, 1.4 % under 12 dB of reduction
+     * and 2.8 % under 20 dB. While it is on, the block runs frame by frame.
+     *
+     * Other characters ignore it. Default 0 (clean).
      */
     void setCharacterColor(T amount) noexcept
     {
         if (!std::isfinite(amount)) return;
         characterColor_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
+
+    /**
+     * @brief Smooths the gain after the ballistics (milliseconds; 0, the
+     *        default, is off).
+     *
+     * The gain change in decibels passes through two equal one-pole sections
+     * before it becomes gain: a second-order smoothing that rounds the
+     * corners the ballistics leave (the start of an attack, the turn into a
+     * release) and takes the ripple of the detector off the gain. The step
+     * of the two sections reaches 63 % in about the time given, so the gain
+     * arrives that much later (a lookahead of the same length puts it back).
+     * A feedback loop reads the gain before the smoothing. Values are held
+     * to [0, 50] ms; a value that is not finite is ignored.
+     */
+    void setGainSmoothing(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        gainSmoothMs_.store(std::clamp(ms, T(0), T(50)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief The smoothing of the gain after the ballistics, in milliseconds. */
+    [[nodiscard]] T getGainSmoothing() const noexcept { return gainSmoothMs_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Selects the Clean character's feed-forward ballistics.
@@ -1207,13 +1265,14 @@ public:
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        const bool fet = character_.load(std::memory_order_relaxed) == Character::FET;
-        const bool feedback = fet || topology_.load(std::memory_order_relaxed) == Topology::FeedBack;
-        const DetectorType detType = fet ? DetectorType::Peak : detectorType_.load(std::memory_order_relaxed);
+        const CharacterProfile& profile = profileOf(character_.load(std::memory_order_relaxed));
+        const bool feedback = topologyFor(profile, topology_.load(std::memory_order_relaxed)) == Topology::FeedBack;
+        const DetectorType detType = detectorFor(profile, detectorType_.load(std::memory_order_relaxed));
         // The same routing as processBlock(): see usePrecision().
         const bool solved = feedback && detType == DetectorType::Peak
                          && mode_.load(std::memory_order_relaxed) == Mode::Downward;
-        const int reading = (precision_.load(std::memory_order_relaxed) == Precision::High
+        const bool layered = isLayered(profile, mode_.load(std::memory_order_relaxed));
+        const int reading = (precision_.load(std::memory_order_relaxed) == Precision::High && !layered
                              && readsBetweenSamples(detType) && (!feedback || solved)) ? kDetectorDelay : 0;
         if (feedback) return reading;
         // Derive the lookahead from the published parameter rather than the
@@ -1266,6 +1325,7 @@ public:
         w.write("spectralTiming", static_cast<float>(spectralTiming_.load(std::memory_order_relaxed)));
         w.write("attackEmphasis", static_cast<float>(attackEmphasis_.load(std::memory_order_relaxed)));
         keyEq_.writeState(w, "key");
+        w.write("gainSmoothing", static_cast<float>(gainSmoothMs_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -1307,6 +1367,7 @@ public:
         setSpectralTiming(static_cast<T>(r.read("spectralTiming", 0.0f)));
         setAttackEmphasis(static_cast<T>(r.read("attackEmphasis", 0.0f)));
         keyEq_.readState(r, "key");
+        setGainSmoothing(static_cast<T>(r.read("gainSmoothing", 0.0f)));
         return true;
     }
 
@@ -1385,8 +1446,9 @@ protected:
         // The FET character is a feedback design like the 1176 it models: it
         // always detects on the compressed output with the hardware's peak
         // rectifier, whatever Topology and Detector say.
-        const Topology topoEff = (charType == Character::FET) ? Topology::FeedBack : topo;
-        const DetectorType detTypeEff = (charType == Character::FET) ? DetectorType::Peak : detType;
+        const CharacterProfile& profile = profileOf(charType);
+        const Topology topoEff = topologyFor(profile, topo);
+        const DetectorType detTypeEff = detectorFor(profile, detType);
 
         // Downward feedback with the peak detector resolves the loop
         // semi-implicitly (the level the loop will read is a known function
@@ -1397,10 +1459,14 @@ protected:
                              && modeType == Mode::Downward
                              && detTypeEff == DetectorType::Peak;
 
-        const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
+        const bool layered = isLayered(profile, modeType);
+        syncLayerState(layered);
+        const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity && !layered;
         const bool decoupled = useDecoupled(charType, topoEff);
         syncDecoupledState(decoupled);
-        const bool precise = usePrecision(topoEff, fbImplicit, splitAdaptive);
+        const bool precise = !layered && usePrecision(topoEff, fbImplicit, splitAdaptive);
+        const bool gainSmooth = gainSmoothRate_ > 0.0;
+        syncGainSmoothing(gainSmooth);
         syncPrecisionState(precise);
         program_ = programTiming(charType, topoEff, decoupled, splitAdaptive);
         syncProgramState(program_.active);
@@ -1444,20 +1510,23 @@ protected:
         T analyticDb = analyticSmooth_.getCurrentValue();
 
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
-                                   feedbackDetectorDelay(detTypeEff), program_.active };
+                                   feedbackDetectorDelay(detTypeEff), program_.active, layered };
 
         // Feed-forward: the detector never reads the output, so the block
         // runs in passes (see processFeedForward). Feedback loops stay per
-        // sample, and so does Precision::High, whose control signal is
-        // worked out several times per sample.
+        // sample, and so do Precision::High, whose control signal is worked
+        // out several times per sample, and the push-pull element, which
+        // applies the gain through a curve.
         const bool feedForward = topoEff == Topology::FeedForward;
-        if (feedForward && !precise)
+        const bool element = profile.colour == Colour::PushPull
+                          && (colorAmt > T(0) || colorSmooth_.isSmoothing());
+        if (feedForward && !precise && !element)
         {
             const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
                                          activeLookahead, scHpf, shared, decoupled,
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
                                          paramsMoving, autoThr, activeLookahead - lookaheadSamples_,
-                                         program_.active, keyBalance, keyEqOn, listen };
+                                         program_.active, keyBalance, keyEqOn, listen, layered, gainSmooth };
             const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal,
                                           staticMakeupDb + analyticDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
@@ -1569,6 +1638,7 @@ protected:
                 const T gainLin = (loopGR == T(0)) ? T(1) : decibelsToGain(loopGR);
                 blockGR = heldBack(loopGR, 0, gainDelay);
                 if (amount < T(1)) blockGR *= amount;
+                if (gainSmooth) blockGR = smoothedGain(blockGR, 0);
                 const T outLin = (blockGR == loopGR) ? gainLin : decibelsToGain(blockGR);
                 for (int ch = 0; ch < nCh; ++ch)
                     applyGain(audio, ch, i, gainLin, blockGR, audioDelay, charType,
@@ -1595,6 +1665,7 @@ protected:
                     const T gainLin = (loopGR == T(0)) ? T(1) : decibelsToGain(loopGR);
                     T heardGR = heldBack(loopGR, ch, gainDelay);
                     if (amount < T(1)) heardGR *= amount;
+                    if (gainSmooth) heardGR = smoothedGain(heardGR, ch);
                     const T outLin = (heardGR == loopGR) ? gainLin : decibelsToGain(heardGR);
                     applyGain(audio, ch, i, gainLin, heardGR, audioDelay, charType,
                               colorAmt, makeupLin, mixVal, outLin);
@@ -1631,6 +1702,7 @@ protected:
         bool decoupled;
         double loopDelay; ///< Detector delay seen by an explicit feedback loop (samples).
         bool program;     ///< Programme-dependent timing acts (see programTiming()).
+        bool layered;     ///< The character runs its two layers (see layeredStep()).
     };
 
     /** @brief Per-block routing of the feed-forward block path. */
@@ -1655,6 +1727,8 @@ protected:
         bool keyBalance;        ///< It reads the spectral balance of the key.
         bool keyEq;             ///< The equalizer of the key has bands in the path.
         bool listen;            ///< The key goes out instead of the audio.
+        bool layered;           ///< The character runs its two layers.
+        bool gainSmooth;        ///< The gain is smoothed after the ballistics.
     };
 
     /** @brief Parameter values of a block whose smoothers are settled. */
@@ -1840,7 +1914,7 @@ protected:
             // What is heard of the gain: held back while the lookahead is
             // shorter than the latency kept for it, and scaled by the amount.
             const bool scaled = ff.paramsMoving || constants.amount < T(1);
-            if (ff.gainDelay > 0 || scaled)
+            if (ff.gainDelay > 0 || scaled || ff.gainSmooth)
             {
                 for (int g = 0; g < nGain; ++g)
                 {
@@ -1854,6 +1928,8 @@ protected:
                     if (scaled)
                         for (int k = 0; k < m; ++k)
                             if (amt[k] < T(1)) gd[k] *= amt[k];
+                    if (ff.gainSmooth)
+                        for (int k = 0; k < m; ++k) gd[k] = smoothedGain(gd[k], g);
                     // SplitPolarity formed its linear gain inside the recursion.
                     if (ff.splitAdaptive)
                         for (int k = 0; k < m; ++k)
@@ -1944,6 +2020,10 @@ protected:
             precLevel_[ch] = precLevel_[0];
             precTarget_[ch] = precTarget_[0];
             programState_[ch] = programState_[0];
+            layerLevelDb_[ch] = layerLevelDb_[0];
+            layerPeakDb_[ch] = layerPeakDb_[0];
+            gainSmoothA_[ch] = gainSmoothA_[0];
+            gainSmoothB_[ch] = gainSmoothB_[0];
         }
     }
 
@@ -1999,7 +2079,21 @@ protected:
                 tgtA[k] = downwardCurve(inDb[k], thr[k], rat[k], kn[k], ff.charType);
         }
 
-        if (dryIn != nullptr)
+        if (ff.layered)
+        {
+            // Two layers, each towards its own curve; the gain is their sum.
+            const CharacterProfile profile = profileOf(ff.charType);
+            double level = layerLevelDb_[ch], peak = layerPeakDb_[ch];
+            for (int k = 0; k < m; ++k)
+            {
+                fast = layeredStep(inDb[k], thr[k], rat[k], kn[k], profile, range, holdN, soft,
+                                   held, counter, level, peak);
+                out[k] = static_cast<T>(fast);
+            }
+            layerLevelDb_[ch] = level;
+            layerPeakDb_[ch] = peak;
+        }
+        else if (dryIn != nullptr)
         {
             // Level-adaptive release (SplitPolarity): full-scale output
             // halves the release time constant, as in applyBallistics().
@@ -2101,6 +2195,17 @@ protected:
             return applyBallistics(targetGR_Db, ch, cfg.splitAdaptive, law.slope, cfg.loopDelay);
         }
 
+        if (cfg.layered)
+        {
+            const double shown = layeredStep(inputDb, thresh, ratio, knee, profileOf(cfg.charType),
+                                             rangeDb_.load(std::memory_order_relaxed), holdSamples_,
+                                             softRange_.load(std::memory_order_relaxed),
+                                             heldGrDb_[ch], holdCounters_[ch],
+                                             layerLevelDb_[ch], layerPeakDb_[ch]);
+            envFastDb_[ch] = shown;
+            return static_cast<T>(shown);
+        }
+
         T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, cfg.charType, cfg.modeType, guardDb);
         targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
         if (cfg.program)
@@ -2132,8 +2237,10 @@ protected:
 
         // outLin is the gain that is heard (gainLin scaled by the amount);
         // gainLin is the one the loop reads back.
-        T wet = input * outLin;
-        if (colorAmt > T(0) && charType == Character::FET)
+        const Colour colour = profileOf(charType).colour;
+        T wet = (colorAmt > T(0) && colour == Colour::PushPull) ? pushPullElement(input, outLin, colorAmt)
+                                                                : input * outLin;
+        if (colorAmt > T(0) && colour == Colour::SecondOrder)
         {
             // 2nd-order FET channel modulation: the drain-source resistance
             // bends with the signal across it, so colour only appears while
@@ -2175,63 +2282,57 @@ protected:
         auto tc = [fs](T ms) { return std::exp(-1.0 / (static_cast<double>(fs) * static_cast<double>(ms) / 1000.0)); };
         const T prevWeight = charFastWeight_;
 
-        // Character ballistics: time constants of the dB-domain envelopes.
-        // The default arm backs up the setter's enum clamp: falling through
-        // with no case would leave the coefficients zero-initialized
-        // (instant ballistics, i.e. a waveshaper).
-        switch (character_.load(std::memory_order_relaxed))
+        // Character ballistics: time constants of the dB-domain envelopes,
+        // from the numbers of the character (see CharacterProfile). The knobs
+        // are held to its limits first; a character without a memory stage
+        // has the fast one stand in for it.
+        const CharacterProfile& profile = profileOf(character_.load(std::memory_order_relaxed));
         {
-            default:
-            case Character::Clean:
-            case Character::Varimu:
-                charAttCoeff_     = tc(attMs);
-                charRelCoeff_     = tc(relMs);
+            const T att = std::clamp(attMs, profile.attackFloorMs, profile.attackCeilMs);
+            const T rel = std::clamp(relMs, profile.releaseFloorMs, profile.releaseCeilMs);
+            charAttCoeff_   = tc(att);
+            charRelCoeff_   = tc(rel * profile.fastRelease);
+            charFastWeight_ = profile.fastWeight;
+            if (profile.fastWeight >= T(1))
+            {
                 charSlowRelCoeff_ = charRelCoeff_;
                 charChargeCoeff_  = charAttCoeff_;
-                charFastWeight_   = T(1); // single envelope
-                {
-                    // Decoupled detector (Clean, feed-forward): the smoothing
-                    // pole's release side is a tenth of the release (never
-                    // faster than the attack, never slower than half the
-                    // release); the hold stage takes the rest of the release
-                    // so the series t63 lands on the knob.
-                    const T smoothMs = std::min(std::max(relMs * T(0.1), attMs), relMs * T(0.5));
-                    decSmoothCoeff_ = tc(smoothMs);
-                    decHoldCoeff_ = tc(static_cast<T>(decoupledHoldTau(
-                        static_cast<double>(relMs), static_cast<double>(smoothMs))));
-                }
-                break;
-
-            case Character::Opto:
-                // T4 cell: the release knob is the ~50% recovery time. With a
-                // 0.6/0.4 fast/slow split, tau_fast = 0.61 x release puts the
-                // half-recovery point on the knob value while the memory tail
-                // decays ~35x slower, capped at the physical 5 s of the cell
-                // (LA-2A spec: 50% in ~0.06 s, complete in 0.5-5 s). The slow
-                // stage charges over ~4 release times (capped at 2 s), so only
-                // sustained compression builds the long tail. The 10 ms attack
-                // floor is the cell's published attack time.
-                charAttCoeff_     = tc(std::max(attMs, T(10)));
-                charRelCoeff_     = tc(relMs * T(0.61));
-                charSlowRelCoeff_ = tc(std::min(relMs * T(25), T(5000)));
-                charChargeCoeff_  = tc(std::clamp(relMs * T(4), T(100), T(2000)));
-                charFastWeight_   = T(0.6);
-                break;
-
-            case Character::FET:
-            {
-                // 1176: knob ranges are 20-800 us attack and 50-1100 ms
-                // release. With a 0.75/0.25 split the compound release passes
-                // ~t63 at the knob value, and a 150 ms history charge gives
-                // the program-dependent tail.
-                const T rel = std::clamp(relMs, T(50), T(1100));
-                charAttCoeff_     = tc(std::clamp(attMs, T(0.02), T(0.8)));
-                charRelCoeff_     = tc(rel * T(0.7));
-                charSlowRelCoeff_ = tc(rel * T(2.5));
-                charChargeCoeff_  = tc(T(150));
-                charFastWeight_   = T(0.75);
-                break;
             }
+            else
+            {
+                charSlowRelCoeff_ = tc(std::min(rel * profile.slowRelease, profile.slowReleaseCeilMs));
+                charChargeCoeff_  = tc(std::clamp(rel * profile.chargeScale, profile.chargeFloorMs,
+                                                  profile.chargeCeilMs));
+            }
+
+            // Decoupled detector (Clean, feed-forward): the smoothing pole's
+            // release side is a tenth of the release (never faster than the
+            // attack, never slower than half the release); the hold stage
+            // takes the rest of the release so the series t63 lands on the
+            // knob.
+            const T smoothMs = std::min(std::max(relMs * T(0.1), attMs), relMs * T(0.5));
+            decSmoothCoeff_ = tc(smoothMs);
+            decHoldCoeff_ = tc(static_cast<T>(decoupledHoldTau(
+                static_cast<double>(relMs), static_cast<double>(smoothMs))));
+
+            // The layers of a layered character run on rates (the share of
+            // the distance covered per sample), which their pace then divides.
+            if (profile.levelShare > T(0))
+            {
+                const double perMs = 1000.0 / static_cast<double>(fs);
+                peakAttRate_ = perMs / static_cast<double>(att);
+                peakRelRate_ = perMs / static_cast<double>(rel);
+                layerAttRate_ = perMs / static_cast<double>(std::max(att * profile.levelAttack,
+                                                                      profile.levelAttackFloorMs));
+                layerRelRate_ = perMs / static_cast<double>(rel * profile.levelRelease);
+            }
+        }
+
+        // The smoothing of the gain after the ballistics: two sections of
+        // half its time each.
+        {
+            const double ms = static_cast<double>(gainSmoothMs_.load(std::memory_order_relaxed));
+            gainSmoothRate_ = (ms > 0.0) ? 1.0 - std::exp(-2000.0 / (static_cast<double>(fs) * ms)) : 0.0;
         }
 
         // The attack as it is observed (a feedback loop, below, changes the
@@ -2274,9 +2375,8 @@ protected:
         // linear-region loop gain (R - 1) in both directions; Varimu uses its
         // base ratio (the progressive part is level-dependent).
         {
-            const auto charNow = character_.load(std::memory_order_relaxed);
-            const bool fbLoop = charNow == Character::FET
-                             || topology_.load(std::memory_order_relaxed) == Topology::FeedBack;
+            const bool fbLoop = topologyFor(profile, topology_.load(std::memory_order_relaxed))
+                             == Topology::FeedBack;
             if (fbLoop)
             {
                 const double loopGain = static_cast<double>(charFastWeight_)
@@ -2514,6 +2614,110 @@ protected:
         return level;
     }
 
+    // ---- Characters as data ----
+
+    /** @brief The harmonic signature a character can add (setCharacterColor()). */
+    enum class Colour
+    {
+        None,
+        SecondOrder,    ///< Second-order modulation of the element by the signal across it.
+        PushPull        ///< The gain applied by the curve of a push-pull pair biased by it.
+    };
+
+    /**
+     * @struct CharacterProfile
+     * @brief What makes a character: the numbers one engine reads.
+     *
+     * Every character has a fast stage; where fastWeight is under 1 a memory
+     * stage runs beside it, charging while the reduction lasts and letting
+     * go slowly. The knobs are held to the limits of the profile before any
+     * stage takes its share of them.
+     */
+    struct CharacterProfile
+    {
+        T attackFloorMs, attackCeilMs;      ///< Limits of the attack knob.
+        T releaseFloorMs, releaseCeilMs;    ///< Limits of the release knob.
+        T fastRelease;                      ///< Release of the fast stage, as a multiple of the knob.
+        T slowRelease, slowReleaseCeilMs;   ///< Release of the memory stage: a multiple of the knob, up to a ceiling.
+        T chargeScale;                      ///< Time the memory stage takes to charge, as a multiple of the release knob...
+        T chargeFloorMs, chargeCeilMs;      ///< ...held to these.
+        T fastWeight;                       ///< Share of the fast stage in the gain (1: no memory stage).
+        T kneeFloorDb;                      ///< Narrowest knee the element can form (0: any).
+        T ratioGrowthDb;                    ///< Decibels over the threshold that double the ratio (0: a fixed ratio).
+        bool ownLoop;                       ///< It detects on its own output with a peak rectifier, whatever Topology and Detector say.
+        Colour colour;                      ///< Its harmonic signature.
+        bool decoupled;                     ///< setCleanBallistics() applies to it.
+        bool programTiming;                 ///< Programme-dependent timing applies to it.
+        bool forwardOnly;                   ///< It runs in feed-forward whatever Topology says.
+        T levelShare;                       ///< Share of the slope a levelling layer takes (0: one layer).
+        T levelLeadDb;                      ///< Decibels under the threshold where the levelling layer starts.
+        T levelAttack, levelAttackFloorMs;  ///< Its attack: a multiple of the knob, and the least it is.
+        T levelRelease;                     ///< Its release, as a multiple of the knob.
+        T attackPaceDb, releasePaceDb;      ///< Decibels of distance to the target that double the time of a layer.
+    };
+
+    static constexpr T kNoLimit = std::numeric_limits<T>::infinity();
+
+    /** @brief The characters, in the order of Character. */
+    static constexpr std::array<CharacterProfile, 5> kProfiles { {
+        // Clean: one envelope on the knobs.
+        { T(0.01), kNoLimit, T(1), kNoLimit, T(1), T(1), kNoLimit, T(0), T(0), T(0), T(1),
+          T(0), T(0), false, Colour::None, true, true,
+          false, T(0), T(0), T(0), T(0), T(0), T(0), T(0) },
+        // Opto: the release knob is the 50 % recovery time. With a 0.6/0.4
+        // split, a fast stage of 0.61 times the release puts the half
+        // recovery on the knob while the memory tail decays some 35 times
+        // slower, up to the 5 s of the cell; the memory charges over four
+        // release times (0.1 to 2 s), so only sustained compression builds
+        // the long tail. The 10 ms attack floor is the cell's.
+        { T(10), kNoLimit, T(1), kNoLimit, T(0.61), T(25), T(5000), T(4), T(100), T(2000), T(0.6),
+          T(10), T(0), false, Colour::None, false, false,
+          false, T(0), T(0), T(0), T(0), T(0), T(0), T(0) },
+        // FET: knobs of 20 to 800 us and 50 to 1100 ms. With a 0.75/0.25
+        // split the compound release passes its t63 at the knob, and a
+        // 150 ms charge gives the tail that depends on the programme.
+        { T(0.02), T(0.8), T(50), T(1100), T(0.7), T(2.5), kNoLimit, T(0), T(150), T(150), T(0.75),
+          T(0), T(0), true, Colour::SecondOrder, false, false,
+          false, T(0), T(0), T(0), T(0), T(0), T(0), T(0) },
+        // Varimu: one envelope, a ratio that grows with the level, a knee
+        // that cannot be hard, and the gain through a push-pull pair.
+        { T(0.01), kNoLimit, T(1), kNoLimit, T(1), T(1), kNoLimit, T(0), T(0), T(0), T(1),
+          T(10), T(40), false, Colour::PushPull, false, true,
+          false, T(0), T(0), T(0), T(0), T(0), T(0), T(0) },
+        // Smooth: a levelling layer with half the slope from 6 dB under the
+        // threshold, eight times the attack (30 ms at least) and six times
+        // the release, under a layer on the knobs; both take twice as long
+        // 12 dB (attack) or 6 dB (release) away from their target.
+        { T(0.01), kNoLimit, T(1), kNoLimit, T(1), T(1), kNoLimit, T(0), T(0), T(0), T(1),
+          T(6), T(0), false, Colour::None, false, false,
+          true, T(0.5), T(6), T(8), T(30), T(6), T(12), T(6) },
+    } };
+
+    /** @brief The profile of a character. */
+    [[nodiscard]] static constexpr CharacterProfile profileOf(Character type) noexcept
+    {
+        const int last = static_cast<int>(kProfiles.size()) - 1;
+        return kProfiles[static_cast<size_t>(std::clamp(static_cast<int>(type), 0, last))];
+    }
+
+    /** @brief The topology a character runs in when the user asks for one. */
+    [[nodiscard]] static constexpr Topology topologyFor(const CharacterProfile& profile, Topology asked) noexcept
+    {
+        return profile.ownLoop ? Topology::FeedBack : (profile.forwardOnly ? Topology::FeedForward : asked);
+    }
+
+    /** @brief Whether a character runs its two layers: it has them, and the mode is Downward. */
+    [[nodiscard]] static constexpr bool isLayered(const CharacterProfile& profile, Mode modeType) noexcept
+    {
+        return profile.levelShare > T(0) && modeType == Mode::Downward;
+    }
+
+    /** @brief The detector a character reads with when the user asks for one. */
+    [[nodiscard]] static constexpr DetectorType detectorFor(const CharacterProfile& profile, DetectorType asked) noexcept
+    {
+        return profile.ownLoop ? DetectorType::Peak : asked;
+    }
+
     // ---- Gain curves ----
 
     /**
@@ -2524,10 +2728,11 @@ protected:
      */
     [[nodiscard]] static T effectiveRatioFor(Character charType, T ratio, T excessDb) noexcept
     {
-        // Fairchild-style progressive compression: a remote-cutoff tube's
-        // effective ratio grows with level above the threshold.
-        if (charType == Character::Varimu && excessDb > T(0))
-            return ratio * (T(1) + excessDb / T(40));
+        // Progressive compression: a remote-cutoff tube's effective ratio
+        // grows with the level above the threshold.
+        const T growth = profileOf(charType).ratioGrowthDb;
+        if (growth > T(0) && excessDb > T(0))
+            return ratio * (T(1) + excessDb / growth);
         return ratio;
     }
 
@@ -2537,8 +2742,8 @@ protected:
         // Neither a remote-cutoff tube (Varimu) nor a photocell (Opto) can
         // form a hard corner: both transfers bend gradually over their whole
         // operating region, so the knee has a 10 dB physical floor.
-        return (charType == Character::Varimu || charType == Character::Opto)
-             ? std::max(knee, T(10)) : knee;
+        const T floor = profileOf(charType).kneeFloorDb;
+        return (floor > T(0)) ? std::max(knee, floor) : knee;
     }
 
     /**
@@ -2566,23 +2771,197 @@ protected:
      */
     [[nodiscard]] static T downwardCurve(T inputDb, T thresh, T ratio, T knee, Character charType) noexcept
     {
+        const CharacterProfile profile = profileOf(charType);
+        if (profile.levelShare > T(0))
+        {
+            const Layers layers = layeredCurve(inputDb, thresh, ratio, knee, profile);
+            return layers.level + layers.peak;
+        }
         const T effectiveRatio = effectiveRatioFor(charType, ratio, inputDb - thresh);
         const T effectiveKnee = effectiveKneeFor(charType, knee);
-        const T slope = T(1) - T(1) / effectiveRatio;
+        return kneeCurve(inputDb, thresh, T(1) - T(1) / effectiveRatio, effectiveKnee);
+    }
 
+    /**
+     * @brief A threshold, a slope (1 - 1/ratio) and a quadratic knee: the
+     *        gain change at a level, in decibels.
+     */
+    [[nodiscard]] static T kneeCurve(T inputDb, T thresh, T slope, T knee) noexcept
+    {
         // Branch-free pieces (the level crosses the threshold at random on
         // dense programme, where a branch per sample mispredicts): below the
         // threshold the linear piece is positive and min() returns 0.
-        if (effectiveKnee <= T(0))
+        if (knee <= T(0))
             return std::min(thresh - inputDb, T(0)) * slope;
 
         // Soft knee: the quadratic below the knee top never exceeds the
         // linear piece, and with x clamped to the knee width it is the larger
         // one above it, so min() picks the right piece on every side.
-        const T halfKnee = effectiveKnee / T(2);
-        const T x = std::clamp(inputDb - (thresh - halfKnee), T(0), effectiveKnee);
-        const T quad = T(0) - slope * x * x / (T(2) * effectiveKnee);
+        const T halfKnee = knee / T(2);
+        const T x = std::clamp(inputDb - (thresh - halfKnee), T(0), knee);
+        const T quad = T(0) - slope * x * x / (T(2) * knee);
         return std::min((thresh - inputDb) * slope, quad);
+    }
+
+    // ---- Layered characters ----
+
+    /** @brief What the two layers of a layered character ask for at a level (dB). */
+    struct Layers
+    {
+        T level;    ///< The levelling layer.
+        T peak;     ///< The layer over it.
+    };
+
+    /**
+     * @brief The curves of the two layers.
+     *
+     * The levelling layer takes its share of the slope from levelLeadDb
+     * under the threshold, over a knee twice that wide; the other layer
+     * takes the rest from as far over the threshold as leaves the sum, far
+     * above, on the curve of the ratio itself.
+     */
+    [[nodiscard]] static Layers layeredCurve(T inputDb, T thresh, T ratio, T knee,
+                                             const CharacterProfile& profile) noexcept
+    {
+        const T slope = T(1) - T(1) / ratio;
+        const T levelSlope = profile.levelShare * slope;
+        const T lag = profile.levelLeadDb * profile.levelShare / (T(1) - profile.levelShare);
+        return { kneeCurve(inputDb, thresh - profile.levelLeadDb, levelSlope, T(2) * profile.levelLeadDb),
+                 kneeCurve(inputDb, thresh + lag, slope - levelSlope, std::max(knee, profile.kneeFloorDb)) };
+    }
+
+    /**
+     * @brief One step of a follower whose time grows with the distance to
+     *        its target: far away it moves at a steady pace, close by like a
+     *        one-pole.
+     *
+     * @param envelope     The follower (dB).
+     * @param target       Where it is going (dB).
+     * @param attackRate   Share of the distance per sample while the gain falls.
+     * @param releaseRate  The same while it recovers.
+     * @param attackPace   Decibels of distance that double the attack time.
+     * @param releasePace  Decibels of distance that double the release time.
+     */
+    [[nodiscard]] static double pacedStep(double envelope, double target, double attackRate, double releaseRate,
+                                          double attackPace, double releasePace) noexcept
+    {
+        const double distance = envelope - target;      // over zero: the gain has to fall
+        const double gap = std::abs(distance);
+        const double rate = (distance > 0.0) ? attackRate / (1.0 + gap / attackPace)
+                                             : releaseRate / (1.0 + gap / releasePace);
+        return target + fastDecay(rate) * distance;
+    }
+
+    /**
+     * @brief One frame of a layered character: hold and range on the whole
+     *        target, each layer towards its part of it, and their sum.
+     *
+     * The levelling layer never asks for more than the bounded whole; the
+     * other layer takes what is left of it, so a held or a limited target
+     * is shared out without a division.
+     */
+    [[nodiscard]] double layeredStep(T inputDb, T thresh, T ratio, T knee, const CharacterProfile& profile,
+                                     T range, int holdN, bool soft, T& held, int& counter,
+                                     double& level, double& peak) const noexcept
+    {
+        const Layers want = layeredCurve(inputDb, thresh, ratio, knee, profile);
+        const T bounded = holdAndRange(want.level + want.peak, range, holdN, held, counter, soft);
+        const double levelTarget = static_cast<double>(std::max(want.level, bounded));
+        const double peakTarget = static_cast<double>(bounded) - levelTarget;
+        level = pacedStep(level, levelTarget, layerAttRate_, layerRelRate_,
+                          static_cast<double>(profile.attackPaceDb), static_cast<double>(profile.releasePaceDb));
+        peak = pacedStep(peak, peakTarget, peakAttRate_, peakRelRate_,
+                         static_cast<double>(profile.attackPaceDb), static_cast<double>(profile.releasePaceDb));
+        if (atRest(level, levelTarget)) level = 0.0;
+        if (atRest(peak, peakTarget)) peak = 0.0;
+        // (While the layers trade places their sum could pass the range.)
+        return std::max(level + peak, -static_cast<double>(range));
+    }
+
+    /**
+     * @brief Seats the two layers on the gain as it stands when a layered
+     *        character engages. Audio thread only.
+     */
+    void syncLayerState(bool layered) noexcept
+    {
+        if (layered && !layeredActive_)
+        {
+            const double share = static_cast<double>(profileOf(character_.load(std::memory_order_relaxed)).levelShare);
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+            {
+                const double shown = envFastDb_[static_cast<size_t>(ch)];
+                layerLevelDb_[static_cast<size_t>(ch)] = share * shown;
+                layerPeakDb_[static_cast<size_t>(ch)] = shown - share * shown;
+            }
+        }
+        layeredActive_ = layered;
+    }
+
+    // ---- The gain after the ballistics ----
+
+    /**
+     * @brief The gain of a variable-mu stage applied by its own curve: two
+     *        halves in push-pull, biased so that the slope of the pair at
+     *        rest is the gain asked for.
+     *
+     * Each half follows a softplus (the smooth cutoff of a remote-cutoff
+     * stage); the pair, half their difference, has the slope of a logistic
+     * of the bias. The bias is the one whose slope is the gain (times the
+     * slope the pair has at no reduction, kPushPullRest, taken back at the
+     * output), so a small signal gets the gain exactly and a large one gets
+     * the curve: compression where the pair is biased open, expansion once
+     * it nears cutoff, and odd harmonics from both.
+     *
+     * @param input  Sample the gain applies to.
+     * @param gain   Linear gain asked for (over 1 it is applied past the pair).
+     * @param amount Level into the pair: at 1 full scale is kPushPullDrive
+     *               times the scale of the curve.
+     */
+    [[nodiscard]] static T pushPullElement(T input, T gain, T amount) noexcept
+    {
+        if (!(gain > T(0)) || !(amount > T(0)) || !std::isfinite(input)) return input * gain;
+        const double g = static_cast<double>(gain);
+        const double slope = std::min(g, 1.0) * kPushPullRest;
+        const double drive = kPushPullDrive * static_cast<double>(amount);
+        // With e the exponential of the bias (the logistic of the bias is
+        // the slope) and u that of the input, the difference of the two
+        // halves is the logarithm of (1 + e u) / (1 + e / u): one
+        // exponential and one logarithm per sample, exact for a small e too.
+        const double e = slope / (1.0 - slope);
+        const double u = std::exp(std::clamp(drive * static_cast<double>(input), -30.0, 30.0));
+        const double pair = 0.5 * std::log1p(e * (u - 1.0 / u) / (1.0 + e / u));
+        return static_cast<T>(pair * (g / slope) / drive);
+    }
+
+    /** @brief One frame of the two smoothing sections on a channel's gain (dB). */
+    [[nodiscard]] T smoothedGain(T grDb, int ch) noexcept
+    {
+        double& first = gainSmoothA_[static_cast<size_t>(ch)];
+        double& second = gainSmoothB_[static_cast<size_t>(ch)];
+        first += gainSmoothRate_ * (static_cast<double>(grDb) - first);
+        second += gainSmoothRate_ * (first - second);
+        // (End the asymptotic tail: 0 dB is exact again once it is reached.)
+        if (grDb == T(0) && std::abs(first) < 1e-6 && std::abs(second) < 1e-6)
+        {
+            first = 0.0;
+            second = 0.0;
+        }
+        return static_cast<T>(second);
+    }
+
+    /**
+     * @brief Seats the smoothing sections on the gain as it stands when the
+     *        smoothing engages. Audio thread only.
+     */
+    void syncGainSmoothing(bool on) noexcept
+    {
+        if (on && !gainSmoothActive_)
+        {
+            const double shown = static_cast<double>(gainReductionDb_.load(std::memory_order_relaxed));
+            gainSmoothA_.fill(shown);
+            gainSmoothB_.fill(shown);
+        }
+        gainSmoothActive_ = on;
     }
 
     /**
@@ -2694,7 +3073,7 @@ protected:
         const T w = effectiveKneeFor(charType, knee);
         T r = std::max(effectiveRatioFor(charType, ratio, eOut), T(1));
         FeedbackLaw law = elementLaw(eOut, r, w);
-        if (charType == Character::Varimu)
+        if (profileOf(charType).ratioGrowthDb > T(0))
         {
             for (int pass = 0; pass < 2; ++pass)
             {
@@ -3081,7 +3460,7 @@ protected:
      *  when setCleanBallistics() selected it. */
     [[nodiscard]] bool useDecoupled(Character charType, Topology topoEff) const noexcept
     {
-        return charType == Character::Clean && topoEff == Topology::FeedForward
+        return profileOf(charType).decoupled && topoEff == Topology::FeedForward
             && cleanBallistics_.load(std::memory_order_relaxed) == CleanBallistics::Decoupled;
     }
 
@@ -3415,7 +3794,7 @@ protected:
     {
         ProgramTiming p;
         if (topoEff != Topology::FeedForward || decoupled || splitAdaptive
-            || (charType != Character::Clean && charType != Character::Varimu))
+            || !profileOf(charType).programTiming)
             return p;
         p.release = static_cast<double>(programRelease_.load(std::memory_order_relaxed));
         p.attack = static_cast<double>(adaptiveAttack_.load(std::memory_order_relaxed));
@@ -3590,9 +3969,9 @@ protected:
     {
         if (autoMakeupMode_.load(std::memory_order_relaxed) != AutoMakeupMode::Analytic) return T(0);
         const Character charType = character_.load(std::memory_order_relaxed);
-        const bool fet = charType == Character::FET;
-        const Topology topoEff = fet ? Topology::FeedBack : topology_.load(std::memory_order_relaxed);
-        const DetectorType detType = fet ? DetectorType::Peak : detectorType_.load(std::memory_order_relaxed);
+        const CharacterProfile& profile = profileOf(charType);
+        const Topology topoEff = topologyFor(profile, topology_.load(std::memory_order_relaxed));
+        const DetectorType detType = detectorFor(profile, detectorType_.load(std::memory_order_relaxed));
         return analyticMakeupDb(charType, mode_.load(std::memory_order_relaxed), detType,
                                 useDecoupled(charType, topoEff), topoEff == Topology::FeedBack);
     }
@@ -3891,6 +4270,25 @@ protected:
     double decHoldCoeff_   = 0.0;  ///< Decoupled hold-stage release coefficient.
     double decSmoothCoeff_ = 0.0;  ///< Decoupled smoothing pole, release side.
     bool decoupledActive_ = false; ///< The decoupled path ran last (audio thread).
+
+    // Layered characters: the two layers and their rates (share of the
+    // distance to the target per sample).
+    std::array<double, kMaxChannels> layerLevelDb_ {};
+    std::array<double, kMaxChannels> layerPeakDb_ {};
+    double layerAttRate_ = 0.0, layerRelRate_ = 0.0, peakAttRate_ = 0.0, peakRelRate_ = 0.0;
+    bool layeredActive_ = false;    ///< The layers ran last (audio thread).
+
+    // The push-pull element of Varimu: the slope of the pair at no reduction
+    // and the level of full scale in units of its curve at amount 1.
+    static constexpr double kPushPullRest = 0.98;
+    static constexpr double kPushPullDrive = 2.0;
+
+    // The gain after the ballistics.
+    std::atomic<T> gainSmoothMs_ { T(0) };          ///< Smoothing of the gain (0: off).
+    double gainSmoothRate_ = 0.0;                   ///< Coefficient of each of its two sections (0: off).
+    std::array<double, kMaxChannels> gainSmoothA_ {};
+    std::array<double, kMaxChannels> gainSmoothB_ {};
+    bool gainSmoothActive_ = false;                 ///< The smoothing ran last (audio thread).
     bool adaptiveMakeupActive_ = false; ///< Adaptive makeup ran last (audio thread).
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).

@@ -50,9 +50,12 @@
  * File loading (loadIR from a path) is excluded when DSPARK_NO_FILE_IO is
  * defined; the raw-data overload keeps working on embedded targets.
  *
+ * The wet signal can be ducked by the dry one and gated relative to it
+ * (setDucking(), setGate(); see TailShaper), both off by default.
+ *
  * Dependencies: Convolver.h, DryWetMixer.h, RingBuffer.h, AudioSpec.h,
  *               AudioBuffer.h, DspMath.h, Resampler.h, StateBlob.h,
- *               WavFile.h (only without DSPARK_NO_FILE_IO).
+ *               TailShaper.h, WavFile.h (only without DSPARK_NO_FILE_IO).
  *
  * @code
  *   dspark::Reverb<float> reverb;
@@ -74,6 +77,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/Resampler.h"
 #include "../Core/StateBlob.h"
+#include "../Core/TailShaper.h"
 #ifndef DSPARK_NO_FILE_IO
 #include "../IO/WavFile.h"
 #endif
@@ -684,9 +688,12 @@ public:
         const int nextPreDelaySamples = calculatePreDelaySamples(spec);
 
         const int nextSwapFade = std::max(1, static_cast<int>(spec.sampleRate * 0.01));
+        std::vector<T> nextLevels(static_cast<size_t>(blockSize), T(0));
+        tail_.prepare(spec.sampleRate);
         if (irStorage_.empty())
         {
             spec_ = spec;
+            tailLevels_ = std::move(nextLevels);
             swapFadeLength_ = nextSwapFade;
             swapFadePos_ = nextSwapFade;
             fftBlockSize_ = fftBlock;
@@ -706,6 +713,7 @@ public:
             std::move(candidate), latency,
             [&]() noexcept {
                 spec_ = spec;
+                tailLevels_ = std::move(nextLevels);
                 swapFadeLength_ = nextSwapFade;
                 swapFadePos_ = nextSwapFade;
                 fftBlockSize_ = fftBlock;
@@ -998,6 +1006,31 @@ public:
     /** @brief Returns the current IR stretch ratio. */
     [[nodiscard]] T getStretch() const noexcept { return stretch_.load(std::memory_order_relaxed); }
 
+    /**
+     * @brief Ducks the wet signal while the dry one plays (see TailShaper):
+     *        by up to `dB` (0 to 48; 0, the default, is off), in proportion to
+     *        the dry level against its own recent peak. Any thread.
+     */
+    void setDucking(T dB) noexcept { tail_.setDucking(dB); }
+
+    /**
+     * @brief Gate on the wet signal (see TailShaper): it closes once the dry
+     *        signal has stayed `thresholdDb` under its recent peak (-80 to 0;
+     *        below -80, the default, the gate is off) for the hold time.
+     */
+    void setGate(T thresholdDb) noexcept { tail_.setGate(thresholdDb); }
+
+    /** @brief Hold of the gate, 0 to 4000 ms (default 100). */
+    void setGateHold(T ms) noexcept { tail_.setGateHold(ms); }
+
+    /** @brief Release of the gate, 5 to 4000 ms (default 150). */
+    void setGateRelease(T ms) noexcept { tail_.setGateRelease(ms); }
+
+    [[nodiscard]] T getDucking() const noexcept { return tail_.getDucking(); }
+    [[nodiscard]] T getGate() const noexcept { return tail_.getGate(); }
+    [[nodiscard]] T getGateHold() const noexcept { return tail_.getGateHold(); }
+    [[nodiscard]] T getGateRelease() const noexcept { return tail_.getGateRelease(); }
+
     // -- Level 3: Expert API ----------------------------------------------------
 
     /**
@@ -1087,6 +1120,10 @@ public:
         w.write("preDelay", static_cast<float>(preDelayMs_.load(std::memory_order_relaxed)));
         w.write("decayScale", static_cast<float>(decayScale_.load(std::memory_order_relaxed)));
         w.write("stretch", static_cast<float>(stretch_.load(std::memory_order_relaxed)));
+        w.write("ducking", static_cast<float>(getDucking()));
+        w.write("gate", static_cast<float>(getGate()));
+        w.write("gateHold", static_cast<float>(getGateHold()));
+        w.write("gateRelease", static_cast<float>(getGateRelease()));
         return w.blob();
     }
 
@@ -1103,6 +1140,10 @@ public:
         T preDelay = static_cast<T>(r.read("preDelay", 0.0f));
         T ds = static_cast<T>(r.read("decayScale", 1.0f));
         T st = static_cast<T>(r.read("stretch", 1.0f));
+        const T duck = static_cast<T>(r.read("ducking", 0.0f));
+        const T gate = static_cast<T>(r.read("gate", -200.0f));
+        const T gateHold = static_cast<T>(r.read("gateHold", 100.0f));
+        const T gateRelease = static_cast<T>(r.read("gateRelease", 150.0f));
         if (!std::isfinite(mix)) mix = mix_.load(std::memory_order_relaxed);
         if (!std::isfinite(preDelay))
             preDelay = preDelayMs_.load(std::memory_order_relaxed);
@@ -1123,6 +1164,10 @@ public:
             preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);
             decayScale_.store(ds, std::memory_order_relaxed);
             stretch_.store(st, std::memory_order_relaxed);
+            tail_.setDucking(duck);
+            tail_.setGate(gate);
+            tail_.setGateHold(gateHold);
+            tail_.setGateRelease(gateRelease);
         };
 
         if (!shapeChanged || spec_.sampleRate <= 0 || irStorage_.empty())
@@ -1192,6 +1237,21 @@ protected:
         int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
         T mixVal = mix_.load(std::memory_order_relaxed);
 
+        // The dry level per frame for the ducking and the gate, read before
+        // the convolution overwrites the buffer.
+        tail_.sync();
+        const bool shaping = tail_.isActive() && nS <= static_cast<int>(tailLevels_.size());
+        if (shaping)
+        {
+            std::fill(tailLevels_.begin(), tailLevels_.begin() + nS, T(0));
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const T* d = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i)
+                    tailLevels_[static_cast<size_t>(i)] = std::max(tailLevels_[static_cast<size_t>(i)], std::abs(d[i]));
+            }
+        }
+
         for (int ch = 0; ch < nCh; ++ch)
         {
             T* data = buffer.getChannel(ch);
@@ -1230,6 +1290,13 @@ protected:
             }
             swapFadePos_ = std::min(swapFadePos_ + nS, swapFadeLength_);
         }
+
+        if (shaping)
+            for (int i = 0; i < nS; ++i)
+            {
+                const T g = tail_.next(tailLevels_[static_cast<size_t>(i)]);
+                for (int ch = 0; ch < nCh; ++ch) buffer.getChannel(ch)[i] *= g;
+            }
 
         mixer_.mixWet(buffer, mixVal);
     }
@@ -1566,6 +1633,8 @@ protected:
     Publisher bankPublisher_;
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
+    TailShaper<T> tail_;              ///< Ducking and gate of the wet signal.
+    std::vector<T> tailLevels_;       ///< Audio owner: the dry level per frame of a part.
     Convolver<T> fallbackConvolver_; ///< Inert engine for getConvolver() with no bank.
 };
 

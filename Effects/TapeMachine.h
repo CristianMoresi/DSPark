@@ -254,7 +254,9 @@ public:
         if (osFactor_ > 1)
         {
             oversampler_ = std::make_unique<Oversampling<T>>(
-                osFactor_, Oversampling<T>::Quality::High);
+                osFactor_, Oversampling<T>::Quality::High,
+                osMode_ == OversamplingMode::MinimumPhase ? Oversampling<T>::Mode::PolyphaseIir
+                                                          : Oversampling<T>::Mode::LinearPhaseFir);
             oversampler_->prepare(spec);
         }
         else
@@ -371,6 +373,12 @@ public:
         trMeanA_ = std::exp(-2.0 * std::numbers::pi * 5.0 * dt);
 
         latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + firCenter_ + delayCenter_;
+        // Behind minimum-phase filters the dry copy crosses the same filters
+        // (in phase at every frequency) and the ring adds the rest of the delay.
+        dryThroughFilters_ = oversampler_ && osMode_ == OversamplingMode::MinimumPhase;
+        if (dryThroughFilters_) dryPath_.prepare(spec, *oversampler_);
+        dryScratch_.resize(numChannels_, maxBlock_);
+        dryDelay_ = latency_ - (dryThroughFilters_ ? oversampler_->getLatency() : 0);
         drySize_ = 1;
         while (drySize_ < latency_ + maxBlock_ + 1) drySize_ <<= 1;
         dryRing_.assign(static_cast<size_t>(numChannels_),
@@ -405,6 +413,7 @@ public:
         for (auto& f : firState_) std::fill(f.begin(), f.end(), T(0));
         for (auto& d : delayRing_) std::fill(d.begin(), d.end(), T(0));
         for (auto& d : dryRing_) std::fill(d.begin(), d.end(), T(0));
+        dryPath_.reset();
         for (auto& s : recordHF_) s.clear();
         for (auto& s : recordLF_) s.clear();
         for (auto& s : playHF_) s.clear();
@@ -518,6 +527,36 @@ public:
 
     /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
     [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return osAutomatic_; }
+
+    /** @brief How the oversampler filters (see setOversamplingMode()). */
+    enum class OversamplingMode
+    {
+        LinearPhase,  ///< Linear-phase half-bands: the latency of the factor, the dry path a delay (default).
+        MinimumPhase  ///< Elliptic allpass half-bands: a few samples of latency, the dry path through the same filters.
+    };
+
+    /**
+     * @brief Chooses the oversampler's filters (SETUP THREAD ONLY, as
+     *  setOversampling(): an active instance is prepared again).
+     *
+     * MinimumPhase runs polyphase allpass half-bands: the oversampler's
+     * share of the latency falls to a few samples, and the dry copy of the
+     * mix crosses the same filters, so a partial mix adds in phase.
+     * getLatency() reflects the change.
+     *
+     * @param mode LinearPhase (default) or MinimumPhase.
+     */
+    void setOversamplingMode(OversamplingMode mode)
+    {
+        mode = static_cast<OversamplingMode>(std::clamp(static_cast<int>(mode), 0, 1));
+        if (mode == osMode_) return;
+        osMode_ = mode;
+        if (prepared_.load(std::memory_order_relaxed))
+            prepare(spec_);
+    }
+
+    /** @brief The oversampler's filters (setOversamplingMode()). */
+    [[nodiscard]] OversamplingMode getOversamplingMode() const noexcept { return osMode_; }
 
     /** @brief Active oversampling factor (1 = off, 4 = default). */
     [[nodiscard]] int getOversamplingFactor() const noexcept { return osFactor_; }
@@ -774,6 +813,7 @@ public:
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("oversampling", osFactor_);
         w.write("oversamplingAuto", osAutomatic_);
+        w.write("oversamplingMode", static_cast<int32_t>(osMode_));
         w.write("transport", transport_.load(std::memory_order_relaxed));
         w.write("humDb", static_cast<float>(humDb_.load(std::memory_order_relaxed)));
         w.write("mains", mains_.load(std::memory_order_relaxed));
@@ -820,6 +860,7 @@ public:
         // Default 4 = the historical fixed factor (older blobs restore 4x).
         setOversampling(r.read("oversampling", 4));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
+        setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
         return true;
     }
 
@@ -893,10 +934,18 @@ private:
         const bool monitorMoving = monitorRamp_.now != 1.0 || monitorRamp_.target != 1.0;
         const double humStep = (mains_.load(std::memory_order_relaxed) == 1 ? 60.0 : 50.0) / sampleRate_;
 
-        // 1. Dry snapshot for the latency-compensated mix.
+        // 1. Dry snapshot for the latency-compensated mix (through the
+        //    oversampler's filters when they are minimum phase).
+        if (dryThroughFilters_)
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+                std::copy_n(buffer.getChannel(ch), nS, dryScratch_.getChannel(ch));
+            auto dryView = dryScratch_.toView().getSubView(0, nS);
+            dryPath_.process(dryView);
+        }
         for (int ch = 0; ch < nCh; ++ch)
         {
-            const T* in = buffer.getChannel(ch);
+            const T* in = dryThroughFilters_ ? dryScratch_.getChannel(ch) : buffer.getChannel(ch);
             auto& dry = dryRing_[static_cast<size_t>(ch)];
             int dp = dryPos_;
             for (int i = 0; i < nS; ++i)
@@ -1165,7 +1214,7 @@ private:
             {
                 T* d = buffer.getChannel(ch);
                 const auto& dry = dryRing_[static_cast<size_t>(ch)];
-                const int dryIdx = (dryPos_ + i - latency_) & (drySize_ - 1);
+                const int dryIdx = (dryPos_ + i - dryDelay_) & (drySize_ - 1);
                 const T drySample = dry[static_cast<size_t>(dryIdx)];
                 T w = static_cast<T>(wet_[static_cast<size_t>(ch)]);
                 if (monitor != 1.0)
@@ -1820,6 +1869,11 @@ private:
     int drySize_ = 1;
     int osFactor_ = 4;               ///< Oversampling factor (setup thread; 1 = off, 4 default).
     bool osAutomatic_ = false;       ///< The factor follows the host rate (setAutomaticOversampling()).
+    OversamplingMode osMode_ = OversamplingMode::LinearPhase; ///< setOversamplingMode() (setup thread).
+    OversamplingDryPath<T> dryPath_; ///< The dry copy through minimum-phase filters.
+    AudioBuffer<T> dryScratch_;      ///< The dry block on its way through dryPath_.
+    bool dryThroughFilters_ = false; ///< The dry copy crosses the filters (minimum phase).
+    int dryDelay_ = 0;               ///< Delay of the dry ring: what the filters do not bring.
     static constexpr double kAutomaticInternalRate = 176400.0; ///< Rate the automatic factor reaches.
 
     std::unique_ptr<Oversampling<T>> oversampler_;

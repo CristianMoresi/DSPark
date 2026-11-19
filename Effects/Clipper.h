@@ -135,8 +135,10 @@ public:
             // preset's last stage lets through (93 dB): every stage is then
             // made at least 100 dB deep. Below that the folding of the curve
             // itself is what is left, so the preset stays.
+            const bool minimum = osMode_.load(std::memory_order_relaxed) == OversamplingMode::MinimumPhase;
             oversampler_ = std::make_unique<Oversampling<T>>(
-                osFactor, Oversampling<T>::Quality::High, Oversampling<T>::Mode::LinearPhaseFir,
+                osFactor, Oversampling<T>::Quality::High,
+                minimum ? Oversampling<T>::Mode::PolyphaseIir : Oversampling<T>::Mode::LinearPhaseFir,
                 osFactor >= 16 ? Oversampling<T>::Depth::Deep : Oversampling<T>::Depth::Preset);
             oversampler_->prepare(spec);
         } else {
@@ -146,7 +148,13 @@ public:
         // Align the dry copy with the latent (oversampled) wet path so that a
         // dry/wet blend below 100% does not comb-filter. The antialiasing
         // delay is added on top by delaying the dry input (pushDryAligned).
-        mixer_.setLatencyCompensation(oversampler_ ? oversampler_->getLatency() : 0);
+        // Behind minimum-phase filters the dry copy crosses the same filters
+        // instead (OversamplingDryPath): the mix then adds in phase at every
+        // frequency, which a delay cannot do against a fractional,
+        // frequency-dependent delay.
+        dryThroughFilters_ = oversampler_ && oversampler_->getMode() == Oversampling<T>::Mode::PolyphaseIir;
+        if (dryThroughFilters_) dryPath_.prepare(spec, *oversampler_);
+        mixer_.setLatencyCompensation(oversampler_ && !dryThroughFilters_ ? oversampler_->getLatency() : 0);
         processFactor_ = oversampler_ ? oversampler_->getFactor() : 1;
         dryScratch_.resize(spec.numChannels, spec.maxBlockSize);
         resetAntialiasState();
@@ -175,6 +183,7 @@ public:
     void reset() noexcept
     {
         mixer_.reset();
+        dryPath_.reset();
         if (oversampler_) oversampler_->reset();
         for (int ch = 0; ch < kMaxChannels; ++ch)
             slewPrev_[ch] = T(0);
@@ -349,6 +358,31 @@ public:
     /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
     [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return osAutomatic_.load(std::memory_order_relaxed); }
 
+    /** @brief How the oversampler filters (see setOversamplingMode()). */
+    enum class OversamplingMode
+    {
+        LinearPhase,  ///< Linear-phase half-bands: the latency of the factor, the dry path a delay (default).
+        MinimumPhase  ///< Elliptic allpass half-bands: a few samples of latency, the dry path through the same filters.
+    };
+
+    /**
+     * @brief Chooses the oversampler's filters (applied by the next prepare()).
+     *
+     * MinimumPhase runs polyphase allpass half-bands: a few samples of
+     * latency instead of the factor's linear-phase latency, and a phase that
+     * bends toward the band edge, which the dry copy follows through the
+     * same filters so a partial mix does not comb-filter.
+     *
+     * @param mode LinearPhase (default) or MinimumPhase.
+     */
+    void setOversamplingMode(OversamplingMode mode) noexcept
+    {
+        osMode_.store(static_cast<OversamplingMode>(std::clamp(static_cast<int>(mode), 0, 1)), std::memory_order_relaxed);
+    }
+
+    /** @brief The oversampler's filters (setOversamplingMode()). */
+    [[nodiscard]] OversamplingMode getOversamplingMode() const noexcept { return osMode_.load(std::memory_order_relaxed); }
+
     [[nodiscard]] Mode getMode() const noexcept { return mode_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getCeiling() const noexcept { return ceilingDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getInputGain() const noexcept { return inputGainDb_.load(std::memory_order_relaxed); }
@@ -396,6 +430,7 @@ public:
         w.write("slewLimit", static_cast<float>(slewLimitMs_.load(std::memory_order_relaxed)));
         w.write("oversampling", osFactor_.load(std::memory_order_relaxed));
         w.write("oversamplingAuto", osAutomatic_.load(std::memory_order_relaxed));
+        w.write("oversamplingMode", static_cast<int32_t>(getOversamplingMode()));
         w.write("antialias", antialias_.load(std::memory_order_relaxed));
         return w.blob();
     }
@@ -414,6 +449,7 @@ public:
         setSlewLimit(static_cast<T>(r.read("slewLimit", 0.0f)));
         setOversampling(r.read("oversampling", 1));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
+        setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
         setAntialiasing(r.read("antialias", false));
         return true;
     }
@@ -527,7 +563,16 @@ protected:
         dryPos_ = pos;
         // The mixer blends only the prepared channels, so the scratch view
         // (prepared channels) is enough whatever the buffer's width.
-        if (extra > 0 && nS == buffer.getNumSamples())
+        if (dryThroughFilters_ && nS == buffer.getNumSamples())
+        {
+            if (extra <= 0)
+                for (int ch = 0; ch < nCh; ++ch)
+                    std::copy_n(buffer.getChannel(ch), nS, dryScratch_.getChannel(ch));
+            auto dry = dryScratch_.toView().getSubView(0, nS);
+            dryPath_.process(dry);
+            mixer_.pushDry(dry);
+        }
+        else if (extra > 0 && nS == buffer.getNumSamples())
             mixer_.pushDry(dryScratch_.toView().getSubView(0, nS));
         else
             mixer_.pushDry(buffer);
@@ -791,6 +836,9 @@ protected:
     std::atomic<T> slewLimitMs_ { T(0) };
     std::atomic<int> osFactor_ { 1 }; // Default to 1 (off)
     std::atomic<bool> osAutomatic_ { false }; ///< The factor follows the host rate.
+    std::atomic<OversamplingMode> osMode_ { OversamplingMode::LinearPhase }; ///< setOversamplingMode().
+    OversamplingDryPath<T> dryPath_;          ///< The dry copy through minimum-phase filters.
+    bool dryThroughFilters_ = false;          ///< The dry copy crosses the filters (minimum phase).
     static constexpr double kAutomaticInternalRate = 88200.0; ///< Rate the automatic factor reaches.
 
     // History states per channel

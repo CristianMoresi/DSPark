@@ -4418,3 +4418,43 @@ DSPARK_TEST(PitchFollower_offline_track_points_and_degenerate_inputs)
     EXPECT_TRUE(carried);
     EXPECT_TRUE(sameVoicing);
 }
+
+// New: the dominant level of a pair (the larger eigenvalue of the averaged
+// covariance) and the spectrum read in bands of the ear.
+DSPARK_TEST(PhaseCorrelation_dominant_level_and_auditory_spectrum)
+{
+    const auto measure = [](float gl, float gr) {
+        PhaseCorrelation<float> pc;
+        pc.prepare(spec(48000.0, 512, 2));
+        std::vector<float> l(512), r(512);
+        for (int blk = 0; blk < 200; ++blk)
+        {
+            for (int i = 0; i < 512; ++i)
+            {
+                const float s = static_cast<float>(std::sin(2.0 * 3.14159265358979323846 * 1000.0 * (blk * 512 + i) / 48000.0));
+                l[static_cast<size_t>(i)] = gl * s;
+                r[static_cast<size_t>(i)] = gr * s;
+            }
+            float* p[2] = { l.data(), r.data() };
+            pc.processBlock(AudioBufferView<float>(p, 2, 512));
+        }
+        return static_cast<double>(pc.getDominantLevelDb());
+    };
+    EXPECT_NEAR(measure(1.0f, 1.0f), 0.0, 0.2);
+    EXPECT_NEAR(measure(1.0f, 0.0f), -3.01, 0.2);
+    EXPECT_NEAR(measure(1.0f, -1.0f), 0.0, 0.2);
+
+    SpectrumAnalyzer<float> sa;
+    sa.prepare(48000.0, 2048);
+    std::vector<float> buf(8192);
+    generateSine(buf.data(), 8192, 1000.0f, 48000.0f);
+    sa.pushSamples(buf.data(), 8192);
+    AuditoryBands<double> bands;
+    bands.prepare(48000.0, 2048, 72);
+    std::vector<float> out(72);
+    std::vector<double> scratch(1025 + 72);
+    SpectrumAnalyzer<float>::toAuditoryBands(bands, sa.getMagnitudesDb(), out.data(), scratch.data());
+    int top = 0;
+    for (int b = 1; b < 72; ++b) if (out[static_cast<size_t>(b)] > out[static_cast<size_t>(top)]) top = b;
+    EXPECT_NEAR(bands.getCentre(top), 1000.0, 120.0);
+}

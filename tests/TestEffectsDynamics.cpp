@@ -25,6 +25,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <initializer_list>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -7303,5 +7304,89 @@ DSPARK_TEST(CrossoverFilter_linear_phase_bands_match_the_ideal_response)
         }
         std::cout << "  " << c.bands << " bands LR" << c.order << ": worst |H - ideal| " << worst << "\n";
         EXPECT_LT(worst, c.tol);
+    }
+}
+
+// New: delta listen. The output of the delta twin plus the output of the
+// plain one is the input, late by the latency: the compressor (no makeup),
+// the de-esser and the dynamic equalizer.
+namespace {
+
+std::vector<float> l13Burst(size_t n)
+{
+    std::vector<float> v(n);
+    uint32_t seed = 21u;
+    for (size_t i = 0; i < n; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double env = (i / 4800) % 2 == 0 ? 0.5 : 0.05;
+        v[i] = static_cast<float>(env * (0.7 * std::sin(2.0 * 3.14159265358979323846 * 900.0 * static_cast<double>(i) / 48000.0)
+                                         + 0.3 * (static_cast<double>(seed >> 8) / 8388608.0 - 1.0)));
+    }
+    return v;
+}
+
+template <typename P>
+std::vector<float> l13Through(P& p, std::vector<float> x, int block = 128)
+{
+    std::vector<float> r = x;
+    for (size_t off = 0; off < x.size(); off += static_cast<size_t>(block))
+    {
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(block), x.size() - off));
+        float* ch[2] = { x.data() + off, r.data() + off };
+        p.processBlock(AudioBufferView<float>(ch, 2, n));
+    }
+    return x;
+}
+
+} // namespace
+
+DSPARK_TEST(Delta_listen_is_the_complement_of_the_output)
+{
+    const std::vector<float> in = l13Burst(48000);
+    const auto check = [&](const std::vector<float>& a, const std::vector<float>& b, int lat) {
+        double worst = 0.0;
+        for (size_t i = static_cast<size_t>(lat); i < in.size(); ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(a[i] + b[i] - in[i - static_cast<size_t>(lat)])));
+        return worst;
+    };
+    {
+        Compressor<float> a, b;
+        for (auto* c : { &a, &b })
+        {
+            c->setThreshold(-24.0f); c->setRatio(4.0f); c->setAttack(5.0f); c->setRelease(80.0f);
+            c->prepare(spec(48000.0, 128, 2));
+        }
+        b.setDelta(true);
+        EXPECT_TRUE(b.isDelta());
+        const auto plain = l13Through(a, in);
+        const auto delta = l13Through(b, in);
+        EXPECT_LT(check(plain, delta, a.getLatency()), 1e-5);
+        double taken = 0.0;
+        for (float x : delta) taken = std::max(taken, std::abs(static_cast<double>(x)));
+        EXPECT_GT(taken, 0.05);
+    }
+    {
+        DeEsser<float> a, b;
+        for (auto* d : { &a, &b }) { d->setThreshold(-40.0f); d->prepare(spec(48000.0, 128, 2)); }
+        b.setDelta(true);
+        const auto plain = l13Through(a, in);
+        const auto delta = l13Through(b, in);
+        EXPECT_LT(check(plain, delta, 0), 1e-6);
+    }
+    {
+        auto a = std::make_unique<DynamicEQ<float>>();
+        auto b = std::make_unique<DynamicEQ<float>>();
+        for (auto* d : { a.get(), b.get() })
+        {
+            DynamicEQ<float>::BandConfig band;
+            band.enabled = true; band.frequency = 900.0f; band.threshold = -30.0f; band.aboveRatio = 4.0f; band.aboveRangeDb = 12.0f;
+            d->setBand(0, band);
+            d->prepare(spec(48000.0, 128, 2));
+        }
+        b->setDelta(true);
+        const auto plain = l13Through(*a, in);
+        const auto delta = l13Through(*b, in);
+        EXPECT_LT(check(plain, delta, a->getLatency()), 1e-5);
     }
 }

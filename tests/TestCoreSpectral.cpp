@@ -10,6 +10,9 @@
 #include "../Core/ZeroLatencyConvolver.h"
 #include "../Core/Hilbert.h"
 #include "../Core/Resampler.h"
+#include "../Core/AuditoryBands.h"
+#include "../Core/SpectralEnvelope.h"
+#include "../Core/SpectralFilter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -2877,4 +2880,164 @@ DSPARK_TEST(ZeroLatencyConvolver_growing_partitions_null_against_exact)
         std::cout << "  block " << block << ": max error " << db << " dB re peak\n";
         EXPECT_LT(db, -115.0);
     }
+}
+
+// ============================================================================
+// Auditory bands, spectral envelope, spectral filter
+// ============================================================================
+
+// New: the published formulas of the auditory scale, the dominant power of a
+// pair, and the band mapping (a bin's weights sum to one).
+DSPARK_TEST(AuditoryBands_scale_loudness_and_band_mapping)
+{
+    EXPECT_NEAR(AuditoryScale::hzToBark(1000.0), 26.81 * 1000.0 / 2960.0 - 0.53, 1e-9);
+    for (double f : { 50.0, 200.0, 1000.0, 5000.0, 15000.0 })
+        EXPECT_NEAR(AuditoryScale::barkToHz(AuditoryScale::hzToBark(f)) / f, 1.0, 1e-9);
+    EXPECT_NEAR(AuditoryScale::criticalBandwidth(1000.0), 25.0 + 75.0 * std::pow(2.4, 0.69), 1e-9);
+    EXPECT_NEAR(AuditoryScale::thresholdInQuietDb(1000.0), 3.64 - 6.5 * std::exp(-0.6 * 2.3 * 2.3) + 1e-3, 1e-9);
+    EXPECT_LT(AuditoryScale::thresholdInQuietDb(3300.0), -4.0);
+    EXPECT_GT(AuditoryScale::loudnessExponent(50.0), AuditoryScale::loudnessExponent(3300.0));
+    EXPECT_NEAR(AuditoryScale::dominantPower(0.5, 0.5, 0.5), 1.0, 1e-12);
+    EXPECT_NEAR(AuditoryScale::dominantPower(0.5, 0.0, 0.0), 0.5, 1e-12);
+    EXPECT_NEAR(AuditoryScale::dominantPower(0.5, 0.5, -0.5), 1.0, 1e-12);
+    EXPECT_NEAR(AuditoryScale::dominantPower(0.5, 0.5, 0.0), 0.5, 1e-12);
+
+    AuditoryBands<double> bands;
+    bands.prepare(48000.0, 2048, 72);
+    EXPECT_EQ(bands.getNumBands(), 72);
+    EXPECT_NEAR(bands.getCentre(0), 20.0, 0.5);
+    EXPECT_NEAR(bands.getCentre(71), 20000.0, 20.0);
+    std::vector<double> power(1025, 0.0), out(72, 0.0);
+    power[100] = 1.0;   // 2.3 kHz: bands wider than a bin there
+    bands.bandPowers(power.data(), out.data());
+    double sum = 0.0;
+    int nonZero = 0;
+    for (double v : out) { sum += v; nonZero += v > 0.0 ? 1 : 0; }
+    EXPECT_NEAR(sum, 1.0, 1e-12);
+    EXPECT_TRUE(nonZero <= 2);
+    std::vector<double> specific(72), quiet(72, 0.0), loud(72, 1e-3);
+    bands.specificLoudness(quiet.data(), specific.data());
+    EXPECT_NEAR(bands.totalLoudness(specific.data()), 0.0, 1e-12);
+    bands.specificLoudness(loud.data(), specific.data());
+    const double l1 = bands.totalLoudness(specific.data());
+    for (auto& v : loud) v *= 10.0;
+    bands.specificLoudness(loud.data(), specific.data());
+    EXPECT_GT(bands.totalLoudness(specific.data()), l1 * 1.5);
+}
+
+// New: the envelope smooths at a width that grows with frequency, and a peak
+// stands over it as a resonance.
+DSPARK_TEST(SpectralEnvelope_finds_a_resonance)
+{
+    SpectralEnvelope<double> env;
+    env.prepare(1025, 1.0 / 3.0);
+    std::vector<double> db(1025, -40.0), res(1025);
+    db[400] = -20.0;
+    env.resonances(db.data(), res.data());
+    EXPECT_GT(res[400], 15.0);
+    double away = 0.0;
+    for (int k = 0; k < 1025; ++k) if (std::abs(k - 400) > 60) away = std::max(away, res[static_cast<size_t>(k)]);
+    EXPECT_LT(away, 0.01);
+    EXPECT_NEAR(env.getWidth(), 1.0 / 3.0, 1e-12);
+}
+
+namespace {
+
+// Runs a SpectralFilter over a signal in blocks of a given size with a design.
+template <typename Design>
+std::vector<float> sfRun(SpectralFilter<float>& f, const std::vector<float>& in, int block, Design&& design,
+                         const std::vector<float>* key = nullptr)
+{
+    std::vector<float> x = in;
+    for (size_t off = 0; off < x.size(); off += static_cast<size_t>(block))
+    {
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(block), x.size() - off));
+        float* p[1] = { x.data() + off };
+        AudioBufferView<float> v(p, 1, n);
+        if (key != nullptr)
+        {
+            std::vector<float> k(key->begin() + static_cast<std::ptrdiff_t>(off), key->begin() + static_cast<std::ptrdiff_t>(off) + n);
+            float* kp[1] = { k.data() };
+            AudioBufferView<float> kv(kp, 1, n);
+            f.processBlock(v, &kv, design);
+        }
+        else
+        {
+            f.processBlock(v, design);
+        }
+    }
+    return x;
+}
+
+std::vector<float> sfNoise(size_t n, uint32_t seed)
+{
+    std::vector<float> v(n);
+    for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = 0.3f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
+    return v;
+}
+
+} // namespace
+
+// New: the spectral filter. A gain of one is the input late by the window,
+// whatever the blocks; a flat gain scales it; a cut leaves nothing before
+// the event (minimum phase); the delta is the complement; a key replaces the
+// power the design reads.
+DSPARK_TEST(SpectralFilter_delay_scale_minimum_phase_delta_and_key)
+{
+    const AudioSpec s = spec(48000.0, 512, 1);
+    const std::vector<float> in = sfNoise(24000, 3u);
+    const auto unity = [](int, const float*, float*, int) noexcept {};
+    SpectralFilter<float> f;
+    f.prepare(s, 1024, 2, 4);
+    EXPECT_EQ(f.getLatency(), 1024);
+    const auto a = sfRun(f, in, 512, unity);
+    double worst = 0.0;
+    for (size_t i = 3000; i < in.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(a[i] - in[i - 1024])));
+    EXPECT_LT(worst, 1e-5);
+    f.reset();
+    const auto b = sfRun(f, in, 77, unity);
+    double chunk = 0.0;
+    for (size_t i = 0; i < in.size(); ++i) chunk = std::max(chunk, std::abs(static_cast<double>(a[i] - b[i])));
+    EXPECT_LT(chunk, 1e-6);
+
+    f.reset();
+    const auto c = sfRun(f, in, 512, [](int, const float*, float* g, int n) noexcept { for (int k = 0; k < n; ++k) g[k] = 0.1f; });
+    double scaled = 0.0;
+    for (size_t i = 3000; i < in.size(); ++i) scaled = std::max(scaled, std::abs(static_cast<double>(c[i] - 0.1f * in[i - 1024])));
+    EXPECT_LT(scaled, 1e-4);
+
+    // A low-pass curve on an impulse: nothing before the impulse comes out.
+    const auto lowPass = [](int, const float*, float* g, int n) noexcept {
+        for (int k = 0; k < n; ++k) g[k] = k * 48000.0f / 2048.0f < 2000.0f ? 1.0f : 0.01f;
+    };
+    std::vector<float> imp(12000, 0.0f);
+    imp[6000] = 1.0f;
+    f.reset();
+    const auto d = sfRun(f, imp, 512, lowPass);
+    double before = 0.0, total = 0.0;
+    for (size_t i = 0; i < d.size(); ++i)
+    {
+        const double e = static_cast<double>(d[i]) * d[i];
+        total += e;
+        if (i < 6000 + 1024 - 1) before += e;
+    }
+    EXPECT_GT(total, 1e-3);
+    EXPECT_LT(before, 1e-9 * total);
+
+    f.reset();
+    const auto kept = sfRun(f, in, 512, lowPass);
+    f.reset();
+    f.setDelta(true);
+    const auto taken = sfRun(f, in, 512, lowPass);
+    f.setDelta(false);
+    double complement = 0.0;
+    for (size_t i = 3000; i < in.size(); ++i)
+        complement = std::max(complement, std::abs(static_cast<double>(kept[i] + taken[i] - in[i - 1024])));
+    EXPECT_LT(complement, 1e-4);
+
+    const std::vector<float> silence(in.size(), 0.0f);
+    double seen = 0.0;
+    f.reset();
+    (void)sfRun(f, in, 512, [&](int, const float* p, float*, int n) noexcept { for (int k = 0; k < n; ++k) seen = std::max(seen, static_cast<double>(p[k])); }, &silence);
+    EXPECT_EQ(seen, 0.0);
 }

@@ -8,6 +8,9 @@
 #include "../Core/BiquadCascade.h"
 #include "../Core/FilterDesign.h"
 #include "../Core/FirBank.h"
+#include "../Core/AuditoryBands.h"
+#include "../Core/GraphicBank.h"
+#include "../Core/LaneCascade.h"
 #include "../Core/KeyEqualizer.h"
 #include "../Core/CabinetModel.h"
 #include "../Core/NormalizedLadder.h"
@@ -4770,4 +4773,90 @@ DSPARK_TEST(TransientFollower_reads_onsets_whatever_the_level)
     env.processBlock(AudioBufferView<float>(&q, 1, 48000));
     EXPECT_NEAR(static_cast<double>(env.getEnvelopeNormalized(0, -60.0f)), 40.0 / 60.0, 0.01);
     EXPECT_NEAR(static_cast<double>(env.getEnvelopeNormalized(0, -20.0f)), 0.0, 0.01);
+}
+
+// ============================================================================
+// Lane cascade and graphic bank
+// ============================================================================
+
+// New: the lane cascade is the serial cascade, late by its lanes.
+DSPARK_TEST(LaneCascade_is_the_serial_cascade_late_by_its_lanes)
+{
+    constexpr int kSections = 13;
+    std::vector<BiquadCoeffs> c(kSections);
+    for (int s = 0; s < kSections; ++s)
+        c[static_cast<size_t>(s)] = BiquadCoeffs::makePeak(48000.0, 60.0 * std::pow(1.6, s), 1.2, (s % 2 ? -4.0 : 5.0));
+    LaneCascade<double, 4> lanes;
+    lanes.prepare(kSections, 1);
+    for (int s = 0; s < kSections; ++s) lanes.setCoeffs(s, c[static_cast<size_t>(s)]);
+    EXPECT_EQ(lanes.getLatency(), 3);
+    std::vector<double> x(4000), ref(4000);
+    uint32_t seed = 9u;
+    for (auto& v : x) { seed = seed * 1664525u + 1013904223u; v = static_cast<double>(seed >> 8) / 8388608.0 - 1.0; }
+    // The serial reference, section by section in direct form I.
+    ref = x;
+    for (int s = 0; s < kSections; ++s)
+    {
+        const auto& q = c[static_cast<size_t>(s)];
+        double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        for (auto& v : ref)
+        {
+            const double y = q.b0 * v + q.b1 * x1 + q.b2 * x2 - q.a1 * y1 - q.a2 * y2;
+            x2 = x1; x1 = v; y2 = y1; y1 = y; v = y;
+        }
+    }
+    std::vector<double> out = x;
+    for (size_t off = 0; off < out.size(); off += 100)
+    {
+        double* p[1] = { out.data() + off };
+        lanes.processBlock(AudioBufferView<double>(p, 1, 100));
+    }
+    double worst = 0.0;
+    for (size_t i = 3; i < out.size(); ++i) worst = std::max(worst, std::abs(out[i] - ref[i - 3]));
+    EXPECT_LT(worst, 1e-12);
+}
+
+// New: the graphic bank meets the gains asked of its bands (the sections'
+// own gains are solved so their skirts do not pile up), and plays them.
+DSPARK_TEST(GraphicBank_meets_the_asked_gains)
+{
+    constexpr int kBands = 24;
+    std::vector<double> centres(kBands);
+    // Uniform in Bark, as the bank's critical-band Q expects.
+    const double z0 = AuditoryScale::hzToBark(50.0), z1 = AuditoryScale::hzToBark(16000.0);
+    for (int b = 0; b < kBands; ++b) centres[static_cast<size_t>(b)] = AuditoryScale::barkToHz(z0 + (z1 - z0) * b / (kBands - 1.0));
+    GraphicBank<float, 8> bank;
+    bank.prepare(48000.0, centres.data(), kBands, 1);
+    EXPECT_EQ(bank.getLatency(), 7);
+    std::vector<float> flat(kBands, 6.0f), zigzag(kBands);
+    for (int b = 0; b < kBands; ++b) zigzag[static_cast<size_t>(b)] = (b % 2 ? -4.0f : 4.0f);
+    bank.setGains(flat.data(), 0, 2);
+    double worst = 0.0, sectionMean = 0.0;
+    for (int b = 1; b < kBands - 1; ++b)
+    {
+        worst = std::max(worst, std::abs(bank.responseDb(centres[static_cast<size_t>(b)]) - 6.0));
+        sectionMean += bank.getSectionGain(b) / (kBands - 2);
+    }
+    EXPECT_LT(worst, 0.5);
+    EXPECT_LT(sectionMean, 5.0);   // the skirts carry part of every band
+    bank.setGains(zigzag.data(), 0, 2);
+    worst = 0.0;
+    for (int b = 2; b < kBands - 2; ++b)
+        worst = std::max(worst, std::abs(bank.responseDb(centres[static_cast<size_t>(b)]) - zigzag[static_cast<size_t>(b)]));
+    EXPECT_LT(worst, 1.5);
+
+    // A tone at a centre comes out at the bank's response there.
+    const double hz = centres[12];
+    std::vector<float> x(48000);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(0.1 * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0));
+    for (size_t off = 0; off < x.size(); off += 256)
+    {
+        const int m = static_cast<int>(std::min<size_t>(256, x.size() - off));
+        float* p[1] = { x.data() + off };
+        bank.processBlock(AudioBufferView<float>(p, 1, m));
+    }
+    double s = 0.0;
+    for (size_t i = 24000; i < x.size(); ++i) s += static_cast<double>(x[i]) * x[i];
+    const double gainDb = 10.0 * std::log10(s / 24000.0 / (0.01 * 0.5));
+    EXPECT_NEAR(gainDb, bank.responseDb(hz), 0.1);
 }

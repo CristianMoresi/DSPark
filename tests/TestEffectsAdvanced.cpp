@@ -28,6 +28,9 @@
 #include "../Effects/detail/PhaseVocoderEngine.h"
 #include "../Effects/GranularProcessor.h"
 #include "../Effects/SpectralDenoiser.h"
+#include "../Effects/TonalBalance.h"
+#include "../Effects/ResonanceSuppressor.h"
+#include "../Effects/SpectralDynamicEQ.h"
 #include "../Effects/TubePreamp.h"
 #include "../Effects/TransformerModel.h"
 #include "../Effects/TapeMachine.h"
@@ -8122,4 +8125,208 @@ DSPARK_TEST(ConvReverb_ir_swap_while_running_is_click_free)
     for (int i = 400 * 256 - 2; i < 403 * 256; ++i)
         swap = std::max(swap, static_cast<double>(std::abs(out[static_cast<size_t>(i)] - out[static_cast<size_t>(i - 1)])));
     EXPECT_LT(swap, 1.5 * steady);
+}
+
+// ============================================================================
+// Spectral effects: tonal balance, resonance suppressor, spectral dynamics,
+// and the options of the denoiser
+// ============================================================================
+
+namespace {
+
+std::vector<float> l13Noise(size_t n, float amp, uint32_t seed)
+{
+    std::vector<float> v(n);
+    for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
+    return v;
+}
+
+// Pink-ish noise (a one-pole low-pass of white noise plus some white).
+std::vector<float> l13Pinkish(size_t n, uint32_t seed)
+{
+    std::vector<float> w = l13Noise(n, 1.0f, seed), v(n);
+    double lp = 0.0;
+    for (size_t i = 0; i < n; ++i) { lp += 0.05 * (w[i] - lp); v[i] = static_cast<float>(0.1 * w[i] + 0.6 * lp); }
+    return v;
+}
+
+std::vector<float> l13Add(std::vector<float> a, double hz, double amp)
+{
+    for (size_t i = 0; i < a.size(); ++i) a[i] += static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0));
+    return a;
+}
+
+template <typename P>
+std::pair<std::vector<float>, std::vector<float>> l13Run(P& p, std::vector<float> l, std::vector<float> r, int block = 256)
+{
+    for (size_t off = 0; off < l.size(); off += static_cast<size_t>(block))
+    {
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(block), l.size() - off));
+        float* ch[2] = { l.data() + off, r.data() + off };
+        p.processBlock(AudioBufferView<float>(ch, 2, n));
+    }
+    return { l, r };
+}
+
+double l13Line(const std::vector<float>& v, double hz, size_t from, size_t n)
+{
+    double re = 0.0, im = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double ph = 2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0;
+        const double w = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * static_cast<double>(i) / static_cast<double>(n));
+        re += w * v[from + i] * std::cos(ph);
+        im += w * v[from + i] * std::sin(ph);
+    }
+    return 20.0 * std::log10(std::max(4.0 * std::sqrt(re * re + im * im) / static_cast<double>(n), 1e-15));
+}
+
+double l13RmsDb(const std::vector<float>& v, size_t from, size_t to)
+{
+    double s = 0.0;
+    for (size_t i = from; i < to; ++i) s += static_cast<double>(v[i]) * v[i];
+    return 10.0 * std::log10(std::max(s / static_cast<double>(to - from), 1e-30));
+}
+
+} // namespace
+
+// New: the tonal balance lowers a band that stands out of the trend of the
+// programme, keeps the loudness, and with every amount at zero is the input
+// late by its latency.
+DSPARK_TEST(TonalBalance_tames_a_peak_and_keeps_the_loudness)
+{
+    const size_t n = 48000 * 4;
+    const std::vector<float> base = l13Pinkish(n, 5u);
+    const std::vector<float> peaked = l13Add(base, 3000.0, 0.15);
+    auto tb = std::make_unique<TonalBalance<float>>();
+    tb->prepare(spec(48000.0, 256, 2));
+    const auto out = l13Run(*tb, peaked, peaked);
+    int at3k = 0;
+    for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+        if (std::abs(tb->getBandCentre(b) - 3000.0) < std::abs(tb->getBandCentre(at3k) - 3000.0)) at3k = b;
+    EXPECT_LT(static_cast<double>(tb->getCorrection(at3k)), -1.0);
+    const int lat = tb->getLatency();
+    EXPECT_LT(l13Line(out.first, 3000.0, 96000, 96000) - l13Line(peaked, 3000.0, 96000 - static_cast<size_t>(lat), 96000), -1.0);
+    EXPECT_NEAR(l13RmsDb(out.first, 96000, n), l13RmsDb(peaked, 96000, n), 1.5);
+
+    auto still = std::make_unique<TonalBalance<float>>();
+    still->setBalance(0.0f); still->setBoost(0.0f); still->setTame(0.0f);
+    still->prepare(spec(48000.0, 256, 2));
+    const auto same = l13Run(*still, base, base);
+    double worst = 0.0;
+    for (size_t i = static_cast<size_t>(lat) + 1000; i < n; ++i)
+        worst = std::max(worst, std::abs(static_cast<double>(same.first[i] - base[i - static_cast<size_t>(lat)])));
+    EXPECT_LT(worst, 1e-4);
+
+    const std::vector<float> silence(48000, 0.0f);
+    auto quiet = std::make_unique<TonalBalance<float>>();
+    quiet->prepare(spec(48000.0, 256, 2));
+    const auto zero = l13Run(*quiet, silence, silence);
+    double top = 0.0;
+    for (float x : zero.first) top = std::max(top, std::abs(static_cast<double>(x)));
+    EXPECT_EQ(top, 0.0);
+
+    TonalBalance<float> c;
+    c.setRange(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(c.getRange(), 6.0f);
+    c.setTilt(40.0f);
+    EXPECT_EQ(c.getTilt(), 6.0f);
+}
+
+// New: the resonance suppressor takes a line out of noise and leaves the
+// noise; the delta is what it takes out.
+DSPARK_TEST(ResonanceSuppressor_takes_out_a_resonance)
+{
+    const size_t n = 48000 * 3;
+    const std::vector<float> noise = l13Noise(n, 0.1f, 7u);
+    const std::vector<float> rung = l13Add(noise, 2000.0, 0.2);
+    auto rs = std::make_unique<ResonanceSuppressor<float>>();
+    rs->prepare(spec(48000.0, 256, 2));
+    const int lat = rs->getLatency();
+    EXPECT_EQ(lat, 2048);
+    const auto out = l13Run(*rs, rung, rung);
+    const size_t from = 72000, len = 48000;
+    EXPECT_LT(l13Line(out.first, 2000.0, from, len) - l13Line(rung, 2000.0, from - static_cast<size_t>(lat), len), -6.0);
+    EXPECT_NEAR(l13Line(out.first, 600.0, from, len), l13Line(rung, 600.0, from - static_cast<size_t>(lat), len), 6.0);
+
+    auto delta = std::make_unique<ResonanceSuppressor<float>>();
+    delta->setDelta(true);
+    delta->prepare(spec(48000.0, 256, 2));
+    const auto taken = l13Run(*delta, rung, rung);
+    double worst = 0.0;
+    for (size_t i = 48000; i < n; ++i)
+        worst = std::max(worst, std::abs(static_cast<double>(out.first[i] + taken.first[i] - rung[i - static_cast<size_t>(lat)])));
+    EXPECT_LT(worst, 1e-3);
+
+    ResonanceSuppressor<float> c;
+    c.setDepth(5.0f);
+    EXPECT_EQ(c.getDepth(), 1.0f);
+    c.setMode(ResonanceSuppressor<float>::Mode::Hard);
+    EXPECT_TRUE(c.getMode() == ResonanceSuppressor<float>::Mode::Hard);
+}
+
+// New: spectral dynamics. Inside one bell, the cell with the loud tone is
+// reduced and a quiet frequency of the same bell is left nearly alone.
+DSPARK_TEST(SpectralDynamicEQ_acts_cell_by_cell)
+{
+    using S = SpectralDynamicEQ<float>;
+    const size_t n = 48000 * 3;
+    const std::vector<float> in = l13Add(l13Add(l13Noise(n, 0.01f, 11u), 2500.0, 0.3), 1500.0, 0.01);
+    auto eq = std::make_unique<S>();
+    S::Band b;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 0.7f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    eq->setBand(0, b);
+    eq->prepare(spec(48000.0, 256, 2));
+    const auto out = l13Run(*eq, in, in);
+    const auto lat = static_cast<size_t>(eq->getLatency());
+    const size_t from = 72000, len = 48000;
+    EXPECT_LT(l13Line(out.first, 2500.0, from, len) - l13Line(in, 2500.0, from - lat, len), -3.0);
+    EXPECT_GT(l13Line(out.first, 1500.0, from, len) - l13Line(in, 1500.0, from - lat, len), -1.5);
+    const S::Band back = eq->getBand(0);
+    EXPECT_TRUE(back.shape == S::Shape::Bell);
+    EXPECT_EQ(back.cells, 32);
+    b.cells = 999;
+    eq->setBand(1, b);
+    EXPECT_EQ(eq->getBand(1).cells, S::kMaxCells);
+}
+
+// New: the options of the denoiser. The delta is the complement of the
+// output; smoothing and release still reduce the learned noise; the filter
+// mode reduces it about as the STFT does, with the same latency.
+DSPARK_TEST(SpectralDenoiser_options_delta_and_filter_mode)
+{
+    const size_t n = 48000 * 3;
+    const std::vector<float> noise = l13Noise(n, 0.05f, 13u);
+    const auto learnThen = [&](SpectralDenoiser<float>& d) {
+        d.prepare(spec(48000.0, 256, 2));
+        d.setLearning(true);
+        (void)l13Run(d, noise, noise);
+        d.setLearning(false);
+        return l13Run(d, noise, noise);
+    };
+    auto plain = std::make_unique<SpectralDenoiser<float>>();
+    const auto a = learnThen(*plain);
+    auto smooth = std::make_unique<SpectralDenoiser<float>>();
+    smooth->setSpectralSmoothing(0.5f);
+    smooth->setGainRelease(100.0f);
+    const auto b = learnThen(*smooth);
+    auto deltaD = std::make_unique<SpectralDenoiser<float>>();
+    deltaD->setDelta(true);
+    const auto c = learnThen(*deltaD);
+    const int lat = plain->getLatency();
+    double worst = 0.0;
+    for (size_t i = 24000; i < n; ++i)
+        worst = std::max(worst, std::abs(static_cast<double>(a.first[i] + c.first[i] - noise[i - static_cast<size_t>(lat)])));
+    EXPECT_LT(worst, 1e-3);
+    const double reducedStft = l13RmsDb(a.first, 48000, n) - l13RmsDb(noise, 48000, n);
+    EXPECT_LT(reducedStft, -6.0);
+    EXPECT_LT(l13RmsDb(b.first, 48000, n) - l13RmsDb(noise, 48000, n), -6.0);
+    auto filtered = std::make_unique<SpectralDenoiser<float>>();
+    filtered->setFilterMode(true);
+    const auto f = learnThen(*filtered);
+    EXPECT_EQ(filtered->getLatency(), lat);
+    EXPECT_NEAR(l13RmsDb(f.first, 48000, n) - l13RmsDb(noise, 48000, n), reducedStft, 4.0);
+    bool finite = true;
+    for (float x : f.first) finite = finite && std::isfinite(x);
+    EXPECT_TRUE(finite);
 }

@@ -302,6 +302,31 @@ DSPARK_TEST(State_roundtrip_new_effects)
     EXPECT_TRUE((roundTrip<SpectralDenoiser<float>>([](auto& d) {
         d.setReduction(24.0f); d.setThreshold(3.0f);
     })));
+    EXPECT_TRUE((roundTrip<SpectralDenoiser<float>>([](auto& d) {
+        d.setSpectralSmoothing(0.4f); d.setGainRelease(120.0f); d.setFilterMode(true); d.setLink(0.5f);
+        KeyEqualizer<float, 2>::Band b;
+        b.shape = KeyEqualizer<float, 2>::Shape::Bell; b.frequency = 3000.0f; b.gainDb = 6.0f;
+        d.setSensitivityBand(0, b);
+    })));
+    EXPECT_TRUE((roundTrip<TonalBalance<float>>([](auto& t) {
+        t.setBalance(0.8f); t.setBoost(0.1f); t.setTame(0.9f); t.setTilt(-1.5f); t.setRange(9.0f);
+        t.setKnee(2.0f); t.setFrequencyRange(40.0f, 16000.0f); t.setLevelCompensation(true); t.setReferenceLevel(90.0f);
+    })));
+    EXPECT_TRUE((roundTrip<ResonanceSuppressor<float>>([](auto& r) {
+        r.setThreshold(5.0f); r.setDepth(0.5f); r.setRange(18.0f); r.setWidth(0.5f); r.setAttack(2.0f);
+        r.setRelease(200.0f); r.setMode(ResonanceSuppressor<float>::Mode::Hard);
+        r.setLinkMode(ResonanceSuppressor<float>::Link::MidSide); r.setLink(0.3f); r.setMidSideBalance(1.5f);
+        r.setQuality(ResonanceSuppressor<float>::Quality::Offline);
+        KeyEqualizer<float, 2>::Band b;
+        b.shape = KeyEqualizer<float, 2>::Shape::HighShelf; b.frequency = 5000.0f; b.gainDb = 4.0f;
+        r.setSensitivityBand(2, b);
+    })));
+    EXPECT_TRUE((roundTrip<SpectralDynamicEQ<float>>([](auto& e) {
+        SpectralDynamicEQ<float>::Band b;
+        b.shape = SpectralDynamicEQ<float>::Shape::HighShelf; b.frequency = 6000.0f; b.threshold = -9.0f;
+        b.ratio = 6.0f; b.range = -8.0f; b.attack = 3.0f; b.release = 90.0f; b.cells = 48;
+        e.setBand(3, b);
+    })));
 }
 
 // The two effects that had no state: every setting survives the trip, a blob

@@ -45,6 +45,11 @@ void instantiate()
     [[maybe_unused]] TailShaper<T> tailShaper;
     [[maybe_unused]] BucketBrigade<T> bucketBrigade;
     [[maybe_unused]] TapeTransport<T> tapeTransport;
+    [[maybe_unused]] AuditoryBands<T> auditoryBands;
+    [[maybe_unused]] SpectralEnvelope<T> spectralEnvelope;
+    [[maybe_unused]] SpectralFilter<T> spectralFilter;
+    [[maybe_unused]] LaneCascade<T, 8> laneCascade;
+    [[maybe_unused]] GraphicBank<T, 8> graphicBank;
     [[maybe_unused]] CabinetModel<T> cabinetModel;
     Oversampling<T> ov(2);
     OversamplingDryPath<T> ovDry;
@@ -102,6 +107,9 @@ void instantiate()
     RingModulator<T> rm;
     Saturation<T> sat;
     SpectralDenoiser<T> denoiser;
+    [[maybe_unused]] TonalBalance<T> tonalBalance;
+    [[maybe_unused]] ResonanceSuppressor<T> resonanceSuppressor;
+    [[maybe_unused]] SpectralDynamicEQ<T> spectralDynamicEq;
     StereoWidth<T> sw;
     StereoGenerator<T> stereoGenerator;
 #if DSPARK_HAS_OFFLINE

@@ -496,11 +496,28 @@ inline EffectSlot makeNoiseGate()
     s.addToggle("Adaptive Hold", false);
     // Threshold counted from the key's own recent level.
     s.addToggle("Auto Threshold", false);
+    // The key (indices 8 to 10): listen to it, a low cut (20 Hz: off) and a
+    // high cut (20 kHz: off), both at 24 dB per octave.
+    s.addToggle("Key Listen", false);
+    s.addSlider("Key Low Cut", 20, 2000, 20, "Hz");
+    s.addSlider("Key High Cut", 500, 20000, 20000, "Hz");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p](int i, float v) {
+        using Gate = dspark::NoiseGate<float>;
         switch(i) {
+            case 8: p->setSidechainListen(v > 0.5f); break;
+            case 9: case 10:
+            {
+                Gate::KeyBand band;
+                band.frequency = v;
+                band.slope = 24.0f;
+                if (i == 9) band.shape = v > 20.5f ? Gate::KeyShape::LowCut : Gate::KeyShape::Off;
+                else        band.shape = v < 19999.0f ? Gate::KeyShape::HighCut : Gate::KeyShape::Off;
+                p->setSidechainBand(i - 9, band);
+                break;
+            }
             case 0: p->setThreshold(v); break;
             case 1: p->setAttack(v); break;
             case 2: p->setHold(v); break;
@@ -527,11 +544,28 @@ inline EffectSlot makeExpander()
     s.addSlider("Range", -80, 0, -60, "dB");
     // Threshold counted from the key's own recent level.
     s.addToggle("Auto Threshold", false);
+    // The key (indices 7 to 9): listen to it, a low cut (20 Hz: off) and a
+    // high cut (20 kHz: off), both at 24 dB per octave.
+    s.addToggle("Key Listen", false);
+    s.addSlider("Key Low Cut", 20, 2000, 20, "Hz");
+    s.addSlider("Key High Cut", 500, 20000, 20000, "Hz");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p](int i, float v) {
+        using Exp = dspark::Expander<float>;
         switch(i) {
+            case 7: p->setSidechainListen(v > 0.5f); break;
+            case 8: case 9:
+            {
+                Exp::KeyBand band;
+                band.frequency = v;
+                band.slope = 24.0f;
+                if (i == 8) band.shape = v > 20.5f ? Exp::KeyShape::LowCut : Exp::KeyShape::Off;
+                else        band.shape = v < 19999.0f ? Exp::KeyShape::HighCut : Exp::KeyShape::Off;
+                p->setSidechainBand(i - 8, band);
+                break;
+            }
             case 0: p->setThreshold(v); break;
             case 1: p->setRatio(v); break;
             case 2: p->setAttack(v); break;

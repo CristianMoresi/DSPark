@@ -490,6 +490,37 @@ All notable user-facing changes to DSPark are documented here.
   `SpectrumAnalyzer::toAuditoryBands()`: a spectrum read in bands of the
   ear's scale. `WindowFunctions::asymmetricHann()`: a window for low-latency
   analysis.
+- `Compressor::setLinkMode()` and `DynamicEQ::setLinkMode()`
+  (`LinkMode::Dominant`, opt-in; state key `linkMode`): a stereo pair linked
+  to the level of its dominant component, the larger eigenvalue of the
+  covariance that the two channels' levels make with their correlation over
+  20 ms (`dominantPairPower()` and `dominantPairLevel()`, new in
+  `Core/DspMath.h`). A source moved by an equal-power pan reads the same
+  wherever it sits, and uncorrelated channels read the louder 3 dB down. A
+  1 kHz tone 21 dB over the threshold of a 4:1 compressor, centred and then
+  panned hard, is reduced by 15.09 and 15.09 dB (Loudest: 15.09 and 17.34);
+  in a dynamic band by 15.73 and 15.73 dB (Loudest: 15.73 and 17.99). With
+  the peak detector the compressor costs 28 to 38 ns per stereo frame with
+  it (17 to 22 with Loudest).
+- Minimum-phase oversampling in `Clipper`, `TubePreamp` and `TapeMachine`
+  (`setOversamplingMode()`, state key `oversamplingMode`), as `Saturation`
+  has it: polyphase allpass half-bands, with the dry copy of the mix through
+  the same filters (`OversamplingDryPath`), so a partial mix adds in phase at
+  every frequency. Latency at 48 kHz in samples, linear phase against
+  minimum phase: `Clipper` 64 and 3 at 2x, 70 and 4 at 4x; `TubePreamp` 71
+  and 10; `TapeMachine` 197 and 131.
+- `FilterEngine::setStructure(Structure::Ladder)` (opt-in; state key
+  `structure`): every section as a normalized ladder, whose memory can only
+  lose energy however fast the coefficients move, on the same 16-sample
+  ramps; `NormalizedLadder::processSegment()` runs one channel along a ramp
+  without moving it on. A resonant low-pass swept by the signal itself
+  (nonlinearity 1, Q 18, noise at three times full scale) peaks at 9.2
+  against 10.9 in direct form. Per stereo frame it costs 12 to 18 ns at rest
+  and 21 to 28 ns moving (direct form 10 to 17 and 12 to 22).
+- `SpectrumAnalyzer::WindowType::AsymmetricHann`: the weight on the recent
+  samples (the fall over the last eighth of the frame). A tone 1024 samples
+  after it starts reads -8.3 dB against -12.0 under a Hann window, and a
+  steady tone reads its level (-6.02 dB for 0.5).
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it
@@ -1338,6 +1369,15 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `PitchShifter::prepare(spec, 0)`: every engine takes the power of two
+  nearest 43 ms, as Studio did (Standard and High kept 2048 at any rate):
+  2048 at 44.1 and 48 kHz as before, 4096 at 88.2 and 96 kHz and 8192 at
+  176.4 and 192 kHz, so the analysis spans the same time at any rate (the
+  latency of Standard and High is twice the frame).
+- `StereoWidth`: the bass mono fades in and out over 20 ms with its filter
+  running. Switching it off stepped the side by its low end (up to 0.45 of a
+  0.5 side at 60 Hz) and switching it back on started from the filter's
+  stale memory; settled, the output is the same to the bit.
 - `TapeMachine::setNoise()`: the hiss is laid on the tape, before the
   reproduce head and the de-emphasis, so it takes the colour of the speed and
   the standard (at NAB 15 ips the band from 5 to 15 kHz is 11 dB under the

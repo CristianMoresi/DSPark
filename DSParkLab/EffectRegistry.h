@@ -321,8 +321,8 @@ inline EffectSlot makeCompressor()
     s.addSlider("Release", 10, 1000, 100, "ms");
     s.addSlider("Knee", 0, 30, 6, "dB");
     s.addSlider("Makeup", -12, 30, 0, "dB");
-    // Order MUST match dspark::Compressor::AutoMakeupMode (Off=0, Static=1, Adaptive=2).
-    s.addChoice("Auto Makeup", {"Off","Static","Adaptive"}, 0);
+    // Order MUST match dspark::Compressor::AutoMakeupMode (Off=0, Static=1, Adaptive=2, Analytic=3).
+    s.addChoice("Auto Makeup", {"Off","Static","Adaptive","Analytic"}, 0);
     s.addSlider("Mix", 0, 1, 1, "");
     // Detector order MUST match dspark::Compressor::DetectorType enum.
     // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4
@@ -346,6 +346,9 @@ inline EffectSlot makeCompressor()
     s.addSlider("Amount", 0, 1, 1, "");
     s.addSlider("Range", 0, 60, 60, "dB");
     s.addToggle("Soft Range", false);
+    // The control signal worked out between the samples (index 19). Order
+    // MUST match dspark::Compressor::Precision (Standard=0, High=1).
+    s.addChoice("Precision", {"Standard","High"}, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -370,6 +373,7 @@ inline EffectSlot makeCompressor()
             case 16: p->setAmount(v); break;
             case 17: p->setRange(v); break;
             case 18: p->setSoftRange(v > 0.5f); break;
+            case 19: p->setPrecision(static_cast<dspark::Compressor<float>::Precision>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -392,6 +396,8 @@ inline EffectSlot makeLimiter()
     s.addToggle("True Peak", false);
     s.addToggle("Hold Every Peak", false);
     s.addToggle("True Peak High Precision", false);
+    // A latency kept for the lookahead to move inside (0: the lookahead itself).
+    s.addSlider("Max Lookahead", 0, 10, 0, "ms");
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p, inputGainDb](auto b) {
         // Input Gain MUST be applied BEFORE the limiter - otherwise
@@ -421,6 +427,7 @@ inline EffectSlot makeLimiter()
                                             : dspark::Limiter<float>::HoldMode::Deepest); break;
             case 9: p->setTruePeakPrecision(v > 0.5f ? dspark::Limiter<float>::TruePeakPrecision::High
                                                      : dspark::Limiter<float>::TruePeakPrecision::Standard); break;
+            case 10: p->setMaxLookahead(v); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -439,6 +446,8 @@ inline EffectSlot makeNoiseGate()
     s.addSlider("Range", -80, 0, -80, "dB");
     s.addChoice("Gate Mode", {"Amplitude","Frequency"}, 0);
     s.addToggle("Adaptive Hold", false);
+    // Threshold counted from the key's own recent level.
+    s.addToggle("Auto Threshold", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -451,6 +460,7 @@ inline EffectSlot makeNoiseGate()
             case 4: p->setRange(v); break;
             case 5: p->setGateMode(static_cast<dspark::NoiseGate<float>::GateMode>(static_cast<int>(v))); break;
             case 6: p->setAdaptiveHold(v > 0.5f); break;
+            case 7: p->setAutoThreshold(v > 0.5f); break;
         }
     };
     return s;
@@ -467,6 +477,8 @@ inline EffectSlot makeExpander()
     s.addSlider("Hold", 0, 500, 50, "ms");
     s.addSlider("Release", 5, 500, 100, "ms");
     s.addSlider("Range", -80, 0, -60, "dB");
+    // Threshold counted from the key's own recent level.
+    s.addToggle("Auto Threshold", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -478,6 +490,7 @@ inline EffectSlot makeExpander()
             case 3: p->setHold(v); break;
             case 4: p->setRelease(v); break;
             case 5: p->setRange(v); break;
+            case 6: p->setAutoThreshold(v > 0.5f); break;
         }
     };
     return s;
@@ -516,6 +529,8 @@ inline EffectSlot makeDeEsser()
     s.addSlider("Threshold", -40, 0, 0, "dB");     // Default 0 dB = never triggers (neutral)
     s.addSlider("Reduction", 0, 24, 0, "dB");      // Default 0 dB = no reduction (neutral)
     s.addChoice("Detection", {"Bandpass","Derivative"}, 0);
+    // Threshold counted from the level of the whole input.
+    s.addToggle("Auto Threshold", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -526,6 +541,7 @@ inline EffectSlot makeDeEsser()
             case 2: p->setThreshold(v); break;
             case 3: p->setReduction(v); break;
             case 4: p->setDetectionMode(static_cast<dspark::DeEsser<float>::DetectionMode>(static_cast<int>(v))); break;
+            case 5: p->setAutoThreshold(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

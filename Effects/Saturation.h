@@ -7,7 +7,7 @@
  * @file Saturation.h
  * @brief Professional multi-algorithm saturation processor with analog simulation.
  *
- * This class provides a high-quality saturation pipeline featuring 10 distinct
+ * This class provides a high-quality saturation pipeline featuring 11 distinct
  * algorithms ranging from soft clipping to complex magnetic tape and
  * transformer modeling. It oversamples 2x by default, so its latency is the
  * oversampler's group delay (see getLatency()); at 1x it is zero. Second-order
@@ -1397,6 +1397,73 @@ public:
     }
 };
 
+// -- Curve (a family with three controls) -------------------------------------
+/**
+ * A soft clipper whose curve is shaped by three controls that would work on
+ * any curve with unit slope at the origin and a ceiling of 1 (here tanh):
+ *
+ * - hardness (0 to 0.95): the curve is a straight line up to it and the
+ *   whole tanh, squeezed, between it and the ceiling. 0 is tanh; towards 1
+ *   the knee shrinks to a corner.
+ * - curvature (0.5 to 4): the exponent p of f(u) = tanh(u^p)^(1/p), which
+ *   keeps the slope at the origin and the ceiling: over 1 the curve stays
+ *   on the line longer and turns faster, under 1 it leaves it at once.
+ * - asymmetry (-1 to 1): over 0 the negative half-cycle meets a ceiling of
+ *   2^-asymmetry, under 0 the positive one meets 2^asymmetry, with the same
+ *   slope at the origin: even harmonics, and a DC term the processor's DC
+ *   blocker removes. Neither half goes past 1.
+ *
+ * It has no antiderivative kernel: with antialiasing on it is delayed to
+ * the common alignment and relies on the oversampling.
+ */
+template <typename T>
+class CurveAlgorithm final : public SaturationAlgorithm<T>
+{
+    std::atomic<T> hardness_ { T(0) }, curvature_ { T(1) }, asymmetry_ { T(0) };
+    T knee_ = T(0), span_ = T(1), invSpan_ = T(1), power_ = T(1), invPower_ = T(1), negative_ = T(1), positive_ = T(1);
+
+public:
+    void prepare(const AudioSpec&) noexcept override {}
+    void reset() noexcept override { this->resetAlign(); }
+    typename Saturation<T>::Algorithm getType() const noexcept override { return Saturation<T>::Algorithm::Curve; }
+
+    /** Publishes the three controls (any thread; values that are not finite keep what they had). */
+    void setShape(T hardness, T curvature, T asymmetry) noexcept
+    {
+        if (std::isfinite(hardness)) hardness_.store(std::clamp(hardness, T(0), T(0.95)), std::memory_order_relaxed);
+        if (std::isfinite(curvature)) curvature_.store(std::clamp(curvature, T(0.5), T(4)), std::memory_order_relaxed);
+        if (std::isfinite(asymmetry)) asymmetry_.store(std::clamp(asymmetry, T(-1), T(1)), std::memory_order_relaxed);
+    }
+    [[nodiscard]] T getHardness() const noexcept { return hardness_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getCurvature() const noexcept { return curvature_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getAsymmetry() const noexcept { return asymmetry_.load(std::memory_order_relaxed); }
+
+    void update(T, T, const AudioSpec&) noexcept override
+    {
+        knee_ = hardness_.load(std::memory_order_relaxed);
+        span_ = T(1) - knee_;
+        invSpan_ = T(1) / span_;
+        power_ = curvature_.load(std::memory_order_relaxed);
+        invPower_ = T(1) / power_;
+        const T asym = asymmetry_.load(std::memory_order_relaxed);
+        negative_ = (asym > T(0)) ? std::pow(T(2), asym) : T(1);
+        positive_ = (asym < T(0)) ? std::pow(T(2), -asym) : T(1);
+    }
+
+    /** The curve on a driven sample. */
+    [[nodiscard]] inline T shape(T x) const noexcept
+    {
+        const T side = (x < T(0)) ? negative_ : positive_;
+        const T u = std::abs(x) * side;
+        if (u <= knee_) return x;
+        const T v = (u - knee_) * invSpan_;
+        const T bent = (power_ == T(1)) ? std::tanh(v) : std::pow(std::tanh(std::pow(v, power_)), invPower_);
+        return std::copysign((knee_ + span_ * bent) / side, x);
+    }
+
+    inline T processSample(T sample, T drive, T, int) noexcept { return shape(sample * drive); }
+};
+
 // -- MultiStage (Tube -> Tape -> Transformer cascade) -------------------------
 template <typename T>
 class MultiStageAlgorithm final : public SaturationAlgorithm<T>
@@ -1527,7 +1594,7 @@ public:
  * @class Saturation
  * @brief Professional multi-algorithm saturation processor with analog simulation.
  *
- * This class provides a high-quality saturation pipeline featuring 10 distinct
+ * This class provides a high-quality saturation pipeline featuring 11 distinct
  * algorithms ranging from soft clipping to complex magnetic tape and
  * transformer modeling. Zero latency at 1x; with oversampling enabled the
  * latency equals the oversampler group delay, plus two samples at 2x (one at
@@ -1562,7 +1629,15 @@ public:
         Wavefolder,  /**< First-order ADAA (Antiderivative Anti-Aliasing) sine wavefolder. */
         Bitcrusher,  /**< Quantization noise generator with TPDF dithering. */
         Downsample,  /**< Sample-and-hold rate reduction with anti-aliasing pre-filtering. */
-        MultiStage   /**< Serial cascade: Tube -> Tape -> Transformer. Gain-staged internally. */
+        MultiStage,  /**< Serial cascade: Tube -> Tape -> Transformer. Gain-staged internally. */
+        Curve        /**< A soft clipper shaped by three controls (setCurveShape()): how far it stays straight, how fast it turns, and how unlike its two halves are. */
+    };
+
+    /** @brief How the oversampler filters (see setOversamplingMode()). */
+    enum class OversamplingMode
+    {
+        LinearPhase,    ///< Linear-phase half-bands: the latency of the factor, the dry path a delay.
+        MinimumPhase    ///< Elliptic allpass half-bands: a few samples of latency, the dry path through the same filters.
     };
 
     /** @brief Determines how the stereo field is processed. */
@@ -1617,6 +1692,7 @@ public:
         pool_[7]  = std::make_unique<detail::BitcrusherAlgorithm<SampleType>>();
         pool_[8]  = std::make_unique<detail::DownsampleAlgorithm<SampleType>>();
         pool_[9]  = std::make_unique<detail::MultiStageAlgorithm<SampleType>>();
+        pool_[10] = std::make_unique<detail::CurveAlgorithm<SampleType>>();
 
         active_.store(pool_[static_cast<int>(Algorithm::SoftClip)].get());
         next_.store(nullptr);
@@ -1668,8 +1744,9 @@ public:
         dryWetMixer_.prepare(spec);
         
         if (oversamplingFactor_ > 1 && !oversampler_)
-            oversampler_ = makeOversampler(oversamplingFactor_);
+            oversampler_ = makeOversampler(oversamplingFactor_, oversamplingMode_);
         if (oversampler_) oversampler_->prepare(spec);
+        prepareStages();
 
         tempBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
         driftBuffer_.resize(spec.numChannels, spec.maxBlockSize * std::max(1, oversamplingFactor_));
@@ -1680,8 +1757,7 @@ public:
 
         // Keep the dry path aligned with the (latent) oversampled wet path so the
         // dry/wet, Delta and adaptive-blend mixes do not comb-filter.
-        dryWetMixer_.setLatencyCompensation(
-            (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
+        alignDryPath();
 
         // Base-rate smoothers (consumed once per base sample).
         auto sr = spec.sampleRate;
@@ -1710,6 +1786,10 @@ public:
         }
 
         reset();
+        if (driveCompensation_.load(std::memory_order_relaxed)) prepareCalibrator();
+        calibrate();
+        outputGainSmoother_.skip();
+        calibrationWait_ = 0;
         prepared_ = true;
     }
 
@@ -1753,6 +1833,8 @@ public:
         prevBlendSample_.fill(SampleType(0));
         prevSlewSample_.fill(SampleType(0));
         alignFresh_ = true;
+        dryPath_.reset();
+        resetStages();
     }
 
     // -- Audio Processing ----------------------------------------------------
@@ -1783,8 +1865,11 @@ public:
 
         // Blocks longer than the prepared maximum are processed in pieces
         // (the scratch buffers and the oversampler hold one maximum block).
+        // The tuned feedback reads what left the curve one delay ago: a piece
+        // is never longer than that delay.
         const int total = buffer.getNumSamples();
-        const int maxBlock = std::max(1, spec_.maxBlockSize);
+        maybeCalibrate(total);
+        const int maxBlock = std::min(std::max(1, spec_.maxBlockSize), syncStages());
         for (int off = 0; off < total; off += maxBlock)
             processChunk(buffer.getSubView(off, std::min(maxBlock, total - off)));
     }
@@ -1796,11 +1881,24 @@ private:
     /// are only as deep as its first (80 dB): every stage is then made at
     /// least 100 dB deep. At 2x and 4x the folding of the curve itself is
     /// what is left, so the preset stays.
-    [[nodiscard]] static std::unique_ptr<Oversampling<SampleType>> makeOversampler(int factor)
+    [[nodiscard]] static std::unique_ptr<Oversampling<SampleType>> makeOversampler(int factor, OversamplingMode mode)
     {
         using Os = Oversampling<SampleType>;
-        return std::make_unique<Os>(factor, Os::Quality::High, Os::Mode::LinearPhaseFir,
+        return std::make_unique<Os>(factor, Os::Quality::High,
+                                    mode == OversamplingMode::MinimumPhase ? Os::Mode::PolyphaseIir
+                                                                           : Os::Mode::LinearPhaseFir,
                                     factor >= 8 ? Os::Depth::Deep : Os::Depth::Preset);
+    }
+
+    /** Aligns the dry path with the wet one: a delay behind linear-phase
+     *  filters, the same filters behind minimum-phase ones (the mix then
+     *  adds in phase at every frequency). Setup thread. */
+    void alignDryPath()
+    {
+        const bool oversampled = oversampler_ && oversamplingFactor_ > 1;
+        dryThroughFilters_ = oversampled && oversamplingMode_ == OversamplingMode::MinimumPhase;
+        if (dryThroughFilters_) dryPath_.prepare(spec_, *oversampler_);
+        dryWetMixer_.setLatencyCompensation((oversampled && !dryThroughFilters_) ? oversampler_->getLatency() : 0);
     }
 
     void processChunk(AudioBufferView<SampleType> buffer) noexcept
@@ -1845,7 +1943,20 @@ private:
                     hold = in[i];
                 }
             }
-            dryWetMixer_.pushDry(dryAligned_.toView().getSubView(0, nS));
+            auto dryView = dryAligned_.toView().getSubView(0, nS);
+            if (dryThroughFilters_) dryPath_.process(dryView);
+            dryWetMixer_.pushDry(dryView);
+        }
+        else if (dryThroughFilters_)
+        {
+            const int nCh = std::min({buffer.getNumChannels(), dryAligned_.getNumChannels(), kMaxCh});
+            const int nS = std::min(buffer.getNumSamples(), dryAligned_.getNumSamples());
+            for (int ch = 0; ch < nCh; ++ch)
+                std::memcpy(dryAligned_.getChannel(ch), buffer.getChannel(ch),
+                            static_cast<std::size_t>(nS) * sizeof(SampleType));
+            auto dryView = dryAligned_.toView().getSubView(0, nS);
+            dryPath_.process(dryView);
+            dryWetMixer_.pushDry(dryView);
         }
         else
         {
@@ -1889,6 +2000,10 @@ private:
             (isMidSide && procMode_ == ProcessingMode::MidOnly)  ? 1 :
             (isMidSide && procMode_ == ProcessingMode::SideOnly) ? 0 : -1;
 
+        // The stages around the curve, in the domain the curve works in and
+        // away from the channel that stays unprocessed.
+        if (stagesOn_) stagesBefore(buffer, keepChannel);
+
         if (oversamplingFactor_ > 1 && oversampler_)
         {
             auto upView = oversampler_->upsample(buffer);
@@ -1923,6 +2038,8 @@ private:
                 std::memcpy(buffer.getChannel(keepChannel), msKeepBuffer_.getChannel(0),
                             static_cast<std::size_t>(baseSamples) * sizeof(SampleType));
         }
+
+        if (stagesOn_) stagesAfter(buffer, keepChannel);
 
         if (isMidSide) MidSide<SampleType>::decode(buffer);
 
@@ -2095,6 +2212,7 @@ public:
         const int order = std::clamp(static_cast<int>(mode), 0, 2);
         antialiasOrder_.store(order, std::memory_order_relaxed);   // serialization readback
         for (auto& a : pool_) if (a) a->setAntialias(order);
+        calibrationRequested_.store(true, std::memory_order_release);
     }
 
     /** @brief The selected antialiasing order. */
@@ -2115,6 +2233,187 @@ public:
         slewSensitivity_.store(std::clamp(amount, SampleType(0), SampleType(1)), std::memory_order_relaxed);
     }
     
+    /**
+     * @brief Shapes the Curve algorithm.
+     * @note Thread-Safe. Taken at the next block; values that are not finite
+     *       keep what they had.
+     * @param hardness  How far the curve stays a straight line before it
+     *                  turns, as a share of its ceiling: 0 (the whole of it
+     *                  bends) to 0.95 (a corner).
+     * @param curvature How fast it turns: 0.5 (it leaves the line at once)
+     *                  to 4 (it stays on it and turns late); 1 is neutral.
+     * @param asymmetry How unlike the two halves are: at +1 the negative
+     *                  half-cycle meets its ceiling at half the level of
+     *                  the positive one's, at -1 the positive one at half
+     *                  the negative one's; 0 is symmetric.
+     */
+    void setCurveShape(SampleType hardness, SampleType curvature, SampleType asymmetry) noexcept
+    {
+        curve().setShape(hardness, curvature, asymmetry);
+        calibrationRequested_.store(true, std::memory_order_release);
+    }
+
+    /** @brief How far the Curve algorithm stays straight (see setCurveShape()). */
+    [[nodiscard]] SampleType getCurveHardness() const noexcept { return curve().getHardness(); }
+    /** @brief How fast the Curve algorithm turns (see setCurveShape()). */
+    [[nodiscard]] SampleType getCurveCurvature() const noexcept { return curve().getCurvature(); }
+    /** @brief How unlike the two halves of the Curve algorithm are (see setCurveShape()). */
+    [[nodiscard]] SampleType getCurveAsymmetry() const noexcept { return curve().getAsymmetry(); }
+
+    /**
+     * @brief Adds a second-order term before the curve of any algorithm.
+     *
+     * The signal meets the curve with a share of its own square (less the
+     * mean of it) added: the two half-cycles are driven unequally and even
+     * harmonics appear, more of them the louder the signal. -1 to 1 (the
+     * sign is the polarity of the term); 0, the default, is off.
+     *
+     * @note Thread-Safe. Smoothed over 20 ms; a value that is not finite is ignored.
+     */
+    void setAsymmetry(SampleType amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        asymmetry_.store(std::clamp(amount, SampleType(-1), SampleType(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief The second-order term before the curve (see setAsymmetry()). */
+    [[nodiscard]] SampleType getAsymmetry() const noexcept { return asymmetry_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Adds noise that follows the programme, before the curve.
+     *
+     * White noise at a level counted from the recent peak of the signal
+     * (held for 50 ms, then released over 150 ms) is added before the curve,
+     * which then shapes it with the signal: it is there while the programme
+     * is and goes with it, so silence stays silent.
+     *
+     * @note Thread-Safe. A value that is not finite is ignored.
+     * @param levelDb Level of the noise under the peak of the programme, in
+     *                decibels: -90 to -20. -120 or less, the default, is off.
+     */
+    void setProgramNoise(SampleType levelDb) noexcept
+    {
+        if (!std::isfinite(levelDb)) return;
+        programNoiseDb_.store(std::clamp(levelDb, kNoiseOffDb, SampleType(-20)), std::memory_order_relaxed);
+    }
+
+    /** @brief Level of the programme noise under the peak, in decibels (see setProgramNoise()). */
+    [[nodiscard]] SampleType getProgramNoise() const noexcept { return programNoiseDb_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Dynamics around the curve: how much the level into it depends
+     *        on the level of the programme.
+     *
+     * A follower of the level (10 ms up, 150 ms down, and the gain it sets
+     * smoothed over 5 ms) moves the gain before
+     * the curve and its inverse comes after it, in time with the wet path,
+     * so the level that leaves is the one that came in and only the amount
+     * of saturation changes. At +1 the curve always sees the programme at
+     * the same peak level (-18 dBFS): a quiet passage saturates as much as a
+     * loud one. At -1 the level into the curve moves twice as far as the
+     * programme does: the loud passages saturate far more than the quiet
+     * ones. The gain is held to 24 dB either way. 0, the default, is off.
+     *
+     * @note Thread-Safe. Smoothed over 20 ms; a value that is not finite is ignored.
+     */
+    void setDynamics(SampleType amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        dynamics_.store(std::clamp(amount, SampleType(-1), SampleType(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief The dynamics around the curve (see setDynamics()). */
+    [[nodiscard]] SampleType getDynamics() const noexcept { return dynamics_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief The band the follower of setDynamics() listens to.
+     *
+     * Over 0 the follower reads the programme through a low-pass at this
+     * frequency: with a negative setDynamics() the low end then pushes the
+     * whole signal into the curve (the threshold of the saturation moves
+     * with the bass, as in a core whose low frequencies fill it first).
+     *
+     * @note Thread-Safe. A value that is not finite is ignored.
+     * @param hz Corner of the low-pass, 20 to 2000 Hz; 0, the default, is the whole band.
+     */
+    void setDynamicsFocus(SampleType hz) noexcept
+    {
+        if (!std::isfinite(hz)) return;
+        dynamicsFocusHz_.store(hz <= SampleType(0) ? SampleType(0) : std::clamp(hz, SampleType(20), SampleType(2000)),
+                               std::memory_order_relaxed);
+    }
+
+    /** @brief The band the dynamics follower listens to, in hertz (0: all of it). */
+    [[nodiscard]] SampleType getDynamicsFocus() const noexcept { return dynamicsFocusHz_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Feeds the output of the curve back into it, inverted, one
+     *        period of a frequency late.
+     *
+     * What leaves the curve (taken back to the level it came in at) returns
+     * to its input with the opposite sign after a delay that, with the
+     * latency of the processor, makes one period of the frequency: a comb
+     * the curve sits inside, with dips on the frequency and its multiples
+     * and peaks half way between them. The loop gain is the amount and
+     * falls as the curve saturates, so it cannot run away. The delay cannot
+     * be shorter than the latency plus 16 samples: getFeedbackFrequency()
+     * gives the frequency in effect. While it is on the block is processed
+     * in pieces no longer than the delay.
+     *
+     * @note Thread-Safe. Values that are not finite are ignored.
+     * @param amount -0.95 to 0.95; 0, the default, is off.
+     * @param hz     Frequency of the comb, from 20 Hz.
+     */
+    void setFeedback(SampleType amount, SampleType hz) noexcept
+    {
+        if (std::isfinite(amount))
+            feedback_.store(std::clamp(amount, SampleType(-0.95), SampleType(0.95)), std::memory_order_relaxed);
+        if (std::isfinite(hz) && hz > SampleType(0))
+            feedbackHz_.store(std::clamp(hz, kMinFeedbackHz, SampleType(20000)), std::memory_order_relaxed);
+    }
+
+    /** @brief The amount of the tuned feedback (see setFeedback()). */
+    [[nodiscard]] SampleType getFeedback() const noexcept { return feedback_.load(std::memory_order_relaxed); }
+
+    /** @brief The frequency of the tuned feedback as it runs: what the latency allows of the one asked for. */
+    [[nodiscard]] SampleType getFeedbackFrequency() const noexcept
+    {
+        if (!(spec_.sampleRate > 0)) return feedbackHz_.load(std::memory_order_relaxed);
+        return static_cast<SampleType>(spec_.sampleRate / static_cast<double>(feedbackDelayFor(getLatency()) + getLatency()));
+    }
+
+    /**
+     * @brief Takes back, at the output, the level the drive adds.
+     *
+     * The gain of the curve on programme (pink noise at -18 dBFS RMS through
+     * a twin of this processor with the algorithm, drive, character, shape,
+     * antialiasing and oversampling as they stand, against the same noise
+     * 40 dB down through the twin at no drive) is measured whenever one of
+     * them changes, and three quarters of it, in decibels, is taken back
+     * at the output: the drive then changes the tone a great deal and the
+     * level a little (a quarter of a decibel per decibel is left, so the
+     * knob is still felt). The measurement runs on the audio thread, two
+     * runs of 4096 samples of the processor, at most every 50 ms while those
+     * settings move.
+     *
+     * @note NOT real-time safe: it allocates the twin. Call it on the setup
+     *       thread, like setOversampling().
+     */
+    void setDriveCompensation(bool on)
+    {
+        if (on == driveCompensation_.load(std::memory_order_relaxed)) return;
+        // The twin is ready before the audio thread can see the flag.
+        if (on && prepared_) prepareCalibrator();
+        driveCompensation_.store(on, std::memory_order_release);
+        calibrationRequested_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Whether the level the drive adds is taken back (see setDriveCompensation()). */
+    [[nodiscard]] bool isDriveCompensation() const noexcept { return driveCompensation_.load(std::memory_order_relaxed); }
+
+    /** @brief The gain the drive compensation is applying, in decibels (0 while it is off). */
+    [[nodiscard]] SampleType getDriveCompensationDb() const noexcept { return compensationDb_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Configures a post-saturation first-order tilt EQ.
      *
@@ -2184,13 +2483,36 @@ public:
     /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
     [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return oversamplingAutomatic_; }
 
+    /**
+     * @brief Chooses the filters of the oversampler (NOT real-time safe, as
+     *  setOversampling()).
+     *
+     * LinearPhase, the default, keeps the phase of the programme and costs
+     * the latency of the factor. MinimumPhase runs elliptic allpass
+     * half-bands: a few samples of latency instead (3 at 2x and 48 kHz) and
+     * a phase that turns towards the top of the band. The dry path of the
+     * mix, of the Delta output and of the adaptive blend then goes through
+     * the same filters with nothing in between, so a partial mix adds in
+     * phase at every frequency instead of combing.
+     */
+    void setOversamplingMode(OversamplingMode mode)
+    {
+        mode = static_cast<OversamplingMode>(std::clamp(static_cast<int>(mode), 0, 1));
+        if (mode == oversamplingMode_) return;
+        oversamplingMode_ = mode;
+        applyOversampling(oversamplingFactor_);
+    }
+
+    /** @brief The filters of the oversampler (see setOversamplingMode()). */
+    [[nodiscard]] OversamplingMode getOversamplingMode() const noexcept { return oversamplingMode_; }
+
 private:
     void applyOversampling(int factor)
     {
         oversamplingFactor_ = factor;
         if (factor > 1)
         {
-            oversampler_ = makeOversampler(factor);
+            oversampler_ = makeOversampler(factor, oversamplingMode_);
             if (spec_.sampleRate > 0) oversampler_->prepare(spec_);
         }
         else
@@ -2208,12 +2530,13 @@ private:
             if (msKeepBuffer_.getNumSamples() < upBlock)
                 msKeepBuffer_.resize(1, upBlock);
 
-            dryWetMixer_.setLatencyCompensation(
-                (oversampler_ && oversamplingFactor_ > 1) ? oversampler_->getLatency() : 0);
+            alignDryPath();
 
             // The drive/character/drift/crossfade clocks follow the factor.
             configureProcessingRate(true);
             reset();
+            if (driveCompensation_.load(std::memory_order_relaxed)) prepareCalibrator();
+            calibrate();
         }
     }
 
@@ -2285,6 +2608,17 @@ public:
         w.write("slewSens", static_cast<float>(slewSensitivity_.load(std::memory_order_relaxed)));
         w.write("oversampling", oversamplingFactor_);
         w.write("oversamplingAuto", oversamplingAutomatic_);
+        w.write("oversamplingMode", static_cast<int32_t>(oversamplingMode_));
+        w.write("curveHardness", static_cast<float>(getCurveHardness()));
+        w.write("curveCurvature", static_cast<float>(getCurveCurvature()));
+        w.write("curveAsymmetry", static_cast<float>(getCurveAsymmetry()));
+        w.write("asymmetry", static_cast<float>(getAsymmetry()));
+        w.write("programNoise", static_cast<float>(getProgramNoise()));
+        w.write("dynamics", static_cast<float>(getDynamics()));
+        w.write("dynamicsFocus", static_cast<float>(getDynamicsFocus()));
+        w.write("feedback", static_cast<float>(getFeedback()));
+        w.write("feedbackHz", static_cast<float>(feedbackHz_.load(std::memory_order_relaxed)));
+        w.write("driveCompensation", driveCompensation_.load(std::memory_order_relaxed));
         return w.blob();
     }
 
@@ -2315,6 +2649,17 @@ public:
         setSlewSensitivity(static_cast<SampleType>(r.read("slewSens", 0.0f)));
         setOversampling(r.read("oversampling", 1));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
+        setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
+        setCurveShape(static_cast<SampleType>(r.read("curveHardness", 0.0f)),
+                      static_cast<SampleType>(r.read("curveCurvature", 1.0f)),
+                      static_cast<SampleType>(r.read("curveAsymmetry", 0.0f)));
+        setAsymmetry(static_cast<SampleType>(r.read("asymmetry", 0.0f)));
+        setProgramNoise(static_cast<SampleType>(r.read("programNoise", -120.0f)));
+        setDynamics(static_cast<SampleType>(r.read("dynamics", 0.0f)));
+        setDynamicsFocus(static_cast<SampleType>(r.read("dynamicsFocus", 0.0f)));
+        setFeedback(static_cast<SampleType>(r.read("feedback", 0.0f)),
+                    static_cast<SampleType>(r.read("feedbackHz", 200.0f)));
+        setDriveCompensation(r.read("driveCompensation", false));
         return true;
     }
 
@@ -2440,7 +2785,12 @@ protected:
         mixSmoother_.setTargetValue(std::clamp(static_cast<float>(p.mix), 0.0f, 1.0f));
         characterSmoother_.setTargetValue(std::clamp(static_cast<float>(p.character), -1.0f, 1.0f));
         driftSmoother_.setTargetValue(std::clamp(static_cast<float>(p.analogDrift), 0.0f, 1.0f));
-        outputGainSmoother_.setTargetValue(static_cast<float>(p.outputGain));
+        userOutputGainDb_ = static_cast<float>(p.outputGain);
+        outputGainSmoother_.setTargetValue(userOutputGainDb_
+                                           + static_cast<float>(compensationDb_.load(std::memory_order_relaxed)));
+        if (p.algorithm != applied_.algorithm || p.driveDb != applied_.driveDb || p.character != applied_.character)
+            calibrationDirty_ = true;
+        applied_ = p;
 
         float nyquist = static_cast<float>(spec_.sampleRate) / 2.0f;
         preHpSmoother_.setTargetValue(std::clamp(static_cast<float>(p.preFilterHpFreq), 10.0f, nyquist));
@@ -2743,6 +3093,7 @@ protected:
             case Algorithm::Bitcrusher:  processCore(static_cast<detail::BitcrusherAlgorithm<SampleType>*>(baseAlgo), buffer, useDrift); break;
             case Algorithm::Downsample:  processCore(static_cast<detail::DownsampleAlgorithm<SampleType>*>(baseAlgo), buffer, useDrift); break;
             case Algorithm::MultiStage:  processCore(static_cast<detail::MultiStageAlgorithm<SampleType>*>(baseAlgo), buffer, useDrift); break;
+            case Algorithm::Curve:       processCore(static_cast<detail::CurveAlgorithm<SampleType>*>(baseAlgo), buffer, useDrift); break;
         }
     }
 
@@ -2811,16 +3162,406 @@ protected:
         }
     }
 
+    // -- Stages around the curve ---------------------------------------------
+
+    [[nodiscard]] detail::CurveAlgorithm<SampleType>& curve() noexcept
+    {
+        return *static_cast<detail::CurveAlgorithm<SampleType>*>(pool_[static_cast<size_t>(Algorithm::Curve)].get());
+    }
+    [[nodiscard]] const detail::CurveAlgorithm<SampleType>& curve() const noexcept
+    {
+        return *static_cast<const detail::CurveAlgorithm<SampleType>*>(pool_[static_cast<size_t>(Algorithm::Curve)].get());
+    }
+
+    /** Samples the feedback line delays so that, with a latency, the loop is one period long. */
+    [[nodiscard]] int feedbackDelayFor(int latency) const noexcept
+    {
+        const double hz = static_cast<double>(feedbackHz_.load(std::memory_order_relaxed));
+        const int period = static_cast<int>(std::lround(spec_.sampleRate / std::max(hz, 1.0)));
+        return std::clamp(period - latency, kMinFeedbackDelay, std::max(kMinFeedbackDelay, feedbackSize_ / 2));
+    }
+
+    /** Sizes the memory of the stages. Setup thread. */
+    void prepareStages()
+    {
+        const int block = std::max(1, spec_.maxBlockSize);
+        const auto pow2 = [](int n) { int p = 64; while (p < n) p <<= 1; return p; };
+        gainSize_ = pow2(block + 1024);
+        gainRing_.assign(static_cast<size_t>(gainSize_), SampleType(1));
+        feedbackSize_ = pow2(2 * static_cast<int>(std::ceil(spec_.sampleRate / static_cast<double>(kMinFeedbackHz))) + 16);
+        feedbackRing_.assign(static_cast<size_t>(feedbackSize_) * static_cast<size_t>(std::clamp(spec_.numChannels, 1, kMaxCh)),
+                             SampleType(0));
+        const double fs = spec_.sampleRate;
+        stageRate_ = 1.0 - std::exp(-1.0 / (0.02 * fs));
+        evenRate_ = 1.0 - std::exp(-2.0 * std::numbers::pi * 10.0 / fs);
+        followUp_ = 1.0 - std::exp(-1.0 / (0.010 * fs));
+        followDown_ = 1.0 - std::exp(-1.0 / (0.150 * fs));
+        dynamicsSmoothRate_ = 1.0 - std::exp(-1.0 / (0.005 * fs));
+        noiseHoldSamples_ = static_cast<int>(0.050 * fs);
+        noiseFall_ = 1.0 - std::exp(-1.0 / (0.150 * fs));
+    }
+
+    /** Clears the memory of the stages. */
+    void resetStages() noexcept
+    {
+        std::fill(gainRing_.begin(), gainRing_.end(), SampleType(1));
+        std::fill(feedbackRing_.begin(), feedbackRing_.end(), SampleType(0));
+        gainPos_ = 0;
+        feedbackPos_ = 0;
+        evenMean_.fill(0.0);
+        focusState_.fill(0.0);
+        followPower_ = 0.0;
+        dynamicsGainDb_ = 0.0;
+        noisePeak_ = 0.0;
+        noiseHoldLeft_ = 0;
+        asymmetryNow_ = static_cast<double>(asymmetry_.load(std::memory_order_relaxed));
+        dynamicsNow_ = static_cast<double>(dynamics_.load(std::memory_order_relaxed));
+        feedbackNow_ = static_cast<double>(feedback_.load(std::memory_order_relaxed));
+        gainTail_ = 0;
+        stagesOn_ = false;
+        feedingBefore_ = false;
+    }
+
+    /**
+     * Takes the settings of the stages for a block and says how long a
+     * piece of it may be (the delay of the feedback line while the feedback
+     * runs). Audio thread.
+     */
+    [[nodiscard]] int syncStages() noexcept
+    {
+        asymmetryTarget_ = static_cast<double>(asymmetry_.load(std::memory_order_relaxed));
+        dynamicsTarget_ = static_cast<double>(dynamics_.load(std::memory_order_relaxed));
+        feedbackTarget_ = static_cast<double>(feedback_.load(std::memory_order_relaxed));
+        const SampleType noiseDb = programNoiseDb_.load(std::memory_order_relaxed);
+        noiseGain_ = (noiseDb > kNoiseOffDb) ? static_cast<double>(decibelsToGain(noiseDb)) : 0.0;
+        const double focusHz = static_cast<double>(dynamicsFocusHz_.load(std::memory_order_relaxed));
+        focusRate_ = (focusHz > 0.0) ? 1.0 - std::exp(-2.0 * std::numbers::pi * focusHz / spec_.sampleRate) : 0.0;
+
+        stageLatency_ = getLatency();
+        const bool feeding = feedbackTarget_ != 0.0 || feedbackNow_ != 0.0;
+        if (feeding && !feedingBefore_) std::fill(feedbackRing_.begin(), feedbackRing_.end(), SampleType(0));
+        feedingBefore_ = feeding;
+        feedbackDelay_ = feedbackDelayFor(stageLatency_);
+        feedbackScale_ = SampleType(1) / decibelsToGain(static_cast<SampleType>(driveSmoother_.getTargetValue()));
+        const bool moving = dynamicsTarget_ != 0.0 || dynamicsNow_ != 0.0 || gainTail_ > 0;
+        stagesOn_ = feeding || moving || noiseGain_ > 0.0
+                 || asymmetryTarget_ != 0.0 || asymmetryNow_ != 0.0;
+        return feeding ? feedbackDelay_ : std::numeric_limits<int>::max();
+    }
+
+    /** A value on its way to a target, 20 ms away; it lands on a target of zero. */
+    static void approach(double& now, double target, double rate) noexcept
+    {
+        now += rate * (target - now);
+        if (target == 0.0 && std::abs(now) < 1e-5) now = 0.0;
+    }
+
+    /** White noise in [-1, 1) for a channel. */
+    [[nodiscard]] SampleType stageNoise(int ch) noexcept
+    {
+        uint32_t& s = noiseSeed_[static_cast<size_t>(ch)];
+        s = s * 1664525u + 1013904223u;
+        return static_cast<SampleType>(static_cast<double>(static_cast<int32_t>(s)) * (1.0 / 2147483648.0));
+    }
+
+    /**
+     * What happens before the curve, at the base rate: the feedback comes
+     * back, the dynamics set the level, the second-order term and the noise
+     * of the programme are added. The channel that stays unprocessed in the
+     * MidOnly and SideOnly modes is left alone.
+     */
+    void stagesBefore(AudioBufferView<SampleType> buffer, int keepChannel) noexcept
+    {
+        const int nCh = std::min({ buffer.getNumChannels(), kMaxCh, spec_.numChannels });
+        const int nS = buffer.getNumSamples();
+        const int gainMask = gainSize_ - 1, feedbackMask = feedbackSize_ - 1;
+        for (int i = 0; i < nS; ++i)
+        {
+            approach(asymmetryNow_, asymmetryTarget_, stageRate_);
+            approach(dynamicsNow_, dynamicsTarget_, stageRate_);
+            approach(feedbackNow_, feedbackTarget_, stageRate_);
+
+            if (feedbackNow_ != 0.0)
+            {
+                const auto at = static_cast<size_t>((feedbackPos_ + i - feedbackDelay_) & feedbackMask);
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    if (ch == keepChannel) continue;
+                    const SampleType back = feedbackRing_[static_cast<size_t>(ch) * static_cast<size_t>(feedbackSize_) + at];
+                    buffer.getChannel(ch)[i] -= static_cast<SampleType>(feedbackNow_) * back;
+                }
+            }
+
+            // The dynamics: one gain for every channel, kept for its inverse.
+            SampleType gain = SampleType(1);
+            if (dynamicsNow_ != 0.0)
+            {
+                double top = 0.0;
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    if (ch == keepChannel) continue;
+                    double heard = static_cast<double>(buffer.getChannel(ch)[i]);
+                    if (!std::isfinite(heard)) heard = 0.0;
+                    if (focusRate_ > 0.0)
+                    {
+                        double& low = focusState_[static_cast<size_t>(ch)];
+                        low += focusRate_ * (heard - low);
+                        heard = low;
+                    }
+                    top = std::max(top, std::abs(heard));
+                }
+                const double power = top * top;
+                followPower_ += (power > followPower_ ? followUp_ : followDown_) * (power - followPower_);
+                const double levelDb = 10.0 * std::log10(followPower_ + 1e-12);
+                const double gainDb = std::clamp(-dynamicsNow_ * (levelDb - kDynamicsReferenceDb), -kDynamicsReachDb, kDynamicsReachDb);
+                // (The follower ripples at twice the frequency of a tone; its
+                // inverse arrives a latency later, so the gain is smoothed.)
+                dynamicsGainDb_ += dynamicsSmoothRate_ * (gainDb - dynamicsGainDb_);
+                gain = decibelsToGain(static_cast<SampleType>(dynamicsGainDb_));
+                gainTail_ = gainSize_;
+            }
+            else
+            {
+                dynamicsGainDb_ = 0.0;
+                if (gainTail_ > 0) --gainTail_;    // the inverse of the last gains is still on its way out
+            }
+            gainRing_[static_cast<size_t>((gainPos_ + i) & gainMask)] = gain;
+
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                if (ch == keepChannel) continue;
+                SampleType& x = buffer.getChannel(ch)[i];
+                x *= gain;
+                if (asymmetryNow_ != 0.0)
+                {
+                    const double square = static_cast<double>(x) * static_cast<double>(x);
+                    double& mean = evenMean_[static_cast<size_t>(ch)];
+                    if (std::isfinite(square)) mean += evenRate_ * (square - mean);
+                    x += static_cast<SampleType>(asymmetryNow_ * kEvenShare * (square - mean));
+                }
+            }
+
+            if (noiseGain_ > 0.0)
+            {
+                double top = 0.0;
+                for (int ch = 0; ch < nCh; ++ch)
+                    if (ch != keepChannel)
+                    {
+                        const double level = std::abs(static_cast<double>(buffer.getChannel(ch)[i]));
+                        if (std::isfinite(level)) top = std::max(top, level);
+                    }
+                if (top >= noisePeak_) { noisePeak_ = top; noiseHoldLeft_ = noiseHoldSamples_; }
+                else if (noiseHoldLeft_ > 0) --noiseHoldLeft_;
+                else noisePeak_ += noiseFall_ * (top - noisePeak_);
+                if (noisePeak_ < 1e-9) noisePeak_ = 0.0;
+                const SampleType level = static_cast<SampleType>(noisePeak_ * noiseGain_);
+                for (int ch = 0; ch < nCh; ++ch)
+                    if (ch != keepChannel) buffer.getChannel(ch)[i] += level * stageNoise(ch);
+            }
+        }
+    }
+
+    /**
+     * What happens after the curve: the inverse of the gain of the dynamics,
+     * as late as the wet path is, and the output written to the feedback
+     * line at the level it came in at.
+     */
+    void stagesAfter(AudioBufferView<SampleType> buffer, int keepChannel) noexcept
+    {
+        const int nCh = std::min({ buffer.getNumChannels(), kMaxCh, spec_.numChannels });
+        const int nS = buffer.getNumSamples();
+        const int gainMask = gainSize_ - 1, feedbackMask = feedbackSize_ - 1;
+        const bool feeding = feedbackTarget_ != 0.0 || feedbackNow_ != 0.0;
+        for (int i = 0; i < nS; ++i)
+        {
+            const SampleType gain = gainRing_[static_cast<size_t>((gainPos_ + i - stageLatency_) & gainMask)];
+            const SampleType back = (gain != SampleType(1)) ? SampleType(1) / gain : SampleType(1);
+            const auto at = static_cast<size_t>((feedbackPos_ + i) & feedbackMask);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                if (ch == keepChannel) continue;
+                SampleType& x = buffer.getChannel(ch)[i];
+                x *= back;
+                if (feeding)
+                {
+                    const SampleType fed = x * feedbackScale_;
+                    feedbackRing_[static_cast<size_t>(ch) * static_cast<size_t>(feedbackSize_) + at] =
+                        std::isfinite(fed) ? std::clamp(fed, SampleType(-2), SampleType(2)) : SampleType(0);
+                }
+            }
+        }
+        gainPos_ = (gainPos_ + nS) & gainMask;
+        feedbackPos_ = (feedbackPos_ + nS) & feedbackMask;
+    }
+
+    /** Measures the curve again when it has moved and the last measurement is old enough. Audio thread. */
+    void maybeCalibrate(int samples) noexcept
+    {
+        const bool asked = calibrationRequested_.exchange(false, std::memory_order_acquire);
+        calibrationWait_ -= samples;
+        if (!asked && (!calibrationDirty_ || calibrationWait_ > 0)) return;
+        calibrate();
+        calibrationWait_ = static_cast<int>(kCalibrationEvery * spec_.sampleRate);
+    }
+
+    /** Builds the twin that measures the gain of the curve, and its noise. Setup thread. */
+    void prepareCalibrator()
+    {
+        if (!calibrator_) calibrator_ = std::make_unique<Saturation>();
+        calibrator_->oversamplingAutomatic_ = false;
+        calibrator_->oversamplingMode_ = oversamplingMode_;
+        calibrator_->applyOversampling(oversamplingFactor_);
+        calibrator_->prepare(AudioSpec { spec_.sampleRate, kCalibrationBlock, 1 });
+
+        // Pink noise at -18 dBFS RMS over the stretch that is measured, the
+        // same every time.
+        calibrationNoise_.assign(static_cast<size_t>(kCalibrationSamples), SampleType(0));
+        calibrationWork_.assign(static_cast<size_t>(kCalibrationSamples), SampleType(0));
+        uint32_t seed = 0x2545F491u;
+        double b0 = 0.0, b1 = 0.0, b2 = 0.0, sum = 0.0;
+        for (auto& sample : calibrationNoise_)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const double white = static_cast<double>(static_cast<int32_t>(seed)) * (1.0 / 2147483648.0);
+            b0 = 0.99765 * b0 + white * 0.0990460;
+            b1 = 0.96300 * b1 + white * 0.2965164;
+            b2 = 0.57000 * b2 + white * 1.0526913;
+            const double pink = b0 + b1 + b2 + white * 0.1848;
+            sample = static_cast<SampleType>(pink);
+        }
+        for (int i = kCalibrationSkip; i < kCalibrationSamples; ++i)
+        {
+            const double pink = static_cast<double>(calibrationNoise_[static_cast<size_t>(i)]);
+            sum += pink * pink;
+        }
+        const double scale = std::pow(10.0, kCalibrationLevelDb / 20.0)
+                           / std::sqrt(sum / static_cast<double>(kCalibrationSamples - kCalibrationSkip));
+        for (auto& sample : calibrationNoise_) sample = static_cast<SampleType>(static_cast<double>(sample) * scale);
+    }
+
+    /**
+     * Measures the gain of the curve on programme with the settings as they
+     * stand and sets the compensation. Audio thread (or the setup thread
+     * before audio runs): it allocates nothing.
+     */
+    void calibrate() noexcept
+    {
+        calibrationDirty_ = false;
+        double compensation = 0.0;
+        if (driveCompensation_.load(std::memory_order_acquire) && calibrator_ && !calibrationNoise_.empty())
+        {
+            Saturation& twin = *calibrator_;
+            Params p = applied_;
+            p.mix = SampleType(1);
+            p.outputGain = SampleType(0);
+            p.analogDrift = SampleType(0);
+            p.processingMode = ProcessingMode::Stereo;
+            p.outputMode = OutputMode::WetOnly;
+            twin.setAntialiasing(static_cast<Antialiasing>(antialiasOrder_.load(std::memory_order_relaxed)));
+            twin.curve().setShape(getCurveHardness(), getCurveCurvature(), getCurveAsymmetry());
+
+            // The gain of the curve is the energy of the noise through the
+            // twin as it stands over the energy of the same noise, 40 dB
+            // down, through the twin at no drive: everything but the curve
+            // (the input high-pass on a short stretch of pink noise above
+            // all) is linear and cancels between the two.
+            const auto energy = [&](const Params& run, double scale) noexcept {
+                twin.applyParamSnapshot(run);
+                twin.reset();
+                for (size_t i = 0; i < calibrationNoise_.size(); ++i)
+                    calibrationWork_[i] = static_cast<SampleType>(static_cast<double>(calibrationNoise_[i]) * scale);
+                for (int off = 0; off < kCalibrationSamples; off += kCalibrationBlock)
+                {
+                    SampleType* channel = calibrationWork_.data() + off;
+                    twin.processChunk(AudioBufferView<SampleType>(&channel, 1, std::min(kCalibrationBlock, kCalibrationSamples - off)));
+                }
+                double sum = 0.0;
+                for (int i = kCalibrationSkip; i < kCalibrationSamples; ++i)
+                {
+                    const double y = static_cast<double>(calibrationWork_[static_cast<size_t>(i)]);
+                    sum += y * y;
+                }
+                return sum;
+            };
+            Params linear = p;
+            linear.driveDb = SampleType(0);
+            const double reference = energy(linear, kCalibrationQuiet) / (kCalibrationQuiet * kCalibrationQuiet);
+            const double driven = energy(p, 1.0);
+            if (reference > 0.0 && driven > 0.0 && std::isfinite(driven) && std::isfinite(reference))
+                compensation = std::clamp(-kCompensationShare * 10.0 * std::log10(driven / reference), -48.0, 24.0);
+        }
+        compensationDb_.store(static_cast<SampleType>(compensation), std::memory_order_relaxed);
+        outputGainSmoother_.setTargetValue(userOutputGainDb_ + static_cast<float>(compensation));
+    }
+
+    static constexpr int kStageChannels = 16;                        ///< Channels the stages keep a memory for.
+    static constexpr SampleType kNoiseOffDb = SampleType(-120);     ///< Programme noise at or under this is off.
+    static constexpr SampleType kMinFeedbackHz = SampleType(20);     ///< Lowest frequency of the tuned feedback.
+    static constexpr int kMinFeedbackDelay = 16;                     ///< Shortest feedback line (and piece of a block).
+    static constexpr double kDynamicsReferenceDb = -18.0;            ///< Level the dynamics bring the programme to.
+    static constexpr double kDynamicsReachDb = 24.0;                 ///< Most gain the dynamics apply, either way.
+    static constexpr double kEvenShare = 0.25;                       ///< Share of the square added at asymmetry 1.
+    static constexpr double kCompensationShare = 0.75;               ///< Share of the measured gain taken back.
+    static constexpr double kCalibrationLevelDb = -18.0;             ///< RMS level of the measuring noise.
+    static constexpr int kCalibrationSamples = 4096;                 ///< Length of a measurement.
+    static constexpr int kCalibrationSkip = 1024;                    ///< Samples left out while the twin settles.
+    static constexpr double kCalibrationQuiet = 0.01;                ///< Level of the reference run (-40 dB).
+    static constexpr int kCalibrationBlock = 256;
+    static constexpr double kCalibrationEvery = 0.05;                ///< Seconds between two measurements while the curve moves.
+
+    std::atomic<SampleType> asymmetry_ { SampleType(0) };
+    std::atomic<SampleType> programNoiseDb_ { kNoiseOffDb };
+    std::atomic<SampleType> dynamics_ { SampleType(0) };
+    std::atomic<SampleType> dynamicsFocusHz_ { SampleType(0) };
+    std::atomic<SampleType> feedback_ { SampleType(0) };
+    std::atomic<SampleType> feedbackHz_ { SampleType(200) };
+
+    // Audio thread.
+    bool stagesOn_ = false;
+    bool feedingBefore_ = false;                    ///< The feedback ran in the last block.
+    double asymmetryNow_ = 0.0, asymmetryTarget_ = 0.0;
+    double dynamicsNow_ = 0.0, dynamicsTarget_ = 0.0;
+    double feedbackNow_ = 0.0, feedbackTarget_ = 0.0;
+    double stageRate_ = 0.0, evenRate_ = 0.0, followUp_ = 0.0, followDown_ = 0.0, focusRate_ = 0.0;
+    double followPower_ = 0.0, noiseGain_ = 0.0, noisePeak_ = 0.0, noiseFall_ = 0.0;
+    double dynamicsGainDb_ = 0.0, dynamicsSmoothRate_ = 0.0;
+    int noiseHoldSamples_ = 0, noiseHoldLeft_ = 0;
+    int stageLatency_ = 0, feedbackDelay_ = kMinFeedbackDelay, gainTail_ = 0;
+    SampleType feedbackScale_ = SampleType(1);
+    std::array<double, kStageChannels> evenMean_ {}, focusState_ {};
+    std::array<uint32_t, kStageChannels> noiseSeed_ { 0x1234567u, 0x89ABCDEu, 0x3C6EF37u, 0x5851F42u,
+                                                           0x14057B7u, 0x2B992DDu, 0x7F4A7C1u, 0x61C8864u,
+                                                           0x0BADF00u, 0x1F123BBu, 0x5DEECE6u, 0x41C64E6u,
+                                                           0x6C07896u, 0x27D4EB2u, 0x165667Bu, 0x4F6CDD1u };
+    std::vector<SampleType> gainRing_, feedbackRing_;
+    int gainSize_ = 64, feedbackSize_ = 64, gainPos_ = 0, feedbackPos_ = 0;
+
+    // Drive compensation.
+    std::atomic<bool> driveCompensation_ { false };
+    int calibrationWait_ = 0;                              ///< Samples before the next measurement may run (audio thread).
+    bool calibrationDirty_ = false;                        ///< The curve moved since the last measurement (audio thread).
+    std::atomic<bool> calibrationRequested_ { false };     ///< A setter outside the parameter queue moved it.
+    std::atomic<SampleType> compensationDb_ { SampleType(0) };
+    float userOutputGainDb_ = 0.0f;
+    std::unique_ptr<Saturation> calibrator_;
+    std::vector<SampleType> calibrationNoise_, calibrationWork_;
+
+    // Minimum-phase oversampling: the dry path through the same filters.
+    OversamplingMode oversamplingMode_ = OversamplingMode::LinearPhase;
+    OversamplingDryPath<SampleType> dryPath_;
+    bool dryThroughFilters_ = false;
+
     AudioSpec spec_ {};
     bool prepared_ = false;
 
-    static constexpr int kNumAlgorithms = 10;
+    static constexpr int kNumAlgorithms = 11;
     std::array<std::unique_ptr<detail::SaturationAlgorithm<SampleType>>, kNumAlgorithms> pool_;
     std::atomic<detail::SaturationAlgorithm<SampleType>*> active_ { nullptr };
     std::atomic<detail::SaturationAlgorithm<SampleType>*> next_   { nullptr };
 
     SpscQueue<Params>  paramQueue_;
     Params             lastParams_;
+    Params             applied_;       ///< The snapshot the audio thread applied last.
     mutable SpinLock   paramsLock_;
     std::atomic<bool>  paramsPending_ { false }; // set when a full queue dropped a snapshot
     std::atomic<int>   antialiasOrder_ { 0 };      ///< Antialiasing order, mirror for getState.

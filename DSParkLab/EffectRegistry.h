@@ -337,6 +337,15 @@ inline EffectSlot makeCompressor()
     // A/B: Branching (default) or Decoupled (opt-in) clean ballistics. Order
     // MUST match dspark::Compressor::CleanBallistics (Branching=0, Decoupled=1).
     s.addChoice("Clean Ballistics", {"Branching","Decoupled"}, 0);       // index 12
+    // Threshold counted from the key's own recent peak (index 13), a latency
+    // kept for the lookahead and the lookahead inside it (14, 15), the share
+    // of the gain change that is applied (16) and a range with no corner (17, 18).
+    s.addToggle("Auto Threshold", false);
+    s.addSlider("Max Lookahead", 0, 10, 0, "ms");
+    s.addSlider("Lookahead", 0, 10, 0, "ms");
+    s.addSlider("Amount", 0, 1, 1, "");
+    s.addSlider("Range", 0, 60, 60, "dB");
+    s.addToggle("Soft Range", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -355,6 +364,12 @@ inline EffectSlot makeCompressor()
             case 10: p->setCharacterColor(v); break;
             case 11: p->setTopology(static_cast<dspark::Compressor<float>::Topology>(static_cast<int>(v))); break;
             case 12: p->setCleanBallistics(static_cast<dspark::Compressor<float>::CleanBallistics>(static_cast<int>(v))); break;
+            case 13: p->setAutoThreshold(v > 0.5f); break;
+            case 14: p->setMaxLookahead(v); break;
+            case 15: p->setLookahead(v); break;
+            case 16: p->setAmount(v); break;
+            case 17: p->setRange(v); break;
+            case 18: p->setSoftRange(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

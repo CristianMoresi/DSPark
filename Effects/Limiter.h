@@ -168,6 +168,8 @@ public:
         delayLines_.resize(static_cast<size_t>(numChannels_));
         for (auto& dl : delayLines_)
             dl.prepare(maxLookaheadSamples * 2 + kChunk); // lookahead glide + one processBlock() chunk
+        gainSpan_ = maxLookaheadSamples * 2 + kChunk;
+        gainLine_.prepare(gainSpan_);
 
         // Gain-computer histories: power-of-two rings. The moving averages
         // look back at most the lookahead; the sliding minimum covers the
@@ -259,6 +261,7 @@ public:
         if (lookaheadDirty_.exchange(false, std::memory_order_acquire))
             applyLookaheadTarget();
         syncParameters();
+        syncKeptLatency();
 
         const bool isp          = ispApplied_;
         const bool adaptive     = adaptiveRelease_.load(std::memory_order_relaxed);
@@ -314,6 +317,10 @@ public:
 
                 advanceGain(chunkPeak_[i], ceiling, adaptive, relMs);
                 chunkGain_[i] = currentGain_;
+                chunkDelay_[i] = chunkLook_[i];
+                // With a latency kept for the lookahead the audio waits that
+                // long and the gain waits the difference.
+                if (kept_) chunkGain_[i] = heldGain(chunkLook_[i], chunkDelay_[i]);
             }
 
             // Pass 3: delay, apply the gain, optional safety clip.
@@ -325,7 +332,7 @@ public:
                 for (int i = 0; i < n; ++i)
                 {
                     const T ceiling = chunkCeiling_[i];
-                    T out = line.read(chunkLook_[i] + (n - 1 - i)) * chunkGain_[i];
+                    T out = line.read(chunkDelay_[i] + (n - 1 - i)) * chunkGain_[i];
 
                     // Rounding backstop: the gain computer already meets the
                     // ceiling; the clamp only trims float rounding and the
@@ -382,6 +389,7 @@ public:
             if (lookaheadCurrent_ < lookTarget)      lookaheadCurrent_ += T(1);
             else if (lookaheadCurrent_ > lookTarget) lookaheadCurrent_ -= T(1);
             sampleLookNow_ = static_cast<int>(lookaheadCurrent_);
+            syncKeptLatency();
         }
         const bool isp = ispApplied_;
         const T ceiling = sampleCeiling_;
@@ -407,6 +415,9 @@ public:
             pendingAnnex_ = T(0);
             pendingSlow_ = T(0);
             publishedGain_.store(currentGain_, std::memory_order_relaxed);
+            sampleGainNow_ = currentGain_;
+            sampleDelayNow_ = sampleLookNow_;
+            if (kept_) sampleGainNow_ = heldGain(sampleLookNow_, sampleDelayNow_);
         }
         else
         {
@@ -415,7 +426,7 @@ public:
             if (chSlow > pendingSlow_) pendingSlow_ = chSlow;
         }
 
-        T out = delayLines_[channel].read(sampleLookNow_) * currentGain_;
+        T out = delayLines_[channel].read(sampleDelayNow_) * sampleGainNow_;
         out = std::clamp(out, -ceiling, ceiling); // exact brickwall contract
 
         if (safetyClip)
@@ -445,6 +456,14 @@ public:
         ceilingSmooth_.skip();
         sampleCeiling_ = ceilingSmooth_.getCurrentValue();
         sampleLookNow_ = lookaheadSamples_;
+        // A latency kept for the lookahead is in place from the first sample.
+        kept_ = latencySamples_ > lookaheadSamples_;
+        latencyCurrent_ = static_cast<T>(kept_ ? latencySamples_ : lookaheadSamples_);
+        gainLine_.reset();
+        if (kept_)
+            for (int i = 0; i < gainSpan_; ++i) gainLine_.push(T(1));
+        sampleDelayNow_ = static_cast<int>(latencyCurrent_);
+        sampleGainNow_ = T(1);
     }
 
     // -- Level 1: Simple API ----------------------------------------------------
@@ -492,6 +511,34 @@ public:
                            std::memory_order_relaxed);
         lookaheadDirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief Keeps a latency for the lookahead to move inside.
+     *
+     * With a maximum set, the audio always waits that long and getLatency()
+     * reports it, whatever setLookahead() says below it: the lookahead can
+     * then be automated without the host having to align anything again, the
+     * gain being held back by the difference. 0 (default) keeps no latency of
+     * its own: the latency is the lookahead, as before. A maximum under the
+     * lookahead changes nothing. In true-peak mode the maximum is raised like
+     * a lookahead of the same length. Set it before playback; a change during
+     * playback glides the audio to the new delay at one sample per sample.
+     *
+     * State key "maxLookahead" (absent = 0).
+     *
+     * @param ms Latency in milliseconds, 0 to 10 (0 turns it off). Non-finite
+     *           values are ignored.
+     */
+    void setMaxLookahead(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        maxLookaheadMs_.store(std::clamp(ms, T(0), static_cast<T>(kMaxLookaheadMs)),
+                              std::memory_order_relaxed);
+        lookaheadDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Latency kept for the lookahead in milliseconds (0: none; see setMaxLookahead()). */
+    [[nodiscard]] T getMaxLookahead() const noexcept { return maxLookaheadMs_.load(std::memory_order_relaxed); }
 
     // -- Level 3: Expert API ----------------------------------------------------
 
@@ -661,13 +708,16 @@ public:
      * thread (the audio thread may consume the change one block later; the
      * glide covers the transition). In true-peak mode the lookahead is at
      * least 49 samples (about 1 ms at 48 kHz); with its high-precision
-     * reading it is the set lookahead plus 262 samples.
+     * reading it is the set lookahead plus 262 samples. With
+     * setMaxLookahead() it is the latency kept, while the lookahead stays
+     * under it.
      */
     [[nodiscard]] int getLatency() const noexcept
     {
         const bool truePeak = truePeakEnabled_.load(std::memory_order_relaxed);
-        return lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), truePeak,
-                                   truePeak && truePeakPrecision_.load(std::memory_order_relaxed) == 1);
+        const bool high = truePeak && truePeakPrecision_.load(std::memory_order_relaxed) == 1;
+        return latencyFor(lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), truePeak, high),
+                          truePeak, high);
     }
 
     /** @brief Current gain reduction in dB (metering).
@@ -696,6 +746,7 @@ public:
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
         w.write("holdMode", static_cast<int32_t>(holdMode_.load(std::memory_order_relaxed)));
         w.write("truePeakPrecision", static_cast<int32_t>(truePeakPrecision_.load(std::memory_order_relaxed)));
+        w.write("maxLookahead", static_cast<float>(maxLookaheadMs_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -715,6 +766,7 @@ public:
         setHoldMode(r.read("holdMode", int32_t(0)) == 1 ? HoldMode::EveryPeak : HoldMode::Deepest);
         setTruePeakPrecision(r.read("truePeakPrecision", int32_t(0)) == 1 ? TruePeakPrecision::High
                                                                          : TruePeakPrecision::Standard);
+        setMaxLookahead(static_cast<T>(r.read("maxLookahead", 0.0f)));
         return true;
     }
 
@@ -907,7 +959,52 @@ protected:
         ispApplied_ = isp;
         tpHighApplied_ = high;
         lookaheadSamples_ = lookaheadSamplesFor(lookaheadMs_.load(std::memory_order_relaxed), isp, high);
+        latencySamples_ = latencyFor(lookaheadSamples_, isp, high);
         configureGainComputer();
+    }
+
+    /** Delay of the audio for a lookahead in samples: the latency kept for it
+     *  (setMaxLookahead()) when that is longer, the lookahead otherwise.
+     *  Shared by the audio side and getLatency(), like lookaheadSamplesFor(). */
+    [[nodiscard]] int latencyFor(int lookahead, bool truePeak, bool highPrecision) const noexcept
+    {
+        const T maxMs = maxLookaheadMs_.load(std::memory_order_relaxed);
+        return (maxMs > T(0)) ? std::max(lookahead, lookaheadSamplesFor(maxMs, truePeak, highPrecision))
+                              : lookahead;
+    }
+
+    /** Engages the held-back gain when a latency longer than the lookahead is
+     *  asked for, and lets go of it once the audio has glided back (audio
+     *  thread). On engaging, the gain line starts full of the gain that is
+     *  sounding and the audio glides out from the lookahead. */
+    inline void syncKeptLatency() noexcept
+    {
+        const bool want = latencySamples_ > lookaheadSamples_;
+        if (want && !kept_)
+        {
+            for (int i = 0; i < gainSpan_; ++i) gainLine_.push(currentGain_);
+            latencyCurrent_ = lookaheadCurrent_;
+            kept_ = true;
+        }
+        else if (!want && kept_ && latencyCurrent_ <= lookaheadCurrent_)
+        {
+            kept_ = false;
+        }
+    }
+
+    /** One frame with a latency kept for the lookahead: glides the delay of
+     *  the audio towards it (never under the lookahead), stores the gain just
+     *  computed and returns the one that is heard, older by the difference.
+     *  @param look  Lookahead of this frame in samples.
+     *  @param delay Receives the delay of the audio for this frame. */
+    [[nodiscard]] inline T heldGain(int look, int& delay) noexcept
+    {
+        const T target = static_cast<T>(latencySamples_);
+        if (latencyCurrent_ < target)      latencyCurrent_ += T(1);
+        else if (latencyCurrent_ > target) latencyCurrent_ -= T(1);
+        delay = std::max(static_cast<int>(latencyCurrent_), look);
+        gainLine_.push(currentGain_);
+        return gainLine_.read(delay - look);
     }
 
     // ---- Gain computer ------------------------------------------------------
@@ -1217,9 +1314,21 @@ protected:
     T chunkGain_[kChunk] = {};
     int chunkLook_[kChunk] = {};
 
+    int chunkDelay_[kChunk] = {};    ///< Delay of the audio per frame (the lookahead, or the latency kept).
+
     // Per-sample path caches (advanced on channel 0, reused by later channels).
     T sampleCeiling_ = T(0.96605);
     int sampleLookNow_ = 96;
+    int sampleDelayNow_ = 96;        ///< Delay of the audio for the frame.
+    T sampleGainNow_ = T(1);         ///< Gain heard in the frame.
+
+    // A latency kept for the lookahead (setMaxLookahead()).
+    std::atomic<T> maxLookaheadMs_ { T(0) }; ///< Latency kept (0: none).
+    int latencySamples_ = 96;        ///< Delay the audio is asked to have (audio thread).
+    T latencyCurrent_ = T(96);       ///< Its smoothed value while kept.
+    bool kept_ = false;              ///< The gain is being held back.
+    int gainSpan_ = 0;               ///< Length of the gain line.
+    RingBuffer<T> gainLine_;         ///< Gains waiting for the audio they belong to.
 
     std::vector<RingBuffer<T>> delayLines_;
 };

@@ -148,6 +148,37 @@ All notable user-facing changes to DSPark are documented here.
   at 6 dB and 1.00 at 12, and a boost the other way round (1.18, 1.39,
   1.90). A band that rests at 0 dB and is not acting returns its input bit
   for bit.
+- `DynamicEQ::setLinearPhase(true)` (off by default; a setup choice): the
+  bands change the level of the signal and nothing of its phase. Each band is
+  then zero-phase kernels (its rest, and the end of each side, chosen as in
+  the mixed engine: half way through the range the band has exactly the
+  magnitude of the nominal one), all of them run by one partitioned
+  convolution, and the gain sets how much of each is added to the signal.
+  200 Hz below the centre of a 6 dB cut at 1 kHz the mixed engine is 19
+  degrees off its input; this mode is within 0.5 with the same level. The
+  latency is half the kernel plus one partition (2560 samples at 44.1 and
+  48 kHz with the default kernel of 4096 taps; `setLinearPhaseKernelLength()`
+  takes 1024 to 65536) and `getLatency()` reports it; the gain is held back
+  to meet the audio it was computed from, and the lookahead comes out of
+  that latency instead of adding to it. The bands add up side by side, each
+  heard from the input, so the latency does not grow with them. Eight bands
+  on a stereo block cost 373 to 466 ns per frame on three compilers, as the
+  other engines (354 to 424); with blocks of 64 samples the block that
+  carries a hop takes 58 to 73 us, and a moved band is designed one kernel
+  per block within that. With no band acting the output is the input, late,
+  to the bit. All the band fields work in the mode (gain at rest, knee,
+  placement, program timing, relative threshold); oversampling is not used
+  with it. The state carries `linear` and `linearTaps`.
+- `FirBank<T>` (new, `Core/FirBank.h`): many long FIR kernels over shared
+  input lines, by one uniformly partitioned convolution in the frequency
+  domain. Each line is transformed once per hop into its own delay line of
+  spectra, and a kernel only multiplies over it and transforms back, for
+  every line that hears it (a mask). `setKernel()` replaces a kernel while
+  the audio runs: it is transformed on the calling thread, without
+  allocating, and comes in at the next hop through a crossfade of one
+  partition; `removeKernel()` fades one out the same way. `room()`, `tap()`
+  and `push()` give the caller the outputs in place, one partition late,
+  whatever way it cuts the stream.
 - `DynamicEQ` bands, in either engine: `BandConfig::gain`, the gain the band
   rests at (the dynamic part moves from there); `knee`, a soft knee around
   the threshold in dB, or `kAutomaticKnee` for one that grows with the

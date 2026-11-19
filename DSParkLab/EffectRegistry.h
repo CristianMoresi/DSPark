@@ -993,15 +993,18 @@ inline EffectSlot makeDynamicEQ()
     auto p = std::make_shared<DEQ>();
 
     // UI mirror: per band [Freq, Q, Threshold, Amount, Ratio, Attack, Release,
-    // Below, Type]. Amount is signed: +dB boosts the band when triggered, -dB
-    // cuts it. It is the node's Y axis, so you drag a band UP to boost or DOWN
-    // to cut. Type selects the dynamic filter shape (Bell / Low Shelf / High
-    // Shelf), matching DynamicEQ::BandShape order.
-    auto ui = std::make_shared<std::array<std::array<float, 9>, 2>>();
-    (*ui)[0] = {  200.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f };
-    (*ui)[1] = { 3000.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f };
+    // Below, Type, Rest Gain, Knee, Place, Timing, Relative]. Amount is signed:
+    // +dB boosts the band when triggered, -dB cuts it. It is the node's Y axis,
+    // so you drag a band UP to boost or DOWN to cut. Type selects the dynamic
+    // filter shape (Bell / Low Shelf / High Shelf), matching DynamicEQ::BandShape
+    // order. The first nine are the controls 0-17 (two bands); the engine toggle
+    // is control 18 and the last five of each band follow it.
+    constexpr int kFields = 14;
+    auto ui = std::make_shared<std::array<std::array<float, kFields>, 2>>();
+    (*ui)[0] = {  200.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    (*ui)[1] = { 3000.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
-    auto buildCfg = [](const std::array<float, 9>& v) {
+    auto buildCfg = [](const std::array<float, kFields>& v) {
         DEQ::BandConfig c{};
         c.frequency = v[0];
         c.q         = std::max(0.1f, v[1]);
@@ -1020,18 +1023,12 @@ inline EffectSlot makeDynamicEQ()
         c.aboveBoost = false; c.belowBoost = false;
         if (below) { c.belowRatio = ratio; c.belowBoost = boost; }
         else       { c.aboveRatio = ratio; c.aboveBoost = boost; }
+        c.gain      = v[9];
+        c.knee      = v[10];                  // below 0: the automatic knee
+        c.placement = static_cast<DEQ::Placement>(std::clamp(static_cast<int>(v[11]), 0, 4));
+        c.timing    = static_cast<DEQ::Timing>(std::clamp(static_cast<int>(v[12]), 0, 1));
+        c.relativeThreshold = v[13] > 0.5f;
         return c;
-    };
-
-    // Shape-aware magnitude of one band at gain g (for both curve overlays).
-    auto bandMag = [](float freq, float q, int shape, float g, double fHz, double sr) {
-        dspark::BiquadCoeffs c;
-        switch (shape) {
-            default: c = dspark::BiquadCoeffs::makePeak(sr, freq, std::max(0.05f, q), g); break;
-            case 1:  c = dspark::BiquadCoeffs::makeLowShelf(sr, freq, g); break;
-            case 2:  c = dspark::BiquadCoeffs::makeHighShelf(sr, freq, g); break;
-        }
-        return static_cast<double>(c.getMagnitude(fHz, sr));
     };
 
     EffectSlot s;
@@ -1051,6 +1048,17 @@ inline EffectSlot makeDynamicEQ()
         s.addToggle(nm("Below Thr"), false);
         s.addChoice(nm("Type"), {"Bell","Low Shelf","High Shelf"}, 0);
     }
+    s.addToggle("Mixed Bands", false);
+    for (int b = 0; b < 2; ++b)
+    {
+        const char* pfx = (b == 0) ? "B1 " : "B2 ";
+        auto nm = [pfx](const char* n){ static char buf[24]; std::snprintf(buf, sizeof(buf), "%s%s", pfx, n); return buf; };
+        s.addSlider(nm("Rest Gain"),  -24, 24, 0.0f, "dB");
+        s.addSlider(nm("Knee"),        -1, 24, 0.0f, "dB");     // -1: automatic
+        s.addChoice(nm("Place"), {"Stereo","Left","Right","Mid","Side"}, 0);
+        s.addChoice(nm("Timing"), {"Manual","Program"}, 0);
+        s.addToggle(nm("Relative Thr"), false);
+    }
     s.prepareFn = [p, ui, buildCfg](auto& sp) {
         p->prepare(sp);
         p->setNumBands(2);
@@ -1060,33 +1068,37 @@ inline EffectSlot makeDynamicEQ()
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, ui, buildCfg](int i, float v) {
-        const int band = i / 9, prm = i % 9;
-        if (band < 0 || band >= 2) return;
+        const int oldCount = 2 * 9;
+        if (i == oldCount) { p->setMixedBands(v > 0.5f); return; }
+        int band = 0, prm = 0;
+        if (i < oldCount) { band = i / 9; prm = i % 9; }
+        else              { band = (i - oldCount - 1) / 5; prm = 9 + (i - oldCount - 1) % 5; }
+        if (i < 0 || band < 0 || band >= 2) return;
         (*ui)[static_cast<std::size_t>(band)][static_cast<std::size_t>(prm)] = v;
         p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)]));
     };
     // The orange curve is LIVE (current applied gain via getBandGainDb): it dips for
     // a cut and rises for a boost as the audio triggers each band. The draggable
-    // nodes sit at each band's Amount target (X=freq, Y=amount, wheel=Q).
-    s.magnitudeFn = [p, bandMag](const float* f, float* mdb, int n, double sr, const float* v) {
-        const float g0 = p->getBandGainDb(0);
-        const float g1 = p->getBandGainDb(1);
-        for (int i = 0; i < n; ++i) {
-            const double fHz = static_cast<double>(f[i]);
-            const double mag = bandMag(v[0], v[1], static_cast<int>(v[8]),  g0, fHz, sr)
-                             * bandMag(v[9], v[10], static_cast<int>(v[17]), g1, fHz, sr);
+    // nodes sit at each band's Amount target (X=freq, Y=amount, wheel=Q). Both
+    // curves are the engine's own (getBandMagnitude): what is drawn is what plays.
+    auto curve = [p](const float* f, float* mdb, int n, float g0, float g1) {
+        std::vector<float> first(static_cast<std::size_t>(std::max(n, 0))), second(first.size());
+        p->getBandMagnitude(0, g0, f, first.data(), n);
+        p->getBandMagnitude(1, g1, f, second.data(), n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double mag = static_cast<double>(first[static_cast<std::size_t>(i)])
+                             * static_cast<double>(second[static_cast<std::size_t>(i)]);
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
+    s.magnitudeFn = [p, curve](const float* f, float* mdb, int n, double, const float*) {
+        curve(f, mdb, n, p->getBandGainDb(0), p->getBandGainDb(1));
+    };
     // Faint target curve = each band's Amount (the ceiling the live curve moves to);
     // the draggable nodes sit on it.
-    s.targetMagnitudeFn = [bandMag](const float* f, float* mdb, int n, double sr, const float* v) {
-        for (int i = 0; i < n; ++i) {
-            const double fHz = static_cast<double>(f[i]);
-            const double mag = bandMag(v[0], v[1], static_cast<int>(v[8]),  v[3],  fHz, sr)
-                             * bandMag(v[9], v[10], static_cast<int>(v[17]), v[12], fHz, sr);
-            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
-        }
+    s.targetMagnitudeFn = [curve](const float* f, float* mdb, int n, double, const float* v) {
+        curve(f, mdb, n, v[3], v[12]);
     };
     s.curveNodes = { {0,3,1}, {9,12,10} };  // X=freq, Y=Amount (drag to boost/cut), wheel=Q
     return s;

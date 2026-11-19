@@ -6,6 +6,7 @@
 #include "../DSPark.h"
 #include "EffectSlot.h"
 
+#include <array>
 #include <memory>
 
 namespace dsplab {
@@ -356,10 +357,30 @@ inline EffectSlot makeCompressor()
     s.addSlider("Adaptive Attack", 0, 1, 0, "");
     s.addSlider("Spectral Timing", 0, 1, 0, "");
     s.addSlider("Attack Emphasis", -1, 1, 0, "");
+    // The equalizer of the key (indices 24 to 31): listen to the key, a low
+    // cut with its slope (20 Hz: off), a high cut (20 kHz: off), a bell and a
+    // tilt about 1 kHz.
+    s.addToggle("Key Listen", false);
+    s.addSlider("Key Low Cut", 20, 2000, 20, "Hz");
+    s.addSlider("Key Low Cut Slope", 6, 48, 12, "dB/oct");
+    s.addSlider("Key High Cut", 500, 20000, 20000, "Hz");
+    s.addSlider("Key Bell Freq", 40, 16000, 1000, "Hz");
+    s.addSlider("Key Bell Gain", -24, 24, 0, "dB");
+    s.addSlider("Key Bell Q", 0.3f, 10, 1, "");
+    s.addSlider("Key Tilt", -6, 6, 0, "dB/oct");
+    using CompKeyBand = dspark::Compressor<float>::KeyBand;
+    using CompKeyShape = dspark::Compressor<float>::KeyShape;
+    auto key = std::make_shared<std::array<CompKeyBand, 4>>();
+    (*key)[0].frequency = 20.0f;
+    (*key)[1].frequency = 20000.0f;
+    (*key)[2].shape = CompKeyShape::Bell;
+    (*key)[2].q = 1.0f;
+    (*key)[3].shape = CompKeyShape::Tilt;
+    (*key)[3].slope = 0.0f;
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, key](int i, float v) {
         switch(i) {
             case 0: p->setThreshold(v); break;
             case 1: p->setRatio(v); break;
@@ -385,6 +406,22 @@ inline EffectSlot makeCompressor()
             case 21: p->setAdaptiveAttack(v); break;
             case 22: p->setSpectralTiming(v); break;
             case 23: p->setAttackEmphasis(v); break;
+            case 24: p->setSidechainListen(v > 0.5f); break;
+            case 25: case 26: case 27: case 28: case 29: case 30: case 31:
+            {
+                auto& k = *key;
+                if (i == 25) k[0].frequency = v;
+                if (i == 26) k[0].slope = v;
+                if (i == 27) k[1].frequency = v;
+                if (i == 28) k[2].frequency = v;
+                if (i == 29) k[2].gainDb = v;
+                if (i == 30) k[2].q = v;
+                if (i == 31) k[3].slope = v;
+                k[0].shape = k[0].frequency > 20.5f ? CompKeyShape::LowCut : CompKeyShape::Off;
+                k[1].shape = k[1].frequency < 19999.0f ? CompKeyShape::HighCut : CompKeyShape::Off;
+                for (int b = 0; b < 4; ++b) p->setSidechainBand(b, k[static_cast<size_t>(b)]);
+                break;
+            }
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

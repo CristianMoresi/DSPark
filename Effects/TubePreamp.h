@@ -154,14 +154,20 @@
  * ramp landed in 0.7 ms with 32-sample blocks and clicked). Channels beyond the prepared count pass through
  * untouched.
  *
+ * An optional cabinet stage (setCabinet(), off by default) runs the wet
+ * signal through a CabinetModel: the speaker's resonance, breakup and
+ * roll-off and the box's reflections, with no latency. It fades in and out
+ * over 20 ms.
+ *
  * Dependencies: Core/WDF.h, Core/Oversampling.h, Core/Biquad.h, Core/FIRFilter.h,
- * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
- * Core/SmoothedValue.h, Core/StateBlob.h.
+ * Core/AudioSpec.h, Core/AudioBuffer.h, Core/CabinetModel.h, Core/DspMath.h,
+ * Core/DenormalGuard.h, Core/SmoothedValue.h, Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
+#include "../Core/CabinetModel.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
 #include "../Core/FIRFilter.h"
@@ -928,6 +934,9 @@ public:
         dryRing_.assign(static_cast<size_t>(numChannels_),
                         std::vector<T>(static_cast<size_t>(drySize_), T(0)));
         dryPos_ = 0;
+        cabinet_.prepare(sampleRate_, numChannels_);
+        cabScratch_.resize(numChannels_, maxBlock_);
+        cabStep_ = 1.0 / std::max(1.0, sampleRate_ * 0.02);
 
         calibrateReference();
 
@@ -956,7 +965,25 @@ public:
         // Seed the anti-zipper ramps at their targets: no fade-in on start.
         gainsInitialized_ = false;
         currentMix_ = mix_.load(std::memory_order_relaxed);
+        cabinet_.reset();
+        cabNow_ = cabinetOn_.load(std::memory_order_relaxed) ? 1.0 : 0.0;
     }
+
+    /**
+     * @brief Runs the wet signal through a loudspeaker cabinet (off by default).
+     *
+     * The cabinet comes after the circuit and before the dry/wet mix, adds
+     * no latency and fades in and out over 20 ms. Its settings (size of the
+     * box, brightness of the speaker, distance of the microphone) are those
+     * of getCabinet(). Safe from any thread.
+     */
+    void setCabinet(bool on) noexcept { cabinetOn_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the cabinet stage is on. */
+    [[nodiscard]] bool isCabinet() const noexcept { return cabinetOn_.load(std::memory_order_relaxed); }
+
+    /** @brief The cabinet model: its setters are safe from any thread. */
+    [[nodiscard]] CabinetModel<T>& getCabinet() noexcept { return cabinet_; }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
 
@@ -1191,6 +1218,8 @@ public:
         w.write("oversampling", osFactor_);
         w.write("oversamplingAuto", osAutomatic_);
         w.write("gridModel", static_cast<int32_t>(gridModel_));
+        w.write("cabinet", cabinetOn_.load(std::memory_order_relaxed));
+        cabinet_.writeState(w, "cab.");
         return w.blob();
     }
 
@@ -1207,6 +1236,8 @@ public:
         setStages(r.read("stages", 1));
         setOutput(static_cast<T>(r.read("output", 0.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setCabinet(r.read("cabinet", false));
+        cabinet_.readState(r, "cab.");
         // The grid model takes effect with the (possibly changed) factor: one
         // rebuild, not two. Blobs without the key restore the Clamp model.
         const auto grid = static_cast<GridModel>(std::clamp(r.read("gridModel", 0), 0, 1));
@@ -1404,6 +1435,8 @@ private:
             supplyNow_.store(static_cast<T>(kBplus - sagSmoother_.getCurrentValue() * current),
                              std::memory_order_relaxed);
         }
+
+        runCabinet(buffer, nCh, nS);
 
         // Latency-compensated mix (ramped: a hard flip on the distorted wet
         // stream clicked at 1.6x the steady-state sample delta).
@@ -3041,6 +3074,41 @@ private:
     int stageWarmupRemaining_ = 0;
     bool bothStagesActive_ = false;
     bool gainsInitialized_ = false;
+    /** The cabinet stage on the wet signal, faded in and out (audio thread). */
+    void runCabinet(AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
+        const double target = cabinetOn_.load(std::memory_order_relaxed) ? 1.0 : 0.0;
+        if (cabNow_ == 0.0 && target == 0.0) return;
+        if (cabNow_ == 1.0 && target == 1.0)
+        {
+            cabinet_.processBlock(buffer.getSubView(0, nS));
+            return;
+        }
+        if (cabNow_ == 0.0) cabinet_.reset();     // its memory is of another time
+        const int n = std::min(nS, cabScratch_.getNumSamples());
+        const int channels = std::min(nCh, cabScratch_.getNumChannels());
+        for (int ch = 0; ch < channels; ++ch)
+            std::copy_n(buffer.getChannel(ch), n, cabScratch_.getChannel(ch));
+        cabinet_.processBlock(cabScratch_.toView().getSubView(0, n));
+        double now = cabNow_;
+        for (int i = 0; i < n; ++i)
+        {
+            now += std::clamp(target - now, -cabStep_, cabStep_);
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                T& x = buffer.getChannel(ch)[i];
+                x = static_cast<T>(static_cast<double>(x) + now * (static_cast<double>(cabScratch_.getChannel(ch)[i]) - static_cast<double>(x)));
+            }
+        }
+        cabNow_ = (n < nS) ? target : now;
+    }
+
+    CabinetModel<T> cabinet_;
+    std::atomic<bool> cabinetOn_ { false };
+    AudioBuffer<T> cabScratch_;
+    double cabNow_ = 0.0;                       ///< Share of the cabinet in the wet signal (audio thread).
+    double cabStep_ = 1.0 / 960.0;
+
     T currentMix_ = T(1);                       ///< Audio-thread mix ramp state.
     T mixMaxStep_ = T(1.0 / 960.0);             ///< Mix ramp rate: full scale per 20 ms.
 

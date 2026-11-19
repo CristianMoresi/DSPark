@@ -6,6 +6,56 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `FilterDesign` (new, `Core/FilterDesign.h`, with `AnalogSection` and
+  `AnalogCascade`): filters described as analog sections and turned into the
+  biquads whose magnitude stays on the analog curve up to Nyquist, for every
+  shape (bells, shelves with a slope, low-pass, high-pass, band-pass, notch,
+  first-order sections, tilt), not only the six that had a closed form.
+  `FilterDesign::digital(section, band)` carries the poles over by impulse
+  invariance, fits the numerator to the analog power by linear least squares
+  (the squared magnitude of a biquad polynomial is a quadratic in 1 - cos w)
+  and, where that is not within a hundredth of a decibel, moves numerator and
+  denominator together in at most two more linear steps weighted for the
+  relative error. It looks at sixteen frequencies across the band and at
+  fourteen around the poles and zeros of the section. Zeros at DC and on the
+  frequency axis stay exactly where the prototype has them and the gain at
+  DC is held; an all-pass stays an all-pass. Worst distance to the analog
+  magnitude from 20 Hz to 20 kHz over centres from 30 Hz to 20 kHz, Q from
+  0.3 to 16 and gains to 24 dB (decibels, worst / mean; the same on three
+  compilers): at 48 kHz bells 0.25 / 0.03 (closed-form matched design
+  2.95 / 0.24, bilinear 11.5 / 1.7), shelves of any slope 0.10 / 0.01
+  (0.44 / 0.08; 6.3 / 1.0), low-pass above -60 dB 0.16 / 0.07 (1.06 / 0.57),
+  high-pass 1.27 / 0.18 (3.79 / 0.49), band-pass 0.37 / 0.20 (2.01 / 0.91),
+  notch 0.42 / 0.09 (bilinear 13.7 / 3.3), first-order sections 0.28 at
+  most (bilinear 9.1); at 44.1 kHz bells 0.52 / 0.06 (4.24 / 0.36); at
+  96 kHz every shape within 0.06 (closed forms 0.03 to 0.43). The design is
+  a smooth function of its parameters: a step of 0.01 dB of gain moves the
+  response by 0.03 dB at most. A section costs 0.55 to 1.0 us where the
+  numerator is enough and 1.4 to 2.6 us with the joint steps (the closed
+  forms 0.06 to 0.10 us), with nothing allocated: it can run where the
+  parameters change. `FilterDesign::Band` keeps the frequencies of the fit
+  for one sample rate; above 20 kHz an error counts less and less.
+  On top of the sections, the cascades of an equalizer as analog prototypes:
+  `highCut()` and `lowCut()` of any slope from 0 to 96 dB per octave as a
+  real number (whole orders are Butterworth to rounding; between them the
+  corner stays at -3 dB and the cascade follows 1 / (1 + w^(2 order)) down
+  to -36 dB within 0.8 dB between 6 and 12 dB per octave, 0.5 at 15 and
+  under 0.1 from 21 up; under 6 dB per octave it is the fraction of a pole,
+  within 0.15 dB; a step of 0.006 dB per octave moves the response by
+  0.07 dB at most, across every whole order), with the resonance on the
+  sharpest pair; `bell()`, `lowShelf()` and `highShelf()` of order 1 to 16
+  (Butterworth: the gain at the centre, half of it at the edges at every
+  order, no overshoot, a cut that is the exact inverse of the boost; the
+  top within 0.1 dB over 7 % of the half width at order 1 and 84 % at
+  order 16); `bandPass()`, `bandStop()` and `allPass()` of any order;
+  `tilt()`, a straight line of -6 to +6 dB per octave across the whole band
+  within 0.07 dB; and `ellipticHighCut()` / `ellipticLowCut()`, an elliptic
+  wall (order 12, 0.05 dB of ripple and 100 dB of floor by default: the
+  floor starts 1.17 times the corner away). As biquads at 48 kHz the
+  cascades stay on their prototypes where a section by section bilinear
+  transform is off by tens of decibels: a 30 dB per octave cut at 12 kHz
+  0.12 dB (35), a 96 dB per octave cut at 16 kHz 0.36 (76), a bell of
+  order 8 at 14 kHz 0.10 (6.9), the wall at 10 kHz 0.45 (40).
 - `BiquadCascade<T, MaxSections, MaxChannels>` (new,
   `Core/BiquadCascade.h`): second-order sections in series, run up to four
   at a time inside one loop over the samples, in direct form I with the node

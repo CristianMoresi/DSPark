@@ -38,6 +38,8 @@ void instantiate()
     Oscillator<T> osc;
     [[maybe_unused]] BiquadCascade<T> cascade;
     [[maybe_unused]] NormalizedLadder<T> normalizedLadder;
+    [[maybe_unused]] const BiquadCoeffs designed = FilterDesign::digital(AnalogSection::peak(1000.0, 1.0, 6.0), FilterDesign::Band(48000.0));
+    [[maybe_unused]] const AnalogCascade designedCut = FilterDesign::highCut(1000.0, 18.0);
     Oversampling<T> ov(2);
     OversamplingDryPath<T> ovDry;
     [[maybe_unused]] const int ovFactor = Oversampling<T>::factorForRate(48000.0);

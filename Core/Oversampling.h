@@ -59,6 +59,7 @@
 #include <cmath>
 #include <complex>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace dspark {
@@ -223,6 +224,33 @@ public:
             filters_[static_cast<size_t>(i)].reset();
             iir_[static_cast<size_t>(i)].reset();
         }
+    }
+
+    /**
+     * @brief The smallest factor that brings a host rate up to an internal rate.
+     *
+     * A nonlinear stage that always runs at about the same internal rate
+     * sounds the same at every host rate and stops paying for oversampling
+     * the host already provides: with the default minimum the factor is 4 at
+     * 44.1 and 48 kHz, 2 at 88.2 and 96 kHz and 1 from 176.4 kHz up.
+     *
+     * @param sampleRate          Host rate in Hz. A rate that is not a positive
+     *                            finite number gives 1.
+     * @param minimumInternalRate Internal rate to reach, in Hz.
+     * @param maxFactor           Largest factor returned (at most 16).
+     * @return A power of two between 1 and maxFactor.
+     */
+    [[nodiscard]] static constexpr int factorForRate(double sampleRate,
+                                                     double minimumInternalRate = 176400.0,
+                                                     int maxFactor = 1 << kMaxStages) noexcept
+    {
+        if (!(sampleRate > 0.0) || !(sampleRate < 1e12)) return 1;
+        const int limit = maxFactor < 1 ? 1 : (maxFactor > (1 << kMaxStages) ? (1 << kMaxStages) : maxFactor);
+        int factor = 1;
+        // A rate a rounding error short of an exact multiple still counts.
+        while (factor * 2 <= limit && sampleRate * factor < minimumInternalRate * (1.0 - 1e-9))
+            factor *= 2;
+        return factor;
     }
 
     /** @brief Returns the current oversampling factor. */
@@ -1019,6 +1047,121 @@ private:
 
     std::array<PolyphaseHalfBand, kMaxStages> filters_;
     std::array<PolyphaseIirHalfBand, kMaxStages> iir_;
+};
+
+/**
+ * @class OversamplingDryPath
+ * @brief Carries a dry signal through the same round trip as an Oversampling
+ *        engine, so that a dry/wet mix adds in phase at every frequency.
+ *
+ * A linear-phase engine delays by a whole number of samples at every
+ * frequency, and the dry path is that delay. A polyphase IIR engine does not:
+ * its round-trip delay is fractional and rises towards the band edge (3.07
+ * samples at 1 kHz and 4.23 at 18 kHz for 2x High at 48 kHz), so against a dry
+ * signal delayed by the rounded figure a 50 % mix of an untouched wet signal
+ * measures a notch above the middle of the band. Here the dry signal runs
+ * through a twin of the engine with nothing between its two halves, which is
+ * the same linear filter the wet signal crosses: the two add in phase, and a
+ * wet path that does nothing nulls against the dry one exactly.
+ *
+ * The twin costs what the engine's filters cost (at 2x High, about as much
+ * again as the round trip itself); the linear-phase case costs a delay.
+ *
+ * Threading: prepare() and reset() on the setup thread (prepare allocates);
+ * process() on the audio thread, noexcept and allocation-free.
+ *
+ * @tparam T           Sample type (float or double).
+ * @tparam MaxChannels Maximum number of channels supported.
+ */
+template <typename T, int MaxChannels = 16>
+class OversamplingDryPath
+{
+public:
+    using Engine = Oversampling<T, MaxChannels>;
+
+    /**
+     * @brief Sizes the path for an engine.
+     * @param spec   The specification the engine was prepared with (base rate).
+     * @param engine The engine whose round trip the dry signal has to match.
+     *               Only its factor, quality, mode and depth are read.
+     */
+    void prepare(const AudioSpec& spec, const Engine& engine)
+    {
+        twin_.reset();
+        delay_.clear();
+        delaySamples_ = 0;
+        writePos_ = 0;
+        numChannels_ = std::clamp(spec.numChannels, 0, MaxChannels);
+        if (engine.getFactor() <= 1 || numChannels_ == 0 || spec.maxBlockSize <= 0)
+            return;
+
+        if (engine.getMode() == Engine::Mode::PolyphaseIir)
+        {
+            twin_ = std::make_unique<Engine>(engine.getFactor(), engine.getQuality(),
+                                             engine.getMode(), engine.getDepth());
+            twin_->prepare(spec);
+        }
+        else
+        {
+            delaySamples_ = engine.getLatency();
+            delay_.assign(static_cast<size_t>(numChannels_) * static_cast<size_t>(std::max(delaySamples_, 1)), T(0));
+        }
+    }
+
+    /** @brief Clears the path's memory. */
+    void reset() noexcept
+    {
+        if (twin_) twin_->reset();
+        std::fill(delay_.begin(), delay_.end(), T(0));
+        writePos_ = 0;
+    }
+
+    /** @brief The delay of the path in base-rate samples, as the engine reports its own. */
+    [[nodiscard]] int getLatency() const noexcept { return twin_ ? twin_->getLatency() : delaySamples_; }
+
+    /**
+     * @brief Passes a block of the dry signal through the path, in place.
+     * @param dry Base-rate block. Blocks longer than prepare()'s maxBlockSize
+     *            keep their tail untouched; channels beyond the prepared
+     *            count are left alone.
+     */
+    void process(AudioBufferView<T> dry) noexcept
+    {
+        if (twin_)
+        {
+            [[maybe_unused]] const auto high = twin_->upsample(dry);
+            twin_->downsample(dry);
+            return;
+        }
+        if (delaySamples_ <= 0) return;
+
+        const int nCh = std::min(dry.getNumChannels(), numChannels_);
+        const int nS = dry.getNumSamples();
+        if (nS <= 0) return;
+        const size_t length = static_cast<size_t>(delaySamples_);
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* x = dry.getChannel(ch);
+            T* line = delay_.data() + static_cast<size_t>(ch) * length;
+            size_t pos = writePos_;
+            for (int i = 0; i < nS; ++i)
+            {
+                const T out = line[pos];
+                line[pos] = x[i];
+                x[i] = out;
+                if (++pos == length) pos = 0;
+            }
+        }
+        // Every channel advanced by the same count from the same position.
+        writePos_ = (writePos_ + static_cast<size_t>(nS)) % length;
+    }
+
+private:
+    std::unique_ptr<Engine> twin_;   ///< Polyphase IIR: the engine again, with nothing in between.
+    std::vector<T> delay_;           ///< Linear phase: one delay line per channel, side by side.
+    int delaySamples_ = 0;
+    int numChannels_ = 0;
+    size_t writePos_ = 0;
 };
 
 } // namespace dspark

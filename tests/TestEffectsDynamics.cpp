@@ -2629,7 +2629,7 @@ DSPARK_TEST(Compressor_invalid_inputs_are_ignored)
 
     // Wild enums clamp to the last member and the getters stay honest.
     subject.setCharacter(static_cast<Comp::Character>(99));
-    EXPECT_EQ(static_cast<int>(subject.getCharacter()), 3);
+    EXPECT_EQ(static_cast<int>(subject.getCharacter()), 4);
     subject.setCharacter(Comp::Character::Clean);
     subject.setDetector(static_cast<Comp::DetectorType>(77));
     EXPECT_EQ(static_cast<int>(subject.getDetector()), 5);
@@ -5508,6 +5508,379 @@ DSPARK_TEST(Gate_and_expander_shape_and_play_their_key)
         EXPECT_TRUE(other2.setState(listenBlob.data(), listenBlob.size()));
         EXPECT_FALSE(other2.isSidechainListen());
     }
+}
+
+// ============================================================================
+// Compressor: the Smooth character, the push-pull element and the gain after
+// the ballistics
+// ============================================================================
+
+namespace {
+
+// Level in dB of the line at `hz` over the last tenth of a second of a signal at 48 kHz
+// (hz a multiple of 10 Hz, so the stretch holds whole periods).
+double compLineDb(const Vec& v, double hz)
+{
+    const size_t n = 4800, from = v.size() - n;
+    double re = 0.0, im = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double phase = 2.0 * kPiD * hz * static_cast<double>(i) / 48000.0;
+        re += static_cast<double>(v[from + i]) * std::cos(phase);
+        im += static_cast<double>(v[from + i]) * std::sin(phase);
+    }
+    return 20.0 * std::log10(std::max(2.0 * std::sqrt(re * re + im * im) / static_cast<double>(n), 1e-12));
+}
+
+// A mono render in blocks of 512.
+template <class Setup>
+Vec compRender(const Vec& in, Setup&& setup)
+{
+    auto c = std::make_unique<Compressor<float>>();
+    setup(*c);
+    c->prepare(AudioSpec{ 48000.0, 512, 1 });
+    std::vector<Vec> x { in };
+    processInBlocks(x, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+    return x[0];
+}
+
+// The same, one sample at a time.
+template <class Setup>
+Vec compRenderSamples(const Vec& in, Setup&& setup)
+{
+    auto c = std::make_unique<Compressor<float>>();
+    setup(*c);
+    c->prepare(AudioSpec{ 48000.0, 512, 1 });
+    Vec y = in;
+    for (auto& s : y) s = c->processSample(s, 0);
+    return y;
+}
+
+} // namespace
+
+// New: the Smooth character. Two layers make its curve: half the slope from
+// 6 dB under the threshold, the whole from 6 dB over, and the ratio's own
+// curve far above. Its followers take longer the farther they are, so a deep
+// reduction comes back more slowly than a shallow one and an onset is caught
+// later than by a one-pole; Topology and Precision do not apply to it; in
+// Upward mode it is the Clean character.
+DSPARK_TEST(Compressor_smooth_character_levels_under_and_catches_over)
+{
+    using C = Compressor<float>;
+    const auto smooth = [](C& c) {
+        c.setCharacter(C::Character::Smooth);
+        c.setDetector(C::DetectorType::Hilbert);
+        c.setThreshold(-20.0f);
+        c.setRatio(4.0f);
+        c.setAttack(5.0f);
+        c.setRelease(100.0f);
+    };
+    const auto clean = [](C& c) {
+        c.setDetector(C::DetectorType::Hilbert);
+        c.setThreshold(-20.0f);
+        c.setRatio(4.0f);
+        c.setAttack(5.0f);
+        c.setRelease(100.0f);
+    };
+
+    // The static curve, on steady tones (decibels of reduction at a level).
+    const auto settled = [&](double levelDb, auto&& setup) {
+        const Vec in = makeSine(1000.0, std::pow(10.0, levelDb / 20.0), 48000.0, 48000 * 4);
+        return compTrace(in, setup).back();
+    };
+    EXPECT_NEAR(settled(-34.0, smooth), 0.0, 0.02);
+    EXPECT_NEAR(settled(-26.0, smooth), -0.5625, 0.08);
+    EXPECT_NEAR(settled(-20.0, smooth), -2.25, 0.08);
+    EXPECT_NEAR(settled(-14.0, smooth), -4.78, 0.08);
+    EXPECT_NEAR(settled(-8.0, smooth), -9.0, 0.08);
+    EXPECT_NEAR(settled(-2.0, smooth), -13.5, 0.08);
+    EXPECT_NEAR(settled(-8.0, clean), -9.0, 0.08);         // far over, the ratio's own curve
+    EXPECT_NEAR(settled(-20.0, clean), 0.0, 0.02);
+
+    // The release: the time to come back to 1/e of the reduction, and the
+    // share of a deep reduction given back in the first 100 ms. A one-pole
+    // rushes (63 % in its time); the layers leave at a steady pace.
+    double smoothEarly = 0.0, cleanEarly = 0.0;
+    const auto release = [&](double levelDb, auto&& setup, double& early) {
+        const Vec in = compToneThenSilence(1000.0, std::pow(10.0, levelDb / 20.0), 3.0, 7.0);
+        const auto trace = compTrace(in, setup);
+        const size_t stop = static_cast<size_t>(48000 * 3 / 16);
+        early = 1.0 - trace[stop + 300] / trace[stop - 1];
+        return compReleaseMs(trace, 48000 * 3);
+    };
+    const double shallow = release(-14.0, smooth, smoothEarly), deep = release(0.0, smooth, smoothEarly);
+    const double cleanShallow = release(-14.0, clean, cleanEarly), cleanDeep = release(0.0, clean, cleanEarly);
+    EXPECT_NEAR(cleanShallow, cleanDeep, 4.0);
+    EXPECT_GT(shallow, cleanShallow * 3.0);
+    EXPECT_GT(deep, cleanDeep * 3.0);
+    EXPECT_LT(deep, 2500.0);
+    EXPECT_GT(cleanEarly, 0.55);
+    EXPECT_LT(smoothEarly, 0.3);
+
+    // An onset 12 dB over the threshold: caught later, and to the same depth.
+    Vec step = makeSine(1000.0, 0.01, 48000.0, 48000 * 3);
+    for (size_t i = 48000; i < step.size(); ++i) step[i] *= 40.0f;     // -40 -> -8 dBFS
+    const auto smoothTrace = compTrace(step, smooth), cleanTrace = compTrace(step, clean);
+    const double smoothAttack = compAttackMs(smoothTrace, 48000, -9.0);
+    const double cleanAttack = compAttackMs(cleanTrace, 48000, -9.0);
+    EXPECT_GT(smoothAttack, cleanAttack * 1.5);
+    EXPECT_LT(smoothAttack, 200.0);
+    EXPECT_NEAR(smoothTrace.back(), cleanTrace.back(), 0.1);
+
+    // The paths: one sample at a time is the block; Topology and Precision change nothing.
+    const Vec burst = compLowOverHigh(24000);
+    const auto dense = [](C& c) {
+        c.setCharacter(C::Character::Smooth);
+        c.setThreshold(-24.0f);
+        c.setRatio(3.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setHoldTime(3.0f);
+        c.setRange(8.0f);
+    };
+    const Vec block = compRender(burst, dense);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, dense)), 1e-6);
+    EXPECT_EQ(compFarthest(block, compRender(burst, [&](C& c) { dense(c); c.setTopology(C::Topology::FeedBack); })), 0.0);
+    EXPECT_EQ(compFarthest(block, compRender(burst, [&](C& c) { dense(c); c.setPrecision(C::Precision::High); })), 0.0);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { dense(c); c.setCharacter(C::Character::Clean); })), 0.01);
+    {
+        C c;
+        dense(c);
+        c.setPrecision(C::Precision::High);
+        c.prepare(AudioSpec{ 48000.0, 512, 1 });
+        EXPECT_EQ(c.getLatency(), 0);
+        c.setCharacter(C::Character::Clean);
+        EXPECT_GT(c.getLatency(), 0);
+    }
+    // The range bounds the sum of the two layers.
+    {
+        const Vec loud = makeSine(1000.0, 0.9, 48000.0, 48000);
+        const auto trace = compTrace(loud, dense);
+        double deepest = 0.0;
+        for (double gr : trace) deepest = std::min(deepest, gr);
+        EXPECT_NEAR(deepest, -8.0, 0.01);
+    }
+    // Upward: one envelope on the knobs, as Clean.
+    const auto upward = [](C& c) { c.setMode(C::Mode::Upward); c.setThreshold(-30.0f); c.setRatio(2.0f); };
+    EXPECT_EQ(compFarthest(compRender(burst, [&](C& c) { upward(c); c.setCharacter(C::Character::Smooth); }),
+                           compRender(burst, upward)), 0.0);
+
+    // Switching characters while it runs carries the gain across.
+    {
+        auto c = std::make_unique<C>();
+        clean(*c);
+        c->prepare(AudioSpec{ 48000.0, 16, 1 });
+        std::vector<Vec> x { makeSine(1000.0, 0.4, 48000.0, 48000 * 2) };
+        int at = 0;
+        double last = 0.0, jump = 0.0;
+        processInBlocks(x, 16, [&](AudioBufferView<float> b) {
+            if (at == 48000) c->setCharacter(C::Character::Smooth);
+            c->processBlock(b);
+            at += b.getNumSamples();
+            const double gr = static_cast<double>(c->getGainReductionDb());
+            if (at > 24000) jump = std::max(jump, std::abs(gr - last));
+            last = gr;
+        });
+        EXPECT_LT(jump, 0.2);                               // dB between two blocks of 16 samples
+    }
+
+    C a;
+    a.setCharacter(C::Character::Smooth);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getCharacter() == C::Character::Smooth);
+}
+
+// New: with the Varimu character the colour applies the gain through a
+// push-pull pair. Its harmonics are odd, grow with the reduction and with
+// the level, a small signal gets the gain exactly, and the other characters
+// are untouched.
+DSPARK_TEST(Compressor_varimu_colour_is_a_push_pull_element_that_bends_with_the_reduction)
+{
+    using C = Compressor<float>;
+    // A reduction pinned by the range: the gain is the same every sample.
+    const auto pinned = [](float rangeDb, float colour) {
+        return [=](C& c) {
+            c.setCharacter(C::Character::Varimu);
+            c.setThreshold(-60.0f);
+            c.setRatio(20.0f);
+            c.setAttack(1.0f);
+            c.setRelease(100.0f);
+            c.setRange(rangeDb);
+            c.setHoldTime(5.0f);          // the target stays down through the zero crossings
+            c.setCharacterColor(colour);
+        };
+    };
+    const Vec tone = makeSine(1000.0, 0.5, 48000.0, 48000);
+    const auto third = [&](const Vec& out) { return compLineDb(out, 3000.0) - compLineDb(out, 1000.0); };
+
+    const Vec plain = compRender(tone, pinned(12.0f, 0.0f));
+    EXPECT_NEAR(compLineDb(plain, 1000.0), -6.02 - 12.0, 0.02);
+    EXPECT_LT(third(plain), -100.0);
+
+    const Vec twelve = compRender(tone, pinned(12.0f, 1.0f));
+    EXPECT_NEAR(third(twelve), -37.0, 1.0);
+    EXPECT_LT(compLineDb(twelve, 2000.0) - compLineDb(twelve, 1000.0), -100.0);   // odd harmonics only
+    EXPECT_LT(compLineDb(twelve, 4000.0) - compLineDb(twelve, 1000.0), -100.0);
+    EXPECT_NEAR(compLineDb(twelve, 1000.0), -18.02 + 0.39, 0.1);
+
+    EXPECT_NEAR(third(compRender(tone, pinned(20.0f, 1.0f))), -31.2, 1.0);
+    EXPECT_NEAR(third(compRender(tone, pinned(6.0f, 1.0f))), -69.5, 3.0);         // the minimum of the pair
+    EXPECT_NEAR(third(compRender(tone, pinned(12.0f, 0.5f))), -48.2, 1.0);
+
+    // At rest (no reduction) the pair is nearly straight.
+    const auto resting = [](C& c) {
+        c.setCharacter(C::Character::Varimu);
+        c.setThreshold(0.0f);
+        c.setCharacterColor(1.0f);
+    };
+    EXPECT_NEAR(third(compRender(tone, resting)), -61.5, 1.0);
+
+    // A small signal gets the gain, and nothing else.
+    const Vec quiet = makeSine(1000.0, 0.01, 48000.0, 48000);
+    const Vec quietOut = compRender(quiet, pinned(12.0f, 1.0f));
+    EXPECT_NEAR(compLineDb(quietOut, 1000.0), -40.0 - 12.0, 0.01);
+    EXPECT_LT(third(quietOut), -95.0);
+
+    // One sample at a time; in a feedback loop; and the characters without it.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C& c) {
+        c.setCharacter(C::Character::Varimu);
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(3.0f);
+        c.setRelease(80.0f);
+        c.setCharacterColor(0.8f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setCharacterColor(0.0f); })), 1e-3);
+    const Vec looped = compRender(burst, [&](C& c) { working(c); c.setTopology(C::Topology::FeedBack); });
+    for (float s : looped) EXPECT_TRUE(std::isfinite(s) && std::abs(s) < 2.0f);
+    const auto others = [&](C::Character type) {
+        const auto base = [=](C& c) { c.setCharacter(type); c.setThreshold(-24.0f); c.setRatio(4.0f); };
+        return compFarthest(compRender(burst, base),
+                            compRender(burst, [&](C& c) { base(c); c.setCharacterColor(1.0f); }));
+    };
+    EXPECT_EQ(others(C::Character::Clean), 0.0);
+    EXPECT_EQ(others(C::Character::Opto), 0.0);
+    EXPECT_EQ(others(C::Character::Smooth), 0.0);
+}
+
+// New: the gain can be smoothed after the ballistics. Two sections round its
+// corners: an attack that was a step arrives over the time set, the ripple a
+// fast release leaves on a low tone goes, and the depth it settles on stays.
+DSPARK_TEST(Compressor_gain_smoothing_rounds_the_gain_after_the_ballistics)
+{
+    using C = Compressor<float>;
+    const auto fast = [](float smoothingMs) {
+        return [=](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(0.1f);
+            c.setRelease(200.0f);
+            c.setGainSmoothing(smoothingMs);
+        };
+    };
+    Vec step = makeSine(1000.0, 0.01, 48000.0, 48000 * 2);
+    for (size_t i = 48000; i < step.size(); ++i) step[i] *= 40.0f;     // -40 -> -8 dBFS
+    const auto sharp = compTrace(step, fast(0.0f)), round = compTrace(step, fast(10.0f));
+    const double sharpMs = compAttackMs(sharp, 48000, sharp.back());
+    EXPECT_LT(sharpMs, 5.0);
+    EXPECT_NEAR(compAttackMs(round, 48000, round.back()) - sharpMs, 10.7, 2.0);
+    EXPECT_NEAR(round.back(), sharp.back(), 0.02);
+    EXPECT_NEAR(round.back(), -9.0, 0.1);
+
+    // The ripple of the gain on a 100 Hz tone with a quick release.
+    const auto riding = [](float smoothingMs) {
+        return [=](C& c) {
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(20.0f);
+            c.setGainSmoothing(smoothingMs);
+        };
+    };
+    const auto ripple = [&](float smoothingMs, double& mean) {
+        const auto trace = compTrace(makeSine(100.0, 0.5, 48000.0, 48000), riding(smoothingMs));
+        double lo = 0.0, hi = -100.0, sum = 0.0;
+        const size_t from = trace.size() - 600;                         // the last fifth of a second
+        for (size_t i = from; i < trace.size(); ++i)
+        {
+            lo = std::min(lo, trace[i]);
+            hi = std::max(hi, trace[i]);
+            sum += trace[i];
+        }
+        mean = sum / 600.0;
+        return hi - lo;
+    };
+    double meanSharp = 0.0, meanRound = 0.0;
+    const double rippleSharp = ripple(0.0f, meanSharp), rippleRound = ripple(20.0f, meanRound);
+    EXPECT_GT(rippleSharp, 0.5);
+    EXPECT_LT(rippleRound, rippleSharp * 0.05);
+    EXPECT_NEAR(meanRound, meanSharp, 0.1);
+
+    // The paths; a feedback loop reads the gain before the smoothing and stays put.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C& c) {
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setGainSmoothing(5.0f);
+        c.setAmount(0.8f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setGainSmoothing(0.0f); })), 1e-3);
+    const auto loop = [](float smoothingMs) {
+        return [=](C& c) {
+            c.setTopology(C::Topology::FeedBack);
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(100.0f);
+            c.setGainSmoothing(smoothingMs);
+        };
+    };
+    const Vec steady = makeSine(1000.0, 0.4, 48000.0, 48000);
+    EXPECT_NEAR(compTrace(steady, loop(20.0f)).back(), compTrace(steady, loop(0.0f)).back(), 0.05);
+
+    // Switched on while the gain is down, it starts from where the gain is.
+    {
+        auto c = std::make_unique<C>();
+        fast(0.0f)(*c);
+        c->prepare(AudioSpec{ 48000.0, 16, 1 });
+        std::vector<Vec> x { makeSine(1000.0, 0.4, 48000.0, 48000) };
+        int at = 0;
+        double last = 0.0, jump = 0.0;
+        processInBlocks(x, 16, [&](AudioBufferView<float> b) {
+            if (at == 24000) c->setGainSmoothing(30.0f);
+            c->processBlock(b);
+            at += b.getNumSamples();
+            const double gr = static_cast<double>(c->getGainReductionDb());
+            if (at > 12000) jump = std::max(jump, std::abs(gr - last));
+            last = gr;
+        });
+        EXPECT_LT(jump, 0.05);
+    }
+
+    // State and wild values.
+    C a;
+    a.setGainSmoothing(12.5f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getGainSmoothing(), 12.5f);
+    b.setGainSmoothing(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(b.getGainSmoothing(), 12.5f);
+    b.setGainSmoothing(900.0f);
+    EXPECT_EQ(b.getGainSmoothing(), 50.0f);
+    b.setGainSmoothing(-3.0f);
+    EXPECT_EQ(b.getGainSmoothing(), 0.0f);
 }
 
 // ============================================================================

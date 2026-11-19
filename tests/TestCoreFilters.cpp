@@ -9,6 +9,7 @@
 #include "../Core/FilterDesign.h"
 #include "../Core/FirBank.h"
 #include "../Core/KeyEqualizer.h"
+#include "../Core/CabinetModel.h"
 #include "../Core/NormalizedLadder.h"
 #include "../Core/StateVariableFilter.h"
 #include "../Core/LadderFilter.h"
@@ -4505,4 +4506,268 @@ DSPARK_TEST(KeyEqualizer_settings_glide_bands_leave_and_wild_values_stay_out)
         EXPECT_EQ(mine.q, theirs.q);
         EXPECT_EQ(mine.slope, theirs.slope);
     }
+}
+
+// ============================================================================
+// CabinetModel
+// ============================================================================
+
+namespace {
+
+using Cab = CabinetModel<float, 2>;
+
+// Gain in dB of a cabinet on a steady tone (measured over the second half of a second).
+double cabToneDb(Cab& cab, double hz)
+{
+    const int n = 48000;
+    std::vector<float> x(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        x[static_cast<size_t>(i)] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * hz * i / 48000.0));
+    const std::vector<float> in = x;
+    for (int off = 0; off < n; off += 512)
+    {
+        float* p = x.data() + off;
+        cab.processBlock(AudioBufferView<float>(&p, 1, std::min(512, n - off)));
+    }
+    double a = 0.0, b = 0.0;
+    for (int i = n / 2; i < n; ++i)
+    {
+        a += static_cast<double>(in[static_cast<size_t>(i)]) * in[static_cast<size_t>(i)];
+        b += static_cast<double>(x[static_cast<size_t>(i)]) * x[static_cast<size_t>(i)];
+    }
+    return 10.0 * std::log10(b / a);
+}
+
+} // namespace
+
+// New: the colour of a cabinet. Nothing under the cone's resonance, a bump
+// on it, the breakup peak and a steep roll-off over the corner, which the
+// size and the brightness move; the direct sound comes out at once.
+DSPARK_TEST(CabinetModel_colours_like_a_speaker_in_a_box)
+{
+    const auto fresh = [](float size, float brightness, float distance) {
+        auto cab = std::make_unique<Cab>();
+        cab->setSize(size);
+        cab->setBrightness(brightness);
+        cab->setDistance(distance);
+        cab->prepare(48000.0, 1);
+        return cab;
+    };
+    {
+        auto cab = fresh(0.5f, 0.5f, 0.0f);
+        EXPECT_NEAR(cab->getResonanceHz(), 140.0 / std::sqrt(2.0), 1e-9);
+        EXPECT_NEAR(cab->getRollOffHz(), 3000.0 * std::sqrt(7.0 / 3.0), 1e-9);
+        EXPECT_NEAR(cabToneDb(*cab, 1000.0), 0.0, 1.5);
+        EXPECT_LT(cabToneDb(*cab, 30.0), -15.0);
+        EXPECT_GT(cabToneDb(*cab, 99.0), 1.5);
+        EXPECT_GT(cabToneDb(*cab, 0.62 * cab->getRollOffHz()), 1.0);
+        EXPECT_LT(cabToneDb(*cab, 2.0 * cab->getRollOffHz()), -20.0);
+    }
+    // Brightness moves the roll-off; size moves the resonance.
+    auto dark = fresh(0.5f, 0.0f, 0.0f), bright = fresh(0.5f, 1.0f, 0.0f);
+    EXPECT_GT(cabToneDb(*bright, 6000.0), cabToneDb(*dark, 6000.0) + 15.0);
+    auto small = fresh(0.0f, 0.5f, 0.0f), large = fresh(1.0f, 0.5f, 0.0f);
+    EXPECT_GT(cabToneDb(*large, 70.0), cabToneDb(*small, 70.0) + 6.0);
+
+    // No latency: the first sample of an impulse is already out.
+    auto cab = fresh(0.5f, 0.5f, 0.6f);
+    std::vector<float> impulse(2048, 0.0f);
+    impulse[0] = 1.0f;
+    float* p = impulse.data();
+    cab->processBlock(AudioBufferView<float>(&p, 1, 2048));
+    EXPECT_GT(std::abs(impulse[0]), 1e-6f);
+    size_t peak = 0;
+    for (size_t i = 1; i < impulse.size(); ++i)
+        if (std::abs(impulse[i]) > std::abs(impulse[peak])) peak = i;
+    EXPECT_LT(peak, static_cast<size_t>(12));
+    // The box: the speaker alone, scaled as the reflections keep the level,
+    // up to the first reflection (0.29 ms, 14 samples); the reflections after it.
+    auto dry = fresh(0.5f, 0.5f, 0.0f);
+    std::vector<float> dryImpulse(2048, 0.0f);
+    dryImpulse[0] = 1.0f;
+    float* q = dryImpulse.data();
+    dry->processBlock(AudioBufferView<float>(&q, 1, 2048));
+    const double energy = 0.45 * 0.45 + 0.32 * 0.32 + 0.25 * 0.25 + 0.18 * 0.18 + 0.12 * 0.12 + 0.08 * 0.08;
+    const double norm = 1.0 / std::sqrt(1.0 + 0.36 * energy);
+    double before = 0.0, after = 0.0, total = 0.0;
+    for (size_t i = 0; i < 2048; ++i)
+    {
+        const double d = static_cast<double>(impulse[i]) - norm * static_cast<double>(dryImpulse[i]);
+        (i < 14 ? before : after) += d * d;
+        total += static_cast<double>(dryImpulse[i]) * dryImpulse[i];
+    }
+    EXPECT_LT(before, total * 1e-10);
+    EXPECT_GT(after, total * 0.05);
+}
+
+// New: the box keeps the level as the microphone moves off, settings glide
+// while audio runs, and wild values stay out.
+DSPARK_TEST(CabinetModel_keeps_the_level_glides_and_ignores_wild_values)
+{
+    // Pink-ish noise level through the speaker at no distance and at full distance.
+    const auto noiseLevel = [](float distance) {
+        auto cab = std::make_unique<Cab>();
+        cab->setDistance(distance);
+        cab->prepare(48000.0, 1);
+        std::vector<float> x(96000);
+        uint32_t seed = 3u;
+        double b0 = 0.0, b1 = 0.0, b2 = 0.0;
+        for (auto& s : x)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const double w = static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0;
+            b0 = 0.99765 * b0 + w * 0.0990460; b1 = 0.96300 * b1 + w * 0.2965164; b2 = 0.57000 * b2 + w * 1.0526913;
+            s = static_cast<float>(0.05 * (b0 + b1 + b2 + w * 0.1848));
+        }
+        for (int off = 0; off < 96000; off += 480)
+        {
+            float* p = x.data() + off;
+            cab->processBlock(AudioBufferView<float>(&p, 1, 480));
+        }
+        double e = 0.0;
+        for (size_t i = 48000; i < x.size(); ++i) e += static_cast<double>(x[i]) * x[i];
+        return 10.0 * std::log10(e);
+    };
+    EXPECT_NEAR(noiseLevel(1.0f), noiseLevel(0.0f), 1.5);
+
+    // A brightness change while a tone runs: the output moves without a step.
+    auto cab = std::make_unique<Cab>();
+    cab->prepare(48000.0, 2);
+    std::vector<float> l(48128), r(48128);
+    for (int i = 0; i < 48128; ++i)
+    {
+        l[static_cast<size_t>(i)] = static_cast<float>(0.3 * std::sin(2.0 * 3.14159265358979323846 * 3000.0 * i / 48000.0));
+        r[static_cast<size_t>(i)] = 0.0f;
+    }
+    double step = 0.0, steady = 0.0;
+    float last = 0.0f;
+    for (int off = 0; off < 48128; off += 256)
+    {
+        if (off == 24064) cab->setBrightness(0.0f);
+        float* p[2] = { l.data() + off, r.data() + off };
+        cab->processBlock(AudioBufferView<float>(p, 2, 256));
+        for (int i = 0; i < 256; ++i)
+        {
+            const double d = std::abs(static_cast<double>(l[static_cast<size_t>(off + i)] - last));
+            last = l[static_cast<size_t>(off + i)];
+            if (off >= 12000 && off < 24064) steady = std::max(steady, d);
+            if (off >= 24064 && off < 26000) step = std::max(step, d);
+            EXPECT_EQ(r[static_cast<size_t>(off + i)], 0.0f);       // the silent channel stays silent
+        }
+    }
+    EXPECT_LT(step, steady * 1.05);
+
+    cab->setSize(0.2f);
+    cab->setSize(std::numeric_limits<float>::quiet_NaN());
+    cab->setBrightness(7.0f);
+    cab->setDistance(-1.0f);
+    EXPECT_EQ(cab->getSize(), 0.2f);
+    EXPECT_EQ(cab->getBrightness(), 1.0f);
+    EXPECT_EQ(cab->getDistance(), 0.0f);
+    cab->prepare(std::numeric_limits<double>::quiet_NaN(), 2);    // ignored
+
+    StateWriter w(stateId("TEST"), 1);
+    cab->writeState(w, "cab.");
+    const auto blob = w.blob();
+    StateReader rd(blob.data(), blob.size());
+    Cab other;
+    other.readState(rd, "cab.");
+    EXPECT_EQ(other.getSize(), 0.2f);
+    EXPECT_EQ(other.getBrightness(), 1.0f);
+    EXPECT_EQ(other.getDistance(), 0.0f);
+}
+
+// ============================================================================
+// TransientFollower
+// ============================================================================
+
+namespace {
+
+// Bursts of a 1 kHz tone, 50 ms on and 200 ms off, at an amplitude.
+std::vector<float> transientBursts(double amplitude, int n)
+{
+    std::vector<float> v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const bool on = (i % 12000) < 2400;
+        v[static_cast<size_t>(i)] = on ? static_cast<float>(amplitude * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * i / 48000.0)) : 0.0f;
+    }
+    return v;
+}
+
+} // namespace
+
+// New: TransientFollower reads how sudden the signal is, not how loud: the
+// same bursts give the same values at -40 dBFS as at -10, a held tone gives
+// none, a step of 12 dB nearly the whole range, and the value holds and then
+// falls; a mono value per frame comes out of a multichannel block.
+DSPARK_TEST(TransientFollower_reads_onsets_whatever_the_level)
+{
+    const int n = 48000;
+    const auto trace = [&](const std::vector<float>& in) {
+        TransientFollower<float> t;
+        t.prepare(48000.0);
+        std::vector<float> out(in.size());
+        for (size_t i = 0; i < in.size(); ++i) out[i] = t.processSample(in[i]);
+        return out;
+    };
+    const auto quiet = trace(transientBursts(0.01, n)), loud = trace(transientBursts(0.316, n));
+    double farthest = 0.0, top = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        farthest = std::max(farthest, std::abs(static_cast<double>(quiet[static_cast<size_t>(i)] - loud[static_cast<size_t>(i)])));
+        top = std::max(top, static_cast<double>(loud[static_cast<size_t>(i)]));
+    }
+    EXPECT_LT(farthest, 1e-4);
+    EXPECT_NEAR(top, 1.0, 1e-6);                     // from silence: the whole range
+
+    // A held tone: nothing once the onset has gone.
+    std::vector<float> held(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) held[static_cast<size_t>(i)] = static_cast<float>(0.3 * std::sin(2.0 * 3.14159265358979323846 * 220.0 * i / 48000.0));
+    const auto steady = trace(held);
+    double tail = 0.0;
+    for (int i = n / 2; i < n; ++i) tail = std::max(tail, static_cast<double>(steady[static_cast<size_t>(i)]));
+    EXPECT_LT(tail, 0.02);
+
+    // A 12 dB step on the tone: close to the whole range, held 20 ms, then falling.
+    std::vector<float> stepped = held;
+    for (int i = n / 2; i < n; ++i) stepped[static_cast<size_t>(i)] *= 3.98f;
+    const auto rise = trace(stepped);
+    double peak = 0.0;
+    int peakAt = 0;
+    for (int i = n / 2; i < n / 2 + 2400; ++i)
+        if (rise[static_cast<size_t>(i)] > peak) { peak = rise[static_cast<size_t>(i)]; peakAt = i; }
+    EXPECT_GT(peak, 0.75);
+    EXPECT_NEAR(static_cast<double>(rise[static_cast<size_t>(peakAt + 900)]), peak, 1e-6);    // still held after 19 ms
+    EXPECT_LT(static_cast<double>(rise[static_cast<size_t>(peakAt + 14400)]), 0.05);         // gone 0.3 s later
+
+    // A block of two channels follows the louder one, and leaves the audio alone.
+    TransientFollower<float> block;
+    block.prepare(48000.0);
+    std::vector<float> a = transientBursts(0.2, 4800), b(4800, 0.0f), values(4800);
+    const std::vector<float> keep = a;
+    float* p[2] = { b.data(), a.data() };
+    block.processBlock(AudioBufferView<float>(p, 2, 4800), values.data());
+    EXPECT_TRUE(a == keep);
+    EXPECT_NEAR(static_cast<double>(values[4799]), static_cast<double>(block.getValue()), 1e-9);
+    EXPECT_NEAR(static_cast<double>(values[100]), 1.0, 1e-6);
+
+    // Settings and the normalized envelope.
+    block.setRange(1.0f);
+    block.setHold(std::numeric_limits<float>::quiet_NaN());
+    block.setRelease(5000.0f);
+    EXPECT_EQ(block.getRange(), 3.0f);
+    EXPECT_EQ(block.getHold(), 20.0f);
+    EXPECT_EQ(block.getRelease(), 2000.0f);
+
+    EnvelopeFollower<float> env;
+    env.prepare(AudioSpec{ 48000.0, 512, 1 });
+    env.setAttack(1.0f);
+    env.setRelease(500.0f);
+    std::vector<float> tone(48000);
+    for (int i = 0; i < 48000; ++i) tone[static_cast<size_t>(i)] = static_cast<float>(0.1 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * i / 48000.0));
+    float* q = tone.data();
+    env.processBlock(AudioBufferView<float>(&q, 1, 48000));
+    EXPECT_NEAR(static_cast<double>(env.getEnvelopeNormalized(0, -60.0f)), 40.0 / 60.0, 0.01);
+    EXPECT_NEAR(static_cast<double>(env.getEnvelopeNormalized(0, -20.0f)), 0.0, 0.01);
 }

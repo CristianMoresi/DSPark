@@ -130,6 +130,30 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         s.setDrive(7.5f); s.setMix(0.7f); s.setCharacter(0.4f);
         s.setAntialiasing(true); s.setOutputGain(-2.0f);
     })));
+    EXPECT_TRUE((roundTrip<Saturation<float>>([](auto& s) {
+        s.setAlgorithm(Saturation<float>::Algorithm::Curve);
+        s.setCurveShape(0.3f, 2.0f, -0.4f); s.setAsymmetry(0.25f);
+        s.setProgramNoise(-60.0f); s.setDynamics(0.5f); s.setDynamicsFocus(150.0f);
+        s.setFeedback(-0.3f, 330.0f); s.setDriveCompensation(true);
+        s.setOversamplingMode(Saturation<float>::OversamplingMode::MinimumPhase);
+    })));
+    {
+        auto a = std::make_unique<MultibandSaturation<float>>();
+        a->prepare(spec(48000.0, 512, 2));
+        a->setNumBands(4); a->setCrossoverFrequency(1, 1200.0f);
+        a->setBandDrive(2, 9.0f); a->setBandLevel(1, -2.5f); a->setBandPan(3, 0.4f);
+        a->setBandMute(0, true); a->setBandSolo(2, true);
+        a->getBandSaturation(3).setAlgorithm(Saturation<float>::Algorithm::Curve);
+        const auto blob = a->getState();
+        auto b = std::make_unique<MultibandSaturation<float>>();
+        b->prepare(spec(48000.0, 512, 2));
+        EXPECT_TRUE(b->setState(blob.data(), blob.size()));
+        EXPECT_TRUE(b->getState() == blob);
+    }
+    EXPECT_TRUE((roundTrip<LoFi<float>>([](auto& l) {
+        l.setBits(6.5f); l.setRate(12000.0f); l.setRateFilter(true); l.setFold(4.0f);
+        l.setSmear(0.2f); l.setPitch(-3.0f); l.setMix(0.6f); l.setOutput(1.5f); l.setDither(true);
+    })));
     EXPECT_TRUE((roundTrip<Clipper<float>>([](auto& c) {
         c.setMode(Clipper<float>::Mode::Soft); c.setCeiling(-0.5f);
         c.setInputGain(3.0f); c.setStages(3); c.setMix(0.65f);

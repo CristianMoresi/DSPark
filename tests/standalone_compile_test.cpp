@@ -42,6 +42,7 @@ void instantiate()
     [[maybe_unused]] const AnalogCascade designedCut = FilterDesign::highCut(1000.0, 18.0);
     [[maybe_unused]] FirBank<T> firBank;
     [[maybe_unused]] KeyEqualizer<T> keyEqualizer;
+    [[maybe_unused]] CabinetModel<T> cabinetModel;
     Oversampling<T> ov(2);
     OversamplingDryPath<T> ovDry;
     [[maybe_unused]] const int ovFactor = Oversampling<T>::factorForRate(48000.0);
@@ -85,6 +86,9 @@ void instantiate()
     SpectralFreeze<T> spectralFreeze;
     Limiter<T> lim;
     MultibandCompressor<T> mbc;
+    [[maybe_unused]] MultibandSaturation<T> mbs;
+    [[maybe_unused]] LoFi<T> lofi;
+    [[maybe_unused]] TransientFollower<T> transientFollower;
     NoiseGate<T> ngt;
     NoiseGenerator<T> ng;
     Panner<T> pan;

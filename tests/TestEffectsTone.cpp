@@ -14,6 +14,8 @@
 #include "../Effects/TubePreamp.h"
 #include "../Effects/TransformerModel.h"
 #include "../Effects/Clipper.h"
+#include "../Effects/MultibandSaturation.h"
+#include "../Effects/LoFi.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <complex>
+#include <functional>
 #include <numbers>
 #include <thread>
 #include <vector>
@@ -947,7 +950,7 @@ DSPARK_TEST(Saturation_invalid_inputs_are_ignored)
     bad.numChannels = -3;
     subject.prepare(bad);
     subject.setAlgorithm(static_cast<Saturation<float>::Algorithm>(97)); // clamps to the last id
-    twin.setAlgorithm(Saturation<float>::Algorithm::MultiStage);
+    twin.setAlgorithm(Saturation<float>::Algorithm::Curve);
 
     double phS = 0.0, phT = 0.0;
     const auto tailSub  = satRunSine(subject, phS, 10);
@@ -4805,4 +4808,763 @@ DSPARK_TEST(Equalizer_natural_phase_follows_the_phase_of_the_analog_curve)
     const EqDistance natural = eqDistance(eqOne(AnalogSection::peak(1000.0, 1.0, 12.0)), low, Mode::NaturalPhase);
     EXPECT_LT(natural.phase, 0.3);
     EXPECT_LT(natural.level, 0.05);
+}
+
+// ============================================================================
+// Saturation: the curve family, minimum-phase oversampling, and the stages
+// around the curve (asymmetry, programme noise, dynamics, tuned feedback,
+// drive compensation)
+// ============================================================================
+
+namespace {
+
+using Sat8 = Saturation<float>;
+using Sat8Vec = std::vector<float>;
+constexpr double kSat8Pi = 3.14159265358979323846;
+
+Sat8Vec sat8Sine(double hz, double amp, int n)
+{
+    Sat8Vec v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        v[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * kSat8Pi * hz * i / 48000.0));
+    return v;
+}
+
+// Pink noise at an RMS level in dBFS.
+Sat8Vec sat8Pink(int n, double rmsDb, uint32_t seed)
+{
+    Sat8Vec v(static_cast<size_t>(n));
+    double b0 = 0.0, b1 = 0.0, b2 = 0.0, sum = 0.0;
+    for (auto& s : v)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const double white = static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0;
+        b0 = 0.99765 * b0 + white * 0.0990460;
+        b1 = 0.96300 * b1 + white * 0.2965164;
+        b2 = 0.57000 * b2 + white * 1.0526913;
+        const double pink = b0 + b1 + b2 + white * 0.1848;
+        s = static_cast<float>(pink);
+        sum += pink * pink;
+    }
+    const double scale = std::pow(10.0, rmsDb / 20.0) / std::sqrt(sum / n);
+    for (auto& s : v) s = static_cast<float>(s * scale);
+    return v;
+}
+
+// A mono render in blocks, the processor set up before prepare().
+template <class Setup>
+Sat8Vec sat8Run(const Sat8Vec& in, Setup&& setup, int block = 512)
+{
+    auto s = std::make_unique<Sat8>();
+    setup(*s);
+    s->prepare(AudioSpec{ 48000.0, block, 1 });
+    Sat8Vec x = in;
+    for (size_t off = 0; off < x.size(); off += static_cast<size_t>(block))
+    {
+        float* p = x.data() + off;
+        const int m = static_cast<int>(std::min(static_cast<size_t>(block), x.size() - off));
+        s->processBlock(AudioBufferView<float>(&p, 1, m));
+    }
+    return x;
+}
+
+// Level in dB of the line at hz over the last 4800 samples (hz a multiple of 10).
+double sat8Line(const Sat8Vec& v, double hz)
+{
+    const size_t n = 4800, from = v.size() - n;
+    double re = 0.0, im = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double ph = 2.0 * kSat8Pi * hz * static_cast<double>(i) / 48000.0;
+        re += static_cast<double>(v[from + i]) * std::cos(ph);
+        im += static_cast<double>(v[from + i]) * std::sin(ph);
+    }
+    return 20.0 * std::log10(std::max(2.0 * std::sqrt(re * re + im * im) / static_cast<double>(n), 1e-15));
+}
+
+double sat8Rms(const Sat8Vec& v, size_t from, size_t to)
+{
+    double sum = 0.0;
+    for (size_t i = from; i < to; ++i) sum += static_cast<double>(v[i]) * static_cast<double>(v[i]);
+    return std::sqrt(sum / static_cast<double>(to - from));
+}
+
+// Harmonic k of a curve on a sine of amplitude amp, in dB, by its Fourier sum.
+template <class Curve>
+double sat8Harmonic(Curve&& curve, double amp, int k)
+{
+    const int n = 4096;
+    double re = 0.0, im = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        const double ph = 2.0 * kSat8Pi * i / n;
+        const double y = curve(amp * std::sin(ph));
+        re += y * std::cos(k * ph);
+        im += y * std::sin(k * ph);
+    }
+    return 20.0 * std::log10(std::max(2.0 * std::sqrt(re * re + im * im) / n, 1e-15));
+}
+
+} // namespace
+
+// New: Algorithm::Curve. At its defaults it is tanh; hardness keeps it a
+// straight line up to a share of its ceiling, curvature changes how fast it
+// turns, and asymmetry gives the negative half-cycle a ceiling of its own.
+DSPARK_TEST(Saturation_curve_family_shapes_the_knee_the_turn_and_the_halves)
+{
+    const auto curve = [](float hardness, float curvature, float asymmetry, float drive) {
+        return [=](Sat8& s) {
+            s.setAlgorithm(Sat8::Algorithm::Curve);
+            s.setOversampling(4);
+            s.setDrive(drive);
+            s.setCurveShape(hardness, curvature, asymmetry);
+        };
+    };
+    const Sat8Vec tone = sat8Sine(1000.0, 0.5, 24000);
+
+    // tanh, to its Fourier series.
+    const Sat8Vec plain = sat8Run(tone, curve(0.0f, 1.0f, 0.0f, 12.0f));
+    const auto tanhOf = [](double x) { return std::tanh(x); };
+    const double g = std::pow(10.0, 12.0 / 20.0);
+    EXPECT_NEAR(sat8Line(plain, 1000.0), sat8Harmonic(tanhOf, 0.5 * g, 1), 0.05);
+    EXPECT_NEAR(sat8Line(plain, 3000.0), sat8Harmonic(tanhOf, 0.5 * g, 3), 0.1);
+    EXPECT_NEAR(sat8Line(plain, 5000.0), sat8Harmonic(tanhOf, 0.5 * g, 5), 0.3);
+    EXPECT_LT(sat8Line(plain, 2000.0) - sat8Line(plain, 1000.0), -100.0);
+
+    // Hardness: a peak under it passes straight; the whole tanh bends it.
+    const Sat8Vec soft = sat8Run(tone, curve(0.0f, 1.0f, 0.0f, 0.0f));
+    const Sat8Vec straight = sat8Run(tone, curve(0.6f, 1.0f, 0.0f, 0.0f));
+    EXPECT_GT(sat8Line(soft, 3000.0) - sat8Line(soft, 1000.0), -40.0);
+    EXPECT_LT(sat8Line(straight, 3000.0) - sat8Line(straight, 1000.0), -100.0);
+
+    // Curvature: over 1 it stays near the line longer.
+    const Sat8Vec late = sat8Run(tone, curve(0.0f, 4.0f, 0.0f, 0.0f));
+    EXPECT_LT(sat8Line(late, 3000.0) - sat8Line(late, 1000.0), sat8Line(soft, 3000.0) - sat8Line(soft, 1000.0) - 15.0);
+    const Sat8Vec early = sat8Run(tone, curve(0.0f, 0.5f, 0.0f, 0.0f));
+    EXPECT_GT(sat8Line(early, 3000.0) - sat8Line(early, 1000.0), sat8Line(soft, 3000.0) - sat8Line(soft, 1000.0) + 3.0);
+
+    // Asymmetry: the negative half meets a ceiling half as high, and even harmonics appear.
+    const Sat8Vec uneven = sat8Run(tone, [&](Sat8& s) { curve(0.0f, 1.0f, 1.0f, 12.0f)(s); s.setDcBlocking(false); });
+    float top = 0.0f, bottom = 0.0f;
+    for (size_t i = 12000; i < uneven.size(); ++i)
+    {
+        top = std::max(top, uneven[i]);
+        bottom = std::min(bottom, uneven[i]);
+    }
+    // tanh(2) over tanh(4) / 2.
+    EXPECT_NEAR(static_cast<double>(top / -bottom), std::tanh(2.0) / (0.5 * std::tanh(4.0)), 0.05);
+    EXPECT_GT(sat8Line(uneven, 2000.0) - sat8Line(uneven, 1000.0), -30.0);
+    // The other way round, the positive half is the one held down: neither goes past 1.
+    const Sat8Vec mirrored = sat8Run(tone, [&](Sat8& s) { curve(0.0f, 1.0f, -1.0f, 12.0f)(s); s.setDcBlocking(false); });
+    float topM = 0.0f, bottomM = 0.0f;
+    for (size_t i = 12000; i < mirrored.size(); ++i)
+    {
+        topM = std::max(topM, mirrored[i]);
+        bottomM = std::min(bottomM, mirrored[i]);
+    }
+    EXPECT_NEAR(static_cast<double>(-bottomM / topM), std::tanh(2.0) / (0.5 * std::tanh(4.0)), 0.05);
+    EXPECT_LT(static_cast<double>(-bottomM), 1.0);
+
+    // Wild values; a block split does not change it.
+    Sat8 s;
+    s.setCurveShape(0.3f, 2.0f, -0.5f);
+    s.setCurveShape(std::numeric_limits<float>::quiet_NaN(), 99.0f, -7.0f);
+    EXPECT_EQ(s.getCurveHardness(), 0.3f);
+    EXPECT_EQ(s.getCurveCurvature(), 4.0f);
+    EXPECT_EQ(s.getCurveAsymmetry(), -1.0f);
+    const Sat8Vec small = sat8Run(tone, curve(0.2f, 1.5f, 0.3f, 6.0f), 64);
+    const Sat8Vec large = sat8Run(tone, curve(0.2f, 1.5f, 0.3f, 6.0f), 2048);
+    double farthest = 0.0;
+    for (size_t i = 0; i < small.size(); ++i)
+        farthest = std::max(farthest, static_cast<double>(std::abs(small[i] - large[i])));
+    EXPECT_LT(farthest, 1e-6);
+}
+
+// New: minimum-phase oversampling. A few samples of latency instead of the
+// factor's, and the dry path goes through the same filters: a half mix of a
+// signal the curve leaves alone is the wet signal itself at every frequency,
+// and the Delta output of it is next to nothing.
+DSPARK_TEST(Saturation_minimum_phase_oversampling_keeps_the_mix_in_phase)
+{
+    const auto base = [](Sat8::OversamplingMode mode, float mix) {
+        return [=](Sat8& s) {
+            s.setAlgorithm(Sat8::Algorithm::SoftClip);
+            s.setOversampling(2);
+            s.setOversamplingMode(mode);
+            s.setMix(mix);
+            s.setPreFilterHpFrequency(10.0f);
+        };
+    };
+    Sat8 linear, minimum;
+    base(Sat8::OversamplingMode::LinearPhase, 1.0f)(linear);
+    base(Sat8::OversamplingMode::MinimumPhase, 1.0f)(minimum);
+    linear.prepare(AudioSpec{ 48000.0, 512, 1 });
+    minimum.prepare(AudioSpec{ 48000.0, 512, 1 });
+    EXPECT_GT(linear.getLatency(), 20);
+    EXPECT_GT(minimum.getLatency(), 0);
+    EXPECT_LT(minimum.getLatency(), 8);
+    EXPECT_TRUE(minimum.getOversamplingMode() == Sat8::OversamplingMode::MinimumPhase);
+
+    for (double hz : { 500.0, 2000.0, 8000.0, 15000.0, 19000.0 })
+    {
+        const Sat8Vec in = sat8Sine(hz, 0.01, 24000);
+        const double wet = sat8Line(sat8Run(in, base(Sat8::OversamplingMode::MinimumPhase, 1.0f)), hz);
+        const double half = sat8Line(sat8Run(in, base(Sat8::OversamplingMode::MinimumPhase, 0.5f)), hz);
+        EXPECT_NEAR(half, wet, 0.03);
+        if (hz < 16000.0)
+        {
+            const double wetLinear = sat8Line(sat8Run(in, base(Sat8::OversamplingMode::LinearPhase, 1.0f)), hz);
+            const double halfLinear = sat8Line(sat8Run(in, base(Sat8::OversamplingMode::LinearPhase, 0.5f)), hz);
+            EXPECT_NEAR(halfLinear, wetLinear, 0.05);
+        }
+    }
+
+    // (What is left is the phase of the input and DC filters of the wet path.)
+    const Sat8Vec in = sat8Sine(8000.0, 0.01, 24000);
+    const Sat8Vec delta = sat8Run(in, [&](Sat8& s) {
+        base(Sat8::OversamplingMode::MinimumPhase, 1.0f)(s);
+        s.setOutputMode(Sat8::OutputMode::Delta);
+    });
+    EXPECT_LT(sat8Rms(delta, 12000, 24000), sat8Rms(in, 12000, 24000) * 0.01);
+
+    // With second-order antialiasing too.
+    const Sat8Vec deltaSecond = sat8Run(in, [&](Sat8& s) {
+        base(Sat8::OversamplingMode::MinimumPhase, 1.0f)(s);
+        s.setAntialiasing(Sat8::Antialiasing::SecondOrder);
+        s.setOutputMode(Sat8::OutputMode::Delta);
+    });
+    // (Here the kernel's own loss at 8 kHz is in it too.)
+    EXPECT_LT(sat8Rms(deltaSecond, 12000, 24000), sat8Rms(in, 12000, 24000) * 0.2);
+}
+
+// New: setAsymmetry(). A share of the square of the signal before any curve:
+// second harmonic in proportion, none at zero.
+DSPARK_TEST(Saturation_asymmetry_adds_even_harmonics_before_any_curve)
+{
+    const Sat8Vec tone = sat8Sine(1000.0, 0.5, 24000);
+    const auto second = [&](float amount, Sat8::Algorithm algo) {
+        const Sat8Vec out = sat8Run(tone, [=](Sat8& s) {
+            s.setAlgorithm(algo);
+            s.setAsymmetry(amount);
+        });
+        return sat8Line(out, 2000.0) - sat8Line(out, 1000.0);
+    };
+    EXPECT_LT(second(0.0f, Sat8::Algorithm::SoftClip), -100.0);
+    const double full = second(1.0f, Sat8::Algorithm::SoftClip);
+    EXPECT_NEAR(full, -24.1, 2.5);
+    EXPECT_NEAR(second(0.5f, Sat8::Algorithm::SoftClip), full - 6.0, 1.0);
+    EXPECT_NEAR(second(-1.0f, Sat8::Algorithm::SoftClip), full, 0.5);
+    EXPECT_GT(second(1.0f, Sat8::Algorithm::Curve), -30.0);
+
+    Sat8 s;
+    s.setAsymmetry(0.4f);
+    s.setAsymmetry(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(s.getAsymmetry(), 0.4f);
+    s.setAsymmetry(5.0f);
+    EXPECT_EQ(s.getAsymmetry(), 1.0f);
+}
+
+// New: setProgramNoise(). Noise counted from the peak of the programme: there
+// while the tone is, at its level under the peak, and gone after it.
+DSPARK_TEST(Saturation_program_noise_follows_the_programme_and_leaves_silence_silent)
+{
+    Sat8Vec in = sat8Sine(1000.0, 0.25, 48000 * 9 / 2);
+    for (size_t i = 48000; i < in.size(); ++i) in[i] = 0.0f;
+    const Sat8Vec quiet = sat8Run(in, [](Sat8& s) { s.setAlgorithm(Sat8::Algorithm::SoftClip); });
+    const Sat8Vec noisy = sat8Run(in, [](Sat8& s) { s.setAlgorithm(Sat8::Algorithm::SoftClip); s.setProgramNoise(-40.0f); });
+    Sat8Vec difference(in.size());
+    for (size_t i = 0; i < in.size(); ++i) difference[i] = noisy[i] - quiet[i];
+    // White noise in [-1, 1): an RMS of 1/sqrt(3) of its peak.
+    EXPECT_NEAR(sat8Rms(difference, 9600, 43200), 0.25 * 0.01 / std::sqrt(3.0), 0.0005);
+    double tail = 0.0;
+    for (size_t i = in.size() - 14400; i < in.size(); ++i) tail = std::max(tail, static_cast<double>(std::abs(difference[i])));
+    EXPECT_LT(tail, 1e-7);
+
+    Sat8 s;
+    s.setProgramNoise(-200.0f);
+    EXPECT_EQ(s.getProgramNoise(), -120.0f);
+    s.setProgramNoise(-5.0f);
+    EXPECT_EQ(s.getProgramNoise(), -20.0f);
+    s.setProgramNoise(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(s.getProgramNoise(), -20.0f);
+}
+
+// New: setDynamics(). At +1 a quiet and a loud tone saturate alike and come
+// out at the level they went in at; at -1 the loud one saturates far more;
+// with a focus the follower hears only the low end.
+DSPARK_TEST(Saturation_dynamics_hold_the_amount_of_saturation_whatever_the_level)
+{
+    const auto measure = [](double amp, float dynamics, float focus, double hz, double& third) {
+        const Sat8Vec in = sat8Sine(hz, amp, 48000);
+        const Sat8Vec out = sat8Run(in, [=](Sat8& s) {
+            s.setAlgorithm(Sat8::Algorithm::SoftClip);
+            s.setDrive(12.0f);
+            s.setDynamics(dynamics);
+            s.setDynamicsFocus(focus);
+        });
+        third = sat8Line(out, 3.0 * hz) - sat8Line(out, hz);
+        return sat8Line(out, hz) - sat8Line(in, hz);
+    };
+    double quiet = 0.0, loud = 0.0;
+    (void)measure(0.0316, 0.0f, 0.0f, 1000.0, quiet);
+    (void)measure(0.5, 0.0f, 0.0f, 1000.0, loud);
+    EXPECT_GT(loud - quiet, 20.0);
+
+    double quietHeld = 0.0, loudHeld = 0.0;
+    const double gainQuiet = measure(0.0316, 1.0f, 0.0f, 1000.0, quietHeld);
+    const double gainLoud = measure(0.5, 1.0f, 0.0f, 1000.0, loudHeld);
+    EXPECT_LT(std::abs(loudHeld - quietHeld), 1.5);
+    EXPECT_LT(std::abs(gainLoud - gainQuiet), 0.3);
+
+    double quietSpread = 0.0, loudSpread = 0.0;
+    (void)measure(0.0316, -1.0f, 0.0f, 1000.0, quietSpread);
+    (void)measure(0.5, -1.0f, 0.0f, 1000.0, loudSpread);
+    EXPECT_GT(loudSpread - quietSpread, loud - quiet + 3.0);
+
+    double heard = 0.0, deaf = 0.0;
+    (void)measure(0.5, -1.0f, 0.0f, 3000.0, heard);
+    (void)measure(0.5, -1.0f, 200.0f, 3000.0, deaf);
+    EXPECT_LT(deaf, heard - 6.0);
+
+    Sat8 s;
+    s.setDynamics(-3.0f);
+    EXPECT_EQ(s.getDynamics(), -1.0f);
+    s.setDynamicsFocus(5.0f);
+    EXPECT_EQ(s.getDynamicsFocus(), 20.0f);
+    s.setDynamicsFocus(-1.0f);
+    EXPECT_EQ(s.getDynamicsFocus(), 0.0f);
+}
+
+// New: setFeedback(). The output of the curve returns to its input, inverted,
+// one period of the frequency later: dips at the frequency and its
+// multiples, peaks half way, the other way round for a negative amount; any
+// block size gives the same output, and it stays bounded at full drive.
+DSPARK_TEST(Saturation_feedback_tunes_a_comb_inside_the_curve)
+{
+    const auto gain = [](float amount, double hz, int block) {
+        const Sat8Vec in = sat8Sine(hz, 0.01, 48000);
+        const Sat8Vec out = sat8Run(in, [=](Sat8& s) {
+            s.setAlgorithm(Sat8::Algorithm::SoftClip);
+            s.setFeedback(amount, 200.0f);
+        }, block);
+        return sat8Line(out, hz) - sat8Line(in, hz);
+    };
+    const double dip = 20.0 * std::log10(1.0 / 1.8), peak = 20.0 * std::log10(1.0 / 0.2);
+    EXPECT_NEAR(gain(0.8f, 200.0, 512), dip, 0.3);
+    EXPECT_NEAR(gain(0.8f, 300.0, 512), peak, 0.8);
+    EXPECT_NEAR(gain(0.8f, 400.0, 512), dip, 0.3);
+    EXPECT_NEAR(gain(-0.8f, 200.0, 512), peak, 0.8);
+    EXPECT_NEAR(gain(-0.8f, 300.0, 512), dip, 0.3);
+
+    Sat8 s;
+    s.setFeedback(0.5f, 200.0f);
+    s.prepare(AudioSpec{ 48000.0, 512, 1 });
+    EXPECT_NEAR(static_cast<double>(s.getFeedbackFrequency()), 200.0, 0.01);
+    s.setFeedback(0.5f, 20000.0f);
+    EXPECT_NEAR(static_cast<double>(s.getFeedbackFrequency()), 48000.0 / (16.0 + s.getLatency()), 0.01);
+    s.setFeedback(3.0f, std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(static_cast<double>(s.getFeedback()), 0.95, 1e-6);
+
+    const Sat8Vec in = sat8Sine(330.0, 0.5, 48000);
+    const auto render = [&](int block) {
+        return sat8Run(in, [](Sat8& x) {
+            x.setAlgorithm(Sat8::Algorithm::SoftClip);
+            x.setDrive(24.0f);
+            x.setFeedback(0.95f, 150.0f);
+        }, block);
+    };
+    const Sat8Vec small = render(64), large = render(2048);
+    double farthest = 0.0, top = 0.0;
+    for (size_t i = 0; i < small.size(); ++i)
+    {
+        farthest = std::max(farthest, static_cast<double>(std::abs(small[i] - large[i])));
+        top = std::max(top, static_cast<double>(std::abs(small[i])));
+    }
+    EXPECT_EQ(farthest, 0.0);
+    EXPECT_TRUE(std::isfinite(top) && top < 2.0);
+}
+
+// New: setDriveCompensation(). Of the level the drive adds on programme, a
+// quarter is left; the compensation follows a drive moved while it runs and
+// is part of the state.
+DSPARK_TEST(Saturation_drive_compensation_leaves_a_quarter_of_the_level_the_drive_adds)
+{
+    const Sat8Vec pink = sat8Pink(49152, -18.0, 77u);
+    const auto level = [&](float drive, bool compensated) {
+        const Sat8Vec out = sat8Run(pink, [=](Sat8& s) {
+            s.setAlgorithm(Sat8::Algorithm::SoftClip);
+            s.setDrive(drive);
+            s.setDriveCompensation(compensated);
+        });
+        return 20.0 * std::log10(sat8Rms(out, 9600, 48000) / sat8Rms(pink, 9600, 48000));
+    };
+    const double plain = level(24.0f, false) - level(0.0f, false);
+    const double kept = level(24.0f, true) - level(0.0f, true);
+    EXPECT_GT(plain, 6.0);
+    EXPECT_NEAR(kept, 0.25 * plain, 0.6);
+    EXPECT_LT(std::abs(level(0.0f, true) - level(0.0f, false)), 0.5);
+
+    // A drive moved while it runs.
+    auto s = std::make_unique<Sat8>();
+    s->setDriveCompensation(true);
+    s->prepare(AudioSpec{ 48000.0, 256, 1 });
+    Sat8Vec x = pink;
+    for (size_t off = 0; off < x.size(); off += 256)
+    {
+        if (off == 12288) s->setDrive(24.0f);
+        float* p = x.data() + off;
+        s->processBlock(AudioBufferView<float>(&p, 1, 256));
+    }
+    EXPECT_LT(static_cast<double>(s->getDriveCompensationDb()), -5.0);
+
+    const auto blob = s->getState();
+    Sat8 other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.isDriveCompensation());
+    s->setDriveCompensation(false);
+    float* p = x.data();
+    s->processBlock(AudioBufferView<float>(&p, 1, 256));
+    EXPECT_EQ(static_cast<double>(s->getDriveCompensationDb()), 0.0);
+}
+
+// ============================================================================
+// MultibandSaturation
+// ============================================================================
+
+namespace {
+
+using MbSat = MultibandSaturation<float>;
+
+// A stereo render in blocks of 512; the processor set up before prepare().
+template <class Setup>
+std::vector<Sat8Vec> mbRun(const Sat8Vec& left, const Sat8Vec& right, Setup&& setup, int block = 512,
+                           const std::function<void(MbSat&, size_t)>& during = nullptr)
+{
+    auto m = std::make_unique<MbSat>();
+    setup(*m);
+    m->prepare(AudioSpec{ 48000.0, block, 2 });
+    std::vector<Sat8Vec> x { left, right };
+    for (size_t off = 0; off < left.size(); off += static_cast<size_t>(block))
+    {
+        if (during) during(*m, off);
+        float* p[2] = { x[0].data() + off, x[1].data() + off };
+        const int n = static_cast<int>(std::min(static_cast<size_t>(block), left.size() - off));
+        m->processBlock(AudioBufferView<float>(p, 2, n));
+    }
+    return x;
+}
+
+Sat8Vec mbTwoTones(int n)
+{
+    Sat8Vec v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        v[static_cast<size_t>(i)] = static_cast<float>(0.25 * std::sin(2.0 * kSat8Pi * 100.0 * i / 48000.0)
+                                                     + 0.25 * std::sin(2.0 * kSat8Pi * 3000.0 * i / 48000.0));
+    return v;
+}
+
+} // namespace
+
+// New: MultibandSaturation. At no drive the bands sum back to the input's
+// level at every frequency, with the same latency the processor reports, and
+// they stay in time when one band runs another oversampling factor (it is
+// delayed to the slowest one).
+DSPARK_TEST(MultibandSaturation_sums_the_bands_back_flat_and_in_time)
+{
+    const auto three = [](MbSat& m) {
+        m.setNumBands(3);
+        m.setCrossoverFrequency(0, 300.0f);
+        m.setCrossoverFrequency(1, 3000.0f);
+    };
+    const auto uneven = [&](MbSat& m) {
+        three(m);
+        m.getBandSaturation(1).setOversampling(4);
+        m.getBandSaturation(2).setOversampling(8);
+    };
+    for (double hz : { 100.0, 300.0, 1000.0, 3000.0, 10000.0 })
+    {
+        const Sat8Vec in = sat8Sine(hz, 0.01, 24000);
+        const auto even = mbRun(in, in, three);
+        const auto mixed = mbRun(in, in, uneven);
+        EXPECT_NEAR(sat8Line(even[0], hz) - sat8Line(in, hz), 0.0, 0.1);
+        EXPECT_NEAR(sat8Line(mixed[0], hz) - sat8Line(in, hz), 0.0, 0.15);
+        EXPECT_NEAR(sat8Line(mixed[1], hz), sat8Line(mixed[0], hz), 1e-6);
+    }
+
+    MbSat m;
+    uneven(m);
+    m.prepare(AudioSpec{ 48000.0, 512, 2 });
+    int slowest = 0;
+    for (int b = 0; b < 3; ++b) slowest = std::max(slowest, m.getBandSaturation(b).getLatency());
+    EXPECT_EQ(m.getLatency(), slowest);
+    EXPECT_GT(m.getBandSaturation(1).getLatency(), m.getBandSaturation(0).getLatency());
+}
+
+// New: each band saturates on its own: drive the high band and the low tone
+// comes out clean while the high one gains its harmonics.
+DSPARK_TEST(MultibandSaturation_drives_one_band_and_leaves_the_others_clean)
+{
+    const Sat8Vec in = mbTwoTones(24000);
+    const auto split = [](float highDrive) {
+        return [=](MbSat& m) {
+            m.setNumBands(2);
+            m.setCrossoverFrequency(0, 1000.0f);
+            m.setBandDrive(1, highDrive);
+        };
+    };
+    const auto out = mbRun(in, in, split(24.0f));
+    const auto calm = mbRun(in, in, split(0.0f));
+    EXPECT_GT(sat8Line(out[0], 9000.0) - sat8Line(out[0], 3000.0), -40.0);
+    EXPECT_LT(sat8Line(calm[0], 9000.0) - sat8Line(calm[0], 3000.0), -40.0);
+    // The low band is what it was (its own soft curve at no drive included).
+    EXPECT_NEAR(sat8Line(out[0], 300.0), sat8Line(calm[0], 300.0), 0.5);
+    EXPECT_NEAR(sat8Line(out[0], 100.0), sat8Line(calm[0], 100.0), 0.05);
+}
+
+// New: level, pan, mute and solo per band, with fades and no click; a band
+// that is not heard is not computed and comes back clean.
+DSPARK_TEST(MultibandSaturation_level_pan_mute_and_solo)
+{
+    const Sat8Vec in = mbTwoTones(48000);
+    const auto two = [](MbSat& m) {
+        m.setNumBands(2);
+        m.setCrossoverFrequency(0, 1000.0f);
+    };
+    const auto plain = mbRun(in, in, two);
+
+    const auto quieter = mbRun(in, in, [&](MbSat& m) { two(m); m.setBandLevel(0, -6.0f); });
+    EXPECT_NEAR(sat8Line(quieter[0], 100.0) - sat8Line(plain[0], 100.0), -6.02, 0.1);
+    EXPECT_NEAR(sat8Line(quieter[0], 3000.0) - sat8Line(plain[0], 3000.0), 0.0, 0.05);
+
+    const auto panned = mbRun(in, in, [&](MbSat& m) { two(m); m.setBandPan(1, -1.0f); });
+    // (What is left on the right is the low band's own share of the tone, 38 dB down.)
+    EXPECT_LT(sat8Line(panned[1], 3000.0) - sat8Line(plain[1], 3000.0), -30.0);
+    EXPECT_NEAR(sat8Line(panned[0], 3000.0) - sat8Line(plain[0], 3000.0), 0.0, 0.05);
+
+    // Muted half way: the low tone fades out without a click and is not computed.
+    bool computedAfter = true;
+    const auto muted = mbRun(in, in, two, 512, [&](MbSat& m, size_t at) {
+        if (at == 24576) m.setBandMute(0, true);
+        if (at + 512 >= 48000) computedAfter = m.isBandComputed(0);
+    });
+    EXPECT_LT(sat8Line(muted[0], 100.0) - sat8Line(plain[0], 100.0), -70.0);
+    EXPECT_FALSE(computedAfter);
+    double step = 0.0, steady = 0.0;
+    for (size_t i = 1; i < 48000; ++i)
+    {
+        const double d = std::abs(static_cast<double>(muted[0][i] - muted[0][i - 1]));
+        if (i > 20000 && i < 24000) steady = std::max(steady, d);
+        if (i >= 24576 && i < 26000) step = std::max(step, d);
+    }
+    EXPECT_LT(step, steady * 1.1);
+
+    // Soloed: only the soloed band is heard; unmuted later, it comes back.
+    const auto soloed = mbRun(in, in, [&](MbSat& m) { two(m); m.setBandSolo(1, true); });
+    EXPECT_LT(sat8Line(soloed[0], 100.0) - sat8Line(plain[0], 100.0), -70.0);
+    // (Without the low band the tone loses its share of the crossover: -0.11 dB.)
+    EXPECT_NEAR(sat8Line(soloed[0], 3000.0) - sat8Line(plain[0], 3000.0), 20.0 * std::log10(81.0 / 82.0), 0.05);
+    const auto back = mbRun(in, in, [&](MbSat& m) { two(m); m.setBandMute(0, true); }, 512, [&](MbSat& m, size_t at) {
+        if (at == 12288) m.setBandMute(0, false);
+    });
+    EXPECT_NEAR(sat8Line(back[0], 100.0), sat8Line(plain[0], 100.0), 0.05);
+
+    // Wild values and the state.
+    MbSat a;
+    two(a);
+    a.setBandLevel(0, -3.5f);
+    a.setBandLevel(0, std::numeric_limits<float>::quiet_NaN());
+    a.setBandLevel(9, 5.0f);
+    a.setBandPan(1, 4.0f);
+    a.setBandSolo(1, true);
+    a.setBandDrive(1, 9.0f);
+    EXPECT_EQ(a.getBandLevel(0), -3.5f);
+    EXPECT_EQ(a.getBandPan(1), 1.0f);
+    const auto blob = a.getState();
+    MbSat b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getNumBands(), 2);
+    EXPECT_EQ(b.getBandLevel(0), -3.5f);
+    EXPECT_EQ(b.getBandPan(1), 1.0f);
+    EXPECT_TRUE(b.isBandSoloed(1));
+    EXPECT_TRUE(b.getState() == blob);
+}
+
+// New: the TubePreamp's cabinet stage. It darkens the top as a speaker does,
+// adds no latency, fades in without a click and is part of the state.
+DSPARK_TEST(TubePreamp_cabinet_stage_colours_the_wet_signal_without_latency)
+{
+    double after = 0.0;
+    const auto run = [&after](double hz, bool cabinet, size_t switchAt, double& step, double& steady) {
+        auto tp = std::make_unique<TubePreamp<float>>();
+        tp->setCabinet(cabinet && switchAt == 0);
+        tp->prepare(AudioSpec{ 48000.0, 256, 1 });
+        Sat8Vec x = sat8Sine(hz, 0.05, 49152);
+        float last = 0.0f;
+        step = 0.0;
+        steady = 0.0;
+        after = 0.0;
+        for (size_t off = 0; off < x.size(); off += 256)
+        {
+            if (switchAt != 0 && off == switchAt) tp->setCabinet(true);
+            float* p = x.data() + off;
+            tp->processBlock(AudioBufferView<float>(&p, 1, 256));
+            for (size_t i = off; i < off + 256; ++i)
+            {
+                const double d = std::abs(static_cast<double>(x[i] - last));
+                last = x[i];
+                if (off + 4096 < switchAt && off > 8192) steady = std::max(steady, d);
+                if (switchAt != 0 && off >= switchAt && off < switchAt + 2048) step = std::max(step, d);
+                if (switchAt != 0 && off >= switchAt + 4096 && off < switchAt + 8192) after = std::max(after, d);
+            }
+        }
+        return x;
+    };
+    double step = 0.0, steady = 0.0;
+    const Sat8Vec open = run(8000.0, false, 0, step, steady);
+    const Sat8Vec boxed = run(8000.0, true, 0, step, steady);
+    EXPECT_LT(sat8Line(boxed, 8000.0), sat8Line(open, 8000.0) - 10.0);
+    const Sat8Vec mid = run(1000.0, true, 0, step, steady);
+    const Sat8Vec midOpen = run(1000.0, false, 0, step, steady);
+    EXPECT_NEAR(sat8Line(mid, 1000.0), sat8Line(midOpen, 1000.0), 2.0);
+
+    // Switched on while it plays: no click (the speaker's presence makes
+    // the slopes of the tone a little steeper once it is on).
+    (void)run(1000.0, true, 24576, step, steady);
+    EXPECT_LT(step, std::max(steady, after) * 1.1);
+
+    TubePreamp<float> a;
+    a.prepare(AudioSpec{ 48000.0, 256, 1 });
+    const int latency = a.getLatency();
+    a.setCabinet(true);
+    a.getCabinet().setSize(0.8f);
+    a.getCabinet().setDistance(0.6f);
+    EXPECT_EQ(a.getLatency(), latency);
+    const auto blob = a.getState();
+    TubePreamp<float> b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.isCabinet());
+    EXPECT_EQ(b.getCabinet().getSize(), 0.8f);
+    EXPECT_EQ(b.getCabinet().getDistance(), 0.6f);
+}
+
+// ============================================================================
+// LoFi
+// ============================================================================
+
+namespace {
+
+// A mono render of a LoFi in blocks of 512, set up before prepare().
+template <class Setup>
+Sat8Vec lofiRun(const Sat8Vec& in, Setup&& setup)
+{
+    auto lofi = std::make_unique<LoFi<float>>();
+    setup(*lofi);
+    lofi->prepare(AudioSpec{ 48000.0, 512, 1 });
+    Sat8Vec x = in;
+    for (size_t off = 0; off < x.size(); off += 512)
+    {
+        float* p = x.data() + off;
+        lofi->processBlock(AudioBufferView<float>(&p, 1, static_cast<int>(std::min<size_t>(512, x.size() - off))));
+    }
+    return x;
+}
+
+} // namespace
+
+// New: LoFi. At its defaults the output is the input to the bit, and so at a
+// mix of 0 whatever the stages do; fewer bits round to their grid, with the
+// error of a step's rounding or, with dither, of half a step.
+DSPARK_TEST(LoFi_is_transparent_off_and_rounds_to_its_bits)
+{
+    const Sat8Vec pink = sat8Pink(24000, -14.0, 11u);
+    const Sat8Vec plain = lofiRun(pink, [](LoFi<float>&) {});
+    double farthest = 0.0;
+    for (size_t i = 0; i < pink.size(); ++i) farthest = std::max(farthest, static_cast<double>(std::abs(plain[i] - pink[i])));
+    EXPECT_EQ(farthest, 0.0);
+    const Sat8Vec dry = lofiRun(pink, [](LoFi<float>& l) { l.setMix(0.0f); l.setBits(2.0f); l.setFold(12.0f); });
+    farthest = 0.0;
+    for (size_t i = 0; i < pink.size(); ++i) farthest = std::max(farthest, static_cast<double>(std::abs(dry[i] - pink[i])));
+    EXPECT_EQ(farthest, 0.0);
+
+    const Sat8Vec rounded = lofiRun(pink, [](LoFi<float>& l) { l.setBits(4.0f); });
+    double offGrid = 0.0, error = 0.0;
+    for (size_t i = 0; i < pink.size(); ++i)
+    {
+        const double scaled = static_cast<double>(rounded[i]) * 8.0;
+        offGrid = std::max(offGrid, std::abs(scaled - std::round(scaled)));
+        const double e = static_cast<double>(rounded[i] - pink[i]);
+        error += e * e;
+    }
+    EXPECT_LT(offGrid, 1e-5);
+    EXPECT_NEAR(std::sqrt(error / pink.size()), (1.0 / 8.0) / std::sqrt(12.0), 0.007);
+    const Sat8Vec dithered = lofiRun(pink, [](LoFi<float>& l) { l.setBits(4.0f); l.setDither(true); });
+    error = 0.0;
+    for (size_t i = 0; i < pink.size(); ++i)
+    {
+        const double e = static_cast<double>(dithered[i] - pink[i]);
+        error += e * e;
+    }
+    EXPECT_NEAR(std::sqrt(error / pink.size()), 0.5 / 8.0, 0.008);
+}
+
+// New: the rate of the hold folds what is above half of it back, as a held
+// signal does; the filter in front takes that out first.
+DSPARK_TEST(LoFi_rate_holds_and_its_filter_takes_out_what_would_fold)
+{
+    const Sat8Vec tone = sat8Sine(1000.0, 0.5, 24000);
+    const Sat8Vec held = lofiRun(tone, [](LoFi<float>& l) { l.setRate(8000.0f); });
+    // A hold of six samples: the image at 7 kHz is the zero-order hold's.
+    const double image = std::sin(kSat8Pi * 7.0 / 8.0) / (kSat8Pi * 7.0 / 8.0)
+                       / (std::sin(kSat8Pi / 8.0) / (kSat8Pi / 8.0));
+    EXPECT_NEAR(sat8Line(held, 7000.0) - sat8Line(held, 1000.0), 20.0 * std::log10(image), 0.3);
+    for (size_t i = 1; i < held.size(); ++i)
+        if (i % 6 != 0) EXPECT_EQ(held[i], held[i - 1]);
+
+    const Sat8Vec high = sat8Sine(6000.0, 0.5, 24000);
+    const Sat8Vec folded = lofiRun(high, [](LoFi<float>& l) { l.setRate(8000.0f); });
+    const Sat8Vec clean = lofiRun(high, [](LoFi<float>& l) { l.setRate(8000.0f); l.setRateFilter(true); });
+    EXPECT_GT(sat8Line(folded, 2000.0) - sat8Line(high, 6000.0), -15.0);
+    EXPECT_LT(sat8Line(clean, 2000.0), sat8Line(folded, 2000.0) - 25.0);
+}
+
+// New: the fold keeps the level of a sine at -12 dBFS whatever its gain,
+// while its harmonics grow; the grains drop the pitch and smear.
+DSPARK_TEST(LoFi_fold_keeps_its_level_and_the_grains_drop_the_pitch)
+{
+    // 997 Hz: a period that is not a whole number of samples, so the samples
+    // of the folded tone cover its phases (at 1 kHz the same 48 phases repeat
+    // and the mean square of a fold of 36 dB reads 1.8 dB away from the tone's).
+    const double hz = 997.0;
+    const Sat8Vec tone = sat8Sine(hz, 0.25, 48000);
+    const double inLevel = sat8Rms(tone, 24000, 48000);
+    for (float fold : { 6.0f, 12.0f, 24.0f, 36.0f })
+    {
+        const Sat8Vec out = lofiRun(tone, [=](LoFi<float>& l) { l.setFold(fold); });
+        EXPECT_NEAR(20.0 * std::log10(sat8Rms(out, 24000, 48000) / inLevel), 0.0, 0.1);
+        if (fold >= 24.0f) EXPECT_GT(sat8Line(out, 3.0 * hz) - sat8Line(out, hz), -20.0);
+    }
+
+    const Sat8Vec down = lofiRun(tone, [](LoFi<float>& l) { l.setPitch(-12.0f); });
+    EXPECT_GT(sat8Line(down, 0.5 * hz), sat8Line(down, hz) + 10.0);
+    const Sat8Vec smeared = lofiRun(tone, [](LoFi<float>& l) { l.setSmear(1.0f); });
+    EXPECT_NEAR(20.0 * std::log10(sat8Rms(smeared, 24000, 48000) / inLevel), 0.0, 3.0);
+    double moved = 0.0;
+    for (size_t i = 24000; i < 48000; ++i) moved = std::max(moved, static_cast<double>(std::abs(smeared[i] - tone[i])));
+    EXPECT_GT(moved, 0.05);
+
+    // Wild values and the state.
+    LoFi<float> a;
+    a.setBits(3.5f); a.setRate(11025.0f); a.setRateFilter(true); a.setDither(true);
+    a.setFold(9.0f); a.setPitch(-5.0f); a.setSmear(0.4f); a.setMix(0.7f); a.setOutput(-3.0f);
+    a.setBits(std::numeric_limits<float>::quiet_NaN());
+    a.setRate(10.0f);
+    a.setPitch(-40.0f);
+    EXPECT_EQ(a.getBits(), 3.5f);
+    EXPECT_EQ(a.getRate(), 100.0f);
+    EXPECT_EQ(a.getPitch(), -24.0f);
+    const auto blob = a.getState();
+    LoFi<float> b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getState() == blob);
+    EXPECT_EQ(LoFi<float>::getLatency(), 0);
 }

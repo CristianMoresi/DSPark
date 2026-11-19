@@ -148,6 +148,25 @@ All notable user-facing changes to DSPark are documented here.
   at 6 dB and 1.00 at 12, and a boost the other way round (1.18, 1.39,
   1.90). A band that rests at 0 dB and is not acting returns its input bit
   for bit.
+- `Compressor`, four controls, all off by default and working in both
+  topologies and in `processSample()`: `setAutoThreshold(true)`: the
+  threshold counts from the key's own recent peak (a reference that rises at
+  once and falls 1 dB per second) instead of from full scale, so the
+  compressor does the same on a take recorded 40 dB lower (with an absolute
+  threshold it would not act there at all). `setMaxLookahead(ms)`: a latency
+  kept for the lookahead; the audio is always that late, `getLatency()`
+  reports it, and `setLookahead()` moves inside it with the gain held back
+  by the difference, so the lookahead can be automated under one delay
+  compensation (0 keeps the latency equal to the lookahead, as before).
+  `setAmount(0..1)`: the share of the gain change that is applied, as a
+  scale of its decibels, with the same timing and nothing of the dry signal
+  added back; at 0 the output is the input bit for bit, and in FeedBack the
+  loop keeps hearing the whole reduction. `setSoftRange(true)`: the gain
+  change approaches the range without a corner, as g / (1 + (g / R)^4)^(1/4)
+  (1.5 % short at half the range, 16 % short at the range, never over it).
+  The hold already froze the release and left the attack free; a test now
+  says so. The state carries `autoThreshold`, `maxLookahead`, `amount` and
+  `softRange`.
 - `DynamicEQ::setLinearPhase(true)` (off by default; a setup choice): the
   bands change the level of the signal and nothing of its phase. Each band is
   then zero-phase kernels (its rest, and the end of each side, chosen as in

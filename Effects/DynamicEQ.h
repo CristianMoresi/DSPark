@@ -317,6 +317,8 @@ public:
 
         updateLookahead();
         reset();
+        for (int ch = 0; ch < std::min(spec.numChannels, kMaxChannels); ++ch)
+            deltaRing_[static_cast<size_t>(ch)].prepare(kDeltaCapacity + std::max(1, spec.maxBlockSize));
         isPrepared_.store(true, std::memory_order_relaxed);
     }
 
@@ -337,6 +339,49 @@ public:
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
         if (!isPrepared_.load(std::memory_order_relaxed)) return;
+        if (!delta_.load(std::memory_order_relaxed))
+        {
+            processImpl(audio, sidechain);
+            return;
+        }
+        // Delta listen: the input, late by the latency, minus the output, in
+        // chunks of the prepared block.
+        const bool selfKeyed = sidechain.getNumChannels() <= 0 || sidechain.getNumSamples() < audio.getNumSamples()
+                            || sidechain.getChannel(0) == audio.getChannel(0);
+        const int nCh = std::min(audio.getNumChannels(), kMaxChannels);
+        const int step = std::max(1, spec_.maxBlockSize);
+        for (int off = 0; off < audio.getNumSamples(); off += step)
+        {
+            const int m = std::min(step, audio.getNumSamples() - off);
+            auto part = audio.getSubView(off, m);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const T* d = part.getChannel(ch);
+                for (int i = 0; i < m; ++i) deltaRing_[static_cast<size_t>(ch)].push(d[i]);
+            }
+            const int late = std::min(getLatency(), kDeltaCapacity);
+            processImpl(part, selfKeyed ? part : sidechain.getSubView(off, m));
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* d = part.getChannel(ch);
+                const auto& ring = deltaRing_[static_cast<size_t>(ch)];
+                for (int i = 0; i < m; ++i) d[i] = ring.read(late + (m - 1 - i)) - d[i];
+            }
+        }
+    }
+
+    /**
+     * @brief Delta listen: the output is what the bands take out (or add),
+     *        the input delayed by the latency minus the output. A monitoring
+     *        control, not in the state.
+     */
+    void setDelta(bool on) noexcept { delta_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the output is the delta. */
+    [[nodiscard]] bool isDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
+
+private:
+    void processImpl(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
+    {
 
         // A sidechain shorter than the audio block would be read past its
         // end; fall back to self-keying instead of over-reading the caller.
@@ -378,6 +423,7 @@ public:
         }
     }
 
+public:
     /**
      * @brief Thread-safe configuration update for a specific band.
      *
@@ -2232,6 +2278,9 @@ private:
     int numFirst_ = 0, numSecond_ = 0;
 
     std::atomic<bool> mixedWanted_ { false };    ///< setMixedBands().
+    static constexpr int kDeltaCapacity = 32768; ///< Longest latency the delta lines up.
+    std::atomic<bool> delta_ { false };          ///< The output is what the bands take out.
+    std::array<RingBuffer<T>, kMaxChannels> deltaRing_ {};
     bool mixedActive_ = false;                   ///< The engine the audio thread is running.
     std::unique_ptr<MixedEngine> mixedEngine_;
     std::unique_ptr<LinearEngine> linear_;       ///< The linear-phase mode; null when it is off.

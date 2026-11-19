@@ -93,6 +93,8 @@ public:
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
 
+        deltaScratch_.assign(static_cast<size_t>(std::min(numChannels_, kMaxChannels)),
+                             std::vector<T>(static_cast<size_t>(std::max(1, spec.maxBlockSize)), T(0)));
         updateEnvelopeCoeffs();
         coefSmoothCoeff_ = static_cast<T>(1.0 - std::exp(-1.0 / (sampleRate_ * 0.001)));
         autoFall_ = std::pow(10.0, -kAutoRefFallDb / (20.0 * sampleRate_));
@@ -108,6 +110,41 @@ public:
      * @param buffer Audio data.
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
+    {
+        if (delta_.load(std::memory_order_relaxed) && !deltaScratch_.empty())
+        {
+            // Delta listen: the input minus the de-essed signal (no latency),
+            // in chunks as long as the scratch.
+            const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(deltaScratch_.size()));
+            const int step = static_cast<int>(deltaScratch_[0].size());
+            for (int off = 0; off < buffer.getNumSamples(); off += step)
+            {
+                const int m = std::min(step, buffer.getNumSamples() - off);
+                auto part = buffer.getSubView(off, m);
+                for (int ch = 0; ch < nCh; ++ch) std::copy_n(part.getChannel(ch), m, deltaScratch_[static_cast<size_t>(ch)].data());
+                processWet(part);
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    T* d = part.getChannel(ch);
+                    const T* in = deltaScratch_[static_cast<size_t>(ch)].data();
+                    for (int i = 0; i < m; ++i) d[i] = in[i] - d[i];
+                }
+            }
+            return;
+        }
+        processWet(buffer);
+    }
+
+    /**
+     * @brief Delta listen: the output is what the de-esser takes out. A
+     *        monitoring control, not in the state.
+     */
+    void setDelta(bool on) noexcept { delta_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the output is the delta. */
+    [[nodiscard]] bool isDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
+
+private:
+    void processWet(AudioBufferView<T> buffer) noexcept
     {
         int numCh = std::min(buffer.getNumChannels(), std::min(numChannels_, kMaxChannels));
         int numSamples = buffer.getNumSamples();
@@ -141,6 +178,7 @@ public:
         gainReduction_.store(blockMaxGr, std::memory_order_relaxed);
     }
 
+public:
     /** @brief Resets internal DSP state. */
     void reset() noexcept
     {
@@ -458,6 +496,8 @@ private:
     static constexpr double kAutoRefFallDb = 1.0;  ///< dB per second its reference falls.
     static constexpr double kAutoRefFloor = 1e-5;  ///< The reference never goes under -100 dBFS.
     std::atomic<bool> autoThreshold_ { false };    ///< The threshold counts from the level of the input.
+    std::atomic<bool> delta_ { false };            ///< The output is what the de-esser takes out.
+    std::vector<std::vector<T>> deltaScratch_;     ///< The input of the block, for the delta.
     bool relative_ = false;                        ///< Its value for the block (audio thread).
     double autoRef_ = kAutoRefFloor;               ///< The reference (linear).
     double autoFall_ = 1.0;                        ///< Its fall per sample (a factor).

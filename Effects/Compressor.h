@@ -1215,6 +1215,15 @@ public:
     [[nodiscard]] bool isSidechainListen() const noexcept { return scListen_.load(std::memory_order_relaxed); }
 
     /**
+     * @brief Delta listen: the output is what the compression takes out, the
+     *        aligned input minus the compressed signal before the makeup gain
+     *        (the mix does not apply). A monitoring control, not in the state.
+     */
+    void setDelta(bool on) noexcept { delta_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the output is the delta. */
+    [[nodiscard]] bool isDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
+
+    /**
      * @brief Sets the RMS analysis window size in milliseconds.
      *
      * Published atomically; the audio thread applies the new window (and
@@ -1970,7 +1979,8 @@ protected:
 
             // F. Application: lookahead, makeup and the parallel mix. The dry
             //    reference carries the same lookahead delay as the wet.
-            const bool plain = ff.lookahead == 0 && !ff.paramsMoving && constants.mix >= T(1);
+            const bool delta = delta_.load(std::memory_order_relaxed);
+            const bool plain = ff.lookahead == 0 && !ff.paramsMoving && constants.mix >= T(1) && !delta;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* data = audio.getChannel(ch) + o;
@@ -1989,7 +1999,7 @@ protected:
                     const T input = dry[k];
                     wet = input * gl[k];
                     const T out = wet * mkLin[k];
-                    data[k] = (mixA[k] < T(1)) ? (input * (T(1) - mixA[k]) + out * mixA[k]) : out;
+                    data[k] = delta ? input - wet : ((mixA[k] < T(1)) ? (input * (T(1) - mixA[k]) + out * mixA[k]) : out);
                 }
                 // Feedback history (pre-makeup) for a later topology switch.
                 fbLastOutput_[ch] = wet;
@@ -2257,13 +2267,15 @@ protected:
         // (makeup sits after the element; feeding it back would shift the
         // static curve and run away with auto makeup).
         fbLastOutput_[ch] = (outLin == gainLin) ? wet : input * gainLin;
+        const T kept = wet;
         wet *= makeupLin;
 
         // Parallel (New York) mix done inline: the dry reference is `input`,
         // which carries the SAME lookahead delay as the wet, so dry and wet
         // stay phase-aligned (the previous DryWetMixer captured the UNDELAYED
         // input and comb-filtered when lookahead + mix<1 were combined).
-        data[i] = (mixVal < T(1)) ? (input * (T(1) - mixVal) + wet * mixVal) : wet;
+        data[i] = delta_.load(std::memory_order_relaxed) ? input - kept
+                : ((mixVal < T(1)) ? (input * (T(1) - mixVal) + wet * mixVal) : wet);
     }
 
     /** 
@@ -4311,6 +4323,7 @@ protected:
     std::array<T, kMaxChannels> scHpfPrev_ {}; ///< HPF x[n-1] state.
     KeyEq keyEq_;                              ///< Equalizer of the key, after the high-pass.
     std::atomic<bool> scListen_ { false };     ///< The key goes out instead of the audio.
+    std::atomic<bool> delta_ { false };        ///< The output is what the compression takes out.
 
     // Split-Polarity Detector State
     std::array<T, kMaxChannels> splitPosEnv_ {}; ///< Positive half-wave tracking.

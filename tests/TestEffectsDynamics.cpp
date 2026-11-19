@@ -5070,6 +5070,308 @@ DSPARK_TEST(Compressor_program_timing_paths_scope_and_state)
 }
 
 // ============================================================================
+// Compressor: the equalizer of the key and the key listen
+// ============================================================================
+
+namespace {
+
+using CompKeyEq = KeyEqualizer<float, 16>;
+
+// A signal through a key equalizer of its own, as the compressor's would shape it.
+template <class Setup>
+Vec compShapedKey(const Vec& in, Setup&& setup)
+{
+    auto eq = std::make_unique<CompKeyEq>();
+    eq->prepare(48000.0);
+    setup(*eq);
+    (void)eq->sync();
+    Vec out = in;
+    for (auto& s : out) s = eq->processSample(s, 0);
+    return out;
+}
+
+double compFarthest(const Vec& p, const Vec& q, size_t from = 0)
+{
+    double d = 0.0;
+    for (size_t i = from; i < p.size(); ++i)
+        d = std::max(d, std::abs(static_cast<double>(p[i]) - static_cast<double>(q[i])));
+    return d;
+}
+
+// A loud low tone under a quiet high one, with a slow swell on both.
+Vec compLowOverHigh(int n)
+{
+    Vec v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = i / 48000.0;
+        const double swell = 0.7 + 0.3 * std::sin(2.0 * kPiD * 1.7 * t);
+        v[static_cast<size_t>(i)] = static_cast<float>(swell * (0.5 * std::sin(2.0 * kPiD * 60.0 * t)
+                                                               + 0.05 * std::sin(2.0 * kPiD * 3000.0 * t)));
+    }
+    return v;
+}
+
+} // namespace
+
+// New: an equalizer on the key. A low cut takes the low tone out of what the
+// detector weighs and the reduction goes with it; the audio is the one of an
+// external key shaped by the same filter (to rounding) in the block path, in
+// the per-sample path and at Precision::High; and in feedback it shapes what
+// the loop reads.
+DSPARK_TEST(Compressor_key_equalizer_decides_what_the_detector_weighs)
+{
+    using C = Compressor<float>;
+    const int n = 48000;
+    const Vec in = compLowOverHigh(n);
+    C::KeyBand cut;
+    cut.shape = C::KeyShape::LowCut;
+    cut.frequency = 500.0f;
+    cut.slope = 24.0f;
+
+    const auto settings = [](C& c) {
+        c.setThreshold(-20.0f);
+        c.setRatio(4.0f);
+        c.setAttack(5.0f);
+        c.setRelease(100.0f);
+    };
+    // Output and the deepest reduction of the last tenth of a second.
+    const auto render = [&](auto&& setup, const Vec* key, double& deepest) {
+        auto c = std::make_unique<C>();
+        settings(*c);
+        setup(*c);
+        c->prepare(AudioSpec{ 48000.0, 512, 1 });
+        std::vector<Vec> x { in };
+        Vec k = key ? *key : Vec();
+        int at = 0;
+        deepest = 0.0;
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) {
+            if (key)
+            {
+                float* ptr = k.data() + at;
+                AudioBufferView<float> side(&ptr, 1, b.getNumSamples());
+                c->processBlock(b, side);
+            }
+            else
+            {
+                c->processBlock(b);
+            }
+            at += b.getNumSamples();
+            if (at > n - 4800) deepest = std::min(deepest, static_cast<double>(c->getGainReductionDb()));
+        });
+        return x[0];
+    };
+
+    double plainGr = 0.0, cutGr = 0.0, sideGr = 0.0;
+    const Vec plain = render([](C&) {}, nullptr, plainGr);
+    const Vec shaped = render([&](C& c) { c.setSidechainBand(0, cut); }, nullptr, cutGr);
+    EXPECT_LT(plainGr, -5.0);                 // the low tone alone asks for some 7 dB
+    EXPECT_GT(cutGr, -0.05);                  // without it the key is under the threshold
+    EXPECT_GT(compFarthest(plain, shaped), 0.1);
+
+    // The same filter on an external key gives the same audio.
+    const Vec key = compShapedKey(in, [&](CompKeyEq& eq) { eq.setBand(0, cut); });
+    const Vec outside = render([](C&) {}, &key, sideGr);
+    EXPECT_LT(compFarthest(shaped, outside), 1e-5);
+
+    // A bell that lifts the quiet tone over the threshold, in every path.
+    C::KeyBand bell;
+    bell.shape = C::KeyShape::Bell;
+    bell.frequency = 3000.0f;
+    bell.gainDb = 24.0f;
+    bell.q = 2.0f;
+    const auto both = [&](C& c) {
+        c.setSidechainBand(0, cut);
+        c.setSidechainBand(3, bell);
+    };
+    const Vec bellKey = compShapedKey(in, [&](CompKeyEq& eq) { eq.setBand(0, cut); eq.setBand(3, bell); });
+    double bellGr = 0.0;
+    const Vec lifted = render(both, nullptr, bellGr);
+    EXPECT_LT(bellGr, -1.0);
+    EXPECT_GT(compFarthest(lifted, shaped), 0.01);
+    EXPECT_LT(compFarthest(lifted, render([](C&) {}, &bellKey, sideGr)), 1e-5);
+
+    auto single = std::make_unique<C>();
+    settings(*single);
+    both(*single);
+    single->prepare(AudioSpec{ 48000.0, 512, 1 });
+    Vec y = in;
+    for (auto& s : y) s = single->processSample(s, 0);
+    EXPECT_LT(compFarthest(lifted, y), 1e-5);
+
+    const auto precise = [&](C& c) { both(c); c.setPrecision(C::Precision::High); };
+    const Vec fine = render(precise, nullptr, bellGr);
+    EXPECT_LT(bellGr, -1.0);
+    EXPECT_LT(compFarthest(fine, render([](C& c) { c.setPrecision(C::Precision::High); }, &bellKey, sideGr)), 1e-5);
+
+    // In feedback the loop reads the compressed output through the equalizer.
+    double loopGr = 0.0, loopCutGr = 0.0;
+    const auto loop = [](C& c) { c.setTopology(C::Topology::FeedBack); c.setDetector(C::DetectorType::Rms); };
+    const Vec fed = render(loop, nullptr, loopGr);
+    const Vec fedCut = render([&](C& c) { loop(c); c.setSidechainBand(0, cut); }, nullptr, loopCutGr);
+    EXPECT_LT(loopGr, -3.0);
+    EXPECT_GT(loopCutGr, -0.05);
+    for (float s : fedCut) EXPECT_TRUE(std::isfinite(s));
+
+    // A band set while it runs is taken by the next block.
+    {
+        auto c = std::make_unique<C>();
+        settings(*c);
+        c->prepare(AudioSpec{ 48000.0, 64, 1 });
+        std::vector<Vec> x { in };
+        double before = 0.0, last = 0.0;
+        int at = 0;
+        processInBlocks(x, 64, [&](AudioBufferView<float> b) {
+            if (at == 24000)
+            {
+                before = static_cast<double>(c->getGainReductionDb());
+                c->setSidechainBand(0, cut);
+            }
+            c->processBlock(b);
+            at += b.getNumSamples();
+            last = static_cast<double>(c->getGainReductionDb());
+        });
+        EXPECT_LT(before, -3.0);
+        EXPECT_GT(last, -0.05);
+        for (float s : x[0]) EXPECT_TRUE(std::isfinite(s));
+    }
+
+    // The bands are part of the state; the curve for a display follows them.
+    C a;
+    both(a);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getSidechainBand(0).shape == C::KeyShape::LowCut);
+    EXPECT_EQ(b.getSidechainBand(0).frequency, 500.0f);
+    EXPECT_EQ(b.getSidechainBand(0).slope, 24.0f);
+    EXPECT_TRUE(b.getSidechainBand(3).shape == C::KeyShape::Bell);
+    EXPECT_EQ(b.getSidechainBand(3).gainDb, 24.0f);
+    EXPECT_TRUE(b.getSidechainBand(1).shape == C::KeyShape::Off);
+    EXPECT_TRUE(b.getState() == blob);
+    b.prepare(AudioSpec{ 48000.0, 512, 1 });
+    const auto curve = b.getSidechainResponse();
+    EXPECT_NEAR(curve.magnitudeDb(3000.0), 24.0, 0.3);
+    EXPECT_LT(curve.magnitudeDb(60.0), -60.0);
+}
+
+// New: key listen. The output is what each detector hears (the key after the
+// high-pass and the equalizer, to rounding), in every path, ahead of the lookahead; the
+// compressor keeps working underneath, so switching it off returns to the
+// audio as if it had never been on; and it is not part of the state.
+DSPARK_TEST(Compressor_key_listen_plays_what_the_detector_hears)
+{
+    using C = Compressor<float>;
+    const int n = 24000;
+    const Vec left = compLowOverHigh(n);
+    Vec right(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        right[static_cast<size_t>(i)] = static_cast<float>(0.4 * std::sin(2.0 * kPiD * 220.0 * i / 48000.0));
+    C::KeyBand bell;
+    bell.shape = C::KeyShape::Bell;
+    bell.frequency = 3000.0f;
+    bell.gainDb = 12.0f;
+    bell.q = 1.5f;
+    const auto shape = [&](CompKeyEq& eq) { eq.setBand(2, bell); };
+    const Vec heardLeft = compShapedKey(left, shape), heardRight = compShapedKey(right, shape);
+    const size_t resumed = 12288;       // first block boundary past the middle
+
+    const auto render = [&](auto&& setup, int block, bool listenSecondHalfOff, double& deepest) {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-24.0f);
+        c->setRatio(4.0f);
+        c->setAttack(2.0f);
+        c->setRelease(60.0f);
+        c->setStereoLink(0.0f);
+        c->setSidechainBand(2, bell);
+        setup(*c);
+        c->prepare(AudioSpec{ 48000.0, block, 2 });
+        std::vector<Vec> x { left, right };
+        int at = 0;
+        deepest = 0.0;
+        processInBlocks(x, block, [&](AudioBufferView<float> b) {
+            if (listenSecondHalfOff && at >= static_cast<int>(resumed)) c->setSidechainListen(false);
+            c->processBlock(b);
+            at += b.getNumSamples();
+            deepest = std::min(deepest, static_cast<double>(c->getGainReductionDb()));
+        });
+        return x;
+    };
+    const auto listening = [](C& c) { c.setSidechainListen(true); };
+
+    // The block path: the key, and the meter still reads.
+    double gr = 0.0;
+    auto out = render(listening, 512, false, gr);
+    EXPECT_LT(compFarthest(out[0], heardLeft), 1e-6);
+    EXPECT_LT(compFarthest(out[1], heardRight), 1e-6);
+    EXPECT_LT(gr, -3.0);
+
+    // With a lookahead the key is heard as it arrives.
+    out = render([&](C& c) { listening(c); c.setLookahead(5.0f); }, 512, false, gr);
+    EXPECT_LT(compFarthest(out[0], heardLeft), 1e-6);
+    EXPECT_LT(compFarthest(out[1], heardRight), 1e-6);
+
+    // The per-sample loop of the block path (Precision::High) and processSample().
+    out = render([&](C& c) { listening(c); c.setPrecision(C::Precision::High); }, 512, false, gr);
+    EXPECT_LT(compFarthest(out[0], heardLeft), 1e-6);
+    EXPECT_LT(compFarthest(out[1], heardRight), 1e-6);
+    {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-24.0f);
+        c->setSidechainBand(2, bell);
+        c->setSidechainListen(true);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        Vec l = left, r = right;
+        for (int i = 0; i < n; ++i)
+        {
+            l[static_cast<size_t>(i)] = c->processSample(l[static_cast<size_t>(i)], 0);
+            r[static_cast<size_t>(i)] = c->processSample(r[static_cast<size_t>(i)], 1);
+        }
+        EXPECT_LT(compFarthest(l, heardLeft), 1e-6);
+        EXPECT_LT(compFarthest(r, heardRight), 1e-6);
+        EXPECT_LT(static_cast<double>(c->getGainReductionDb()), -1.0);
+    }
+
+    // An external key is what is heard, each channel its own.
+    {
+        auto c = std::make_unique<C>();
+        c->setSidechainBand(2, bell);
+        c->setSidechainListen(true);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        std::vector<Vec> x { left, left };
+        Vec keyA = right, keyB = left;
+        int at = 0;
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) {
+            float* ptr[2] = { keyA.data() + at, keyB.data() + at };
+            AudioBufferView<float> side(ptr, 2, b.getNumSamples());
+            c->processBlock(b, side);
+            at += b.getNumSamples();
+        });
+        EXPECT_LT(compFarthest(x[0], heardRight), 1e-6);
+        EXPECT_LT(compFarthest(x[1], heardLeft), 1e-6);
+    }
+
+    // Switched off half way, the audio is the one of a compressor that never listened.
+    const auto never = render([](C&) {}, 512, false, gr);
+    const auto half = render(listening, 512, true, gr);
+    EXPECT_GT(compFarthest(half[0], heardLeft), 0.01);
+    EXPECT_EQ(compFarthest(never[0], half[0], resumed), 0.0);
+    EXPECT_EQ(compFarthest(never[1], half[1], resumed), 0.0);
+    const auto neverFine = render([](C& c) { c.setPrecision(C::Precision::High); }, 512, false, gr);
+    const auto halfFine = render([&](C& c) { listening(c); c.setPrecision(C::Precision::High); }, 512, true, gr);
+    EXPECT_EQ(compFarthest(neverFine[0], halfFine[0], resumed), 0.0);
+
+    // A monitoring switch: the state does not carry it.
+    C a;
+    a.setSidechainListen(true);
+    EXPECT_TRUE(a.isSidechainListen());
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_FALSE(b.isSidechainListen());
+}
+
+// ============================================================================
 // Limiter: a latency kept for the lookahead
 // ============================================================================
 

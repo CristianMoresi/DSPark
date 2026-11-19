@@ -8,6 +8,7 @@
 #include "../Core/BiquadCascade.h"
 #include "../Core/FilterDesign.h"
 #include "../Core/FirBank.h"
+#include "../Core/KeyEqualizer.h"
 #include "../Core/NormalizedLadder.h"
 #include "../Core/StateVariableFilter.h"
 #include "../Core/LadderFilter.h"
@@ -4267,4 +4268,241 @@ DSPARK_TEST(FirBank_kernel_changes_crossfade_over_one_partition)
     bank.removeKernel(-1);
     EXPECT_TRUE(bank.isKernelSilent(5));
     EXPECT_TRUE(!bank.isKernelActive(5));
+}
+
+// ============================================================================
+// KeyEqualizer
+// ============================================================================
+
+namespace {
+
+using KeyEq2 = KeyEqualizer<float, 2>;
+
+// Gain in decibels of a key equalizer on a tone, once it has settled.
+double keyEqToneDb(KeyEq2& eq, double hz)
+{
+    const int n = 48000;
+    double in2 = 0.0, out2 = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        const float x = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979323846 * hz * i / 48000.0));
+        const float y = eq.processSample(x, 0);
+        if (i >= n / 2)
+        {
+            in2 += static_cast<double>(x) * x;
+            out2 += static_cast<double>(y) * y;
+        }
+    }
+    return 10.0 * std::log10(out2 / in2);
+}
+
+KeyEq2::Band keyEqBand(KeyEq2::Shape shape, float hz, float gainDb, float q, float slope)
+{
+    KeyEq2::Band band;
+    band.shape = shape;
+    band.frequency = hz;
+    band.gainDb = gainDb;
+    band.q = q;
+    band.slope = slope;
+    return band;
+}
+
+} // namespace
+
+// New: the equalizer of a key. Each shape lands on the curve it is set to,
+// the response it reports is the one it plays, and with no band in the path
+// it hands the sample back untouched.
+DSPARK_TEST(KeyEqualizer_bands_land_on_the_curves_they_are_set_to)
+{
+    using Shape = KeyEq2::Shape;
+    {
+        KeyEq2 idle;
+        EXPECT_FALSE(idle.sync());                      // not prepared: out of the path
+        EXPECT_EQ(idle.processSample(0.25f, 0), 0.25f);
+        idle.advance(64);
+        idle.prepare(48000.0);
+        EXPECT_FALSE(idle.sync());                      // prepared, every band off
+        EXPECT_FALSE(idle.hasBands());
+        EXPECT_EQ(idle.processSample(-0.5f, 1), -0.5f);
+    }
+
+    const auto fresh = [](const KeyEq2::Band& band) {
+        auto eq = std::make_unique<KeyEq2>();
+        eq->prepare(48000.0);
+        eq->setBand(0, band);
+        return eq;
+    };
+
+    // A 24 dB per octave low cut is the Butterworth high-pass of order 4.
+    {
+        auto eq = fresh(keyEqBand(Shape::LowCut, 200.0f, 0.0f, 0.7071f, 24.0f));
+        EXPECT_TRUE(eq->sync());
+        EXPECT_TRUE(eq->hasBands());
+        EXPECT_NEAR(keyEqToneDb(*eq, 200.0), -3.01, 0.15);
+        EXPECT_NEAR(keyEqToneDb(*eq, 50.0), -48.16, 0.6);
+        EXPECT_NEAR(keyEqToneDb(*eq, 2000.0), 0.0, 0.05);
+    }
+    // A 48 dB per octave high cut: order 8, the steepest.
+    {
+        auto eq = fresh(keyEqBand(Shape::HighCut, 2000.0f, 0.0f, 0.7071f, 48.0f));
+        EXPECT_TRUE(eq->sync());
+        EXPECT_NEAR(keyEqToneDb(*eq, 2000.0), -3.01, 0.2);
+        EXPECT_NEAR(keyEqToneDb(*eq, 4000.0), -48.16, 1.0);
+        EXPECT_NEAR(keyEqToneDb(*eq, 200.0), 0.0, 0.05);
+    }
+    // A bell: its gain at the centre and half of it (in decibels) at the two
+    // edges, which are frequency / q apart.
+    {
+        auto eq = fresh(keyEqBand(Shape::Bell, 1000.0f, 9.0f, 2.0f, 12.0f));
+        EXPECT_TRUE(eq->sync());
+        EXPECT_NEAR(keyEqToneDb(*eq, 1000.0), 9.0, 0.1);
+        EXPECT_NEAR(keyEqToneDb(*eq, 780.78), 4.5, 0.25);
+        EXPECT_NEAR(keyEqToneDb(*eq, 1280.78), 4.5, 0.25);
+        EXPECT_NEAR(keyEqToneDb(*eq, 60.0), 0.0, 0.1);
+    }
+    // Shelves: the gain on their side, half of it at the corner, nothing far away.
+    {
+        auto eq = fresh(keyEqBand(Shape::HighShelf, 3000.0f, -8.0f, 0.7071f, 12.0f));
+        EXPECT_TRUE(eq->sync());
+        EXPECT_NEAR(keyEqToneDb(*eq, 3000.0), -4.0, 0.2);
+        EXPECT_NEAR(keyEqToneDb(*eq, 100.0), 0.0, 0.1);
+        EXPECT_NEAR(keyEqToneDb(*eq, 15000.0), -8.0, 0.4);
+    }
+    {
+        auto eq = fresh(keyEqBand(Shape::LowShelf, 300.0f, 6.0f, 0.7071f, 6.0f));
+        EXPECT_TRUE(eq->sync());
+        EXPECT_NEAR(keyEqToneDb(*eq, 300.0), 3.0, 0.2);
+        EXPECT_NEAR(keyEqToneDb(*eq, 20.0), 6.0, 0.3);
+        EXPECT_NEAR(keyEqToneDb(*eq, 8000.0), 0.0, 0.1);
+    }
+    // A tilt: 3 dB per octave about its pivot.
+    {
+        auto eq = fresh(keyEqBand(Shape::Tilt, 1000.0f, 0.0f, 0.7071f, 3.0f));
+        EXPECT_TRUE(eq->sync());
+        EXPECT_NEAR(keyEqToneDb(*eq, 1000.0), 0.0, 0.3);
+        EXPECT_NEAR(keyEqToneDb(*eq, 250.0), -6.0, 0.6);
+        EXPECT_NEAR(keyEqToneDb(*eq, 4000.0), 6.0, 0.6);
+    }
+    // A bell or a shelf at 0 dB is not in the path.
+    {
+        auto eq = fresh(keyEqBand(Shape::Bell, 1000.0f, 0.0f, 2.0f, 12.0f));
+        EXPECT_FALSE(eq->sync());
+    }
+
+    // Six bands at once: what it plays is what it reports.
+    auto eq = std::make_unique<KeyEq2>();
+    eq->prepare(48000.0);
+    eq->setBand(0, keyEqBand(Shape::LowCut, 90.0f, 0.0f, 1.2f, 18.0f));
+    eq->setBand(1, keyEqBand(Shape::Bell, 400.0f, -6.0f, 1.5f, 12.0f));
+    eq->setBand(2, keyEqBand(Shape::Bell, 2500.0f, 7.5f, 3.0f, 12.0f));
+    eq->setBand(3, keyEqBand(Shape::HighShelf, 6000.0f, 4.0f, 0.7071f, 12.0f));
+    eq->setBand(4, keyEqBand(Shape::Tilt, 800.0f, 0.0f, 0.7071f, -1.5f));
+    eq->setBand(5, keyEqBand(Shape::HighCut, 14000.0f, 0.0f, 0.7071f, 12.0f));
+    EXPECT_TRUE(eq->sync());
+    const auto response = eq->getResponse();
+    EXPECT_GT(response.count, 6);
+    for (double hz : { 40.0, 90.0, 250.0, 400.0, 1000.0, 2500.0, 6000.0, 12000.0 })
+        EXPECT_NEAR(keyEqToneDb(*eq, hz), response.magnitudeDb(hz), 0.05);
+}
+
+// New: settings move while the key runs. A change glides (no step in the
+// output), a band switched off leaves and the equalizer goes out of the path
+// to the bit, each channel keeps a memory of its own, and wild values cannot
+// get in.
+DSPARK_TEST(KeyEqualizer_settings_glide_bands_leave_and_wild_values_stay_out)
+{
+    using Shape = KeyEq2::Shape;
+    auto eq = std::make_unique<KeyEq2>();
+    eq->prepare(48000.0);
+    eq->setBand(0, keyEqBand(Shape::Bell, 1000.0f, 12.0f, 1.0f, 12.0f));
+    EXPECT_TRUE(eq->sync());
+
+    const auto tone = [](int i) {
+        return static_cast<float>(0.2 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * i / 48000.0));
+    };
+    // Largest step between two samples of the output over a stretch, and the peak at its end.
+    int at = 0;
+    float last = 0.0f;
+    const auto run = [&](int samples, double& step, double& peak) {
+        step = 0.0;
+        peak = 0.0;
+        for (int i = 0; i < samples; ++i, ++at)
+        {
+            const float y = eq->processSample(tone(at), 0);
+            EXPECT_EQ(eq->processSample(0.0f, 1), 0.0f);      // the silent channel stays silent
+            eq->advance(1);
+            step = std::max(step, static_cast<double>(std::abs(y - last)));
+            if (i >= samples - 96) peak = std::max(peak, static_cast<double>(std::abs(y)));
+            last = y;
+        }
+    };
+
+    double step = 0.0, peak = 0.0;
+    run(9600, step, peak);
+    const double loudStep = step;
+    EXPECT_NEAR(20.0 * std::log10(peak / 0.2), 12.0, 0.1);
+
+    // From +12 to -12 dB: the output glides down, no sample steps further
+    // than the loud tone already did.
+    eq->setBand(0, keyEqBand(Shape::Bell, 1000.0f, -12.0f, 1.0f, 12.0f));
+    EXPECT_TRUE(eq->sync());
+    run(480, step, peak);
+    EXPECT_LT(step, loudStep * 1.02);
+    EXPECT_GT(peak, 0.2 * 0.5);                               // half way through the ramp, not there yet
+    run(4800, step, peak);
+    EXPECT_NEAR(20.0 * std::log10(peak / 0.2), -12.0, 0.1);
+
+    // Off: it leaves over the ramp and then the equalizer is out of the path.
+    eq->setBand(0, keyEqBand(Shape::Off, 1000.0f, -12.0f, 1.0f, 12.0f));
+    EXPECT_TRUE(eq->sync());                                  // still leaving
+    run(480, step, peak);
+    EXPECT_TRUE(eq->isActive());
+    run(4800, step, peak);
+    EXPECT_FALSE(eq->isActive());
+    EXPECT_FALSE(eq->hasBands());
+    EXPECT_EQ(eq->processSample(0.123f, 0), 0.123f);
+
+    // Back in: it starts transparent and glides to its curve.
+    eq->setBand(0, keyEqBand(Shape::LowCut, 4000.0f, 0.0f, 0.7071f, 24.0f));
+    EXPECT_TRUE(eq->sync());
+    run(96, step, peak);
+    EXPECT_GT(peak, 0.2 * 0.5);
+    run(9600, step, peak);
+    EXPECT_NEAR(20.0 * std::log10(peak / 0.2), -48.16, 1.0);
+
+    // Wild values.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    eq->setBand(-1, keyEqBand(Shape::Bell, 100.0f, 3.0f, 1.0f, 12.0f));
+    eq->setBand(99, keyEqBand(Shape::Bell, 100.0f, 3.0f, 1.0f, 12.0f));
+    EXPECT_TRUE(eq->getBand(99).shape == Shape::Off);
+    eq->setBand(1, keyEqBand(Shape::Bell, 500.0f, 3.0f, 2.0f, 12.0f));
+    eq->setBand(1, keyEqBand(static_cast<Shape>(77), nan, 90.0f, nan, nan));
+    const auto band = eq->getBand(1);
+    EXPECT_TRUE(band.shape == Shape::Tilt);
+    EXPECT_EQ(band.frequency, 500.0f);
+    EXPECT_EQ(band.gainDb, 24.0f);
+    EXPECT_EQ(band.q, 2.0f);
+    EXPECT_EQ(band.slope, 12.0f);
+    eq->prepare(std::numeric_limits<double>::quiet_NaN());   // ignored
+    eq->prepare(-48000.0);
+    EXPECT_TRUE(eq->sync());
+    run(4800, step, peak);
+    EXPECT_TRUE(std::isfinite(peak));
+
+    // The state: every band, under a prefix.
+    StateWriter w(stateId("TEST"), 1);
+    eq->writeState(w, "key");
+    const auto blob = w.blob();
+    StateReader r(blob.data(), blob.size());
+    auto other = std::make_unique<KeyEq2>();
+    other->readState(r, "key");
+    for (int b = 0; b < KeyEq2::kBands; ++b)
+    {
+        const auto mine = eq->getBand(b), theirs = other->getBand(b);
+        EXPECT_TRUE(mine.shape == theirs.shape);
+        EXPECT_EQ(mine.frequency, theirs.frequency);
+        EXPECT_EQ(mine.gainDb, theirs.gainDb);
+        EXPECT_EQ(mine.q, theirs.q);
+        EXPECT_EQ(mine.slope, theirs.slope);
+    }
 }

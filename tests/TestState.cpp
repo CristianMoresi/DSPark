@@ -82,6 +82,10 @@ DSPARK_TEST(State_roundtrip_dynamics)
         c.setDetector(Compressor<float>::DetectorType::Hybrid);
         c.setProgramRelease(0.7f); c.setAdaptiveAttack(0.3f);
         c.setSpectralTiming(0.5f); c.setAttackEmphasis(-0.4f);
+        Compressor<float>::KeyBand band;
+        band.shape = Compressor<float>::KeyShape::HighShelf;
+        band.frequency = 3200.0f; band.gainDb = -4.5f; band.q = 1.3f; band.slope = 6.0f;
+        c.setSidechainBand(4, band);
     })));
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);

@@ -329,9 +329,10 @@ inline EffectSlot makeCompressor()
     // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4, Hybrid=5
     s.addChoice("Detector", {"Peak","RMS","TruePeak","SplitPolarity","Hilbert","Hybrid"}, 0);
     // Character order MUST match dspark::Compressor::Character enum.
-    // Enum: Clean=0, Opto=1, FET=2, Varimu=3
-    s.addChoice("Character", {"Clean","Opto","FET","Varimu"}, 0);
-    // Harmonic signature of the character (FET: 1176-calibrated 2nd order).
+    // Enum: Clean=0, Opto=1, FET=2, Varimu=3, Smooth=4
+    s.addChoice("Character", {"Clean","Opto","FET","Varimu","Smooth"}, 0);
+    // Harmonic signature of the character (FET: 2nd order of the element;
+    // Varimu: the gain through a push-pull pair).
     s.addSlider("Color", 0, 1, 0, "");
     // Order MUST match dspark::Compressor::Topology (FeedForward=0, FeedBack=1).
     s.addChoice("Topology", {"FeedForward","FeedBack"}, 0);              // index 11
@@ -368,6 +369,8 @@ inline EffectSlot makeCompressor()
     s.addSlider("Key Bell Gain", -24, 24, 0, "dB");
     s.addSlider("Key Bell Q", 0.3f, 10, 1, "");
     s.addSlider("Key Tilt", -6, 6, 0, "dB/oct");
+    // The gain smoothed after the ballistics (index 32).
+    s.addSlider("Gain Smoothing", 0, 50, 0, "ms");
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -422,6 +425,7 @@ inline EffectSlot makeCompressor()
                 for (int b = 0; b < 4; ++b) p->setSidechainBand(b, k[static_cast<size_t>(b)]);
                 break;
             }
+            case 32: p->setGainSmoothing(v); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

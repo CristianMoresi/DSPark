@@ -409,8 +409,8 @@ DSPARK_TEST(Equalizer_invalid_inputs_are_ignored)
     wild.type = static_cast<EQ::BandType>(99); wild.slope = 999;
     subject.setBand(1, wild);
     twin.setBand(1, wild); // both get the sanitized copy
-    EXPECT_EQ(static_cast<int>(subject.getBandConfig(1).type), 7); // clamped to Tilt
-    EXPECT_EQ(subject.getBandConfig(1).slope, 48);
+    EXPECT_EQ(static_cast<int>(subject.getBandConfig(1).type), 0); // not a type: the band keeps its own
+    EXPECT_EQ(subject.getBandConfig(1).slope, 96);                  // clamped (the cookbook engine runs 48)
 
     // The NaN never reached the stored config nor the state blob.
     EXPECT_NEAR(subject.getBandConfig(0).frequency, 1000.0f, 1e-3f);
@@ -3913,4 +3913,402 @@ DSPARK_TEST(FilterEngine_drift_seed_makes_renders_reproducible)
     e->reset();
     const auto ra = render(*a);
     EXPECT_TRUE(render(*e) == ra);
+}
+
+// ============================================================================
+// Equalizer: the analog response (bands designed from their prototypes and run
+// in a cascade with ramped coefficients)
+// ============================================================================
+
+namespace {
+
+using AnalogEq = Equalizer<double>;
+
+// Runs a signal through an equalizer in blocks (one channel).
+void eqRun(AnalogEq& eq, std::vector<double>& x, int block = 256)
+{
+    const int total = static_cast<int>(x.size());
+    for (int off = 0; off < total; off += block)
+    {
+        double* ch[1] = { x.data() + off };
+        eq.processBlock(AudioBufferView<double>(ch, 1, std::min(block, total - off)));
+    }
+}
+
+// Level in decibels of a response at a frequency (the sum of its discrete Fourier transform there).
+double eqLevelDb(const std::vector<double>& h, double hz, double fs)
+{
+    const double w = 2.0 * 3.14159265358979323846 * hz / fs;
+    double re = 0.0, im = 0.0;
+    for (size_t n = 0; n < h.size(); ++n)
+    {
+        re += h[n] * std::cos(w * static_cast<double>(n));
+        im -= h[n] * std::sin(w * static_cast<double>(n));
+    }
+    return 10.0 * std::log10(std::max(re * re + im * im, 1e-30));
+}
+
+// The response an equalizer gives to an impulse.
+std::vector<double> eqImpulse(AnalogEq& eq, int length = 16384)
+{
+    std::vector<double> h(static_cast<size_t>(length), 0.0);
+    h[0] = 1.0;
+    eqRun(eq, h);
+    return h;
+}
+
+AnalogEq::BandConfig eqBand(AnalogEq::BandType type, double hz, double gain, double q, double slope = 12.0, int order = 1)
+{
+    AnalogEq::BandConfig cfg;
+    cfg.type = type;
+    cfg.frequency = hz;
+    cfg.gain = gain;
+    cfg.q = q;
+    cfg.slope = slope;
+    cfg.order = order;
+    return cfg;
+}
+
+// Worst distance in decibels, over a list of frequencies, between what an equalizer with one band plays
+// and an analog prototype.
+double eqWorstAgainst(const AnalogCascade& proto, const AnalogEq::BandConfig& cfg, bool analog,
+                      const std::vector<double>& freqs, double fs = 48000.0, bool linearPhase = false)
+{
+    AnalogEq eq;
+    eq.setAnalogResponse(analog);
+    if (linearPhase) eq.setFilterMode(AnalogEq::FilterMode::LinearPhase);
+    eq.setBand(0, cfg);
+    eq.prepare({ fs, 256, 1 });
+    const std::vector<double> h = eqImpulse(eq, linearPhase ? 3 * 32768 : 16384);
+    double worst = 0.0;
+    for (const double hz : freqs)
+    {
+        const double want = proto.magnitudeDb(hz);
+        if (want > -70.0) worst = std::max(worst, std::abs(eqLevelDb(h, hz, fs) - want));
+    }
+    return worst;
+}
+
+AnalogCascade eqOne(const AnalogSection& section)
+{
+    AnalogCascade c;
+    c.add(section);
+    return c;
+}
+
+} // namespace
+
+// The gap: next to Nyquist the cookbook bands shrink (a high shelf reaches its
+// plateau early, a bell narrows). With the analog response the audio stays on
+// the analog curve in both phase modes.
+DSPARK_TEST(Equalizer_analog_response_stays_on_the_analog_curves)
+{
+    using Type = AnalogEq::BandType;
+    const std::vector<double> top = { 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000 };
+    const std::vector<double> wide = { 50, 200, 1000, 4000, 8000, 12000, 16000, 19000 };
+
+    // A high shelf of +12 dB at 12 kHz (Q 0.7071 is the plain shelf).
+    {
+        const AnalogEq::BandConfig cfg = eqBand(Type::HighShelf, 12000.0, 12.0, 0.7071);
+        const AnalogCascade proto = eqOne(AnalogSection::highShelf(12000.0, 12.0));
+        const double plain = eqWorstAgainst(proto, cfg, false, top), analog = eqWorstAgainst(proto, cfg, true, top);
+        EXPECT_GT(plain, 0.8);
+        EXPECT_LT(analog, 0.15);
+        EXPECT_LT(eqWorstAgainst(proto, cfg, true, wide), 0.15);
+    }
+    // A bell of -18 dB at 15 kHz, Q 1: the closed-form bell the equalizer uses by default is off by decibels.
+    {
+        const AnalogEq::BandConfig cfg = eqBand(Type::Peak, 15000.0, -18.0, 1.0);
+        const AnalogCascade proto = eqOne(AnalogSection::peak(15000.0, 1.0, -18.0));
+        const double before = eqWorstAgainst(proto, cfg, false, top), analog = eqWorstAgainst(proto, cfg, true, top);
+        EXPECT_GT(before, 1.0);
+        EXPECT_LT(analog, 0.3);
+        EXPECT_LT(3.0 * analog, before);
+    }
+    // A notch at 14 kHz and a tilt: the cookbook forms have no matched design at all.
+    {
+        const AnalogEq::BandConfig cfg = eqBand(Type::Notch, 14000.0, 0.0, 2.0);
+        const AnalogCascade proto = eqOne(AnalogSection::notch(14000.0, 2.0));
+        const std::vector<double> around = { 6000, 9000, 11000, 12500, 13500, 14500, 15500, 17000, 19000 };
+        EXPECT_GT(eqWorstAgainst(proto, cfg, false, around), 1.0);
+        EXPECT_LT(eqWorstAgainst(proto, cfg, true, around), 0.5);
+    }
+    // The linear-phase kernel is built from the prototype itself.
+    {
+        const AnalogEq::BandConfig cfg = eqBand(Type::HighShelf, 12000.0, 12.0, 0.7071);
+        const AnalogCascade proto = eqOne(AnalogSection::highShelf(12000.0, 12.0));
+        EXPECT_GT(eqWorstAgainst(proto, cfg, false, top, 48000.0, true), 0.8);
+        EXPECT_LT(eqWorstAgainst(proto, cfg, true, top, 48000.0, true), 0.05);
+    }
+}
+
+// A cut takes any slope from 0 to 96 dB per octave with the analog response;
+// the cookbook engine keeps its whole slopes from 6 to 48.
+DSPARK_TEST(Equalizer_analog_cuts_take_any_slope)
+{
+    using Type = AnalogEq::BandType;
+    const std::vector<double> freqs = { 100, 500, 1000, 1500, 2000, 2500, 3000, 4000, 6000, 8000, 12000, 16000 };
+    double before = 0.0;
+    for (const double slope : { 3.0, 9.0, 15.0, 30.0, 45.5, 72.0, 96.0 })
+    {
+        const AnalogEq::BandConfig cfg = eqBand(Type::LowPass, 2000.0, 0.0, 0.7071, slope);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::highCut(2000.0, slope), cfg, true, freqs), 0.3);
+
+        AnalogEq eq;
+        eq.setAnalogResponse(true);
+        eq.setBand(0, cfg);
+        eq.prepare({ 48000.0, 256, 1 });
+        EXPECT_NEAR(static_cast<double>(eq.getBandConfig(0).slope), slope, 1e-9);
+        const std::vector<double> h = eqImpulse(eq);
+        if (slope >= 6.0) EXPECT_NEAR(eqLevelDb(h, 2000.0, 48000.0), -3.0103, 0.05);
+        // The steeper the slope, the lower an octave above the corner.
+        const double octave = eqLevelDb(h, 4000.0, 48000.0);
+        if (before != 0.0) EXPECT_LT(octave, before - 1.0);
+        before = octave;
+    }
+    // A low cut of 30 dB per octave at 200 Hz, with resonance.
+    {
+        const AnalogEq::BandConfig cfg = eqBand(Type::HighPass, 200.0, 0.0, 2.0, 30.0);
+        const std::vector<double> low = { 40, 80, 120, 160, 200, 260, 400, 1000, 5000, 15000 };
+        EXPECT_LT(eqWorstAgainst(FilterDesign::lowCut(200.0, 30.0, 2.0), cfg, true, low), 0.3);
+    }
+    // The cookbook engine runs a slope past its range as its steepest, and a slope in between as the nearest whole one.
+    {
+        AnalogEq steep, steepest, between, whole;
+        steep.setBand(0, eqBand(Type::LowPass, 2000.0, 0.0, 0.7071, 96.0));
+        steepest.setBand(0, eqBand(Type::LowPass, 2000.0, 0.0, 0.7071, 48.0));
+        between.setBand(0, eqBand(Type::LowPass, 2000.0, 0.0, 0.7071, 23.6));
+        whole.setBand(0, eqBand(Type::LowPass, 2000.0, 0.0, 0.7071, 24.0));
+        for (AnalogEq* eq : { &steep, &steepest, &between, &whole }) eq->prepare({ 48000.0, 256, 1 });
+        EXPECT_TRUE(eqImpulse(steep, 2048) == eqImpulse(steepest, 2048));
+        EXPECT_TRUE(eqImpulse(between, 2048) == eqImpulse(whole, 2048));
+        EXPECT_EQ(static_cast<double>(steep.getBandConfig(0).slope), 96.0);
+    }
+}
+
+// Bells, shelves, notches and band-passes of any order, the all-pass, the flat
+// tilt and the walls. A band only the analog response can make runs with it
+// whatever the switch says.
+DSPARK_TEST(Equalizer_analog_bands_of_any_order_and_the_new_types)
+{
+    using Type = AnalogEq::BandType;
+    for (const bool analog : { false, true })
+    {
+        const double half = 0.25, root = std::sqrt(1.0 + half * half);      // Q 2
+        const std::vector<double> bell = { 300, 1000, 2000, 3000 * (root - half), 3000, 3000 * (root + half), 5000, 10000, 18000 };
+        EXPECT_LT(eqWorstAgainst(FilterDesign::bell(3000.0, 2.0, 12.0, 4), eqBand(Type::Peak, 3000.0, 12.0, 2.0, 12.0, 4), analog, bell), 0.05);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::lowShelf(400.0, -9.0, 6), eqBand(Type::LowShelf, 400.0, -9.0, 0.7071, 12.0, 6), analog, bell), 0.05);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::highShelf(6000.0, 6.0, 3), eqBand(Type::HighShelf, 6000.0, 6.0, 0.7071, 12.0, 3), analog, bell), 0.1);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::bandPass(3000.0, 2.0, 3), eqBand(Type::BandPass, 3000.0, 0.0, 2.0, 12.0, 3), analog, bell), 0.7);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::bandStop(3000.0, 2.0, 2), eqBand(Type::Notch, 3000.0, 0.0, 2.0, 12.0, 2), analog,
+                                 { 300, 1000, 2000, 2400, 3700, 5000, 10000, 18000 }), 0.1);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::tilt(1000.0, 3.0), eqBand(Type::FlatTilt, 1000.0, 3.0, 0.7071), analog,
+                                 { 30, 100, 250, 1000, 4000, 10000, 16000, 19000 }), 0.1);
+        EXPECT_LT(eqWorstAgainst(FilterDesign::ellipticHighCut(8000.0), eqBand(Type::LowPassWall, 8000.0, 0.0, 0.7071), analog,
+                                 { 100, 1000, 4000, 6000, 7000, 7600, 7900, 8000 }), 0.06);    // inside its ripple of 0.05 dB
+        EXPECT_LT(eqWorstAgainst(FilterDesign::ellipticLowCut(200.0), eqBand(Type::HighPassWall, 200.0, 0.0, 0.7071), analog,
+                                 { 205, 220, 300, 1000, 8000, 19000 }), 0.1);
+
+        // The wall is down by its floor a quarter of an octave past its corner.
+        AnalogEq wall;
+        wall.setAnalogResponse(analog);
+        wall.setBand(0, eqBand(Type::LowPassWall, 8000.0, 0.0, 0.7071));
+        wall.prepare({ 48000.0, 256, 1 });
+        const std::vector<double> h = eqImpulse(wall);
+        for (const double hz : { 9400.0, 9600.0, 11000.0, 14000.0, 18000.0, 23000.0 }) EXPECT_LT(eqLevelDb(h, hz, 48000.0), -99.0);
+
+        // An all-pass keeps the level at every frequency and turns the phase.
+        for (const int order : { 1, 2, 5 })
+        {
+            AnalogEq all;
+            all.setAnalogResponse(analog);
+            all.setBand(0, eqBand(Type::AllPass, 1000.0, 0.0, 1.5, 12.0, order));
+            all.prepare({ 48000.0, 256, 1 });
+            const std::vector<double> a = eqImpulse(all, 32768);
+            for (const double hz : { 60.0, 500.0, 1000.0, 2000.0, 9000.0, 20000.0 }) EXPECT_NEAR(eqLevelDb(a, hz, 48000.0), 0.0, 1e-6);
+            EXPECT_TRUE(std::abs(a[0]) < 0.999);      // not the identity
+        }
+    }
+    // The types of the cookbook engine keep to it with the switch off.
+    {
+        AnalogEq plain;
+        plain.setBand(0, eqBand(Type::Peak, 3000.0, 12.0, 2.0));
+        plain.prepare({ 48000.0, 256, 1 });
+        BiquadCoeffs sections[16];
+        EXPECT_EQ(plain.buildBandSections(plain.getBandConfig(0), sections, 16), 1);
+        EXPECT_EQ(plain.buildBandSections(eqBand(Type::Peak, 3000.0, 12.0, 2.0, 12.0, 4), sections, 16), 4);
+        EXPECT_EQ(plain.buildBandSections(eqBand(Type::LowPassWall, 3000.0, 0.0, 0.7071), sections, 16), 6);
+        EXPECT_EQ(plain.buildBandSections(eqBand(Type::Peak, 3000.0, 12.0, 2.0, 12.0, 16), sections, 4), 4);
+    }
+}
+
+// The curve an interface draws is the audio, section for section.
+DSPARK_TEST(Equalizer_analog_analysis_curve_is_the_audio)
+{
+    using Type = AnalogEq::BandType;
+    AnalogEq eq;
+    eq.setAnalogResponse(true);
+    eq.setBand(0, eqBand(Type::HighPass, 80.0, 0.0, 1.2, 21.0));
+    eq.setBand(1, eqBand(Type::Peak, 2500.0, -7.0, 3.0, 12.0, 5));
+    eq.setBand(2, eqBand(Type::HighShelf, 9000.0, 8.0, 0.9));
+    eq.setBand(3, eqBand(Type::Tilt, 700.0, 4.0, 0.7071));
+    eq.setBand(4, eqBand(Type::LowPass, 17000.0, 0.0, 0.7071, 13.0));
+    eq.prepare({ 48000.0, 256, 1 });
+    const std::vector<double> h = eqImpulse(eq, 65536);
+    const double freqs[] = { 40, 80, 150, 700, 2000, 2500, 3200, 9000, 15000, 19000 };
+    double drawn[10];
+    eq.getMagnitudeForFrequencyArray(freqs, drawn, 10);
+    for (int i = 0; i < 10; ++i)
+        EXPECT_NEAR(eqLevelDb(h, freqs[i], 48000.0), 20.0 * std::log10(drawn[i]), 2e-3);
+}
+
+// A change of a band glides: nothing steps, a small move takes its time and a
+// jump is quick, and the result does not depend on how the host cuts the
+// stream.
+DSPARK_TEST(Equalizer_analog_parameter_changes_glide)
+{
+    using Type = AnalogEq::BandType;
+    const double fs = 48000.0;
+    const auto tone = [&](int n) { return 0.5 * std::sin(2.0 * 3.14159265358979323846 * 100.0 * n / fs); };
+    const auto run = [&](double toGain, int block, std::vector<double>& out) {
+        AnalogEq eq;
+        eq.setAnalogResponse(true);
+        eq.setBand(0, eqBand(Type::LowShelf, 400.0, 0.0, 0.7071));
+        eq.prepare({ fs, 512, 1 });
+        out.resize(9600);
+        for (size_t n = 0; n < out.size(); ++n) out[n] = tone(static_cast<int>(n));
+        for (int off = 0; off < 9600; off += block)
+        {
+            if (off == 2400) eq.setBand(0, eqBand(Type::LowShelf, 400.0, toGain, 0.7071));
+            double* ch[1] = { out.data() + off };
+            eq.processBlock(AudioBufferView<double>(ch, 1, std::min(block, 9600 - off)));
+        }
+    };
+    std::vector<double> jump, small, cut;
+    run(12.0, 240, jump);
+    run(0.5, 240, small);
+    run(12.0, 48, cut);
+    EXPECT_TRUE(jump == cut);                                  // the same for any partition
+
+    // No step anywhere: the largest move between samples is that of the tone at its final level.
+    const double steady = 0.5 * std::pow(10.0, 12.0 / 20.0) * 2.0 * 3.14159265358979323846 * 100.0 / fs;
+    double largest = 0.0;
+    for (size_t n = 1; n < jump.size(); ++n) largest = std::max(largest, std::abs(jump[n] - jump[n - 1]));
+    EXPECT_LT(largest, 1.1 * steady);
+
+    // Before the change the band rests: the tone passes untouched.
+    for (int n = 0; n < 2400; ++n) EXPECT_TRUE(jump[static_cast<size_t>(n)] == tone(n));
+    // The jump has landed in 20 ms; the small move is still on its way then and lands in 60.
+    const auto gainAt = [&](const std::vector<double>& y, int from) {
+        double in = 0.0, out = 0.0;
+        for (int n = from; n < from + 480; ++n) { in += tone(n) * tone(n); out += y[static_cast<size_t>(n)] * y[static_cast<size_t>(n)]; }
+        return 10.0 * std::log10(out / in);
+    };
+    EXPECT_NEAR(gainAt(jump, 2400 + 960), 11.9, 0.3);
+    EXPECT_LT(gainAt(small, 2400 + 480), 0.45);
+    EXPECT_NEAR(gainAt(small, 2400 + 2880), 0.5, 0.02);
+}
+
+// A gain band at 0 dB is out of the path: the samples pass untouched, and it
+// comes back and leaves again without a step.
+DSPARK_TEST(Equalizer_analog_band_at_zero_gain_leaves_the_path)
+{
+    using Type = AnalogEq::BandType;
+    const double fs = 48000.0;
+    AnalogEq eq;
+    eq.setAnalogResponse(true);
+    eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 2.0));
+    eq.setBand(1, eqBand(Type::HighShelf, 6000.0, 0.01, 0.7071));
+    eq.setBand(2, eqBand(Type::FlatTilt, 1000.0, 0.0, 0.7071));
+    eq.prepare({ fs, 256, 1 });
+    uint32_t seed = 77u;
+    const auto noise = [&]() { seed = seed * 1664525u + 1013904223u; return (static_cast<double>(seed >> 8) / 8388608.0 - 1.0) * 0.4; };
+
+    std::vector<double> x(4800), y;
+    for (double& v : x) v = noise();
+    y = x;
+    eqRun(eq, y);
+    EXPECT_TRUE(y == x);
+
+    // In: 6 dB at 1 kHz. Out again: untouched once the glide has landed and its tail has gone.
+    eq.setBand(0, eqBand(Type::Peak, 1000.0, 6.0, 2.0));
+    std::vector<double> in(9600);
+    for (size_t n = 0; n < in.size(); ++n) in[n] = 0.3 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(n) / fs);
+    y = in;
+    eqRun(eq, y);
+    double peak = 0.0, step = 0.0;
+    for (size_t n = 4800; n < y.size(); ++n) peak = std::max(peak, std::abs(y[n]));
+    for (size_t n = 1; n < y.size(); ++n) step = std::max(step, std::abs(y[n] - y[n - 1]));
+    EXPECT_NEAR(20.0 * std::log10(peak / 0.3), 6.0, 0.05);
+    EXPECT_LT(step, 1.1 * 0.3 * 2.0 * 2.0 * 3.14159265358979323846 * 1000.0 / fs);
+
+    eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 2.0));
+    for (size_t n = 0; n < in.size(); ++n) in[n] = 0.3 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(n + 9600) / fs);
+    y = in;
+    eqRun(eq, y);
+    step = 0.0;
+    for (size_t n = 1; n < y.size(); ++n) step = std::max(step, std::abs(y[n] - y[n - 1]));
+    EXPECT_LT(step, 1.1 * 0.3 * 2.0 * 2.0 * 3.14159265358979323846 * 1000.0 / fs);
+    std::vector<double> tail(4800);
+    for (double& v : tail) v = noise();
+    y = tail;
+    eqRun(eq, y);
+    EXPECT_TRUE(y == tail);
+}
+
+// The per-sample form plays what the block form plays, channel by channel, and
+// the state carries the new fields.
+DSPARK_TEST(Equalizer_analog_per_sample_form_and_state)
+{
+    using Type = AnalogEq::BandType;
+    AnalogEq block, single;
+    for (AnalogEq* eq : { &block, &single })
+    {
+        eq->setAnalogResponse(true);
+        eq->setBand(0, eqBand(Type::Peak, 900.0, 7.0, 3.0, 12.0, 3));
+        eq->setBand(1, eqBand(Type::LowPass, 9000.0, 0.0, 1.1, 27.5));
+        eq->setBand(2, eqBand(Type::HighPassWall, 60.0, 0.0, 0.7071));
+        eq->prepare({ 48000.0, 128, 2 });
+    }
+    uint32_t seed = 5u;
+    std::vector<double> l(4096), r(4096);
+    for (size_t n = 0; n < l.size(); ++n)
+    {
+        seed = seed * 1664525u + 1013904223u; l[n] = (static_cast<double>(seed >> 8) / 8388608.0 - 1.0) * 0.5;
+        seed = seed * 1664525u + 1013904223u; r[n] = (static_cast<double>(seed >> 8) / 8388608.0 - 1.0) * 0.5;
+    }
+    std::vector<double> bl = l, br = r;
+    for (int off = 0; off < 4096; off += 128)
+    {
+        double* ch[2] = { bl.data() + off, br.data() + off };
+        block.processBlock(AudioBufferView<double>(ch, 2, 128));
+    }
+    double worst = 0.0;
+    for (size_t n = 0; n < l.size(); ++n)
+    {
+        worst = std::max(worst, std::abs(single.processSample(l[n], 0) - bl[n]));
+        worst = std::max(worst, std::abs(single.processSample(r[n], 1) - br[n]));
+    }
+    EXPECT_LT(worst, 1e-9);
+
+    const std::vector<uint8_t> blob = block.getState();
+    AnalogEq other;
+    EXPECT_FALSE(other.isAnalogResponse());
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.isAnalogResponse());
+    EXPECT_EQ(other.getBandConfig(0).order, 3);
+    EXPECT_NEAR(static_cast<double>(other.getBandConfig(1).slope), 27.5, 1e-6);
+    EXPECT_TRUE(other.getBandConfig(2).type == Type::HighPassWall);
+    EXPECT_TRUE(other.getState() == blob);
+
+    // Values that are not a band: the order and the slope come back inside their ranges.
+    AnalogEq::BandConfig wild = eqBand(Type::Peak, 1000.0, 3.0, 1.0, 500.0, 99);
+    other.setBand(3, wild);
+    EXPECT_EQ(other.getBandConfig(3).order, 16);
+    EXPECT_EQ(static_cast<double>(other.getBandConfig(3).slope), 96.0);
+    wild.slope = std::numeric_limits<double>::quiet_NaN();
+    wild.order = -4;
+    other.setBand(3, wild);
+    EXPECT_EQ(other.getBandConfig(3).order, 1);
+    EXPECT_EQ(static_cast<double>(other.getBandConfig(3).slope), 96.0);
 }

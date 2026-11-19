@@ -91,6 +91,20 @@ All notable user-facing changes to DSPark are documented here.
   `analog`, and `order` and `slopeDb` per band; older states load as before.
   A band type that is not one now keeps the band's own type instead of
   clamping to the last.
+- `Equalizer` bands take a place in the stereo pair
+  (`BandConfig::placement`: `Stereo`, the default, `Left`, `Right`, `Mid` or
+  `Side`), in either engine and in both phase modes. The left, right and
+  stereo bands run first; then the pair is turned into middle and sides
+  for the bands placed there, and back. In LinearPhase the same is one
+  matrix of four kernels between the two channels, built in the background
+  like the single kernel, so the latency does not change and a set of bands
+  with no placement costs what it did. A band that changes place comes in
+  through the 20 ms band fade. With one channel the left and middle bands
+  act on it and the right and side bands do nothing; `processSample()` runs
+  the left and right bands and leaves the middle and side ones to
+  `processBlock()`, which sees both channels of a frame.
+  `getMagnitudeForFrequencyArray()` takes the place to draw (the stereo
+  bands and the ones placed there). The state carries `place` per band.
 - `BiquadCascade<T, MaxSections, MaxChannels>` (new,
   `Core/BiquadCascade.h`): second-order sections in series, run up to four
   at a time inside one loop over the samples, in direct form I with the node

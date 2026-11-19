@@ -372,6 +372,7 @@ inline EffectSlot makeCompressor()
     s.addSlider("Key Tilt", -6, 6, 0, "dB/oct");
     // The gain smoothed after the ballistics (index 32).
     s.addSlider("Gain Smoothing", 0, 50, 0, "ms");
+    s.addToggle("Delta Listen", false);   // 33: what the compression takes out
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -427,6 +428,7 @@ inline EffectSlot makeCompressor()
                 break;
             }
             case 32: p->setGainSmoothing(v); break;
+            case 33: p->setDelta(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -618,6 +620,7 @@ inline EffectSlot makeDeEsser()
     s.addChoice("Detection", {"Bandpass","Derivative"}, 0);
     // Threshold counted from the level of the whole input.
     s.addToggle("Auto Threshold", false);
+    s.addToggle("Delta Listen", false);   // 6: what the de-esser takes out
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -629,6 +632,7 @@ inline EffectSlot makeDeEsser()
             case 3: p->setReduction(v); break;
             case 4: p->setDetectionMode(static_cast<dspark::DeEsser<float>::DetectionMode>(static_cast<int>(v))); break;
             case 5: p->setAutoThreshold(v > 0.5f); break;
+            case 6: p->setDelta(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -1412,6 +1416,7 @@ inline EffectSlot makeDynamicEQ()
     auto linearApplied = std::make_shared<std::atomic<bool>>(false);
     auto lastSpec = std::make_shared<dspark::AudioSpec>();
     s.addToggle("Linear Phase", false);
+    s.addToggle("Delta Listen", false);   // what the bands take out
     s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
         const bool want = linearWanted->load(std::memory_order_relaxed);
         p->setLinearPhase(want);
@@ -1436,6 +1441,7 @@ inline EffectSlot makeDynamicEQ()
         const int oldCount = 2 * 9;
         if (i == oldCount) { p->setMixedBands(v > 0.5f); return; }
         if (i == oldCount + 1 + 2 * 5) { linearWanted->store(v > 0.5f, std::memory_order_relaxed); return; }
+        if (i == oldCount + 2 + 2 * 5) { p->setDelta(v > 0.5f); return; }
         int band = 0, prm = 0;
         if (i < oldCount) { band = i / 9; prm = i % 9; }
         else              { band = (i - oldCount - 1) / 5; prm = 9 + (i - oldCount - 1) % 5; }
@@ -1912,15 +1918,171 @@ inline EffectSlot makeSpectralDenoiser()
     s.addToggle("Learn Noise", false);
     s.addSlider("Reduction", 0, 40, 18, "dB");
     s.addSlider("Threshold", 1, 8, 2, "x");
+    // The options (indices 3 to 10).
+    s.addSlider("Spectral Smoothing", 0, 0.95f, 0, "");                 // 3
+    s.addSlider("Gain Release", 0, 500, 0, "ms");                       // 4
+    s.addToggle("Delta Listen", false);                                 // 5
+    s.addToggle("Filter Mode (minimum phase)", false);                  // 6
+    s.addSlider("Link (filter mode)", 0, 1, 0, "");                     // 7
+    // Order MUST match dspark::KeyEqualizer::Shape.
+    s.addChoice("Sensitivity Band", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 8
+    s.addSlider("Sensitivity Freq", 20, 20000, 3000, "Hz", true);       // 9
+    s.addSlider("Sensitivity Gain", -12, 12, 6, "dB");                  // 10
+    auto sens = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, sens](int i, float v) {
+        using KE = dspark::KeyEqualizer<float, 2>;
         switch (i) {
             case 0: p->setLearning(v > 0.5f); break;
             case 1: p->setReduction(v); break;
             case 2: p->setThreshold(v); break;
+            case 3: p->setSpectralSmoothing(v); break;
+            case 4: p->setGainRelease(v); break;
+            case 5: p->setDelta(v > 0.5f); break;
+            case 6: p->setFilterMode(v > 0.5f); break;
+            case 7: p->setLink(v); break;
+            case 8: sens->shape = static_cast<KE::Shape>(static_cast<int>(v)); p->setSensitivityBand(0, *sens); break;
+            case 9: sens->frequency = v; p->setSensitivityBand(0, *sens); break;
+            case 10: sens->gainDb = v; p->setSensitivityBand(0, *sens); break;
         }
+    };
+    return s;
+}
+
+// =============================================================================
+// SPECTRAL
+// =============================================================================
+
+inline EffectSlot makeTonalBalance()
+{
+    auto p = std::make_shared<dspark::TonalBalance<float>>();
+    EffectSlot s;
+    s.name = "Tonal Balance"; s.category = "Spectral";
+    s.addSlider("Balance", 0, 1, 0, "");                       // 0 - default 0 = no global move
+    s.addSlider("Boost", 0, 1, 0, "");                         // 1
+    s.addSlider("Tame", 0, 1, 0, "");                          // 2
+    s.addSlider("Tilt", -6, 6, 0, "dB/oct");                   // 3
+    s.addSlider("Range", 0, 24, 6, "dB");                      // 4
+    s.addSlider("Knee", 0.1f, 12, 3, "dB");                    // 5
+    s.addSlider("Low Freq", 20, 2000, 40, "Hz", true);         // 6
+    s.addSlider("High Freq", 1000, 20000, 16000, "Hz", true);  // 7
+    s.addToggle("Level Compensation", false);                  // 8
+    s.addSlider("Reference Level", 60, 130, 100, "dB SPL");    // 9
+    auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, range](int i, float v) {
+        switch (i) {
+            case 0: p->setBalance(v); break;
+            case 1: p->setBoost(v); break;
+            case 2: p->setTame(v); break;
+            case 3: p->setTilt(v); break;
+            case 4: p->setRange(v); break;
+            case 5: p->setKnee(v); break;
+            case 6: (*range)[0] = v; p->setFrequencyRange((*range)[0], (*range)[1]); break;
+            case 7: (*range)[1] = v; p->setFrequencyRange((*range)[0], (*range)[1]); break;
+            case 8: p->setLevelCompensation(v > 0.5f); break;
+            case 9: p->setReferenceLevel(v); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeResonanceSuppressor()
+{
+    using RS = dspark::ResonanceSuppressor<float>;
+    auto p = std::make_shared<RS>();
+    EffectSlot s;
+    s.name = "Resonance Suppressor"; s.category = "Spectral";
+    s.addSlider("Threshold", 0, 30, 3, "dB");                   // 0
+    s.addSlider("Depth", 0, 1, 0, "");                          // 1 - default 0 = no reduction
+    s.addSlider("Range", 0, 48, 12, "dB");                      // 2
+    s.addSlider("Width", 0.05f, 4, 0.333f, "oct", true);        // 3
+    s.addSlider("Attack", 0.5f, 500, 5, "ms", true);            // 4
+    s.addSlider("Release", 5, 2000, 80, "ms", true);            // 5
+    s.addChoice("Mode", {"Soft","Hard"}, 0);                    // 6 - order MUST match RS::Mode
+    s.addChoice("Stereo", {"Per Bin","Mid/Side"}, 0);           // 7 - order MUST match RS::Link
+    s.addSlider("Link", 0, 1, 1, "");                           // 8
+    s.addSlider("Mid/Side Balance", 0, 2, 1, "");               // 9
+    s.addToggle("Delta Listen", false);                         // 10
+    s.addToggle("Band Solo", false);                            // 11
+    s.addChoice("Quality (on reload)", {"Realtime","Offline"}, 0); // 12
+    s.addChoice("Sensitivity Band", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 13
+    s.addSlider("Sensitivity Freq", 20, 20000, 3000, "Hz", true); // 14
+    s.addSlider("Sensitivity Gain", -12, 12, 6, "dB");          // 15
+    auto sens = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, sens](int i, float v) {
+        using KE = dspark::KeyEqualizer<float, 2>;
+        switch (i) {
+            case 0: p->setThreshold(v); break;
+            case 1: p->setDepth(v); break;
+            case 2: p->setRange(v); break;
+            case 3: p->setWidth(v); break;
+            case 4: p->setAttack(v); break;
+            case 5: p->setRelease(v); break;
+            case 6: p->setMode(static_cast<RS::Mode>(static_cast<int>(v))); break;
+            case 7: p->setLinkMode(static_cast<RS::Link>(static_cast<int>(v))); break;
+            case 8: p->setLink(v); break;
+            case 9: p->setMidSideBalance(v); break;
+            case 10: p->setDelta(v > 0.5f); break;
+            case 11: p->setBandSolo(v > 0.5f); break;
+            case 12: p->setQuality(static_cast<RS::Quality>(static_cast<int>(v))); break;
+            case 13: sens->shape = static_cast<KE::Shape>(static_cast<int>(v)); p->setSensitivityBand(0, *sens); break;
+            case 14: sens->frequency = v; p->setSensitivityBand(0, *sens); break;
+            case 15: sens->gainDb = v; p->setSensitivityBand(0, *sens); break;
+        }
+    };
+    return s;
+}
+
+inline EffectSlot makeSpectralDynamicEQ()
+{
+    using SD = dspark::SpectralDynamicEQ<float>;
+    auto p = std::make_shared<SD>();
+    EffectSlot s;
+    s.name = "Spectral Dynamic EQ"; s.category = "Spectral";
+    // Two bands of nine controls: order MUST match the setParamFn below and
+    // the shape choice dspark::SpectralDynamicEQ::Shape.
+    for (int b = 0; b < 2; ++b)
+    {
+        const std::string n = "B" + std::to_string(b + 1) + " ";
+        s.addChoice((n + "Shape").c_str(), {"Off","Bell","Low Shelf","High Shelf"}, 0);
+        s.addSlider((n + "Freq").c_str(), 20, 20000, b == 0 ? 2500.0f : 7000.0f, "Hz", true);
+        s.addSlider((n + "Q").c_str(), 0.1f, 20, 1, "", true);
+        s.addSlider((n + "Threshold").c_str(), -60, 0, -12, "dB");
+        s.addSlider((n + "Ratio").c_str(), 1, 20, 3, ":1");
+        s.addSlider((n + "Range").c_str(), -24, 24, -12, "dB");
+        s.addSlider((n + "Attack").c_str(), 0.5f, 500, 10, "ms", true);
+        s.addSlider((n + "Release").c_str(), 5, 2000, 150, "ms", true);
+        s.addSlider((n + "Cells").c_str(), 1, 128, 32, "");
+    }
+    auto bands = std::make_shared<std::array<SD::Band, 2>>();
+    (*bands)[0].frequency = 2500.0f;
+    (*bands)[1].frequency = 7000.0f;
+    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    s.processFn = [p](auto b) { p->processBlock(b); };
+    s.resetFn   = [p]() { p->reset(); };
+    s.setParamFn = [p, bands](int i, float v) {
+        if (i < 0 || i >= 18) return;
+        auto& b = (*bands)[static_cast<std::size_t>(i / 9)];
+        switch (i % 9) {
+            case 0: b.shape = static_cast<SD::Shape>(static_cast<int>(v)); break;
+            case 1: b.frequency = v; break;
+            case 2: b.q = v; break;
+            case 3: b.threshold = v; break;
+            case 4: b.ratio = v; break;
+            case 5: b.range = v; break;
+            case 6: b.attack = v; break;
+            case 7: b.release = v; break;
+            case 8: b.cells = static_cast<int>(v); break;
+        }
+        p->setBand(i / 9, b);
     };
     return s;
 }
@@ -1973,6 +2135,10 @@ inline std::vector<EffectSlot> createAllEffects()
         makeGain(),
         makeNoiseGenerator(),
         makeSpectralDenoiser(),
+        // Spectral
+        makeTonalBalance(),
+        makeResonanceSuppressor(),
+        makeSpectralDynamicEQ(),
     };
 }
 

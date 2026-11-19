@@ -43,7 +43,7 @@
  * getGainReductionDb()/getLatency() are metering/host reads (relaxed).
  *
  * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, SmoothedValue.h,
- *               RingBuffer.h, DenormalGuard.h, Hilbert.h,
+ *               RingBuffer.h, DenormalGuard.h, Hilbert.h, KeyEqualizer.h,
  *               TruePeakDetector.h, StateBlob.h.
  */
 
@@ -54,6 +54,7 @@
 #include "../Core/RingBuffer.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Hilbert.h"
+#include "../Core/KeyEqualizer.h"
 #include "../Core/TruePeakDetector.h"
 #include "../Core/StateBlob.h"
 
@@ -302,6 +303,7 @@ public:
 
         updateHpfCoefficients();
         scHpfDirty_.store(false, std::memory_order_relaxed);
+        keyEq_.prepare(sampleRate_);
 
         // RMS Buffer pre-allocation (Max 500ms to ensure zero real-time allocation)
         int maxRmsSamples = static_cast<int>(sampleRate_ * 0.5) + 1;
@@ -451,6 +453,13 @@ public:
             && scHpfDirty_.load(std::memory_order_relaxed)
             && scHpfDirty_.exchange(false, std::memory_order_acquire))
             updateHpfCoefficients();
+        // The equalizer of the key takes its settings and moves its ramps
+        // once per frame, on channel 0.
+        if (channel == 0)
+        {
+            (void)keyEq_.sync();
+            keyEq_.advance(1);
+        }
 
         // The sidechain filter must process whatever the detector consumes:
         // in FeedBack that is the compressed output (previous sample on the
@@ -459,6 +468,7 @@ public:
         T detectorIn = detectorSafe((topoEff == Topology::FeedBack && !fbImplicit)
                      ? fbLastOutput_[channel] : input);
         if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
+        detectorIn = keyEq_.processSample(detectorIn, channel);
 
         const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
         const bool decoupled = useDecoupled(charType, topoEff);
@@ -545,7 +555,8 @@ public:
         fbLastOutput_[channel] = (amount < T(1)) ? input * loopGainLinear : output;
         output *= makeupToGain(makeup);
         gainReductionDb_.store(smoothedGR_Db, std::memory_order_relaxed);
-        return output;
+        // Key listen: what the detector heard goes out instead.
+        return scListen_.load(std::memory_order_relaxed) ? detectorIn : output;
     }
 
     /** 
@@ -553,6 +564,7 @@ public:
      */
     void reset() noexcept
     {
+        keyEq_.reset();
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             envFastDb_[ch] = 0.0; // 0 dB gain change = neutral
@@ -1094,6 +1106,56 @@ public:
         scHpfDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief The equalizer of the key (see setSidechainBand()). */
+    using KeyEq = KeyEqualizer<T, 16>;
+    /** @brief The settings of one band of the key equalizer. */
+    using KeyBand = typename KeyEq::Band;
+    /** @brief What a band of the key equalizer does. */
+    using KeyShape = typename KeyEq::Shape;
+    /** @brief Bands of the key equalizer. */
+    static constexpr int kKeyBands = KeyEq::kBands;
+
+    /**
+     * @brief Sets a band of the equalizer of the key.
+     *
+     * Six bands shape what the detector weighs, after the sidechain
+     * high-pass: low and high cuts from 6 to 48 dB per octave, bells,
+     * shelves and a tilt, each designed from its analog curve. They act on
+     * whatever the detector reads (the programme, the external key or, in
+     * FeedBack, the compressed output) and never on the audio. A change
+     * glides over 20 ms; a band that is Off costs nothing. The timing that
+     * follows the spectral balance (setSpectralTiming()) and the analytic
+     * makeup read the key before the equalizer.
+     *
+     * @param band     Band index in [0, kKeyBands); others are ignored.
+     * @param settings Shape, frequency, gain, q and slope of the band.
+     */
+    void setSidechainBand(int band, const KeyBand& settings) noexcept { keyEq_.setBand(band, settings); }
+
+    /** @brief The settings of a band of the key equalizer. */
+    [[nodiscard]] KeyBand getSidechainBand(int band) const noexcept { return keyEq_.getBand(band); }
+
+    /**
+     * @brief The curve of the key equalizer, for a display: build it when the
+     *        bands change and read each frequency from it.
+     */
+    [[nodiscard]] typename KeyEq::Response getSidechainResponse() const noexcept { return keyEq_.getResponse(); }
+
+    /**
+     * @brief Plays the key instead of the compressed audio.
+     *
+     * The output of each channel is what its detector hears, after the
+     * sidechain high-pass and the equalizer: the programme, the external key
+     * or, in FeedBack with a detector that keeps a memory, the compressed
+     * output of the previous sample. It is not delayed by the lookahead, and
+     * the compressor keeps working underneath (the meter still reads). It is
+     * a monitoring switch: it is not part of the state.
+     */
+    void setSidechainListen(bool on) noexcept { scListen_.store(on, std::memory_order_relaxed); }
+
+    /** @brief Whether the key is being played instead of the audio. */
+    [[nodiscard]] bool isSidechainListen() const noexcept { return scListen_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Sets the RMS analysis window size in milliseconds.
      *
@@ -1203,6 +1265,7 @@ public:
         w.write("adaptiveAttack", static_cast<float>(adaptiveAttack_.load(std::memory_order_relaxed)));
         w.write("spectralTiming", static_cast<float>(spectralTiming_.load(std::memory_order_relaxed)));
         w.write("attackEmphasis", static_cast<float>(attackEmphasis_.load(std::memory_order_relaxed)));
+        keyEq_.writeState(w, "key");
         return w.blob();
     }
 
@@ -1243,6 +1306,7 @@ public:
         setAdaptiveAttack(static_cast<T>(r.read("adaptiveAttack", 0.0f)));
         setSpectralTiming(static_cast<T>(r.read("spectralTiming", 0.0f)));
         setAttackEmphasis(static_cast<T>(r.read("attackEmphasis", 0.0f)));
+        keyEq_.readState(r, "key");
         return true;
     }
 
@@ -1299,6 +1363,8 @@ protected:
         if (scHpfDirty_.load(std::memory_order_relaxed)
             && scHpfDirty_.exchange(false, std::memory_order_acquire))
             updateHpfCoefficients();
+        const bool keyEqOn = keyEq_.sync();
+        const bool listen = scListen_.load(std::memory_order_relaxed);
 
         // Apply a pending RMS window change here, on the audio thread.
         if (rmsWindowDirty_.exchange(false, std::memory_order_acquire))
@@ -1391,7 +1457,7 @@ protected:
                                          activeLookahead, scHpf, shared, decoupled,
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
                                          paramsMoving, autoThr, activeLookahead - lookaheadSamples_,
-                                         program_.active, keyBalance };
+                                         program_.active, keyBalance, keyEqOn, listen };
             const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal,
                                           staticMakeupDb + analyticDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
@@ -1435,6 +1501,7 @@ protected:
 
             // 1. Detection path (per channel: every detector keeps its own state)
             T linkedLin[kDetectorPoints] = {};
+            T heard[kMaxChannels] = {};
             double lowSq = 0.0, highSq = 0.0;
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -1454,6 +1521,8 @@ protected:
                 detectorIn = detectorSafe(detectorIn);
                 if (keyBalance) balanceBands(detectorIn, ch, lowSq, highSq);
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
+                if (keyEqOn) detectorIn = keyEq_.processSample(detectorIn, ch);
+                heard[ch] = detectorIn;
 
                 // dB is monotonic in the linear level, so the linked level is
                 // the dB of the largest linear level (one log per frame and
@@ -1534,6 +1603,11 @@ protected:
                 }
             }
 
+            if (keyEqOn) keyEq_.advance(1);
+            // Key listen: what the detectors heard goes out instead.
+            if (listen)
+                for (int ch = 0; ch < nCh; ++ch) audio.getChannel(ch)[i] = heard[ch];
+
             gainReductionDb_.store(blockGR, std::memory_order_relaxed);
 
             // Auto-makeup envelope tracks slowly (~300ms)
@@ -1579,6 +1653,8 @@ protected:
         int gainDelay;          ///< Samples the gain is held back: the latency kept minus the lookahead.
         bool program;           ///< Programme-dependent timing acts.
         bool keyBalance;        ///< It reads the spectral balance of the key.
+        bool keyEq;             ///< The equalizer of the key has bands in the path.
+        bool listen;            ///< The key goes out instead of the audio.
     };
 
     /** @brief Parameter values of a block whose smoothers are settled. */
@@ -1610,6 +1686,7 @@ protected:
         T level[kMaxChannels][kChunk];   // linear level, then dB level, then linear gain
         T gain[kMaxChannels][kChunk];    // smoothed gain change (dB)
         T delayed[kMaxChannels][kChunk]; // lookahead-delayed input (the dry reference)
+        T heard[kMaxChannels][kChunk];   // the key as the detectors read it (key listen)
         const int nGain = ff.shared ? 1 : nCh;
 
         if (!ff.paramsMoving)
@@ -1653,20 +1730,24 @@ protected:
                 const T* src = ((scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))
                                            : audio.getChannel(ch)) + o;
                 T* lv = level[ch];
-                if (ff.detType == DetectorType::Peak && !ff.scHpf)
+                if (ff.detType == DetectorType::Peak && !ff.scHpf && !ff.keyEq && !ff.listen)
                 {
                     for (int k = 0; k < m; ++k) lv[k] = std::abs(detectorSafe(src[k]));
                 }
                 else
                 {
+                    T* key = heard[ch];
                     for (int k = 0; k < m; ++k)
                     {
                         T d = detectorSafe(src[k]);
                         if (ff.scHpf) d = applySidechainHPF(d, ch);
+                        if (ff.keyEq) d = keyEq_.processSample(d, ch);
+                        key[k] = d;
                         lv[k] = detectLevelLinear(d, ch, ff.detType);
                     }
                 }
             }
+            if (ff.keyEq) keyEq_.advance(m);
 
             // The spectral balance of the key, for the timing that follows it
             // (the key as the detector reads it, before the sidechain filter).
@@ -1837,6 +1918,10 @@ protected:
                 // Feedback history (pre-makeup) for a later topology switch.
                 fbLastOutput_[ch] = wet;
             }
+
+            // Key listen: what the detectors heard goes out instead.
+            if (ff.listen)
+                for (int ch = 0; ch < nCh; ++ch) std::copy_n(heard[ch], m, audio.getChannel(ch) + o);
         }
         if (nS > 0) gainReductionDb_.store(lastGr, std::memory_order_relaxed);
 
@@ -3826,6 +3911,8 @@ protected:
     T scHpfA0_ = T(0);                         ///< HPF normalized feedforward coefficient.
     std::array<T, kMaxChannels> scHpfState_ {};///< HPF y[n-1] state.
     std::array<T, kMaxChannels> scHpfPrev_ {}; ///< HPF x[n-1] state.
+    KeyEq keyEq_;                              ///< Equalizer of the key, after the high-pass.
+    std::atomic<bool> scListen_ { false };     ///< The key goes out instead of the audio.
 
     // Split-Polarity Detector State
     std::array<T, kMaxChannels> splitPosEnv_ {}; ///< Positive half-wave tracking.

@@ -109,7 +109,8 @@ public:
         Blackman,       ///< High dynamic range.
         BlackmanHarris, ///< Highest side lobe rejection.
         FlatTop,        ///< Amplitude-accurate measurement.
-        Rectangular     ///< No windowing (transient analysis).
+        Rectangular,    ///< No windowing (transient analysis).
+        AsymmetricHann  ///< Low latency: a Hann rise and a fall over the last eighth, so the weight sits on the recent samples (the display follows sooner, with wider lobes).
     };
 
     /**
@@ -512,6 +513,7 @@ private:
             case WindowType::BlackmanHarris: WindowFunctions<T>::blackmanHarris(dst, size); break;
             case WindowType::FlatTop: WindowFunctions<T>::flatTop(dst, size); break;
             case WindowType::Rectangular: WindowFunctions<T>::rectangular(dst, size); break;
+            case WindowType::AsymmetricHann: WindowFunctions<T>::asymmetricHann(dst, size, std::max(1, size / 8)); break;
             case WindowType::Hann:
             default: // wild enum value: fall back to Hann (never a zeroed window)
                 WindowFunctions<T>::hann(dst, size);

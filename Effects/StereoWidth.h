@@ -145,7 +145,20 @@ public:
         const T widthStep   = widthMaxStep_;
         const bool bassMono = bassMonoEnabled_.load(std::memory_order_acquire);
 
-        if (bassMono)
+        // The bass mono fades in and out over 20 ms with its filter running
+        // (switching it outright stepped the side by its low end); coming
+        // back from rest, the filter starts from silence under a fade that
+        // starts from zero. Settled, the arithmetic is the plain filter's.
+        const T bassTarget = bassMono ? T(1) : T(0);
+        if (snapBass_)
+        {
+            bassAmount_ = bassTarget;
+            snapBass_ = false;
+        }
+        if (bassMono && bassAmount_ == T(0)) sideState_ = T(0);
+        const T bassStart = bassAmount_;
+
+        if (bassMono || bassAmount_ > T(0))
         {
             const T coeff = bassMonoCoeff_.load(std::memory_order_relaxed);
 
@@ -168,7 +181,8 @@ public:
                 T sideLpIn = side;
                 sideState_ += coeff * (sideLpIn - sideState_) + antiDenormal_;
                 sideState_ -= antiDenormal_; // Denormal flush
-                side = sideLpIn - sideState_;
+                const T amount = moveTowards(bassStart, bassTarget, widthStep * static_cast<T>(i + 1));
+                side = sideLpIn - amount * sideState_;
 
                 left[i]  = mid + side;
                 right[i] = mid - side;
@@ -188,6 +202,7 @@ public:
             }
         }
         currentWidth_ = moveTowards(widthStart, widthTarget, widthStep * static_cast<T>(numSamples));
+        bassAmount_ = moveTowards(bassStart, bassTarget, widthStep * static_cast<T>(numSamples));
     }
 
     /** @brief Clears the internal filter states to prevent artifact ringing. */
@@ -195,6 +210,7 @@ public:
     {
         sideState_ = T(0);
         snapWidth_ = true;   // the next block starts settled (no glide on start)
+        snapBass_ = true;
     }
 
 
@@ -248,6 +264,8 @@ private:
     T currentWidth_ = T(1);
     T widthMaxStep_ = T(1.0 / 960.0);   ///< One width unit per 20 ms.
     bool snapWidth_ = true;             ///< Next block lands on the target at once.
+    T bassAmount_ = T(0);               ///< How much of the bass mono is applied (fades over 20 ms).
+    bool snapBass_ = true;              ///< Next block lands the bass mono on its target at once.
 
     // Anti-denormal DC offset (type generic)
     static constexpr T antiDenormal_ = static_cast<T>(1e-15); 

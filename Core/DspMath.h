@@ -249,6 +249,48 @@ template <FloatType T>
 }
 
 /**
+ * @brief Power of the dominant component of a stereo pair: the larger
+ *        eigenvalue of the pair's covariance [ll lr; lr rr].
+ *
+ * A source in both channels in phase or out of phase gives ll + rr; two
+ * uncorrelated channels give the larger of ll and rr.
+ *
+ * @param ll Mean square of the first channel.
+ * @param rr Mean square of the second channel.
+ * @param lr Mean product of the two.
+ * @return The larger eigenvalue (0 or more).
+ */
+[[nodiscard]] inline double dominantPairPower(double ll, double rr, double lr) noexcept
+{
+    const double half = 0.5 * (ll - rr);
+    return std::max(0.0, 0.5 * (ll + rr) + std::sqrt(half * half + lr * lr));
+}
+
+/**
+ * @brief Level of the dominant component of a stereo pair from the levels
+ *        of its two channels and their squared correlation.
+ *
+ * The level is the square root of half the dominant power of the covariance
+ * the two levels and the correlation make: a source in both channels reads
+ * its level in each, and a source moved by an equal-power pan reads the same
+ * level anywhere in the image (panned hard, 3 dB under its level in the
+ * channel it is in). Two uncorrelated channels read the louder 3 dB down.
+ *
+ * @param levelL Level (amplitude) of the first channel.
+ * @param levelR Level of the second channel.
+ * @param rho2   Squared correlation of the two, in [0, 1].
+ * @return The level of the dominant component.
+ */
+template <FloatType T>
+[[nodiscard]] inline T dominantPairLevel(T levelL, T levelR, double rho2) noexcept
+{
+    const double pl = static_cast<double>(levelL) * static_cast<double>(levelL);
+    const double pr = static_cast<double>(levelR) * static_cast<double>(levelR);
+    const double cross = std::sqrt(std::clamp(rho2, 0.0, 1.0) * pl * pr);
+    return static_cast<T>(std::sqrt(0.5 * dominantPairPower(pl, pr, cross)));
+}
+
+/**
  * @brief Fast approximation of tan(x) using a Pade [5,4] rational approximant.
  *
  * Measured relative error against std::tan (the approximant's, so float and

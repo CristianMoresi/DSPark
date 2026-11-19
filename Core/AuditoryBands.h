@@ -108,8 +108,7 @@ struct AuditoryScale
      */
     [[nodiscard]] static double dominantPower(double ll, double rr, double lr) noexcept
     {
-        const double half = 0.5 * (ll - rr);
-        return std::max(0.0, 0.5 * (ll + rr) + std::sqrt(half * half + lr * lr));
+        return dominantPairPower(ll, rr, lr);
     }
 };
 

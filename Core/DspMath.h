@@ -223,6 +223,32 @@ template <FloatType T>
 }
 
 /**
+ * @brief e^(-x) for x >= 0 by a rational approximation: the coefficient of a
+ *        one-pole whose time changes every sample.
+ *
+ * The [3/3] Pade approximant of the exponential,
+ * (120 - 60x + 12x^2 - x^3) / (120 + 60x + 12x^2 + x^3): four multiplies and
+ * one division, with no call into the math library. For a follower,
+ * x = 1 / (rate * time): a time of one sample or more keeps x at 1 or under.
+ * Relative error against std::exp: 1.1e-5 at x = 1 (under 1e-9 at 0.25), 1.5e-3 at
+ * x = 2, 3.1 % at x = 3. The argument is held to [0, 4] (the approximant
+ * turns negative past 4.6): beyond 4 the result stays at 0.013, a follower
+ * that is instant either way.
+ *
+ * @param x Decay, in time constants (a number: NaN is not handled).
+ * @return Approximation of e^(-x), in (0, 1].
+ */
+template <FloatType T>
+[[nodiscard]] inline T fastDecay(T x) noexcept
+{
+    const T v = std::min(std::max(x, T(0)), T(4));
+    const T v2 = v * v;
+    const T even = T(120) + T(12) * v2;
+    const T odd = v * (T(60) + v2);
+    return (even - odd) / (even + odd);
+}
+
+/**
  * @brief Fast approximation of tan(x) using a Pade [5,4] rational approximant.
  *
  * Measured relative error against std::tan (the approximant's, so float and

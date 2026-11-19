@@ -107,7 +107,7 @@ public:
         Rms,            ///< Sliding-window Root-Mean-Square. Smoother, responds to average energy.
         TruePeak,       ///< 4x oversampled peak detection (ITU-R BS.1770-4 compliant).
         SplitPolarity,  ///< Separate envelopes for the positive and negative half-waves.
-        Hilbert         ///< Analytic-signal magnitude from a zero-latency allpass pair
+        Hilbert,        ///< Analytic-signal magnitude from a zero-latency allpass pair
                         ///< (HilbertIIR): a ripple-free envelope on sustained tones from
                         ///< 20 Hz up, so the static curve holds exactly and low tones are
                         ///< not modulated at their own frequency (THD+N of a 30 Hz tone
@@ -115,6 +115,12 @@ public:
                         ///< The larger of that magnitude and the rectified input is
                         ///< used, so an onset is caught as fast as with Peak. Adds no
                         ///< latency.
+        Hybrid          ///< RMS for what is steady and peak for what jumps: the larger of
+                        ///< the root of twice the mean square (a one-pole mean over the time
+                        ///< of setRmsWindow()) and the rectified sample. A steady tone
+                        ///< reads its peak with next to no ripple, like Hilbert at a
+                        ///< fraction of its cost, and whatever rises over the running
+                        ///< level is caught in the same sample, like Peak.
     };
 
     /** @brief Signal routing topology for the detector sidechain. */
@@ -454,13 +460,27 @@ public:
                      ? fbLastOutput_[channel] : input);
         if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
 
-        T levelDb = detectLevel(detectorIn, channel, detTypeEff);
-
         const bool splitAdaptive = detTypeEff == DetectorType::SplitPolarity;
         const bool decoupled = useDecoupled(charType, topoEff);
         syncDecoupledState(decoupled);
+        // Programme-dependent timing: the settings are taken on channel 0,
+        // which also advances the balance of the key.
+        if (advanceShared)
+        {
+            program_ = programTiming(charType, topoEff, decoupled, splitAdaptive);
+            syncProgramState(program_.active);
+            if (program_.active && program_.spectral > 0.0)
+            {
+                double lowSq = 0.0, highSq = 0.0;
+                balanceBands(detectorSafe(input), channel, lowSq, highSq);
+                (void)balanceAdvance(lowSq, highSq);
+            }
+        }
+
+        T levelDb = detectLevel(detectorIn, channel, detTypeEff);
+
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
-                                   feedbackDetectorDelay(detTypeEff) };
+                                   feedbackDetectorDelay(detTypeEff), program_.active };
         // The automatic threshold counts from the recent peak of what this
         // channel's detector reads (of its input, in FeedBack).
         T threshNow = thresh;
@@ -547,6 +567,9 @@ public:
             precLevel_[ch] = -100.0;
             precTarget_[ch] = 0.0;
             interp_[ch] = {};
+            programState_[ch] = {};
+            balanceBands_[ch] = {};
+            hybridMeanSq_[ch] = 0.0;
             lookaheadBuffers_[ch].reset();
             gainDelay_[ch].reset();
             autoRefDb_[ch] = -100.0;
@@ -559,6 +582,7 @@ public:
         for (auto& cnt : rmsRecomputeCounters_) cnt = 0;
 
         truePeak_.reset();
+        balanceLow_ = balanceHigh_ = balance_ = 0.0;
         holdCounters_.fill(0);
         heldGrDb_.fill(T(0));
         gainReductionDb_.store(T(0), std::memory_order_relaxed);
@@ -835,12 +859,118 @@ public:
     /** @brief How finely the control signal is computed (see setPrecision()). */
     [[nodiscard]] Precision getPrecision() const noexcept { return precision_.load(std::memory_order_relaxed); }
 
-    /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, Hilbert). */
+    /**
+     * @brief Makes the release depend on how long the compressor has been working.
+     *
+     * The release time becomes the knob's after a brief reduction and up to
+     * eight times the knob's after a sustained one. What tells them apart is
+     * a slow follower (1.5 s) of the depth of the gain change against the
+     * depth itself: a peak that comes and goes leaves it near zero and
+     * releases at the knob's time; a passage that has kept the compressor
+     * down for a second or more releases slowly, so the level does not pump
+     * back up between phrases. `amount` weighs it (0, the default, is the
+     * fixed release).
+     *
+     * This and the three settings that follow act on the Clean and Varimu
+     * characters in feed-forward with Branching ballistics, in every path
+     * (processBlock(), processSample() and Precision::High). Opto and FET
+     * have a memory of their own; Decoupled, feedback and the SplitPolarity
+     * detector keep fixed times.
+     *
+     * State key "programRelease" (absent = 0).
+     *
+     * @param amount 0 to 1. Non-finite values are ignored.
+     */
+    void setProgramRelease(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        programRelease_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Weight of the programme-dependent release (see setProgramRelease()). */
+    [[nodiscard]] T getProgramRelease() const noexcept { return programRelease_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Makes the attack depend on how far the target is.
+     *
+     * A target 6 dB or more past the gain is met with the knob's attack; one
+     * that is only just past it, with an attack up to four times longer. A
+     * transient is still caught at the nominal speed, while the last
+     * decibels of every attack, and the small swells of dense programme, are
+     * taken gently (less of the waveform ends up in the gain). `amount`
+     * weighs it (0, the default, is the fixed attack). Same scope as
+     * setProgramRelease().
+     *
+     * State key "adaptiveAttack" (absent = 0).
+     *
+     * @param amount 0 to 1. Non-finite values are ignored.
+     */
+    void setAdaptiveAttack(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        adaptiveAttack_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Weight of the target-dependent attack (see setAdaptiveAttack()). */
+    [[nodiscard]] T getAdaptiveAttack() const noexcept { return adaptiveAttack_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Makes attack and release follow the spectral balance of the key.
+     *
+     * The key is measured in two bands of the same width on a logarithmic
+     * axis, 30 to 200 Hz and 2.5 to 16 kHz (what lies under 30 Hz is left
+     * out, so rumble and DC do not count), and their balance, between -1
+     * (all low) and +1 (all high), moves both times: at full weight a bright
+     * key is followed three times faster and a dark one three times slower,
+     * and programme with the same power in every octave stays on the knobs.
+     * Short times suit a snare and long ones a bass; this sets them from
+     * what is playing. The key is the one the detector reads, before the
+     * sidechain filter. `amount` weighs it (0, the default, is off). Same
+     * scope as setProgramRelease().
+     *
+     * State key "spectralTiming" (absent = 0).
+     *
+     * @param amount 0 to 1. Non-finite values are ignored.
+     */
+    void setSpectralTiming(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        spectralTiming_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Weight of the spectral balance on the times (see setSpectralTiming()). */
+    [[nodiscard]] T getSpectralTiming() const noexcept { return spectralTiming_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Deepens or softens the gain change while it attacks.
+     *
+     * After the ballistics, the difference between the gain and a copy of it
+     * smoothed over 30 ms is added back while the gain is falling: at +1 the
+     * leading edge of every reduction goes as far again past its smoothed
+     * course (more bite on the transient), at -1 the attack follows the
+     * smoothed copy (the transient is let through and the body is held). It
+     * only acts while the gain falls; a settled gain and a release are left
+     * as they are. 0 (default) is off. Same scope as setProgramRelease().
+     *
+     * State key "attackEmphasis" (absent = 0).
+     *
+     * @param amount -1 to +1. Non-finite values are ignored.
+     */
+    void setAttackEmphasis(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        attackEmphasis_.store(std::clamp(amount, T(-1), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief Emphasis of the attack (see setAttackEmphasis()). */
+    [[nodiscard]] T getAttackEmphasis() const noexcept { return attackEmphasis_.load(std::memory_order_relaxed); }
+
+    /** @brief Changes the level detection algorithm (Peak, RMS, TruePeak, SplitPolarity, Hilbert, Hybrid). */
     void setDetector(DetectorType type) noexcept
     {
         // The shared TruePeakDetector builds its coefficients lazily on first
         // use (thread-safe static), so this is a pure atomic publication.
-        detectorType_.store(clampEnum(type, DetectorType::Hilbert), std::memory_order_relaxed);
+        detectorType_.store(clampEnum(type, DetectorType::Hybrid), std::memory_order_relaxed);
     }
 
     /**
@@ -1069,6 +1199,10 @@ public:
         w.write("amount", static_cast<float>(amount_.load(std::memory_order_relaxed)));
         w.write("softRange", softRange_.load(std::memory_order_relaxed));
         w.write("precision", static_cast<int32_t>(precision_.load(std::memory_order_relaxed)));
+        w.write("programRelease", static_cast<float>(programRelease_.load(std::memory_order_relaxed)));
+        w.write("adaptiveAttack", static_cast<float>(adaptiveAttack_.load(std::memory_order_relaxed)));
+        w.write("spectralTiming", static_cast<float>(spectralTiming_.load(std::memory_order_relaxed)));
+        w.write("attackEmphasis", static_cast<float>(attackEmphasis_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -1105,6 +1239,10 @@ public:
         setAmount(static_cast<T>(r.read("amount", 1.0f)));
         setSoftRange(r.read("softRange", false));
         setPrecision(static_cast<Precision>(r.read("precision", 0)));
+        setProgramRelease(static_cast<T>(r.read("programRelease", 0.0f)));
+        setAdaptiveAttack(static_cast<T>(r.read("adaptiveAttack", 0.0f)));
+        setSpectralTiming(static_cast<T>(r.read("spectralTiming", 0.0f)));
+        setAttackEmphasis(static_cast<T>(r.read("attackEmphasis", 0.0f)));
         return true;
     }
 
@@ -1198,6 +1336,9 @@ protected:
         syncDecoupledState(decoupled);
         const bool precise = usePrecision(topoEff, fbImplicit, splitAdaptive);
         syncPrecisionState(precise);
+        program_ = programTiming(charType, topoEff, decoupled, splitAdaptive);
+        syncProgramState(program_.active);
+        const bool keyBalance = program_.active && program_.spectral > 0.0;
 
         // Lookahead breaks causal logic in Feedback mode, so it is strictly
         // disabled there.
@@ -1237,7 +1378,7 @@ protected:
         T analyticDb = analyticSmooth_.getCurrentValue();
 
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
-                                   feedbackDetectorDelay(detTypeEff) };
+                                   feedbackDetectorDelay(detTypeEff), program_.active };
 
         // Feed-forward: the detector never reads the output, so the block
         // runs in passes (see processFeedForward). Feedback loops stay per
@@ -1249,7 +1390,8 @@ protected:
             const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
                                          activeLookahead, scHpf, shared, decoupled,
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
-                                         paramsMoving, autoThr, activeLookahead - lookaheadSamples_ };
+                                         paramsMoving, autoThr, activeLookahead - lookaheadSamples_,
+                                         program_.active, keyBalance };
             const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal,
                                           staticMakeupDb + analyticDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
@@ -1293,6 +1435,7 @@ protected:
 
             // 1. Detection path (per channel: every detector keeps its own state)
             T linkedLin[kDetectorPoints] = {};
+            double lowSq = 0.0, highSq = 0.0;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 // The sidechain filter must process whatever the detector
@@ -1309,6 +1452,7 @@ protected:
                 else
                     detectorIn = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
                 detectorIn = detectorSafe(detectorIn);
+                if (keyBalance) balanceBands(detectorIn, ch, lowSq, highSq);
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
 
                 // dB is monotonic in the linear level, so the linked level is
@@ -1323,6 +1467,8 @@ protected:
                     if (!shared) pointLevelDb_[ch][j] = gainToDecibels(level[j]);
                 }
             }
+
+            if (keyBalance) (void)balanceAdvance(lowSq, highSq);
 
             // The automatic threshold: its reference follows the largest
             // level the gain computers read in feed-forward, and the linked
@@ -1410,6 +1556,7 @@ protected:
         bool splitAdaptive;
         bool decoupled;
         double loopDelay; ///< Detector delay seen by an explicit feedback loop (samples).
+        bool program;     ///< Programme-dependent timing acts (see programTiming()).
     };
 
     /** @brief Per-block routing of the feed-forward block path. */
@@ -1430,6 +1577,8 @@ protected:
         bool paramsMoving;
         bool autoThreshold;     ///< The threshold counts from the key's recent peak.
         int gainDelay;          ///< Samples the gain is held back: the latency kept minus the lookahead.
+        bool program;           ///< Programme-dependent timing acts.
+        bool keyBalance;        ///< It reads the spectral balance of the key.
     };
 
     /** @brief Parameter values of a block whose smoothers are settled. */
@@ -1519,6 +1668,25 @@ protected:
                 }
             }
 
+            // The spectral balance of the key, for the timing that follows it
+            // (the key as the detector reads it, before the sidechain filter).
+            double balance[kChunk];
+            if (ff.keyBalance)
+            {
+                double lowSq[kChunk] = {}, highSq[kChunk] = {};
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    const T* src = ((scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))
+                                               : audio.getChannel(ch)) + o;
+                    for (int k = 0; k < m; ++k) balanceBands(detectorSafe(src[k]), ch, lowSq[k], highSq[k]);
+                }
+                for (int k = 0; k < m; ++k) balance[k] = balanceAdvance(lowSq[k], highSq[k]);
+            }
+            else
+            {
+                std::fill_n(balance, m, balance_);
+            }
+
             // Lookahead: the delayed audio is the input the gain applies to.
             if (ff.lookahead > 0)
             {
@@ -1585,7 +1753,7 @@ protected:
             {
                 const T* dryIn = (ff.lookahead > 0) ? delayed[g] : audio.getChannel(g) + o;
                 runGainRecursion(level[g], gain[g], m, g, ff, thrUse, rat, kn,
-                                 ff.splitAdaptive ? dryIn : nullptr);
+                                 ff.splitAdaptive ? dryIn : nullptr, balance);
             }
 
             // What is heard of the gain: held back while the lookahead is
@@ -1690,6 +1858,7 @@ protected:
             heldGrDb_[ch] = heldGrDb_[0];
             precLevel_[ch] = precLevel_[0];
             precTarget_[ch] = precTarget_[0];
+            programState_[ch] = programState_[0];
         }
     }
 
@@ -1710,9 +1879,12 @@ protected:
      *               to. The recursion then also writes the linear gain into
      *               inDb (each frame's level is consumed before it is
      *               overwritten). nullptr otherwise.
+     * @param balance Spectral balance of the key per frame (see
+     *               setSpectralTiming()), read by programme-dependent timing.
      */
     void runGainRecursion(T* inDb, T* out, int m, int ch, const FeedForwardConfig& ff,
-                          const T* thr, const T* rat, const T* kn, const T* dryIn) noexcept
+                          const T* thr, const T* rat, const T* kn, const T* dryIn,
+                          const double* balance) noexcept
     {
         double fast = envFastDb_[ch];
         double slow = envSlowDb_[ch];
@@ -1770,6 +1942,16 @@ protected:
                 inDb[k] = gl;
                 lastWet = dryIn[k] * gl;
             }
+        }
+        else if (ff.program)
+        {
+            ProgramState state = programState_[ch];
+            for (int k = 0; k < m; ++k)
+            {
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
+                out[k] = static_cast<T>(programStep(static_cast<double>(tgt), fast, state, balance[k]));
+            }
+            programState_[ch] = state;
         }
         else
         {
@@ -1836,6 +2018,9 @@ protected:
 
         T targetGR_Db = computeGain(inputDb, thresh, ratio, knee, cfg.charType, cfg.modeType, guardDb);
         targetGR_Db = applyHoldAndRange(targetGR_Db, ch);
+        if (cfg.program)
+            return static_cast<T>(programStep(static_cast<double>(targetGR_Db), envFastDb_[ch],
+                                              programState_[static_cast<size_t>(ch)], balance_));
         return cfg.decoupled ? applyBallisticsDecoupled(targetGR_Db, ch, cfg.splitAdaptive)
                              : applyBallistics(targetGR_Db, ch, cfg.splitAdaptive);
     }
@@ -2026,6 +2211,24 @@ protected:
         splitDetAttCoeff_ = std::exp(T(-1) / (fs * T(44.39e-6)));
         splitDetRelCoeff_ = std::exp(T(-1) / (fs * T(2.2562e-3)));
 
+        // Programme-dependent timing: the two times as decays per sample
+        // (the coefficient is fastDecay() of them, scaled), and the poles of
+        // its measures.
+        {
+            const double rate = static_cast<double>(fs);
+            const auto pole = [rate](double hz) { return 1.0 - std::exp(-2.0 * std::numbers::pi * hz / rate); };
+            const auto over = [rate](double seconds) { return 1.0 - std::exp(-1.0 / (rate * seconds)); };
+            attackX_ = -std::log(std::max(charAttCoeff_, 1e-300));
+            releaseX_ = -std::log(std::max(charRelCoeff_, 1e-300));
+            subRate_ = pole(kBalanceFloorHz);
+            lowRate_ = pole(kBalanceLowHz);
+            midRate_ = pole(kBalanceHighHz);
+            highRate_ = pole(std::min(kBalanceCeilingHz, 0.45 * rate));
+            balanceRate_ = over(kBalanceSeconds);
+            sustainRate_ = over(kSustainSeconds);
+            emphasisRate_ = over(kEmphasisSeconds);
+        }
+
         // Upward silence-guard envelope: 60 dB/s linear decay.
         upwardGuardDecay_ = T(60) / fs;
 
@@ -2208,6 +2411,18 @@ protected:
                 // level and catches a step as fast as the peak detector.
                 const double mag = hilbertDetectors_[ch].magnitude(static_cast<double>(sample));
                 level = static_cast<T>(std::max(mag, std::abs(static_cast<double>(sample))));
+                break;
+            }
+
+            case DetectorType::Hybrid:
+            {
+                // The root of twice the mean square is the peak of a steady
+                // tone; the rectified sample is over it only while the level
+                // rises faster than the mean can.
+                double& meanSq = hybridMeanSq_[static_cast<size_t>(ch)];
+                const double x = static_cast<double>(sample);
+                meanSq += hybridRate_ * (x * x - meanSq);
+                level = static_cast<T>(std::max(std::sqrt(2.0 * meanSq), std::abs(x)));
                 break;
             }
         }
@@ -2773,7 +2988,8 @@ protected:
      */
     [[nodiscard]] double feedbackDetectorDelay(DetectorType detType) const noexcept
     {
-        return (detType == DetectorType::Rms) ? static_cast<double>(rmsWindowSamples_) : 0.0;
+        return (detType == DetectorType::Rms || detType == DetectorType::Hybrid)
+             ? static_cast<double>(rmsWindowSamples_) : 0.0;
     }
 
     /** @brief The Clean character in feed-forward runs the decoupled detector
@@ -3038,24 +3254,183 @@ protected:
         double& hold = envHoldDb_[c];
         double& fast = envFastDb_[c];
         double& slow = envSlowDb_[c];
+        double targets[kDetectorPoints] = {};
+        double deepest = 0.0;
         for (int j = 0; j < count; ++j)
         {
-            const T target = holdAndRange(
+            targets[j] = static_cast<double>(holdAndRange(
                 computeGain(levelDb[j], thresh, ratio, knee, cfg.charType, cfg.modeType, guardDb),
-                range, holdLength, heldGrDb_[c], holdCounters_[c], soft);
-            const double to = static_cast<double>(target);
+                range, holdLength, heldGrDb_[c], holdCounters_[c], soft));
+            deepest = (j == 0) ? targets[j] : std::min(deepest, targets[j]);
+        }
+        // Programme-dependent timing sets the two coefficients once per
+        // frame, for steps of an eighth of a sample.
+        double attack = subAttCoeff_, release = subRelCoeff_;
+        if (cfg.program)
+        {
+            const ProgramCoeffs timed = programCoeffs(deepest, fast, programState_[c], balance_, 1.0 / kSubsteps);
+            attack = timed.attack;
+            release = timed.release;
+        }
+        for (int j = 0; j < count; ++j)
+        {
+            const double to = targets[j];
             for (int s = 1; s <= stepsEach; ++s)
             {
                 const double at = last + (to - last) * (s * share);
                 sum += cfg.decoupled
                     ? decoupledCore(at, hold, fast, subDecHoldCoeff_, subAttCoeff_, subDecSmoothCoeff_)
-                    : ballisticsCore(at, fast, slow, subAttCoeff_, subRelCoeff_, subChargeCoeff_,
-                                     subSlowRelCoeff_);
+                    : ballisticsCore(at, fast, slow, attack, release, subChargeCoeff_, subSlowRelCoeff_);
             }
             last = to;
         }
         precTarget_[c] = last;
-        return static_cast<T>(sum * (1.0 / kSubsteps));
+        const double mean = sum * (1.0 / kSubsteps);
+        return static_cast<T>(cfg.program ? programShape(mean, programState_[c]) : mean);
+    }
+
+    // ---- Programme-dependent timing (setProgramRelease and the three after it) ----
+
+    /** @brief The weights of a block (zero where the routing leaves the times fixed). */
+    struct ProgramTiming
+    {
+        double release = 0.0;   ///< Weight of the sustained reduction on the release.
+        double attack = 0.0;    ///< Weight of the closeness of the target on the attack.
+        double spectral = 0.0;  ///< Weight of the balance of the key on both.
+        double emphasis = 0.0;  ///< Emphasis of the attack, -1 to +1.
+        bool active = false;    ///< Any of them acts.
+    };
+
+    /** @brief State of one gain computer under programme-dependent timing. */
+    struct ProgramState
+    {
+        double sustained = 0.0; ///< Slow follower of the depth of the gain change (dB).
+        double smoothed = 0.0;  ///< The gain smoothed over kEmphasisSeconds (dB).
+    };
+
+    /** @brief State of the two bands the balance of one channel's key is read from. */
+    struct BalanceBands
+    {
+        double sub = 0.0;  ///< Under kBalanceFloorHz.
+        double low = 0.0;  ///< From there to kBalanceLowHz: the low band.
+        double mid = 0.0;  ///< Under kBalanceHighHz.
+        double high = 0.0; ///< From there to kBalanceCeilingHz: the high band.
+    };
+
+    /** @brief The two coefficients of a frame. */
+    struct ProgramCoeffs
+    {
+        double attack, release;
+    };
+
+    /** @brief The weights for this routing: the Clean and Varimu characters
+     *  in feed-forward with Branching ballistics. */
+    [[nodiscard]] ProgramTiming programTiming(Character charType, Topology topoEff, bool decoupled,
+                                              bool splitAdaptive) const noexcept
+    {
+        ProgramTiming p;
+        if (topoEff != Topology::FeedForward || decoupled || splitAdaptive
+            || (charType != Character::Clean && charType != Character::Varimu))
+            return p;
+        p.release = static_cast<double>(programRelease_.load(std::memory_order_relaxed));
+        p.attack = static_cast<double>(adaptiveAttack_.load(std::memory_order_relaxed));
+        p.spectral = static_cast<double>(spectralTiming_.load(std::memory_order_relaxed));
+        p.emphasis = static_cast<double>(attackEmphasis_.load(std::memory_order_relaxed));
+        p.active = p.release > 0.0 || p.attack > 0.0 || p.spectral > 0.0 || p.emphasis != 0.0;
+        return p;
+    }
+
+    /** @brief Seats the measures on the gain that is sounding when the
+     *  programme-dependent timing engages. Audio thread only. */
+    void syncProgramState(bool active) noexcept
+    {
+        if (active && !programActive_)
+            for (size_t ch = 0; ch < static_cast<size_t>(kMaxChannels); ++ch)
+                programState_[ch] = { std::abs(envFastDb_[ch]), envFastDb_[ch] };
+        programActive_ = active;
+    }
+
+    /**
+     * @brief Feeds one channel's key to the two bands of the balance and adds
+     *        their squares to the frame's.
+     *
+     * One-pole splits: what a low-pass at kBalanceFloorHz keeps is taken out,
+     * and the rest goes through a low-pass at kBalanceLowHz (the low band);
+     * what a low-pass at kBalanceHighHz leaves out goes through one at
+     * kBalanceCeilingHz (the high band). The bands are equally wide on a
+     * logarithmic axis, so a key with the same power in every octave gives
+     * the two the same.
+     */
+    void balanceBands(T key, int ch, double& lowSq, double& highSq) noexcept
+    {
+        BalanceBands& b = balanceBands_[static_cast<size_t>(ch)];
+        const double x = static_cast<double>(key);
+        b.sub += subRate_ * (x - b.sub);
+        b.low += lowRate_ * ((x - b.sub) - b.low);
+        b.mid += midRate_ * (x - b.mid);
+        b.high += highRate_ * ((x - b.mid) - b.high);
+        lowSq += b.low * b.low;
+        highSq += b.high * b.high;
+    }
+
+    /** @brief Smooths the frame's two powers and returns the balance of the
+     *  key: -1 all low, +1 all high, 0 the same in both (or silence). */
+    [[nodiscard]] double balanceAdvance(double lowSq, double highSq) noexcept
+    {
+        balanceLow_ += balanceRate_ * (lowSq - balanceLow_);
+        balanceHigh_ += balanceRate_ * (highSq - balanceHigh_);
+        const double sum = balanceLow_ + balanceHigh_;
+        balance_ = (sum > kBalanceSilence) ? (balanceHigh_ - balanceLow_) / sum : 0.0;
+        return balance_;
+    }
+
+    /**
+     * @brief The attack and release coefficients of a frame under
+     *        programme-dependent timing, and the advance of its measures.
+     *
+     * @param target  Gain target of the frame (dB).
+     * @param fast    The gain now (dB).
+     * @param state   Measures of this gain computer.
+     * @param balance Spectral balance of the key.
+     * @param share   Share of a sample each step of the follower covers.
+     */
+    [[nodiscard]] ProgramCoeffs programCoeffs(double target, double fast, ProgramState& state,
+                                              double balance, double share) const noexcept
+    {
+        // How sustained the gain change is: a slow follower of its depth
+        // against the depth itself.
+        const double depth = std::abs(fast);
+        state.sustained += sustainRate_ * (depth - state.sustained);
+        // (Squared: a peak that came and went must count for next to nothing.)
+        const double held = std::min(state.sustained / (depth + kSustainFloorDb), 1.0);
+        const double sustain = held * held;
+        // How close the target is: full at none, nothing from kFullAttackDb.
+        const double excess = std::max(fast - target, 0.0);
+        const double close = 1.0 - std::min(excess * (1.0 / kFullAttackDb), 1.0);
+        // A bright key shortens both times and a dark one lengthens them.
+        const double tilt = program_.spectral * balance;
+        const double speed = share * (2.0 + tilt) / (2.0 - tilt);
+        return { fastDecay(attackX_ * speed / (1.0 + kAttackStretch * program_.attack * close)),
+                 fastDecay(releaseX_ * speed / (1.0 + kReleaseStretch * program_.release * sustain)) };
+    }
+
+    /** @brief The gain with the emphasis of the attack: what it is under
+     *  its own smoothed course while it falls, added again (or taken off). */
+    [[nodiscard]] double programShape(double gain, ProgramState& state) const noexcept
+    {
+        state.smoothed += emphasisRate_ * (gain - state.smoothed);
+        return gain + program_.emphasis * std::min(gain - state.smoothed, 0.0);
+    }
+
+    /** @brief One step of the branching follower with programme-dependent
+     *  timing (the single envelope of Clean and Varimu). */
+    [[nodiscard]] double programStep(double target, double& fast, ProgramState& state,
+                                     double balance) const noexcept
+    {
+        const ProgramCoeffs timed = programCoeffs(target, fast, state, balance, 1.0);
+        fast = branchingStep(fast, target, timed.attack, timed.release);
+        if (atRest(fast, target)) fast = 0.0;
+        return programShape(fast, state);
     }
 
     // ---- Analytic makeup ----
@@ -3223,7 +3598,8 @@ protected:
      * The programme is a Gaussian signal as the detector reads it. For the
      * detectors that rectify, the magnitudes of its samples (a half normal);
      * for TruePeak the largest of kTruePeakSamples of them (the four points
-     * between samples are not independent); for Hilbert its envelope (a
+     * between samples are not independent); for Hybrid those magnitudes held
+     * over the root of twice the mean square; for Hilbert its envelope (a
      * Rayleigh, kEnvelopeLiftDb higher since the detector also takes the
      * rectified sample); for the RMS window a log-normal about the RMS with
      * the spread of windowSpreadDb(). Each level gives a target on the static
@@ -3242,6 +3618,7 @@ protected:
         const bool window = key.detType == DetectorType::Rms;
         const bool envelope = key.detType == DetectorType::Hilbert;
         const bool between = key.detType == DetectorType::TruePeak;
+        const bool hybrid = key.detType == DetectorType::Hybrid;
         const double spread = window ? windowSpreadDb(static_cast<double>(key.window)) : 0.0;
         double target[kMakeupNodes], weight[kMakeupNodes];
         T held = T(0);
@@ -3264,7 +3641,9 @@ protected:
                 if (envelope) weight[i] *= t;
                 if (between)
                     weight[i] *= std::pow(std::erf(t * 0.70710678118654752), kTruePeakSamples - 1.0);
-                levelDb += 20.0 * std::log10(t) + (envelope ? kEnvelopeLiftDb : 0.0);
+                // Hybrid never reads under the root of twice the mean square.
+                levelDb += 20.0 * std::log10(hybrid ? std::max(t, std::numbers::sqrt2) : t)
+                         + (envelope ? kEnvelopeLiftDb : 0.0);
             }
             const T gain = computeGain(static_cast<T>(levelDb), key.thresh, key.ratio, key.knee, key.charType,
                                        key.modeType, static_cast<T>(rmsDb + kSustainedOverRmsDb));
@@ -3345,6 +3724,10 @@ protected:
             {
                 rmsWindowSamples_ = std::max(1, requestedSamples);
             }
+
+            // The Hybrid detector's mean of the squares takes the same time.
+            hybridRate_ = 1.0 - std::exp(-1.0 / (sampleRate_ * std::max(static_cast<double>(rmsWindowMs_), 1.0)
+                                                 / 1000.0));
 
             for (int ch = 0; ch < kMaxChannels; ++ch)
             {
@@ -3510,6 +3893,44 @@ protected:
     double subChargeCoeff_ = 0.0;    ///< Memory-stage charge coefficient of an eighth of a sample.
     double subDecHoldCoeff_ = 0.0;   ///< Decoupled hold coefficient of an eighth of a sample.
     double subDecSmoothCoeff_ = 0.0; ///< Decoupled smoothing coefficient of an eighth of a sample.
+
+    // Programme-dependent timing (setProgramRelease() and the three after it).
+    static constexpr double kSustainSeconds = 1.5;      ///< Follower of the depth of the gain change.
+    static constexpr double kSustainFloorDb = 0.5;      ///< Depth under which a reduction does not count as sustained.
+    static constexpr double kReleaseStretch = 7.0;      ///< The release grows up to 1 + this.
+    static constexpr double kAttackStretch = 3.0;       ///< The attack grows up to 1 + this.
+    static constexpr double kFullAttackDb = 6.0;        ///< Distance to the target from which the attack is the knob's.
+    static constexpr double kEmphasisSeconds = 0.03;    ///< Smoothing the emphasis of the attack measures against.
+    static constexpr double kBalanceFloorHz = 30.0;     ///< The low band of the balance starts here.
+    static constexpr double kBalanceLowHz = 200.0;      ///< And ends here.
+    static constexpr double kBalanceHighHz = 2500.0;    ///< The high band starts here.
+    static constexpr double kBalanceCeilingHz = 16000.0;///< And ends here.
+    static constexpr double kBalanceSeconds = 0.05;     ///< Smoothing of the two powers.
+    static constexpr double kBalanceSilence = 1e-24;    ///< Summed power under which the balance is 0.
+    std::atomic<T> programRelease_ { T(0) };            ///< Weight of the sustained reduction on the release.
+    std::atomic<T> adaptiveAttack_ { T(0) };            ///< Weight of the closeness of the target on the attack.
+    std::atomic<T> spectralTiming_ { T(0) };            ///< Weight of the balance of the key on both times.
+    std::atomic<T> attackEmphasis_ { T(0) };            ///< Emphasis of the attack.
+    ProgramTiming program_ {};                          ///< The weights of the block (audio thread).
+    bool programActive_ = false;                        ///< They acted last (audio thread).
+    std::array<ProgramState, kMaxChannels> programState_ {};  ///< Measures per gain computer.
+    std::array<BalanceBands, kMaxChannels> balanceBands_ {};  ///< Bands of the key per channel.
+    double balanceLow_ = 0.0;        ///< Smoothed power of the low band.
+    double balanceHigh_ = 0.0;       ///< Smoothed power of the high band.
+    double balance_ = 0.0;           ///< Their balance, -1 to +1.
+    double attackX_ = 0.0;           ///< The attack as a decay per sample (-ln of its coefficient).
+    double releaseX_ = 0.0;          ///< The release as a decay per sample.
+    double subRate_ = 0.0;           ///< Pole of the split at kBalanceFloorHz.
+    double lowRate_ = 0.0;           ///< Pole of the split at kBalanceLowHz.
+    double midRate_ = 0.0;           ///< Pole of the split at kBalanceHighHz.
+    double highRate_ = 0.0;          ///< Pole of the split at kBalanceCeilingHz.
+    double balanceRate_ = 0.0;       ///< Pole of the smoothing of the two powers.
+    double sustainRate_ = 0.0;       ///< Pole of the follower of the depth.
+    double emphasisRate_ = 0.0;      ///< Pole of the smoothing the emphasis measures against.
+
+    // Hybrid detector: a one-pole mean of the squares per channel.
+    std::array<double, kMaxChannels> hybridMeanSq_ {};  ///< Mean square of the key.
+    double hybridRate_ = 0.0;                           ///< Its pole (the time of the RMS window).
 
     // Analytic makeup: the programme it assumes and its cached result.
     static constexpr int kMakeupNodes = 48;             ///< Levels of the programme that are weighed.

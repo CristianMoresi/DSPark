@@ -167,6 +167,72 @@ All notable user-facing changes to DSPark are documented here.
   The hold already froze the release and left the attack free; a test now
   says so. The state carries `autoThreshold`, `maxLookahead`, `amount` and
   `softRange`.
+- `Compressor::setAutoMakeup(AutoMakeupMode::Analytic)`: a makeup worked out
+  from the settings, with nothing measured. It is minus the gain the
+  ballistics come to rest on over dense programme: the levels of a Gaussian
+  signal as the selected detector reads them, each with its target on the
+  static curve, and the followers resting where their attack and release
+  pulls cancel (the memory stage of Opto and FET, the decoupled hold and a
+  feedback loop each in their own way). A constant between edits, so it never
+  pumps, and it moves to its new value over a few tens of milliseconds after
+  one. It takes the programme at -18 dBFS RMS; with `setAutoThreshold(true)`
+  the threshold counts from the programme's own peak and the result holds at
+  any level, and it follows `setAmount()`. Works in Downward and in Upward.
+  Level left over the input's on pink noise at -18 dBFS (dB): Peak detector
+  within 0.1 over thresholds from -30 to -10 dB, ratios from 2 to 10, attacks
+  from 0.5 to 100 ms and releases from 20 ms to 1 s, where the Static mode
+  leaves -2.4 to +6.1; decoupled and feedback 0.2; RMS, Hilbert, TruePeak and
+  Opto 0.3; FET 0.5; Upward 0.03; with the automatic threshold the same at
+  -36 and at -6 dBFS (0.14 at most). On programme that swells 5 dB up and
+  down it stays within 0.7, where the Adaptive mode is 0.2 to 1.2 off. The
+  RMS window reads the low end of the programme: on white noise it is off
+  by up to 1.3.
+- `Compressor::setPrecision(Precision::High)` (off by default): the control
+  signal is worked out between the samples, the audio staying at its rate.
+  The Peak and TruePeak detectors read the key at four points per sample
+  (the sample and three points before it, from a 16-sample windowed-sinc
+  interpolation) and the ballistics take eight steps per sample towards a
+  target that moves along the line between those points (between samples for
+  RMS and Hilbert, whose reading is already smooth); the gain is the mean of
+  the eight. In `processBlock()`, in feed-forward and in the feedback loops
+  solved against the input (the Peak detector, Downward: the FET character
+  among them). The interpolated detectors read 7 samples late and the audio
+  waits for them: `getLatency()` reports 7 samples more with Peak or
+  TruePeak, none with RMS or Hilbert. Largest line that is no harmonic of a
+  tone 12 dB over a 4:1 threshold, 48 kHz, Standard to High (dBc): Peak
+  detector at 0.1 ms / 50 ms -77 to -111 at 1 kHz, -66 to -86 at 5 kHz, -51
+  to -85 at 15 kHz, -38 to -66 at 18 kHz; at 5 ms / 100 ms -83 to -130, -83
+  to -98, -79 to -98 and -46 to -76; FET at 20 us, ratio 20, 30 dB over -68
+  to -91, -50 to -66, -49 to -70 and -37 to -66; Clean in feedback -71 to
+  -104 at 1 kHz and -39 to -72 at 18 kHz; decoupled -70 to -94 and -39 to
+  -66; Hilbert -124 to -153 at 1 kHz. The gain of the tone stays within
+  0.1 dB of Standard in every case. A stereo frame costs 125 ns against 17 in
+  feed-forward and 190 against 52 with FET (x64 server core). Two things
+  were tried first and dropped on measurement: averaging the rectifier and
+  the static curve over three consecutive values (second-order antiderivative
+  antialiasing) read a tone of the top octave up to 10 dB low, since the
+  average over three sorted values is not the average along the waveform;
+  and the eight steps alone, with the target on a line between samples,
+  gave 10 to 30 dB up to 5 kHz and nothing at 18 kHz. State key `precision`.
+- `Limiter::setMaxLookahead(ms)`: a latency kept for the lookahead. The
+  audio always waits that long, `getLatency()` reports it, and
+  `setLookahead()` moves under it with the gain held back by the difference,
+  so the lookahead can be automated under one delay compensation. The output
+  is the one of the same lookahead with no latency kept, later by the
+  difference and bit for bit. 0 (default) keeps the latency equal to the
+  lookahead, as before. State key `maxLookahead`.
+- `Expander::setAutoThreshold(true)`, `NoiseGate::setAutoThreshold(true)`
+  and `DeEsser::setAutoThreshold(true)` (off by default): the threshold
+  counts from the programme instead of from full scale, as it already could
+  in `Compressor`. A reference rises at once and falls 1 dB per second; in
+  the expander and the gate it follows the detected level (and falls a
+  quarter as fast while the key is under the closing threshold, so a pause
+  lowers the threshold by 1 dB every four seconds), in the de-esser the
+  largest sample of the whole input, so the band is judged against the voice
+  that carries it. The output of a signal 30 dB lower is then the same
+  output 30 dB lower (to the rounding of the arithmetic: 2e-7 of its peak),
+  where a threshold in dBFS treats the quieter signal otherwise or not at
+  all. State key `autoThreshold` in the three.
 - `DynamicEQ::setLinearPhase(true)` (off by default; a setup choice): the
   bands change the level of the signal and nothing of its phase. Each band is
   then zero-phase kernels (its rest, and the end of each side, chosen as in
@@ -1905,6 +1971,19 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Compressor`: an envelope within 1e-4 dB of zero was put back on zero
+  whatever its target, to end the tail of a release. Leaving zero in steps
+  shorter than that, each step was undone and the gain never moved: a slow
+  attack ignored a shallow target for good (200 ms of attack and 0.3 dB of
+  reduction asked for: 0 dB, at 48 and at 96 kHz; 100 ms at 96 kHz ignored
+  anything under 1 dB), and the memory stage of the Opto character, which
+  charges over two seconds with a release of 500 ms, never charged under
+  9.6 dB of reduction at 48 kHz, so on light compression the gain settled
+  short of the curve and the long tail was missing (ten seconds 6 dB over a
+  2:1 threshold now read 3.0 dB of reduction and, one second into the pause
+  that follows, 1.05 dB: the memory). The envelope is now put on zero only when
+  its target is there too. Deeper or faster settings are bit for bit as they
+  were.
 - `Synthesizer` with oversampling, built with one recent compiler: every event
   landed early, by 32 samples at 2x and 17 at 4x, and where it landed depended
   on where the block began. The two lines that place the content against the

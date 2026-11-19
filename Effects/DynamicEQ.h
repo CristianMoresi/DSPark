@@ -58,6 +58,17 @@
  * other way round. A band that rests at 0 dB and is not acting returns its
  * input bit for bit.
  *
+ * Linear phase (setLinearPhase(), off by default; a setup choice): the
+ * filters of a band are then zero-phase kernels, run by one partitioned
+ * convolution (Core/FirBank.h), and the gain sets how much of each is added
+ * to the signal, which is late by the latency of the mode (half the kernel
+ * plus one partition: 2560 samples at 44.1 and 48 kHz). The band changes the
+ * level and nothing of the phase; its gain is held back to meet the audio it
+ * was computed from; and the bands add up side by side, each one heard from
+ * the input, so the mode has one latency whatever the number of bands. The
+ * ends are chosen as in the mixed engine, on magnitudes: half way through
+ * the range the band has exactly the magnitude of the nominal one.
+ *
  * What the gain follows, per band (all off by default):
  * - BandConfig::knee: a soft knee around the threshold, or an automatic one
  *   that grows with the width of the band and with its range.
@@ -78,8 +89,9 @@
  *   of the first pair, and listens to the same part of the sidechain.
  *
  * Threading model (per method; the model is docs/threading.md):
- * - prepare() / reset() / setOversampling() / setState(): setup or UI threads
- *   only, never concurrently with processBlock().
+ * - prepare() / reset() / setOversampling() / setLinearPhase() /
+ *   setLinearPhaseKernelLength() / setState(): setup or UI threads only,
+ *   never concurrently with processBlock().
  * - setMixedBands(): any thread; the audio thread changes engine at the next
  *   block and the bands start clean there (may click: choose it before
  *   playback).
@@ -107,7 +119,8 @@
  *   before playback).
  *
  * Dependencies: MidSide.h, AudioBuffer.h, AudioSpec.h, Biquad.h,
- *               BiquadCascade.h, DspMath.h, FilterDesign.h, Hilbert.h,
+ *               BiquadCascade.h, DspMath.h, FFT.h, FilterDesign.h, FirBank.h,
+ *               Hilbert.h,
  *               Oversampling.h, RingBuffer.h, DenormalGuard.h, StateBlob.h.
  */
 
@@ -118,6 +131,8 @@
 #include "../Core/BiquadCascade.h"
 #include "../Core/DspMath.h"
 #include "../Core/FilterDesign.h"
+#include "../Core/FirBank.h"
+#include "../Core/FFT.h"
 #include "../Core/Hilbert.h"
 #include "../Core/Oversampling.h"
 #include "../Core/RingBuffer.h"
@@ -235,7 +250,7 @@ public:
         if (oversamplingAutomatic_)
             oversamplingFactor_ = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate, 4);
 
-        if (oversamplingFactor_ > 1)
+        if (oversamplingFactor_ > 1 && !linearWanted_)
         {
             // Two oversamplers: the audio-path one owns the buffer that we
             // both process and downsample back; the sidechain one only acts
@@ -262,9 +277,41 @@ public:
             band.cut.setNumSections(1);
             band.lift.setNumSections(1);
         }
-        designBand_.prepare(sampleRate_ * oversamplingFactor_);
+        designBand_.prepare(sampleRate_ * runFactor());
 
-        int maxLaSamples = static_cast<int>(sampleRate_ * oversamplingFactor_ * 0.01) + 1;
+        // The linear-phase mode: a bank of kernels (one per band and branch),
+        // the signal and the weights late by its latency, and the transform
+        // the kernels are designed with. linear_ gates the mode: set last.
+        linear_.reset();
+        if (linearWanted_)
+        {
+            auto engine = std::make_unique<LinearEngine>();
+            LinearEngine& e = *engine;
+            e.kernel = resolveLinearTaps(spec.sampleRate);
+            e.channels = std::min(spec.numChannels, kMaxChannels);
+            e.bank.prepare(e.kernel, e.kernel / kLinearPartitions, e.channels + (e.channels >= 2 ? 2 : 0),
+                           MaxBands * kLinearBranches);
+            e.latency = e.kernel / 2 + e.bank.getLatency();
+            e.designFft = std::make_unique<FFTReal<T>>(static_cast<size_t>(e.kernel));
+            e.spectrum.assign(static_cast<size_t>(e.kernel + 2), T(0));
+            e.time.assign(static_cast<size_t>(e.kernel), T(0));
+            e.taps.assign(static_cast<size_t>(e.kernel), T(0));
+            e.window.resize(static_cast<size_t>(e.kernel));
+            for (int m = 0; m < e.kernel; ++m)
+            {
+                const double t = 2.0 * std::numbers::pi * m / e.kernel;
+                e.window[static_cast<size_t>(m)] = static_cast<T>(
+                    0.35875 - 0.48829 * std::cos(t) + 0.14128 * std::cos(2.0 * t) - 0.01168 * std::cos(3.0 * t));
+            }
+            for (int ch = 0; ch < kMaxChannels; ++ch) e.dry[ch].prepare(e.latency + 1);
+            int ring = 1;
+            while (ring < e.latency + kDetChunk + 1) ring <<= 1;
+            e.weightMask = ring - 1;
+            e.weights.assign(static_cast<size_t>(MaxBands * 2) * static_cast<size_t>(ring), T(0));
+            linear_ = std::move(engine);
+        }
+
+        int maxLaSamples = static_cast<int>(sampleRate_ * runFactor() * 0.01) + 1;
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].prepare(maxLaSamples);
 
@@ -407,6 +454,60 @@ public:
     [[nodiscard]] bool isMixedBands() const noexcept { return mixedWanted_.load(std::memory_order_relaxed); }
 
     /**
+     * @brief Linear phase: the bands change the level of the signal and nothing of its phase.
+     *
+     * Each band is then zero-phase filters (its rest, and the end of each
+     * side, as in the mixed engine), run by one partitioned convolution, and
+     * the gain sets how much of each is added to the signal, late by the
+     * latency of the mode: half the kernel plus one partition (2560 samples
+     * at 44.1 and 48 kHz with the default kernel; getLatency() reports it).
+     * The bands add up side by side, each one heard from the input, so two
+     * bands that overlap add their changes instead of multiplying them. The
+     * detector runs ahead of the audio by that latency, and the gain is held
+     * back to meet it (less the lookahead, which costs no latency here). The
+     * kernel resolves bands down to about its own length: with the default
+     * one a bell narrower than some 100 Hz comes out wider and shallower
+     * (setLinearPhaseKernelLength()). The mode runs at the host rate:
+     * oversampling is not used with it.
+     *
+     * @note Setup threads only: like setOversampling() this un-prepares the
+     *       processor until the next prepare().
+     *
+     * @param on True for linear phase.
+     */
+    void setLinearPhase(bool on) noexcept
+    {
+        if (on == linearWanted_) return;
+        linearWanted_ = on;
+        isPrepared_.store(false, std::memory_order_relaxed);
+    }
+
+    /** @brief Whether the bands run in linear phase (setLinearPhase()). */
+    [[nodiscard]] bool isLinearPhase() const noexcept { return linearWanted_; }
+
+    /**
+     * @brief Asks for the length of the linear-phase kernels, in taps.
+     *
+     * A power of two from 1024 to 65536 (other values go up to the next
+     * one); 0, the default, is 4096 at 44.1 and 48 kHz and in proportion at
+     * higher rates. Longer kernels resolve lower and narrower bands and add
+     * latency (half the kernel plus an eighth). Setup threads only: it
+     * un-prepares the processor when the mode is on.
+     *
+     * @param taps Kernel length, or 0 for the automatic one.
+     */
+    void setLinearPhaseKernelLength(int taps) noexcept
+    {
+        taps = std::clamp(taps, 0, 65536);
+        if (taps == linearTaps_) return;
+        linearTaps_ = taps;
+        if (linearWanted_) isPrepared_.store(false, std::memory_order_relaxed);
+    }
+
+    /** @brief The kernel length in use (after prepare()), or the one asked for. */
+    [[nodiscard]] int getLinearPhaseKernelLength() const noexcept { return linear_ ? linear_->kernel : linearTaps_; }
+
+    /**
      * @brief The magnitude response of a band with its dynamic part at a
      *        given gain, as the engine in use plays it.
      *
@@ -427,8 +528,28 @@ public:
         if (band < 0 || band >= MaxBands || sampleRate_ <= 0.0 || !std::isfinite(dynamicGainDb)) return;
 
         const BandConfig cfg = staged_[static_cast<size_t>(band)].read();
-        const double fs = sampleRate_ * oversamplingFactor_;
+        const double fs = sampleRate_ * runFactor();
         const double rest = static_cast<double>(cfg.gain), moved = static_cast<double>(dynamicGainDb);
+
+        if (linearWanted_)
+        {
+            // Linear phase: the magnitudes of the prototypes, mixed as the mode mixes them.
+            const double range = rangeTowards(cfg, moved > 0.0);
+            const bool acts = range > kRestDb && moved != 0.0;
+            const double side = moved > 0.0 ? range : -range;
+            const double ratio = std::pow(10.0, moved / 20.0), endRatio = std::pow(10.0, side / 20.0);
+            const double weight = acts ? std::clamp((ratio - 1.0) / (endRatio - 1.0), 0.0, 1.0) : 0.0;
+            const double reach = 1.0 + std::pow(10.0, side / 40.0);
+            const AnalogSection atRest = prototypeOf(cfg, rest), atHalf = prototypeOf(cfg, 0.5 * side);
+            for (int i = 0; i < numPoints; ++i)
+            {
+                const double omega = 2.0 * std::numbers::pi * static_cast<double>(frequencies[i]);
+                const double base = std::abs(rest) > kRestDb ? std::sqrt(atRest.magnitudeSquared(omega)) : 1.0;
+                const double moving = acts ? 1.0 + weight * reach * (std::sqrt(atHalf.magnitudeSquared(omega)) - 1.0) : 1.0;
+                magnitudes[i] = static_cast<T>(base * moving);
+            }
+            return;
+        }
 
         if (!isMixedBands())
         {
@@ -538,7 +659,8 @@ public:
      */
     [[nodiscard]] int getLatency() const noexcept
     {
-        const int factor = std::max(oversamplingFactor_, 1);
+        if (linear_) return linear_->latency;      // the lookahead comes out of it
+        const int factor = runFactor();
         const int la = lookaheadSamples_.load(std::memory_order_relaxed) / factor;
         const int os = oversampler_ ? oversampler_->getLatency() : 0;
         return la + os;
@@ -564,6 +686,15 @@ public:
         }
         for (int ch = 0; ch < kMaxChannels; ++ch)
             lookaheadBuf_[ch].reset();
+        if (linear_)
+        {
+            linear_->bank.reset();
+            for (auto& line : linear_->dry) line.reset();
+            std::fill(linear_->weights.begin(), linear_->weights.end(), T(0));
+            linear_->weightPos = 0;
+            linear_->played.fill(false);
+            linear_->snap = true;
+        }
         if (oversampler_) oversampler_->reset();
         if (oversamplerSc_) oversamplerSc_->reset();
         refreshCounter_ = 0;
@@ -579,6 +710,8 @@ public:
         w.write("numBands", n);
         w.write("lookahead", static_cast<float>(lookaheadMs_));
         w.write("mixed", isMixedBands());
+        w.write("linear", linearWanted_);
+        w.write("linearTaps", linearTaps_);
         char key[28];
         for (int i = 0; i < n; ++i)
         {
@@ -686,6 +819,8 @@ public:
         // Blobs written before the key existed were rendered without lookahead.
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setMixedBands(r.read("mixed", false));
+        setLinearPhaseKernelLength(r.read("linearTaps", 0));
+        setLinearPhase(r.read("linear", false));
         return true;
     }
 
@@ -760,6 +895,9 @@ private:
         return cfg.placement == Placement::Mid || cfg.placement == Placement::Side;
     }
 
+    /** @brief The factor the bands run at: the linear-phase mode runs at the host rate. */
+    [[nodiscard]] int runFactor() const noexcept { return linearWanted_ ? 1 : std::max(oversamplingFactor_, 1); }
+
     /** @brief Whether a band has something to act on: one channel has no right and no sides. */
     [[nodiscard]] static bool plays(const BandConfig& cfg, int numChannels) noexcept
     {
@@ -777,7 +915,7 @@ private:
         const int laSamples = lookaheadSamples_.load(std::memory_order_relaxed);
 
         // A change of engine: every band starts clean in the new one.
-        const bool mixed = mixedWanted_.load(std::memory_order_relaxed) && mixedEngine_ != nullptr;
+        const bool mixed = mixedWanted_.load(std::memory_order_relaxed) && mixedEngine_ != nullptr && !linear_;
         if (mixed != mixedActive_)
         {
             mixedActive_ = mixed;
@@ -808,6 +946,7 @@ private:
             if (ofThePair(states_[b].cfg)) second_[static_cast<size_t>(numSecond_++)] = b;
             else first_[static_cast<size_t>(numFirst_++)] = b;
         }
+        if (linear_) serviceLinear(nb);
 
         // 2. Chunks: the detection and the gain of every band run first, band
         //    by band and channel by channel, so each detector (and its allpass
@@ -824,7 +963,8 @@ private:
                 computeGains(b, chunkLen);
             }
 
-            if (mixedActive_) applyMixed(audio, chunkStart, chunkLen, nCh, laSamples);
+            if (linear_) applyLinear(audio, chunkStart, chunkLen, nCh, laSamples);
+            else if (mixedActive_) applyMixed(audio, chunkStart, chunkLen, nCh, laSamples);
             else applyRedesigned(audio, chunkStart, chunkLen, nCh, nb, laSamples, currentFs);
         }
     }
@@ -1195,9 +1335,7 @@ private:
         for (int j = 0; j < n; ++j)
         {
             const double d = static_cast<double>(gains[j]);
-            double cut = 0.0, lift = 0.0;
-            if (d < 0.0 && st.cuts) cut = std::min((1.0 - fastPow10(d * 0.05)) * st.cutScale, 1.0);
-            else if (d > 0.0 && st.lifts) lift = std::min((fastPow10(d * 0.05) - 1.0) * st.liftScale, 1.0);
+            const double cut = cutWeight(st, d), lift = liftWeight(st, d);
             engine.cutWeight[static_cast<size_t>(j)] = cut;
             engine.liftWeight[static_cast<size_t>(j)] = lift;
             down = down || cut > 0.0;
@@ -1245,6 +1383,272 @@ private:
                     y[j] += static_cast<T>(engine.liftWeight[static_cast<size_t>(j)]) * (end[j] - y[j]);
             }
         }
+    }
+
+    // -- Linear phase ---------------------------------------------------------
+
+    static constexpr int kLinearBranches = 3;        ///< Per band: its rest, the end of its cuts, the end of its lifts.
+    static constexpr int kLinearDefaultTaps = 4096;  ///< Kernel at 44.1 and 48 kHz; it grows with the rate.
+    static constexpr int kLinearPartitions = 8;      ///< Partitions per kernel: the bank adds one of latency.
+
+    /** @brief Everything the linear-phase mode needs, allocated in prepare(). */
+    struct LinearEngine
+    {
+        FirBank<T> bank;                                         ///< One kernel per band and branch.
+        std::unique_ptr<FFTReal<T>> designFft;
+        std::vector<T> spectrum, time, taps, window;
+        std::array<RingBuffer<T>, kMaxChannels> dry;             ///< The signal, late.
+        std::vector<T> weights;                                  ///< Per band and side: the weights, late.
+        int weightMask = 0, weightPos = 0;
+        std::array<std::array<bool, kLinearBranches>, MaxBands> pending {};   ///< Branches that wait for their design.
+        std::array<bool, MaxBands> played {};                    ///< Bands that played in the last block.
+        std::array<std::array<T, kDetChunk>, kMaxChannels + 2> lines {};      ///< What the bank hears of a run.
+        int next = 0;                                            ///< Where the search for a design resumes.
+        int kernel = 0, latency = 0, channels = 0;
+        bool snap = true;                                        ///< Every design that waits lands on the next block, at once.
+    };
+
+    /** @brief The kernel length the mode runs: the one asked for, or 4096 taps at 44.1 and 48 kHz and in proportion above. */
+    [[nodiscard]] int resolveLinearTaps(double sampleRate) const noexcept
+    {
+        int taps = linearTaps_;
+        if (taps <= 0)
+        {
+            taps = kLinearDefaultTaps;
+            while (taps < 65536 && sampleRate > 1.5 * 48000.0 * (taps / kLinearDefaultTaps)) taps <<= 1;
+        }
+        int size = 1024;
+        while (size < taps && size < 65536) size <<= 1;
+        return size;
+    }
+
+    /** @brief The input lines of the bank that hear a band: its channels, or the middle or the sides of the pair. */
+    [[nodiscard]] unsigned linearMask(const BandConfig& cfg) const noexcept
+    {
+        const int channels = linear_->channels;
+        switch (cfg.placement)
+        {
+            case Placement::Left:  return 1u;
+            case Placement::Right: return channels >= 2 ? 2u : 0u;
+            case Placement::Mid:   return channels >= 2 ? 1u << channels : 1u;
+            case Placement::Side:  return channels >= 2 ? 1u << (channels + 1) : 0u;
+            default:               return (1u << channels) - 1u;
+        }
+    }
+
+    /**
+     * @brief Designs the kernel of one branch of a band and hands it to the bank.
+     *
+     * Zero phase, from the magnitude of the analog prototypes: the rest of
+     * the band minus one, or what the end of a side adds to the signal
+     * (through the rest). The end is chosen as in the mixed engine: half way
+     * through the range the band has exactly the magnitude of the nominal
+     * one.
+     */
+    void designLinearBranch(int b, int branch) noexcept
+    {
+        LinearEngine& e = *linear_;
+        const BandState& st = states_[b];
+        const BandConfig& cfg = st.cfg;
+        const int index = b * kLinearBranches + branch;
+        const bool has = branch == 0 ? st.rests : (branch == 1 ? st.cuts : st.lifts);
+        if (!has)
+        {
+            e.bank.removeKernel(index);
+            return;
+        }
+
+        const AnalogSection rest = prototypeOf(cfg, static_cast<double>(cfg.gain));
+        const double range = branch == 1 ? -rangeTowards(cfg, false) : rangeTowards(cfg, true);
+        const AnalogSection half = prototypeOf(cfg, 0.5 * range);
+        const double reach = 1.0 + std::pow(10.0, range / 40.0);
+        const int bins = e.kernel / 2;
+        const double step = 2.0 * std::numbers::pi * sampleRate_ / static_cast<double>(e.kernel);
+        for (int k = 0; k <= bins; ++k)
+        {
+            const double omega = step * static_cast<double>(k);
+            const double atRest = st.rests ? std::sqrt(rest.magnitudeSquared(omega)) : 1.0;
+            const double level = branch == 0 ? atRest - 1.0
+                                             : atRest * reach * (std::sqrt(half.magnitudeSquared(omega)) - 1.0);
+            e.spectrum[static_cast<size_t>(2 * k)] = static_cast<T>(level);
+            e.spectrum[static_cast<size_t>(2 * k + 1)] = T(0);
+        }
+        e.designFft->inverse(e.spectrum.data(), e.time.data());
+        // Centred on half the kernel, and windowed.
+        const int centre = e.kernel / 2;
+        for (int m = 0; m < e.kernel; ++m)
+            e.taps[static_cast<size_t>(m)] = e.time[static_cast<size_t>((m + centre) % e.kernel)] * e.window[static_cast<size_t>(m)];
+        e.bank.setKernel(index, e.taps.data(), linearMask(cfg));
+    }
+
+    /**
+     * @brief Housekeeping of the mode, once per block: bands that stop
+     *        playing leave the bank, and one design that waits is done (all
+     *        of them on the first block, where nothing has sounded yet).
+     */
+    void serviceLinear(int nb) noexcept
+    {
+        LinearEngine& e = *linear_;
+        for (int b = 0; b < MaxBands; ++b)
+        {
+            const auto at = static_cast<size_t>(b);
+            const bool on = b < nb && playing_[at];
+            if (on && !e.played[at])
+                e.pending[at].fill(true);
+            if (!on && e.played[at])
+                for (int branch = 0; branch < kLinearBranches; ++branch)
+                    e.bank.removeKernel(b * kLinearBranches + branch);
+            e.played[at] = on;
+        }
+
+        const int total = MaxBands * kLinearBranches;
+        for (int step = 0; step < total; ++step)
+        {
+            const int index = (e.next + step) % total;
+            const int b = index / kLinearBranches, branch = index % kLinearBranches;
+            if (!e.pending[static_cast<size_t>(b)][static_cast<size_t>(branch)]) continue;
+            e.pending[static_cast<size_t>(b)][static_cast<size_t>(branch)] = false;
+            if (!e.played[static_cast<size_t>(b)]) continue;
+            designLinearBranch(b, branch);
+            if (e.snap) continue;
+            e.next = (index + 1) % total;
+            break;
+        }
+        if (e.snap)
+        {
+            e.bank.reset();     // nothing has sounded: the kernels land with no fade
+            e.snap = false;
+        }
+    }
+
+    /**
+     * @brief The linear-phase mode over one chunk: the signal, late, plus
+     *        what each branch of each band adds to it, weighted by its gain.
+     *
+     * The bands add up side by side, each one heard from the input, so the
+     * mode has one latency whatever the number of bands. The weights are as
+     * late as the audio minus the lookahead.
+     */
+    void applyLinear(AudioBufferView<T>& audio, int start, int n, int nCh, int laSamples) noexcept
+    {
+        LinearEngine& e = *linear_;
+        const size_t ring = static_cast<size_t>(e.weightMask) + 1u;
+        const int lineChannels = std::min(nCh, e.channels);
+        const bool pair = e.channels >= 2;
+        const int delay = e.latency - std::clamp(laSamples, 0, e.latency);
+
+        // The weights of this chunk, into their delay.
+        for (int k = 0; k < numFirst_ + numSecond_; ++k)
+        {
+            const int b = k < numFirst_ ? first_[static_cast<size_t>(k)] : second_[static_cast<size_t>(k - numFirst_)];
+            const BandState& st = states_[b];
+            const T* gains = dynDb_[static_cast<size_t>(b)].data();
+            T* cuts = e.weights.data() + static_cast<size_t>(b * 2) * ring;
+            T* lifts = cuts + ring;
+            for (int j = 0; j < n; ++j)
+            {
+                const double d = static_cast<double>(gains[j]);
+                const auto at = static_cast<size_t>((e.weightPos + j) & e.weightMask);
+                cuts[at] = static_cast<T>(cutWeight(st, d));
+                lifts[at] = static_cast<T>(liftWeight(st, d));
+            }
+            meterGainDb_[b].store(gains[n - 1], std::memory_order_relaxed);
+        }
+
+        int done = 0;
+        while (done < n)
+        {
+            const int run = std::min(n - done, e.bank.room());
+
+            // What the bank hears: the channels (a non-finite sample as
+            // silence), and the middle and the sides of the pair.
+            const T* heard[kMaxChannels + 2] = {};
+            for (int ch = 0; ch < lineChannels; ++ch)
+            {
+                const T* x = audio.getChannel(ch) + start + done;
+                T* line = e.lines[static_cast<size_t>(ch)].data();
+                for (int j = 0; j < run; ++j) line[j] = std::isfinite(x[j]) ? x[j] : T(0);
+                heard[ch] = line;
+            }
+            if (pair && lineChannels >= 1)
+            {
+                T* middle = e.lines[static_cast<size_t>(kMaxChannels)].data();
+                T* sides = e.lines[static_cast<size_t>(kMaxChannels + 1)].data();
+                const T* left = e.lines[0].data();
+                if (lineChannels >= 2)
+                {
+                    const T* right = e.lines[1].data();
+                    for (int j = 0; j < run; ++j)
+                    {
+                        middle[j] = (left[j] + right[j]) * T(0.5);
+                        sides[j] = (left[j] - right[j]) * T(0.5);
+                    }
+                    heard[e.channels + 1] = sides;
+                }
+                else
+                {
+                    std::copy_n(left, run, middle);     // one channel is its own middle
+                }
+                heard[e.channels] = middle;
+            }
+
+            // The signal, late.
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* y = audio.getChannel(ch) + start + done;
+                for (int j = 0; j < run; ++j)
+                {
+                    e.dry[ch].push(y[j]);
+                    y[j] = e.dry[ch].read(e.latency);
+                }
+            }
+
+            // What each branch of each band adds.
+            for (int k = 0; k < numFirst_ + numSecond_; ++k)
+            {
+                const int b = k < numFirst_ ? first_[static_cast<size_t>(k)] : second_[static_cast<size_t>(k - numFirst_)];
+                const Placement where = states_[b].cfg.placement;
+                const T* sideWeights[kLinearBranches] = { nullptr, e.weights.data() + static_cast<size_t>(b * 2) * ring,
+                                                          e.weights.data() + static_cast<size_t>(b * 2 + 1) * ring };
+                for (int branch = 0; branch < kLinearBranches; ++branch)
+                {
+                    const int index = b * kLinearBranches + branch;
+                    if (e.bank.isKernelSilent(index)) continue;
+                    const T* weights = sideWeights[branch];
+                    const auto add = [&](int line, int ch, T sign) noexcept {
+                        if (ch >= nCh) return;
+                        const T* wet = e.bank.tap(index, line);
+                        T* y = audio.getChannel(ch) + start + done;
+                        if (weights == nullptr)
+                        {
+                            for (int j = 0; j < run; ++j) y[j] += sign * wet[j];
+                            return;
+                        }
+                        for (int j = 0; j < run; ++j)
+                            y[j] += sign * weights[static_cast<size_t>((e.weightPos + done + j - delay) & e.weightMask)] * wet[j];
+                    };
+                    switch (where)
+                    {
+                        case Placement::Left:  add(0, 0, T(1)); break;
+                        case Placement::Right: add(1, 1, T(1)); break;
+                        case Placement::Mid:
+                            add(pair ? e.channels : 0, 0, T(1));
+                            if (pair) add(e.channels, 1, T(1));
+                            break;
+                        case Placement::Side:
+                            if (pair) { add(e.channels + 1, 0, T(1)); add(e.channels + 1, 1, T(-1)); }
+                            break;
+                        default:
+                            for (int ch = 0; ch < lineChannels; ++ch) add(ch, ch, T(1));
+                            break;
+                    }
+                }
+            }
+
+            e.bank.push(heard, run);
+            done += run;
+        }
+        e.weightPos = (e.weightPos + n) & e.weightMask;
     }
 
     /**
@@ -1317,6 +1721,12 @@ private:
             filters.cut.reset();
             filters.lift.reset();
         }
+        if (linear_)
+        {
+            const size_t ring = static_cast<size_t>(linear_->weightMask) + 1u;
+            std::fill_n(linear_->weights.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(b * 2) * ring),
+                        2u * ring, T(0));
+        }
     }
 
     /** @brief A band that comes into play: clean, and designed again at the next update. */
@@ -1346,18 +1756,65 @@ private:
         return range;
     }
 
-    /** @brief The filter of a band's shape at one gain, fitted to its analog curve. */
-    [[nodiscard]] BiquadCoeffs designShape(const BandConfig& cfg, double gainDb) const noexcept
+    /** @brief The analog prototype of a band's shape at one gain. */
+    [[nodiscard]] static AnalogSection prototypeOf(const BandConfig& cfg, double gainDb) noexcept
     {
         const double hz = std::clamp(static_cast<double>(cfg.frequency), 1.0, 80000.0);
         const double q = std::max(static_cast<double>(cfg.q), 0.025);
         const double gain = std::clamp(gainDb, -96.0, 96.0);
         switch (cfg.shape)
         {
-            case BandShape::LowShelf:  return FilterDesign::digital(AnalogSection::lowShelf(hz, gain), designBand_);
-            case BandShape::HighShelf: return FilterDesign::digital(AnalogSection::highShelf(hz, gain), designBand_);
-            default:                   return FilterDesign::digital(AnalogSection::peak(hz, q, gain), designBand_);
+            case BandShape::LowShelf:  return AnalogSection::lowShelf(hz, gain);
+            case BandShape::HighShelf: return AnalogSection::highShelf(hz, gain);
+            default:                   return AnalogSection::peak(hz, q, gain);
         }
+    }
+
+    /** @brief The filter of a band's shape at one gain, fitted to its analog curve. */
+    [[nodiscard]] BiquadCoeffs designShape(const BandConfig& cfg, double gainDb) const noexcept
+    {
+        return FilterDesign::digital(prototypeOf(cfg, gainDb), designBand_);
+    }
+
+    /** @brief What a band is made of with fixed filters: whether it rests away from 0 dB, and the end of each side. */
+    struct Sides
+    {
+        bool rests = false, cuts = false, lifts = false;
+        double cutRange = 0.0, liftRange = 0.0;
+    };
+
+    [[nodiscard]] static Sides sidesOf(const BandConfig& cfg) noexcept
+    {
+        Sides s;
+        s.cutRange = rangeTowards(cfg, false);
+        s.liftRange = rangeTowards(cfg, true);
+        s.cuts = s.cutRange > kRestDb;
+        s.lifts = s.liftRange > kRestDb;
+        s.rests = std::abs(static_cast<double>(cfg.gain)) > kRestDb;
+        return s;
+    }
+
+    /** @brief Stores the sides of a band and the scales that turn its gain into the weight of each end. */
+    static void adoptSides(BandState& st, const Sides& s) noexcept
+    {
+        st.rests = s.rests;
+        st.cuts = s.cuts;
+        st.lifts = s.lifts;
+        st.cutScale = s.cuts ? 1.0 / (1.0 - std::pow(10.0, -s.cutRange / 20.0)) : 0.0;
+        st.liftScale = s.lifts ? 1.0 / (std::pow(10.0, s.liftRange / 20.0) - 1.0) : 0.0;
+        st.designed = true;
+    }
+
+    /** @brief The weight of the end of the cuts for a gain of d dB from the rest (0 for a lift). */
+    [[nodiscard]] static double cutWeight(const BandState& st, double d) noexcept
+    {
+        return (d < 0.0 && st.cuts) ? std::min((1.0 - fastPow10(d * 0.05)) * st.cutScale, 1.0) : 0.0;
+    }
+
+    /** @brief The weight of the end of the lifts for a gain of d dB from the rest (0 for a cut). */
+    [[nodiscard]] static double liftWeight(const BandState& st, double d) noexcept
+    {
+        return (d > 0.0 && st.lifts) ? std::min((fastPow10(d * 0.05) - 1.0) * st.liftScale, 1.0) : 0.0;
     }
 
     /**
@@ -1394,9 +1851,9 @@ private:
         const BandConfig& cfg = st.cfg;
         MixedBand& filters = mixedEngine_->bands[static_cast<size_t>(b)];
         const double rest = static_cast<double>(cfg.gain);
-        const double cutRange = rangeTowards(cfg, false), liftRange = rangeTowards(cfg, true);
-        const bool cuts = cutRange > kRestDb, lifts = liftRange > kRestDb;
-        const bool rests = std::abs(rest) > kRestDb;
+        const Sides sides = sidesOf(cfg);
+        const bool rests = sides.rests, cuts = sides.cuts, lifts = sides.lifts;
+        const double cutRange = sides.cutRange, liftRange = sides.liftRange;
 
         // A filter that was out of the band comes in clean; one that was
         // playing glides to its new design.
@@ -1410,12 +1867,7 @@ private:
         if (cuts) place(filters.cut, designEnd(cfg, -cutRange), st.cuts, cuts);
         if (lifts) place(filters.lift, designEnd(cfg, liftRange), st.lifts, lifts);
 
-        st.rests = rests;
-        st.cuts = cuts;
-        st.lifts = lifts;
-        st.cutScale = cuts ? 1.0 / (1.0 - std::pow(10.0, -cutRange / 20.0)) : 0.0;
-        st.liftScale = lifts ? 1.0 / (std::pow(10.0, liftRange / 20.0) - 1.0) : 0.0;
-        st.designed = true;
+        adoptSides(st, sides);
     }
 
     void updateBandInternalState(int b, double fs) noexcept
@@ -1531,13 +1983,22 @@ private:
             st.knee = static_cast<T>(std::min(kKneePerOctave * (1.0 + octaves) * std::sqrt(range / 12.0), 40.0));
         }
 
-        if (mixedActive_) designMixedBand(b, fs);
+        if (linear_)
+        {
+            // The kernels of the band are designed again, one per block.
+            adoptSides(st, sidesOf(cfg));
+            linear_->pending[static_cast<size_t>(b)].fill(true);
+        }
+        else if (mixedActive_)
+        {
+            designMixedBand(b, fs);
+        }
     }
 
     void updateLookahead() noexcept
     {
         if (sampleRate_ > 0) {
-            int samples = static_cast<int>(sampleRate_ * oversamplingFactor_ * lookaheadMs_ / T(1000));
+            int samples = static_cast<int>(sampleRate_ * runFactor() * lookaheadMs_ / T(1000));
             lookaheadSamples_.store(samples, std::memory_order_relaxed);
         }
     }
@@ -1773,6 +2234,9 @@ private:
     std::atomic<bool> mixedWanted_ { false };    ///< setMixedBands().
     bool mixedActive_ = false;                   ///< The engine the audio thread is running.
     std::unique_ptr<MixedEngine> mixedEngine_;
+    std::unique_ptr<LinearEngine> linear_;       ///< The linear-phase mode; null when it is off.
+    bool linearWanted_ = false;                  ///< setLinearPhase(): applied by prepare().
+    int linearTaps_ = 0;                         ///< Kernel length asked for; 0 is automatic.
     FilterDesign::Band designBand_;              ///< The frequencies the mixed bands are fitted over.
 };
 

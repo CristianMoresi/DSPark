@@ -1531,10 +1531,48 @@ inline EffectSlot makeTapeMachine()
     s.addSlider("Head Bump", 0, 1, 0.5f, "");
     s.addSlider("Wow/Flutter", 0, 1, 0.15f, "");
     s.addSlider("Mix", 0, 1, 1, "");
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    // The machine around the tape (indices 8 to 24). Order of every choice
+    // MUST match its enum in dspark::TapeMachine.
+    s.addChoice("Transport", {"Modulated","Speed"}, 0);                    // 8
+    s.addSlider("Hiss", -120, -40, -120, "dBFS");                          // 9
+    s.addSlider("Hum", -120, -40, -120, "dBFS");                           // 10
+    s.addChoice("Mains", {"50 Hz","60 Hz"}, 0);                            // 11
+    s.addSlider("Crosstalk", -120, -30, -120, "dB");                       // 12
+    s.addSlider("Asymmetry", 0, 1, 0, "");                                 // 13
+    s.addSlider("Transformer", 0, 1, 0, "");                               // 14
+    s.addChoice("Head", {"Bump","Contour"}, 0);                            // 15
+    s.addChoice("Electronics", {"Ideal","Circuit"}, 0);                    // 16
+    s.addSlider("Align HF", -6, 6, 0, "dB");                               // 17
+    s.addSlider("Align LF", -6, 6, 0, "dB");                               // 18
+    s.addChoice("Formulation", {"Classic","High Output","Vintage"}, 0);    // 19
+    s.addChoice("Track", {"Half","Full","Quarter"}, 0);                    // 20
+    s.addSlider("Calibration", 0, 9, 0, "dB");                             // 21
+    s.addChoice("Monitor", {"Repro","Sync","Input"}, 0);                   // 22
+    s.addToggle("Auto Oversampling", false);                               // 23
+    // setAutomaticOversampling() is a setup call (it re-prepares): the UI
+    // records the wish and the audio thread applies it between blocks.
+    auto autoWanted  = std::make_shared<std::atomic<int>>(0);
+    auto autoApplied = std::make_shared<std::atomic<int>>(0);
+    auto hum = std::make_shared<std::atomic<float>>(-120.0f);
+    auto mains = std::make_shared<std::atomic<int>>(0);
+    auto align = std::make_shared<std::array<std::atomic<float>, 2>>();
+    s.prepareFn = [p, autoWanted, autoApplied](auto& sp) {
+        const int want = autoWanted->load(std::memory_order_relaxed);
+        p->setAutomaticOversampling(want != 0);
+        autoApplied->store(want, std::memory_order_relaxed);
+        p->prepare(sp);
+    };
+    s.processFn = [p, autoWanted, autoApplied](auto b) {
+        const int want = autoWanted->load(std::memory_order_relaxed);
+        if (want != autoApplied->load(std::memory_order_relaxed)) {
+            p->setAutomaticOversampling(want != 0);   // setup call - safe here (audio thread)
+            if (want == 0) p->setOversampling(4);
+            autoApplied->store(want, std::memory_order_relaxed);
+        }
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, autoWanted, hum, mains, align](int i, float v) {
         using TM = dspark::TapeMachine<float>;
         switch (i) {
             case 0: p->setDrive(v); break;
@@ -1545,6 +1583,22 @@ inline EffectSlot makeTapeMachine()
             case 5: p->setHeadBump(v); break;
             case 6: p->setWowFlutter(v); break;
             case 7: p->setMix(v); break;
+            case 8: p->setTransport(static_cast<TM::Transport>(static_cast<int>(v))); break;
+            case 9: p->setNoise(v); break;
+            case 10: hum->store(v); p->setHum(v, static_cast<TM::Mains>(mains->load())); break;
+            case 11: mains->store(static_cast<int>(v)); p->setHum(hum->load(), static_cast<TM::Mains>(static_cast<int>(v))); break;
+            case 12: p->setCrosstalk(v); break;
+            case 13: p->setAsymmetry(v); break;
+            case 14: p->setTransformer(v); break;
+            case 15: p->setHeadModel(static_cast<TM::HeadModel>(static_cast<int>(v))); break;
+            case 16: p->setElectronics(static_cast<TM::Electronics>(static_cast<int>(v))); break;
+            case 17: (*align)[0].store(v); p->setAlignment(v, (*align)[1].load()); break;
+            case 18: (*align)[1].store(v); p->setAlignment((*align)[0].load(), v); break;
+            case 19: p->setFormulation(static_cast<TM::Formulation>(static_cast<int>(v))); break;
+            case 20: p->setTrackFormat(static_cast<TM::TrackFormat>(static_cast<int>(v))); break;
+            case 21: p->setCalibrationLevel(v); break;
+            case 22: p->setMonitor(static_cast<TM::Monitor>(static_cast<int>(v))); break;
+            case 23: autoWanted->store(v > 0.5f ? 1 : 0, std::memory_order_relaxed); break;
         }
     };
     return s;

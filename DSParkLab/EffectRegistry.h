@@ -379,6 +379,7 @@ inline EffectSlot makeCompressor()
     s.addSlider("Gain Smoothing", 0, 50, 0, "ms");
     s.addToggle("Delta Listen", false);   // 33: what the compression takes out
     s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // 34: the pair read as its dominant component
+    s.addChoice("Opto Cell", {"Two stages","Three stages"}, 0); // 35: the Opto character with a medium memory
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -436,6 +437,7 @@ inline EffectSlot makeCompressor()
             case 32: p->setGainSmoothing(v); break;
             case 33: p->setDelta(v > 0.5f); break;
             case 34: p->setLinkMode(static_cast<dspark::Compressor<float>::LinkMode>(static_cast<int>(v))); break;
+            case 35: p->setOptoCell(static_cast<dspark::Compressor<float>::OptoCell>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -777,6 +779,7 @@ inline EffectSlot makeMultibandSaturation()
         s.addToggle((n + "Mute").c_str(), false);
         s.addToggle((n + "Solo").c_str(), false);
     }
+    s.addChoice("Crossover Structure", {"Direct form","Ladder"}, 0);                        // index 26
     s.prepareFn = [p, modeApplied](auto& sp) {
         p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(modeApplied->load(std::memory_order_relaxed)));
         p->prepare(sp);
@@ -799,6 +802,7 @@ inline EffectSlot makeMultibandSaturation()
         if (i >= 1 && i <= 3) { k[static_cast<size_t>(i - 1)] = v; placeSplits(); return; }
         if (i == 4) { for (int b = 0; b < 4; ++b) p->setBandAlgorithm(b, static_cast<dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); return; }
         if (i == 5) { modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); return; }
+        if (i == 26) { p->setCrossoverStructure(static_cast<MbSat::Crossover::Structure>(static_cast<int>(v))); return; }
         const int band = (i - 6) / 5, field = (i - 6) % 5;
         switch (field) {
             case 0: p->setBandDrive(band, v); break;
@@ -1520,6 +1524,8 @@ inline EffectSlot makeMultibandCompressor()
     s.addSlider("Release", 10, 1000, 120, "ms");           // 9
     // Order MUST match CrossoverFilter::FilterMode (MinimumPhase=0, LinearPhase=1).
     s.addChoice("Crossover", {"Minimum phase","Linear phase"}, 0); // 10
+    // Order MUST match CrossoverFilter::Structure (DirectForm=0, Ladder=1).
+    s.addChoice("Crossover Structure", {"Direct form","Ladder"}, 0); // 11
     s.prepareFn = [p](auto& sp) {
         p->prepare(sp);
         p->setNumBands(3);
@@ -1541,6 +1547,7 @@ inline EffectSlot makeMultibandCompressor()
             case 8: for (int b = 0; b < 3; ++b) p->setBandAttack(b, v); break;
             case 9: for (int b = 0; b < 3; ++b) p->setBandRelease(b, v); break;
             case 10: p->setCrossoverMode(static_cast<typename dspark::CrossoverFilter<float, 12>::FilterMode>(static_cast<int>(v))); break;
+            case 11: p->setCrossoverStructure(static_cast<typename dspark::CrossoverFilter<float, 12>::Structure>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() {

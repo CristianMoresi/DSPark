@@ -476,6 +476,15 @@ private:
         if (sel && sel->multibandFn)
             drawMultiband(dl, sel, p0, w, h);
         if (sel) drawLegend(dl, sel, p0, w);
+        // An effect that is not in the chain is not heard: say so where the eye is.
+        if (sel && !sel->enabled.get())
+        {
+            const char* msg = "Off: this effect is not in the chain. Press On (or E) to hear it.";
+            const ImVec2 ts = ImGui::CalcTextSize(msg);
+            const ImVec2 a(p0.x + px(10.0f), p0.y + px(8.0f));
+            dl->AddRectFilled(a, ImVec2(a.x + ts.x + px(16.0f), a.y + ts.y + px(10.0f)), IM_COL32(120, 40, 34, 235), px(5.0f));
+            dl->AddText(ImVec2(a.x + px(8.0f), a.y + px(5.0f)), IM_COL32(255, 232, 220, 255), msg);
+        }
 
         // Readout under the cursor: the frequency and the curve there.
         if (hovered && dragNode_ < 0)
@@ -744,7 +753,7 @@ private:
             const float gr = std::clamp(-sel->gainReductionDbFn(), 0.0f, 48.0f) + 0.0f;
             grHistory_[static_cast<size_t>(grHead_)] = gr;
             grHead_ = (grHead_ + 1) % kHistory;
-            drawGrHistory(gr, graphW, innerH);
+            drawGrHistory(gr, graphW, innerH, sel->statusFn ? sel->statusFn() : std::string());
         }
         else
             drawScope(engine, graphW, innerH);
@@ -758,7 +767,7 @@ private:
         ImGui::EndChild();
     }
 
-    void drawGrHistory(float now, float w, float h)
+    void drawGrHistory(float now, float w, float h, const std::string& status)
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -788,6 +797,13 @@ private:
         dl->AddText(ImVec2(p0.x + px(6.0f), p1.y - ImGui::GetTextLineHeight() - px(4.0f)), IM_COL32(215, 220, 230, 255), b);
         std::snprintf(b, sizeof(b), "%.0f dB", scale);
         dl->AddText(ImVec2(p1.x - ImGui::CalcTextSize(b).x - px(6.0f), p1.y - ImGui::GetTextLineHeight() - px(4.0f)), IM_COL32(120, 126, 140, 255), b);
+        if (!status.empty())
+        {
+            const ImVec2 ts = ImGui::CalcTextSize(status.c_str());
+            const ImVec2 a(p1.x - ts.x - px(12.0f), p0.y + px(5.0f));
+            dl->AddRectFilled(a, ImVec2(p1.x - px(4.0f), a.y + ts.y + px(6.0f)), IM_COL32(20, 22, 28, 220), px(3.0f));
+            dl->AddText(ImVec2(a.x + px(4.0f), a.y + px(3.0f)), IM_COL32(255, 214, 140, 255), status.c_str());
+        }
         dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
     }
 

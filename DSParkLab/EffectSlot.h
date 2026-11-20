@@ -135,6 +135,10 @@ public:
     std::function<void(const float* freqsHz, float* magsDb, int n,
                        double sampleRate, const float* paramValues)> targetMagnitudeFn;
 
+    // A line of live state shown over the gain-reduction history (e.g. the
+    // threshold a compressor is using right now).
+    std::function<std::string()> statusFn;
+
     // A second live curve, drawn thinner in another colour (e.g. the second
     // channel of a processor that treats the two apart). Same signature.
     std::function<void(const float* freqsHz, float* magsDb, int n,

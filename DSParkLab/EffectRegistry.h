@@ -7,8 +7,9 @@
 #include "EffectSlot.h"
 
 #include <array>
-#include <string>
+#include <complex>
 #include <memory>
+#include <string>
 
 namespace dsplab {
 
@@ -289,6 +290,38 @@ inline EffectSlot makeLadderFilter()
             case 4: p->setSaturation(static_cast<typename dspark::LadderFilter<float>::Saturation>(static_cast<int>(v))); break;
         }
     };
+    // The small-signal response of the ladder, from the same equations the
+    // filter runs (four one-poles of the bilinear transform, the loop gain
+    // k = 4 x resonance resolved without delay): L = 1 / (1 + s), the loop
+    // input u = 1 / (1 + k L^4), and each mode's tap of the stages. Drive
+    // only shapes the loop when it saturates, so it is not in the curve.
+    s.magnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+        using C = std::complex<double>;
+        const double fc = std::clamp(static_cast<double>(v[0]), 20.0, 0.49 * sr);
+        const double k = 4.0 * std::clamp(static_cast<double>(v[1]), 0.0, 1.0);
+        const int mode = std::clamp(static_cast<int>(v[3]), 0, 5);
+        const double wc = std::tan(3.14159265358979323846 * fc / sr);
+        for (int i = 0; i < n; ++i)
+        {
+            const double fi = std::min(static_cast<double>(f[i]), 0.4999 * sr);
+            const C sj(0.0, std::tan(3.14159265358979323846 * fi / sr) / wc);
+            const C L = 1.0 / (1.0 + sj);
+            const C u = 1.0 / (1.0 + k * L * L * L * L);
+            C h;
+            switch (mode)
+            {
+                case 0: h = L * u; break;
+                case 1: h = L * L * u; break;
+                case 2: h = L * L * L * u; break;
+                case 3: h = L * L * L * L * u; break;
+                case 4: h = (L - L * L * L) * u; break;
+                default: { const C hp = 1.0 - L; h = hp * hp * hp * hp * u; break; }
+            }
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, std::abs(h))));
+        }
+    };
+    s.curveNodes = { {0, -1, -1} };   // X = cutoff (the node rides the curve)
+    s.liveLabel = "Response (small signal)";
     return s;
 }
 
@@ -313,6 +346,48 @@ inline EffectSlot makeStateVariableFilter()
             case 3: p->setMode(static_cast<typename dspark::StateVariableFilter<float>::Mode>(static_cast<int>(v))); break;
         }
     };
+    // The response of the state-variable filter, from the same equations it
+    // runs: the bilinear transform pre-warped at the cutoff (the shelves by
+    // the square root of the gain, as the filter does), damping R = 1 / (2Q)
+    // (the bell's narrowed or widened by the gain), and each mode's mix of
+    // the low-pass, band-pass and high-pass outputs.
+    s.magnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+        using C = std::complex<double>;
+        const double pi = 3.14159265358979323846;
+        const double fc = std::clamp(static_cast<double>(v[0]), 20.0, 0.499 * sr);
+        const double R = 1.0 / (2.0 * std::max(0.1, static_cast<double>(v[1])));
+        const double db = static_cast<double>(v[2]);
+        const double A = std::pow(10.0, std::fabs(db) / 40.0);
+        const double As = db >= 0.0 ? A : 1.0 / A;
+        const int mode = std::clamp(static_cast<int>(v[3]), 0, 7);
+        double g = std::tan(pi * fc / sr);
+        if (mode == 6) g /= std::sqrt(As);
+        if (mode == 7) g *= std::sqrt(As);
+        const double Rb = db >= 0.0 ? R / A : R * A;
+        const double r = mode == 5 ? Rb : R;
+        for (int i = 0; i < n; ++i)
+        {
+            const double fi = std::min(static_cast<double>(f[i]), 0.4999 * sr);
+            const C sj(0.0, std::tan(pi * fi / sr) / g);
+            const C d = sj * sj + 2.0 * r * sj + 1.0;
+            const C lp = 1.0 / d, bp = sj / d, hp = sj * sj / d;
+            C h;
+            switch (mode)
+            {
+                case 0: h = lp; break;
+                case 1: h = hp; break;
+                case 2: h = bp; break;
+                case 3: h = lp + hp; break;
+                case 4: h = lp + hp - 2.0 * R * bp; break;
+                case 5: h = 1.0 + (db >= 0.0 ? A * A - 1.0 : 1.0 / (A * A) - 1.0) * 2.0 * Rb * bp; break;
+                case 6: h = As * As * lp + As * 2.0 * R * bp + hp; break;
+                default: h = lp + As * 2.0 * R * bp + As * As * hp; break;
+            }
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, std::abs(h))));
+        }
+    };
+    s.curveNodes = { {0, 2, 1} };   // X = cutoff, Y = gain (bell and shelves), wheel = Q
+    s.liveLabel = "Response";
     return s;
 }
 
@@ -421,9 +496,10 @@ inline EffectSlot makeCompressor()
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, key](int i, float v) {
+    auto thrKnob = std::make_shared<std::atomic<float>>(0.0f);
+    s.setParamFn = [p, key, thrKnob](int i, float v) {
         switch(i) {
-            case 0: p->setThreshold(v); break;
+            case 0: p->setThreshold(v); thrKnob->store(v, std::memory_order_relaxed); break;
             case 1: p->setRatio(v); break;
             case 2: p->setAttack(v); break;
             case 3: p->setRelease(v); break;
@@ -483,6 +559,18 @@ inline EffectSlot makeCompressor()
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
+    // The threshold in use: with Auto Threshold it is the programme's recent
+    // peak plus the Threshold knob, so the knob reads as "dB under the peak".
+    s.statusFn = [p, thrKnob]() {
+        char b[96];
+        const double now = static_cast<double>(p->getThresholdInUseDb());
+        if (p->isAutoThreshold())
+            std::snprintf(b, sizeof(b), "Threshold now %.1f dBFS (%.1f dB under the recent peak)",
+                          now, 0.0 - static_cast<double>(thrKnob->load(std::memory_order_relaxed)));
+        else
+            std::snprintf(b, sizeof(b), "Threshold %.1f dBFS", now);
+        return std::string(b);
+    };
     s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18 });
     s.group("Character", { 8, 9, 10, 11, 12, 19, 34, 35 });
     s.group("Timing", { 13, 14, 15, 20, 21, 22, 23, 32 });
@@ -1438,42 +1526,41 @@ inline EffectSlot makeDynamicEQ()
     using DEQ = dspark::DynamicEQ<float>;
     auto p = std::make_shared<DEQ>();
 
-    // UI mirror: per band [Freq, Q, Threshold, Amount, Ratio, Attack, Release,
-    // Below, Type, Rest Gain, Knee, Channels, Timing, Relative]. Amount is signed:
-    // +dB boosts the band when triggered, -dB cuts it. It is the node's Y axis,
-    // so you drag a band UP to boost or DOWN to cut. Type selects the dynamic
-    // filter shape (Bell / Low Shelf / High Shelf), matching DynamicEQ::BandShape
-    // order. The first nine are the controls 0-17 (two bands); the engine toggle
-    // is control 18 and the last five of each band follow it.
-    constexpr int kFields = 14;
+    // Per band, 17 controls: what the band is (frequency, Q, type, threshold,
+    // knee, rest gain, channels, timing, relative threshold), then what it
+    // does ABOVE the threshold and what it does BELOW it, each side with its
+    // ratio (1: the side does nothing), its amount (+dB raises the band, -dB
+    // cuts it, the size is the most it moves), its attack and its release.
+    constexpr int kFields = 17;
+    constexpr int kAboveRatio = 9, kAboveAmount = 10, kBelowRatio = 13, kBelowAmount = 14;
     auto ui = std::make_shared<std::array<std::array<float, kFields>, 2>>();
-    (*ui)[0] = {  200.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    (*ui)[1] = { 3000.0f, 1.0f, -20.0f, -6.0f, 3.0f, 10.0f, 80.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    (*ui)[0] = {  200.0f, 1.0f, 0.0f, -20.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                  3.0f, -6.0f, 10.0f, 80.0f,   1.0f, 6.0f, 10.0f, 120.0f };
+    (*ui)[1] = { 3000.0f, 1.0f, 0.0f, -20.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                  3.0f, -6.0f, 10.0f, 80.0f,   1.0f, 6.0f, 10.0f, 120.0f };
 
     auto buildCfg = [](const std::array<float, kFields>& v) {
         DEQ::BandConfig c{};
         c.frequency = v[0];
         c.q         = std::max(0.1f, v[1]);
-        c.threshold = v[2];
-        c.shape     = static_cast<DEQ::BandShape>(
-                          std::clamp(static_cast<int>(v[8]), 0, 2));
+        c.shape     = static_cast<DEQ::BandShape>(std::clamp(static_cast<int>(v[2]), 0, 2));
+        c.threshold = v[3];
+        c.knee      = v[4];                   // below 0: the automatic knee
+        c.gain      = v[5];
+        c.scope     = static_cast<DEQ::Scope>(std::clamp(static_cast<int>(v[6]), 0, 4));
+        c.timing    = static_cast<DEQ::Timing>(std::clamp(static_cast<int>(v[7]), 0, 1));
+        c.relativeThreshold = v[8] > 0.5f;
         c.enabled   = true;
-        const float amount = v[3], ratio = std::max(1.0f, v[4]), atk = v[5], rel = v[6];
-        const bool below = v[7] > 0.5f;       // act when below threshold instead of above
-        const bool boost = amount > 0.0f;     // sign of Amount = boost / cut
-        const float range = std::fabs(amount);
-        c.aboveRatio = 1.0f; c.belowRatio = 1.0f;
-        c.aboveRangeDb = range; c.belowRangeDb = range;
-        c.aboveAttackMs = atk; c.belowAttackMs = atk;
-        c.aboveReleaseMs = rel; c.belowReleaseMs = rel;
-        c.aboveBoost = false; c.belowBoost = false;
-        if (below) { c.belowRatio = ratio; c.belowBoost = boost; }
-        else       { c.aboveRatio = ratio; c.aboveBoost = boost; }
-        c.gain      = v[9];
-        c.knee      = v[10];                  // below 0: the automatic knee
-        c.scope = static_cast<DEQ::Scope>(std::clamp(static_cast<int>(v[11]), 0, 4));
-        c.timing    = static_cast<DEQ::Timing>(std::clamp(static_cast<int>(v[12]), 0, 1));
-        c.relativeThreshold = v[13] > 0.5f;
+        c.aboveRatio = std::max(1.0f, v[kAboveRatio]);
+        c.aboveRangeDb = std::fabs(v[kAboveAmount]);
+        c.aboveBoost = v[kAboveAmount] > 0.0f;
+        c.aboveAttackMs = v[11];
+        c.aboveReleaseMs = v[12];
+        c.belowRatio = std::max(1.0f, v[kBelowRatio]);
+        c.belowRangeDb = std::fabs(v[kBelowAmount]);
+        c.belowBoost = v[kBelowAmount] > 0.0f;
+        c.belowAttackMs = v[15];
+        c.belowReleaseMs = v[16];
         return c;
     };
 
@@ -1481,39 +1568,38 @@ inline EffectSlot makeDynamicEQ()
     s.name = "Dynamic EQ"; s.category = "Filters";
     for (int b = 0; b < 2; ++b)
     {
-        const char* pfx = (b == 0) ? "B1 " : "B2 ";
-        auto nm = [pfx](const char* n){ static char buf[24]; std::snprintf(buf, sizeof(buf), "%s%s", pfx, n); return buf; };
-        const auto& d = (*ui)[b];
-        s.addSlider(nm("Freq"),      20, 20000, d[0], "Hz", true);
-        s.addSlider(nm("Q"),       0.2f,    10, d[1], "");
-        s.addSlider(nm("Threshold"), -60,    0, d[2], "dB");
-        s.addSlider(nm("Amount"),    -24,   24, d[3], "dB");   // node Y: +boost / -cut
-        s.addSlider(nm("Ratio"),       1,   12, d[4], ":1");
-        s.addSlider(nm("Attack"),   0.1f,  100, d[5], "ms");
-        s.addSlider(nm("Release"),     5,  500, d[6], "ms");
-        s.addToggle(nm("Below Thr"), false);
-        s.addChoice(nm("Type"), {"Bell","Low Shelf","High Shelf"}, 0);
+        const std::string pfx = "B" + std::to_string(b + 1) + " ";
+        const auto& d = (*ui)[static_cast<std::size_t>(b)];
+        const auto nm = [&](const char* n) { return pfx + n; };
+        s.addSlider(nm("Freq").c_str(),      20, 20000, d[0], "Hz", true);
+        s.addSlider(nm("Q").c_str(),       0.2f,    10, d[1], "");
+        s.addChoice(nm("Type").c_str(), {"Bell","Low Shelf","High Shelf"}, 0);
+        s.addSlider(nm("Threshold").c_str(), -60,    0, d[3], "dB");
+        s.addSlider(nm("Knee").c_str(),       -1,   24, d[4], "dB");     // -1: automatic
+        s.addSlider(nm("Rest Gain").c_str(), -24,   24, d[5], "dB");
+        s.addChoice(nm("Channels").c_str(), {"Stereo","Left","Right","Mid","Side"}, 0);
+        s.addChoice(nm("Timing").c_str(), {"Manual","Program"}, 0);
+        s.addToggle(nm("Relative Thr").c_str(), false);
+        s.addSlider(nm("Above Ratio").c_str(),   1, 12, d[9], ":1");     // 1: no action above
+        s.addSlider(nm("Above Amount").c_str(), -24, 24, d[10], "dB");   // node Y: +raise / -cut
+        s.addSlider(nm("Above Attack").c_str(), 0.1f, 100, d[11], "ms");
+        s.addSlider(nm("Above Release").c_str(),   5, 500, d[12], "ms");
+        s.addSlider(nm("Below Ratio").c_str(),   1, 12, d[13], ":1");    // 1: no action below
+        s.addSlider(nm("Below Amount").c_str(), -24, 24, d[14], "dB");
+        s.addSlider(nm("Below Attack").c_str(), 0.1f, 100, d[15], "ms");
+        s.addSlider(nm("Below Release").c_str(),   5, 500, d[16], "ms");
     }
-    s.addToggle("Mixed Bands", false);
-    for (int b = 0; b < 2; ++b)
-    {
-        const char* pfx = (b == 0) ? "B1 " : "B2 ";
-        auto nm = [pfx](const char* n){ static char buf[24]; std::snprintf(buf, sizeof(buf), "%s%s", pfx, n); return buf; };
-        s.addSlider(nm("Rest Gain"),  -24, 24, 0.0f, "dB");
-        s.addSlider(nm("Knee"),        -1, 24, 0.0f, "dB");     // -1: automatic
-        s.addChoice(nm("Channels"), {"Stereo","Left","Right","Mid","Side"}, 0);
-        s.addChoice(nm("Timing"), {"Manual","Program"}, 0);
-        s.addToggle(nm("Relative Thr"), false);
-    }
-    // Linear phase (control 29) is a setup call: the UI records the wish and
-    // the audio thread prepares the processor again between blocks.
+    constexpr int kGlobal = 2 * kFields;      // 34: the controls of the whole equalizer
+    s.addToggle("Mixed Bands", false);        // 34
+    s.addToggle("Linear Phase", false);       // 35
+    s.addToggle("Hear Removed", false);       // 36: what the bands take out (or add)
+    s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // 37: stereo bands read the dominant component
+    s.addChoice("Structure", {"Direct Form","Ladder"}, 0); // 38: the band filter as a normalized ladder
+    // Linear phase is a setup call: the interface records the wish and the
+    // audio thread prepares the processor again between blocks.
     auto linearWanted  = std::make_shared<std::atomic<bool>>(false);
     auto linearApplied = std::make_shared<std::atomic<bool>>(false);
     auto lastSpec = std::make_shared<dspark::AudioSpec>();
-    s.addToggle("Linear Phase", false);
-    s.addToggle("Hear Removed", false);   // what the bands take out
-    s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // stereo bands read the dominant component
-    s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // the band filter as a normalized ladder
     s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
         const bool want = linearWanted->load(std::memory_order_relaxed);
         p->setLinearPhase(want);
@@ -1535,23 +1621,24 @@ inline EffectSlot makeDynamicEQ()
     };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, ui, buildCfg, linearWanted](int i, float v) {
-        const int oldCount = 2 * 9;
-        if (i == oldCount) { p->setMixedBands(v > 0.5f); return; }
-        if (i == oldCount + 1 + 2 * 5) { linearWanted->store(v > 0.5f, std::memory_order_relaxed); return; }
-        if (i == oldCount + 2 + 2 * 5) { p->setRemovalListen(v > 0.5f); return; }
-        if (i == oldCount + 3 + 2 * 5) { p->setLinkMode(static_cast<dspark::DynamicEQ<float>::LinkMode>(static_cast<int>(v))); return; }
-        if (i == oldCount + 4 + 2 * 5) { p->setStructure(static_cast<dspark::DynamicEQ<float>::Structure>(static_cast<int>(v))); return; }
-        int band = 0, prm = 0;
-        if (i < oldCount) { band = i / 9; prm = i % 9; }
-        else              { band = (i - oldCount - 1) / 5; prm = 9 + (i - oldCount - 1) % 5; }
-        if (i < 0 || band < 0 || band >= 2) return;
-        (*ui)[static_cast<std::size_t>(band)][static_cast<std::size_t>(prm)] = v;
+        switch (i - kGlobal) {
+            case 0: p->setMixedBands(v > 0.5f); return;
+            case 1: linearWanted->store(v > 0.5f, std::memory_order_relaxed); return;
+            case 2: p->setRemovalListen(v > 0.5f); return;
+            case 3: p->setLinkMode(static_cast<DEQ::LinkMode>(static_cast<int>(v))); return;
+            case 4: p->setStructure(static_cast<DEQ::Structure>(static_cast<int>(v))); return;
+            default: break;
+        }
+        if (i < 0 || i >= kGlobal) return;
+        const int band = i / kFields, field = i % kFields;
+        (*ui)[static_cast<std::size_t>(band)][static_cast<std::size_t>(field)] = v;
         p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)]));
     };
-    // The orange curve is LIVE (current applied gain via getBandGainDb): it dips for
-    // a cut and rises for a boost as the audio triggers each band. The draggable
-    // nodes sit at each band's Amount target (X=freq, Y=amount, wheel=Q). Both
-    // curves are the engine's own (getBandMagnitude): what is drawn is what plays.
+    // The engine's own curves (getBandMagnitude): what is drawn is what plays.
+    // Live: each band at the gain it applies now. Behind it: the bands at the
+    // full amount of each side (above in grey, below in blue), where the
+    // band can go; the node is the above amount (drag it up to raise the
+    // band when the level passes the threshold, down to cut it).
     auto curve = [p](const float* f, float* mdb, int n, float g0, float g1) {
         std::vector<float> first(static_cast<std::size_t>(std::max(n, 0))), second(first.size());
         p->getBandMagnitude(0, g0, f, first.data(), n);
@@ -1563,20 +1650,29 @@ inline EffectSlot makeDynamicEQ()
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
+    // A side with ratio 1 does nothing: its curve stays at the rest gain.
+    const auto sideAt = [](const float* v, int ratio, int amount) {
+        return v[ratio] > 1.0f ? v[amount] : 0.0f;
+    };
     s.magnitudeFn = [p, curve](const float* f, float* mdb, int n, double, const float*) {
         curve(f, mdb, n, p->getBandGainDb(0), p->getBandGainDb(1));
     };
-    // Faint target curve = each band's Amount (the ceiling the live curve moves to);
-    // the draggable nodes sit on it.
-    s.targetMagnitudeFn = [curve](const float* f, float* mdb, int n, double, const float* v) {
-        curve(f, mdb, n, v[3], v[12]);
+    s.targetMagnitudeFn = [curve, sideAt](const float* f, float* mdb, int n, double, const float* v) {
+        curve(f, mdb, n, sideAt(v, kAboveRatio, kAboveAmount), sideAt(v + kFields, kAboveRatio, kAboveAmount));
     };
-    s.curveNodes = { {0,3,1}, {9,12,10} };  // X=freq, Y=Amount (drag to boost/cut), wheel=Q
+    s.secondaryMagnitudeFn = [curve, sideAt](const float* f, float* mdb, int n, double, const float* v) {
+        curve(f, mdb, n, sideAt(v, kBelowRatio, kBelowAmount), sideAt(v + kFields, kBelowRatio, kBelowAmount));
+    };
+    s.curveNodes = { {0, kAboveAmount, 1}, {kFields, kFields + kAboveAmount, kFields + 1} };
+    s.gainReductionDbFn = [p]() {
+        return std::min({ 0.0f, static_cast<float>(p->getBandGainDb(0)), static_cast<float>(p->getBandGainDb(1)) });
+    };
     s.liveLabel = "Gain now";
-    s.targetLabel = "Amount";
-    s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 19, 20, 21, 22, 23 });
-    s.group("Band 2", { 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 27, 28 });
-    s.group("Engine", { 18, 29, 30, 31, 32 });
+    s.targetLabel = "Full above";
+    s.secondaryLabel = "Full below";
+    s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 });
+    s.group("Band 2", { 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 });
+    s.group("Engine", { 34, 35, 36, 37, 38 });
     return s;
 }
 

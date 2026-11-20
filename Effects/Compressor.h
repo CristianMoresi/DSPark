@@ -536,6 +536,7 @@ public:
             double& ref = autoRefDb_[static_cast<size_t>(channel)];
             ref = std::max(static_cast<double>(heard), ref - autoRefFall_);
             threshNow = thresh + static_cast<T>(ref);
+            if (channel == 0) thresholdInUseDb_.store(threshNow, std::memory_order_relaxed);
         }
         T smoothedGR_Db = gainPath(levelDb, channel, cfg, threshNow, ratio, knee);
         // The gain the loop reads back is the whole one; the amount scales
@@ -870,6 +871,15 @@ public:
 
     /** @brief Whether the threshold counts from the key's recent peak (setAutoThreshold()). */
     [[nodiscard]] bool isAutoThreshold() const noexcept { return autoThreshold_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief The threshold in use, in dBFS (metering; any thread): the set
+     *        one, or with setAutoThreshold() the key's recent peak plus it.
+     */
+    [[nodiscard]] T getThresholdInUseDb() const noexcept
+    {
+        return isAutoThreshold() ? thresholdInUseDb_.load(std::memory_order_relaxed) : threshold_.load(std::memory_order_relaxed);
+    }
 
     /**
      * @brief Sets how much of the gain change is applied, as a scale of its decibels.
@@ -1812,6 +1822,7 @@ protected:
                     for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(detectorSafe(audio.getChannel(ch)[i])));
                 autoRefDb_[0] = std::max(static_cast<double>(gainToDecibels(top)), autoRefDb_[0] - autoRefFall_);
                 threshNow = thresh + static_cast<T>(autoRefDb_[0]);
+                thresholdInUseDb_.store(threshNow, std::memory_order_relaxed);
             }
 
             // 2. Stereo linking, static curve and character ballistics (log
@@ -2106,6 +2117,7 @@ protected:
                 }
                 autoRefDb_[0] = ref;
                 thrUse = thrNow;
+                if (m > 0) thresholdInUseDb_.store(thrNow[m - 1], std::memory_order_relaxed);
             }
 
             // D. Static curve, hold/range and ballistics: the serial part.
@@ -4730,6 +4742,7 @@ protected:
     // Automatic threshold, lookahead inside a fixed latency, amount, soft range.
     static constexpr double kAutoRefFallDb = 1.0;   ///< dB per second the reference of the automatic threshold falls.
     std::atomic<bool> autoThreshold_ { false };     ///< The threshold counts from the key's own recent peak.
+    std::atomic<T> thresholdInUseDb_ { T(0) };      ///< With the automatic threshold, the threshold of the last sample (metering).
     std::array<double, kMaxChannels> autoRefDb_ {}; ///< That reference per channel (the linked one in slot 0), in dB.
     double autoRefFall_ = 0.0;                      ///< Its fall per sample, in dB.
     std::atomic<T> maxLookaheadMs_ { T(0) };        ///< Latency kept for the lookahead (0: the lookahead itself).

@@ -157,6 +157,8 @@ inline EffectSlot makeEqualizer()
         std::snprintf(nm, sizeof(nm), "Band %d Place", b + 1);
         s.addChoice(nm, {"Stereo","Left","Right","Mid","Side"}, 0);
     }
+    // Structure (index 31): the minimum-phase bands as normalized ladders.
+    s.addChoice("Structure", {"Direct Form","Ladder"}, 0);
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {
@@ -171,6 +173,7 @@ inline EffectSlot makeEqualizer()
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, toType, toSlope, toOrder](int i, float v) {
         if (i == 22) { p->setAnalogResponse(v > 0.5f); return; }
+        if (i == 31) { p->setStructure(static_cast<EQ::Structure>(std::clamp(static_cast<int>(v), 0, 1))); return; }
         if (i >= 27 && i <= 30)
         {
             auto cfg = p->getBandConfig(i - 27);
@@ -625,6 +628,7 @@ inline EffectSlot makeDeEsser()
     // Threshold counted from the level of the whole input.
     s.addToggle("Auto Threshold", false);
     s.addToggle("Delta Listen", false);   // 6: what the de-esser takes out
+    s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // 7: the cut bell as a normalized ladder
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -637,6 +641,7 @@ inline EffectSlot makeDeEsser()
             case 4: p->setDetectionMode(static_cast<dspark::DeEsser<float>::DetectionMode>(static_cast<int>(v))); break;
             case 5: p->setAutoThreshold(v > 0.5f); break;
             case 6: p->setDelta(v > 0.5f); break;
+            case 7: p->setStructure(static_cast<dspark::DeEsser<float>::Structure>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -1434,6 +1439,7 @@ inline EffectSlot makeDynamicEQ()
     s.addToggle("Linear Phase", false);
     s.addToggle("Delta Listen", false);   // what the bands take out
     s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // stereo bands read the dominant component
+    s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // the band filter as a normalized ladder
     s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
         const bool want = linearWanted->load(std::memory_order_relaxed);
         p->setLinearPhase(want);
@@ -1460,6 +1466,7 @@ inline EffectSlot makeDynamicEQ()
         if (i == oldCount + 1 + 2 * 5) { linearWanted->store(v > 0.5f, std::memory_order_relaxed); return; }
         if (i == oldCount + 2 + 2 * 5) { p->setDelta(v > 0.5f); return; }
         if (i == oldCount + 3 + 2 * 5) { p->setLinkMode(static_cast<dspark::DynamicEQ<float>::LinkMode>(static_cast<int>(v))); return; }
+        if (i == oldCount + 4 + 2 * 5) { p->setStructure(static_cast<dspark::DynamicEQ<float>::Structure>(static_cast<int>(v))); return; }
         int band = 0, prm = 0;
         if (i < oldCount) { band = i / 9; prm = i % 9; }
         else              { band = (i - oldCount - 1) / 5; prm = 9 + (i - oldCount - 1) % 5; }

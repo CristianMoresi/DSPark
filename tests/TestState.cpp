@@ -88,6 +88,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         band.frequency = 3200.0f; band.gainDb = -4.5f; band.q = 1.3f; band.slope = 6.0f;
         c.setSidechainBand(4, band);
         c.setGainSmoothing(7.5f);
+        c.setOptoCell(Compressor<float>::OptoCell::ThreeStage);
     })));
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);
@@ -146,6 +147,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         a->setBandDrive(2, 9.0f); a->setBandLevel(1, -2.5f); a->setBandPan(3, 0.4f);
         a->setBandMute(0, true); a->setBandSolo(2, true);
         a->getBandSaturation(3).setAlgorithm(Saturation<float>::Algorithm::Curve);
+        a->setCrossoverStructure(MultibandSaturation<float>::Crossover::Structure::Ladder);
         const auto blob = a->getState();
         auto b = std::make_unique<MultibandSaturation<float>>();
         b->prepare(spec(48000.0, 512, 2));
@@ -265,6 +267,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         x.setCrossoverFrequency(1, 2800.0f);
         x.setOrder(48);
         x.setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
+        x.setStructure(CrossoverFilter<float>::Structure::Ladder);
     })));
     EXPECT_TRUE((roundTrip<DynamicEQ<float>>([](auto& d) {
         DynamicEQ<float>::BandConfig b;
@@ -393,6 +396,7 @@ DSPARK_TEST(State_multiband_nested_blobs)
     a.setNumBands(3);
     a.setOrder(48);
     a.setCrossoverMode(CrossoverFilter<float, 12>::FilterMode::LinearPhase);
+    a.setCrossoverStructure(CrossoverFilter<float, 12>::Structure::Ladder);
     a.setCrossoverFrequency(0, 180.0f);
     a.setCrossoverFrequency(1, 3500.0f);
     a.setBandThreshold(0, -24.0f);
@@ -407,6 +411,7 @@ DSPARK_TEST(State_multiband_nested_blobs)
     EXPECT_TRUE(blobsEqual(blob, b.getState()));
     EXPECT_EQ(b.getOrder(), 48);
     EXPECT_TRUE((b.getCrossoverMode() == CrossoverFilter<float, 12>::FilterMode::LinearPhase));
+    EXPECT_TRUE((b.getCrossoverStructure() == CrossoverFilter<float, 12>::Structure::Ladder));
     EXPECT_NEAR(static_cast<float>(b.getCrossoverFrequency(0)), 180.0f, 1e-3f);
 
     // The nested band states really carried the per-band parameters.

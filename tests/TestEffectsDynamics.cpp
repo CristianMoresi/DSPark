@@ -2036,6 +2036,45 @@ DSPARK_TEST(Compressor_opto_release_has_memory)
     EXPECT_LT(residual[0], 2.5f);               // brief peak lets go quickly
 }
 
+// The three-stage cell keeps the two published figures of the two-stage one
+// (half the reduction back in one release time, fully charged; a complete
+// release of 0.5 to 5 s) and adds a medium memory: a short phrase leaves more
+// tail than with two stages, sustained compression a smaller deep tail.
+DSPARK_TEST(Compressor_opto_three_stage_cell_keeps_the_spec_and_adds_a_medium_memory)
+{
+    const double fs = 48000.0;
+    auto residualAfter = [fs](bool three, double burst, double after, float* depth) {
+        Compressor<float> comp;
+        setupCharacterComp(comp, fs, Compressor<float>::Character::Opto, 100.0f);
+        if (three) comp.setOptoCell(Compressor<float>::OptoCell::ThreeStage);
+        auto trace = compressorGrTrace(comp, fs, burst, 3.5);
+        const size_t t0 = static_cast<size_t>(fs * burst);
+        if (depth != nullptr) *depth = -trace[t0 - 1];
+        return -trace[t0 + static_cast<size_t>(fs * after)];
+    };
+
+    float depth = 0.0f;
+    const float half = residualAfter(true, 4.0, 0.1, &depth);
+    EXPECT_GT(depth, 12.0f);
+    EXPECT_NEAR(half / depth, 0.50f, 0.10f);
+
+    // A 150 ms phrase: the medium memory has charged, the deep one hardly.
+    const float shortThree = residualAfter(true, 0.15, 0.3, nullptr);
+    const float shortTwo = residualAfter(false, 0.15, 0.3, nullptr);
+    EXPECT_GT(shortThree, shortTwo + 0.3f);
+    EXPECT_LT(shortThree, 4.0f);
+
+    // Sustained: still releasing after 3 s, with a smaller deep tail.
+    const float longThree = residualAfter(true, 4.0, 3.0, nullptr);
+    const float longTwo = residualAfter(false, 4.0, 3.0, nullptr);
+    EXPECT_GT(longThree, 0.1f);
+    EXPECT_LT(longThree, longTwo);
+
+    // The default is the two-stage cell.
+    Compressor<float> comp;
+    EXPECT_TRUE((comp.getOptoCell() == Compressor<float>::OptoCell::TwoStage));
+}
+
 DSPARK_TEST(Compressor_fet_release_t63_tracks_knob)
 {
     // 1176 model: the compound two-stage release passes ~t63 near the knob.
@@ -7080,6 +7119,73 @@ DSPARK_TEST(CrossoverFilter_glide_is_block_size_independent)
             maxDiff = std::max(maxDiff, std::abs(a[0][static_cast<size_t>(i)] - b[0][static_cast<size_t>(i)]));
         EXPECT_EQ(maxDiff, 0.0f);
     }
+}
+
+// The ladder structure: with the splits still, every band of every order is
+// the direct form's; with a split jumping between 100 Hz and 10 kHz every
+// block, the band sum stays as bounded as in direct form (the 5 ms glide of
+// the split keeps the direct form's memory consistent, so the ladder does not
+// lower that peak: 0.65 and 0.70 against 0.65 and 0.64 at LR24 and LR48).
+DSPARK_TEST(CrossoverFilter_ladder_structure_matches_and_holds_under_jumps)
+{
+    using X = CrossoverFilter<float>;
+    const int n = 24000;
+    Vec in(static_cast<size_t>(n));
+    uint32_t rng = 0x13572468u;
+    for (auto& v : in)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        v = 0.3f * (static_cast<float>(rng >> 8) / 8388608.0f - 1.0f);
+    }
+    for (int order : { 12, 24, 48 })
+    {
+        auto make = [order](X::Structure structure) {
+            auto x = std::make_unique<X>();
+            x->setNumBands(4);
+            x->setOrder(order);
+            x->setStructure(structure);
+            x->prepare(AudioSpec{ 48000.0, 512, 1 });
+            return x;
+        };
+        auto direct = make(X::Structure::DirectForm);
+        auto ladder = make(X::Structure::Ladder);
+        EXPECT_TRUE((ladder->getStructure() == X::Structure::Ladder));
+        const auto a = crossoverSplit(*direct, in, 4, 333);
+        const auto b = crossoverSplit(*ladder, in, 4, 333);
+        float worst = 0.0f;
+        for (int band = 0; band < 4; ++band)
+            for (int i = 0; i < n; ++i)
+                worst = std::max(worst, std::abs(a[static_cast<size_t>(band)][static_cast<size_t>(i)]
+                                                 - b[static_cast<size_t>(band)][static_cast<size_t>(i)]));
+        EXPECT_LT(worst, 1e-6f);
+    }
+
+    float peak[2] = { 0.0f, 0.0f };
+    for (int k = 0; k < 2; ++k)
+    {
+        auto x = std::make_unique<X>();
+        x->setNumBands(2);
+        x->setOrder(48);
+        x->setStructure(k == 0 ? X::Structure::DirectForm : X::Structure::Ladder);
+        x->prepare(AudioSpec{ 48000.0, 64, 1 });
+        Vec low(64), high(64);
+        for (int off = 0, block = 0; off + 64 <= n; off += 64, ++block)
+        {
+            x->setCrossoverFrequency(0, (block % 2 == 0) ? 100.0f : 10000.0f);
+            Vec work(in.begin() + off, in.begin() + off + 64);
+            float* ip = work.data();
+            float* lp = low.data();
+            float* hp = high.data();
+            AudioBufferView<float> iv(&ip, 1, 64);
+            AudioBufferView<float> views[2] = { AudioBufferView<float>(&lp, 1, 64), AudioBufferView<float>(&hp, 1, 64) };
+            x->processBlock(iv, views, 2);
+            for (int i = 0; i < 64; ++i)
+                peak[k] = std::max(peak[k], std::abs(low[static_cast<size_t>(i)] + high[static_cast<size_t>(i)]));
+        }
+    }
+    EXPECT_TRUE(std::isfinite(peak[1]));
+    EXPECT_LT(peak[1], 1.0f);
+    EXPECT_LT(peak[1], 1.25f * peak[0]);
 }
 
 // Defect: in linear-phase mode a live band-count change left the bands it

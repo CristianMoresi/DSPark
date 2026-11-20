@@ -152,8 +152,10 @@ public:
     float displayRangeDb = 24.0f;
 
     // Draggable curve nodes (parameter indices; -1 = that axis is fixed).
-    // X drag -> freqParam (log), Y drag -> gainParam, mouse wheel -> qParam.
-    struct CurveNode { int freqParam = -1; int gainParam = -1; int qParam = -1; };
+    // X drag -> freqParam (log), Y drag -> gainParam, mouse wheel -> qParam;
+    // with enableParam, the node shows only while that control is not 0 (a
+    // band whose shape is Off has nothing to drag).
+    struct CurveNode { int freqParam = -1; int gainParam = -1; int qParam = -1; int enableParam = -1; };
     std::vector<CurveNode> curveNodes;
 
     // Tabs of the control panel, in order (see group()).

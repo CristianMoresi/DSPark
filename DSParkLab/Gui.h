@@ -39,6 +39,9 @@ public:
     /// A larger font for titles (set by main() when a system font is found).
     static void setTitleFont(ImFont* f) noexcept { titleFont() = f; }
 
+    /// The scale of the display (1 at 96 dpi): every size of the layout follows it.
+    static void setScale(float s) noexcept { uiScale() = std::clamp(s, 0.5f, 4.0f); }
+
     // Dark theme with an amber accent (call once after StyleColorsDark()).
     static void applyTheme()
     {
@@ -99,7 +102,7 @@ public:
         drawTopBar(engine);
         ImGui::Spacing();
 
-        ImGui::BeginChild("Browser", ImVec2(220.0f, 0), ImGuiChildFlags_Borders);
+        ImGui::BeginChild("Browser", ImVec2(px(230.0f), 0), ImGuiChildFlags_Borders);
         drawBrowser(effects);
         ImGui::EndChild();
         ImGui::SameLine();
@@ -114,12 +117,15 @@ public:
 private:
     // --- Sizes of the control grid ----------------------------------------------
 
-    static constexpr float kCellW = 94.0f;
-    static constexpr float kKnobR = 21.0f;
     static constexpr float kFMin = 20.0f, kFMax = 20000.0f;
     static constexpr int   kHistory = 360;   // frames of gain-reduction history
 
     static ImFont*& titleFont() noexcept { static ImFont* f = nullptr; return f; }
+    static float& uiScale() noexcept { static float s = 1.0f; return s; }
+    /// A size in pixels at 96 dpi, in the pixels of this display.
+    static float px(float v) noexcept { return v * uiScale(); }
+    static float cellW() noexcept { return px(104.0f); }
+    static float knobR() noexcept { return px(21.0f); }
 
     // --- Interface state ----------------------------------------------------------
 
@@ -139,9 +145,10 @@ private:
 
     // --- Mapping helpers -----------------------------------------------------------
 
+    /// A cell of the control grid: two lines of name, the control, a line of value.
     static float cellH() noexcept
     {
-        return 2.0f * ImGui::GetTextLineHeight() + 2.0f * kKnobR + 14.0f;
+        return 3.0f * ImGui::GetTextLineHeight() + 2.0f * knobR() + px(16.0f);
     }
     static float freqToX(float f, float x0, float w)
     {
@@ -186,6 +193,18 @@ private:
         return t + "...";
     }
 
+    /// The text in at most two lines of a width: broken between words (the
+    /// first line as long as it fits), the second cut if it still does not.
+    static std::array<std::string, 2> twoLines(const std::string& s, float maxW)
+    {
+        if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return { std::string(), s };
+        size_t best = std::string::npos;
+        for (size_t i = s.find(' '); i != std::string::npos; i = s.find(' ', i + 1))
+            if (ImGui::CalcTextSize(s.substr(0, i).c_str()).x <= maxW) best = i;
+        if (best == std::string::npos) return { std::string(), fitText(s, maxW) };
+        return { s.substr(0, best), fitText(s.substr(best + 1), maxW) };
+    }
+
     // --- Keys -------------------------------------------------------------------------
 
     void handleKeys(AudioEngine& engine, EffectSlot* sel)
@@ -206,7 +225,7 @@ private:
         if (titleFont()) ImGui::PushFont(titleFont());
         ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.28f, 1.0f), "DSParkLab");
         if (titleFont()) ImGui::PopFont();
-        ImGui::SameLine(0, 18);
+        ImGui::SameLine(0, px(18.0f));
 
         ImGui::BeginDisabled(loading);
         if (ImGui::Button("Open..."))
@@ -223,7 +242,7 @@ private:
         }
         ImGui::SameLine();
         const bool playing = engine.isPlaying();
-        if (ImGui::Button(playing ? "Pause" : "Play", ImVec2(64, 0)))
+        if (ImGui::Button(playing ? "Pause" : "Play", ImVec2(px(64.0f), 0)))
             engine.togglePlay();
         ImGui::SetItemTooltip("Space");
         ImGui::SameLine();
@@ -236,21 +255,21 @@ private:
             engine.setLooping(loop);
 
         // A/B switch: wide and coloured, the most used control while listening.
-        ImGui::SameLine(0, 16);
+        ImGui::SameLine(0, px(16.0f));
         const bool bypass = engine.isBypassed();
         ImGui::PushStyleColor(ImGuiCol_Button, bypass ? ImVec4(0.55f, 0.18f, 0.16f, 1.0f) : ImVec4(0.16f, 0.36f, 0.22f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bypass ? ImVec4(0.66f, 0.24f, 0.20f, 1.0f) : ImVec4(0.20f, 0.45f, 0.28f, 1.0f));
-        if (ImGui::Button(bypass ? "B: Bypassed" : "A: Processed", ImVec2(120, 0)))
+        if (ImGui::Button(bypass ? "B: Bypassed" : "A: Processed", ImVec2(px(130.0f), 0)))
             engine.setBypass(!bypass);
         ImGui::PopStyleColor(2);
         ImGui::SetItemTooltip("Switch between the processed and the dry signal (B)");
 
         // Seek bar: the transport jumps when the bar is released.
-        ImGui::SameLine(0, 16);
+        ImGui::SameLine(0, px(16.0f));
         const float playPos = engine.getPosition();
         float shown = seekActive_ ? seekValue_ : playPos;
-        const float infoW = 250.0f;
-        ImGui::SetNextItemWidth(std::max(80.0f, ImGui::GetContentRegionAvail().x - infoW));
+        const float infoW = px(270.0f);
+        ImGui::SetNextItemWidth(std::max(px(80.0f), ImGui::GetContentRegionAvail().x - infoW));
         ImGui::SliderFloat("##seek", &shown, 0.0f, 1.0f, "");
         if (ImGui::IsItemActivated()) seekActive_ = true;
         if (seekActive_) seekValue_ = shown;
@@ -348,11 +367,11 @@ private:
 
         const float total = ImGui::GetContentRegionAvail().y;
         const float width = ImGui::GetContentRegionAvail().x;
-        const float activityH = 84.0f;
+        const float activityH = px(96.0f);
         float controlsH = controlsHeight(*sel, width);
-        controlsH = std::clamp(controlsH, cellH() + 24.0f, std::max(cellH() + 24.0f, total * 0.48f));
+        controlsH = std::clamp(controlsH, cellH() + px(24.0f), std::max(cellH() + px(24.0f), total * 0.5f));
         float displayH = total - controlsH - activityH - 2.0f * ImGui::GetStyle().ItemSpacing.y;
-        if (displayH < 180.0f) displayH = 180.0f;
+        if (displayH < px(180.0f)) displayH = px(180.0f);
 
         drawDisplay(engine, sel, displayH);
         drawActivity(engine, sel, activityH);
@@ -363,8 +382,8 @@ private:
 
     void drawWelcome(AudioEngine& engine)
     {
-        drawDisplay(engine, nullptr, std::max(180.0f, ImGui::GetContentRegionAvail().y - 84.0f - 8.0f));
-        drawActivity(engine, nullptr, 84.0f);
+        drawDisplay(engine, nullptr, std::max(px(180.0f), ImGui::GetContentRegionAvail().y - px(104.0f)));
+        drawActivity(engine, nullptr, px(96.0f));
     }
 
     void drawHeader(EffectSlot* sel)
@@ -372,13 +391,10 @@ private:
         if (titleFont()) ImGui::PushFont(titleFont());
         ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "%s", sel->name.c_str());
         if (titleFont()) ImGui::PopFont();
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", sel->category.c_str());
-
-        ImGui::SameLine(0, 18);
+        ImGui::SameLine(0, px(18.0f));
         const bool on = sel->enabled.get();
         ImGui::PushStyleColor(ImGuiCol_Button, on ? ImVec4(0.75f, 0.45f, 0.12f, 1.0f) : ImVec4(0.19f, 0.21f, 0.26f, 1.0f));
-        if (ImGui::Button(on ? "On" : "Off", ImVec2(52, 0)))
+        if (ImGui::Button(on ? "On" : "Off", ImVec2(px(52.0f), 0)))
             sel->enabled = !on;
         ImGui::PopStyleColor();
         ImGui::SetItemTooltip("Put the effect in or out of the chain (E)");
@@ -433,7 +449,7 @@ private:
         {
             const float x = freqToX(gridF[i], p0.x, w);
             dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(38, 42, 52, 255));
-            dl->AddText(ImVec2(x + 3, p1.y - 17), IM_COL32(105, 112, 128, 255), gridL[i]);
+            dl->AddText(ImVec2(x + px(3.0f), p1.y - ImGui::GetTextLineHeight() - px(3.0f)), IM_COL32(105, 112, 128, 255), gridL[i]);
         }
         const bool curves = sel && (sel->magnitudeFn || sel->activityFn);
         if (curves)
@@ -444,8 +460,8 @@ private:
                 const float y = dbToYeq(d, p0.y, h);
                 dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y),
                             std::fabs(d) < 0.01f ? IM_COL32(72, 78, 94, 255) : IM_COL32(34, 38, 47, 255));
-                char b[8]; std::snprintf(b, sizeof(b), "%+.0f", d);
-                dl->AddText(ImVec2(p0.x + 4, y - 15), IM_COL32(105, 112, 128, 255), b);
+                char b[8]; std::snprintf(b, sizeof(b), std::fabs(d) < 0.01f ? "0" : "%+.0f", d);
+                dl->AddText(ImVec2(p0.x + px(4.0f), y - ImGui::GetTextLineHeight()), IM_COL32(105, 112, 128, 255), b);
             }
         }
 
@@ -552,7 +568,7 @@ private:
             sel->targetMagnitudeFn(freqs, extra, N, sr, sel->values.data());
             for (int i = 0; i < N; ++i)
                 pts[i] = ImVec2(xAt(i), dbToYeq(std::clamp(extra[i], -range_, range_), p0.y, h));
-            dl->AddPolyline(pts, N, IM_COL32(255, 200, 90, 95), 0, 1.6f);
+            dl->AddPolyline(pts, N, IM_COL32(170, 182, 210, 150), 0, px(1.6f));
         }
         if (sel->secondaryMagnitudeFn)
         {
@@ -570,7 +586,7 @@ private:
             for (int i = 1; i < N; ++i)
                 dl->AddQuadFilled(pts[i - 1], pts[i], ImVec2(pts[i].x, zeroY), ImVec2(pts[i - 1].x, zeroY),
                                   IM_COL32(255, 170, 60, 28));
-            dl->AddPolyline(pts, N, IM_COL32(255, 186, 70, 255), 0, 2.4f);
+            dl->AddPolyline(pts, N, IM_COL32(255, 186, 70, 255), 0, px(2.4f));
             outMags = mags;
             outN = N;
         }
@@ -596,7 +612,7 @@ private:
             for (int ni = 0; ni < static_cast<int>(sel->curveNodes.size()); ++ni)
             {
                 const auto& nd = sel->curveNodes[static_cast<size_t>(ni)];
-                if (nd.freqParam < 0) continue;
+                if (nd.freqParam < 0 || !nodeShown(*sel, nd)) continue;
                 const float fHz = sel->values[static_cast<size_t>(nd.freqParam)];
                 const float gain = nd.gainParam >= 0 ? sel->values[static_cast<size_t>(nd.gainParam)] : curveDbAt(fHz);
                 const ImVec2 cc(freqToX(fHz, p0.x, w), dbToYeq(gain, p0.y, h));
@@ -609,11 +625,11 @@ private:
         for (int ni = 0; ni < static_cast<int>(sel->curveNodes.size()); ++ni)
         {
             const auto& node = sel->curveNodes[static_cast<size_t>(ni)];
-            if (node.freqParam < 0) continue;
+            if (node.freqParam < 0 || !nodeShown(*sel, node)) continue;
             const float fHz = sel->values[static_cast<size_t>(node.freqParam)];
             const float gain = node.gainParam >= 0 ? sel->values[static_cast<size_t>(node.gainParam)] : curveDbAt(fHz);
             const ImVec2 c(freqToX(fHz, p0.x, w), dbToYeq(gain, p0.y, h));
-            const bool nearNode = std::fabs(mouse.x - c.x) < 12.0f && std::fabs(mouse.y - c.y) < 12.0f;
+            const bool nearNode = std::fabs(mouse.x - c.x) < px(12.0f) && std::fabs(mouse.y - c.y) < px(12.0f);
             const bool active = dragNode_ == ni && dragOwner_ == sel;
 
             if (active && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
@@ -634,8 +650,8 @@ private:
             }
 
             const ImU32 col = (active || nearNode) ? IM_COL32(255, 232, 150, 255) : IM_COL32(255, 186, 70, 255);
-            dl->AddCircleFilled(c, 7.0f, col);
-            dl->AddCircle(c, 7.0f, IM_COL32(25, 25, 25, 255), 0, 1.5f);
+            dl->AddCircleFilled(c, px(8.0f), col);
+            dl->AddCircle(c, px(8.0f), IM_COL32(25, 25, 25, 255), 0, px(1.5f));
             char lbl[8]; std::snprintf(lbl, sizeof(lbl), "%d", ni + 1);
             const ImVec2 ls = ImGui::CalcTextSize(lbl);
             dl->AddText(ImVec2(c.x - ls.x * 0.5f, c.y - ls.y * 0.5f), IM_COL32(20, 20, 20, 255), lbl);
@@ -651,13 +667,18 @@ private:
                 else if (hasQ)     std::snprintf(vb, sizeof(vb), "%.0f Hz  Q %.2f", fHz, qv);
                 else               std::snprintf(vb, sizeof(vb), "%.0f Hz", fHz);
                 const ImVec2 tsz = ImGui::CalcTextSize(vb);
-                ImVec2 tp(c.x + 12, c.y - 9);
-                if (tp.x + tsz.x > p0.x + w) tp.x = c.x - 12 - tsz.x;
+                ImVec2 tp(c.x + px(12.0f), c.y - tsz.y * 0.5f);
+                if (tp.x + tsz.x > p0.x + w) tp.x = c.x - px(12.0f) - tsz.x;
                 dl->AddRectFilled(ImVec2(tp.x - 3, tp.y - 2), ImVec2(tp.x + tsz.x + 3, tp.y + tsz.y + 2), IM_COL32(20, 22, 28, 225), 3.0f);
                 dl->AddText(tp, IM_COL32(255, 236, 185, 255), vb);
             }
         }
         if (dragNode_ >= 0 && !ImGui::IsItemActive()) { dragNode_ = -1; dragOwner_ = nullptr; }
+    }
+
+    static bool nodeShown(const EffectSlot& s, const EffectSlot::CurveNode& n)
+    {
+        return n.enableParam < 0 || s.values[static_cast<size_t>(n.enableParam)] > 0.5f;
     }
 
     static void drawMultiband(ImDrawList* dl, EffectSlot* sel, ImVec2 p0, float w, float h)
@@ -677,7 +698,7 @@ private:
             const float barH = grDb / 24.0f * (h * 0.5f);
             dl->AddRectFilled(ImVec2(left + 2, p0.y), ImVec2(right - 2, p0.y + barH), IM_COL32(230, 90, 70, 150));
             char lbl[24]; std::snprintf(lbl, sizeof(lbl), "-%.1f dB", grDb);
-            dl->AddText(ImVec2(left + 6, p0.y + 26), IM_COL32(235, 235, 240, 255), lbl);
+            dl->AddText(ImVec2(left + px(6.0f), p0.y + px(30.0f)), IM_COL32(235, 235, 240, 255), lbl);
             left = right;
         }
     }
@@ -689,20 +710,20 @@ private:
         int n = 0;
         if (sel->magnitudeFn && !sel->liveLabel.empty()) items[n++] = { &sel->liveLabel, IM_COL32(255, 186, 70, 255), false };
         if (sel->secondaryMagnitudeFn && !sel->secondaryLabel.empty()) items[n++] = { &sel->secondaryLabel, IM_COL32(110, 210, 230, 255), false };
-        if (sel->targetMagnitudeFn && !sel->targetLabel.empty()) items[n++] = { &sel->targetLabel, IM_COL32(255, 200, 90, 140), false };
+        if (sel->targetMagnitudeFn && !sel->targetLabel.empty()) items[n++] = { &sel->targetLabel, IM_COL32(170, 182, 210, 200), false };
         if (sel->activityFn && !sel->activityLabel.empty()) items[n++] = { &sel->activityLabel, IM_COL32(230, 80, 70, 170), true };
-        float x = p0.x + w - 10.0f;
-        const float y = p0.y + 8.0f;
+        float x = p0.x + w - px(10.0f);
+        const float y = p0.y + px(8.0f);
         for (int i = n - 1; i >= 0; --i)
         {
             const ImVec2 ts = ImGui::CalcTextSize(items[i].text->c_str());
             x -= ts.x;
             dl->AddText(ImVec2(x, y), IM_COL32(200, 205, 215, 255), items[i].text->c_str());
-            x -= 22.0f;
+            x -= px(22.0f);
             const float my = y + ts.y * 0.5f;
-            if (items[i].filled) dl->AddRectFilled(ImVec2(x, my - 5), ImVec2(x + 16, my + 5), items[i].col, 2.0f);
-            else dl->AddLine(ImVec2(x, my), ImVec2(x + 16, my), items[i].col, 2.5f);
-            x -= 14.0f;
+            if (items[i].filled) dl->AddRectFilled(ImVec2(x, my - px(5.0f)), ImVec2(x + px(16.0f), my + px(5.0f)), items[i].col, px(2.0f));
+            else dl->AddLine(ImVec2(x, my), ImVec2(x + px(16.0f), my), items[i].col, px(2.5f));
+            x -= px(14.0f);
         }
     }
 
@@ -713,13 +734,14 @@ private:
         ImGui::BeginChild("Activity", ImVec2(0, h), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
         const float avail = ImGui::GetContentRegionAvail().x;
         const float innerH = ImGui::GetContentRegionAvail().y;
-        const float toneW = 300.0f, meterW = 120.0f;
+        const float toneW = px(300.0f), meterW = px(118.0f);
         const bool hasGr = sel && sel->gainReductionDbFn;
-        const float graphW = std::max(120.0f, avail - toneW - meterW - 3.0f * ImGui::GetStyle().ItemSpacing.x);
+        const float graphW = std::max(px(120.0f), avail - toneW - meterW - 3.0f * ImGui::GetStyle().ItemSpacing.x);
 
         if (hasGr)
         {
-            const float gr = std::clamp(-sel->gainReductionDbFn(), 0.0f, 48.0f);
+            // + 0.0f: a reduction of zero reads as 0, not as -0.
+            const float gr = std::clamp(-sel->gainReductionDbFn(), 0.0f, 48.0f) + 0.0f;
             grHistory_[static_cast<size_t>(grHead_)] = gr;
             grHead_ = (grHead_ + 1) % kHistory;
             drawGrHistory(gr, graphW, innerH);
@@ -763,9 +785,9 @@ private:
         }
         char b[48];
         std::snprintf(b, sizeof(b), "Gain reduction  %.1f dB", now);
-        dl->AddText(ImVec2(p0.x + 6, p1.y - 18), IM_COL32(215, 220, 230, 255), b);
+        dl->AddText(ImVec2(p0.x + px(6.0f), p1.y - ImGui::GetTextLineHeight() - px(4.0f)), IM_COL32(215, 220, 230, 255), b);
         std::snprintf(b, sizeof(b), "%.0f dB", scale);
-        dl->AddText(ImVec2(p1.x - ImGui::CalcTextSize(b).x - 6, p1.y - 18), IM_COL32(120, 126, 140, 255), b);
+        dl->AddText(ImVec2(p1.x - ImGui::CalcTextSize(b).x - px(6.0f), p1.y - ImGui::GetTextLineHeight() - px(4.0f)), IM_COL32(120, 126, 140, 255), b);
         dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
     }
 
@@ -788,7 +810,7 @@ private:
                                 mid - std::clamp(waveL_[static_cast<size_t>(i)], -1.0f, 1.0f) * h * 0.46f);
             dl->AddPolyline(pts, n, IM_COL32(110, 200, 150, 230), 0, 1.3f);
         }
-        dl->AddText(ImVec2(p0.x + 6, p1.y - 18), IM_COL32(150, 156, 170, 255), "Output");
+        dl->AddText(ImVec2(p0.x + px(6.0f), p1.y - ImGui::GetTextLineHeight() - px(4.0f)), IM_COL32(150, 156, 170, 255), "Output");
         dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
     }
 
@@ -797,26 +819,37 @@ private:
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(w, h));
+        // Two thin bars (-60 to 0 dBFS, ticks every 12 dB) and, beside them,
+        // the peak of each channel in figures: nothing overlaps.
         const float peaks[2] = { engine.getPeakL(), engine.getPeakR() };
         const char* names[2] = { "L", "R" };
-        const float barW = (w - 30.0f) * 0.5f;
+        const float barW = px(11.0f), gap = px(5.0f);
+        const float top = p0.y + px(3.0f), bottom = p0.y + h - px(3.0f);
         for (int c = 0; c < 2; ++c)
         {
             const float db = peaks[c] > 0.0f ? 20.0f * std::log10(peaks[c]) : -100.0f;
             const float t = std::clamp((db + 60.0f) / 60.0f, 0.0f, 1.0f);
-            const float x0 = p0.x + 4.0f + static_cast<float>(c) * (barW + 6.0f);
-            const float top = p0.y + 2.0f, bottom = p0.y + h - 18.0f;
-            dl->AddRectFilled(ImVec2(x0, top), ImVec2(x0 + barW, bottom), IM_COL32(24, 27, 34, 255), 2.0f);
+            const float x0 = p0.x + px(2.0f) + static_cast<float>(c) * (barW + gap);
+            dl->AddRectFilled(ImVec2(x0, top), ImVec2(x0 + barW, bottom), IM_COL32(24, 27, 34, 255), px(2.0f));
             const float y = bottom - t * (bottom - top);
             const ImU32 col = db > -1.0f ? IM_COL32(235, 70, 60, 255) : db > -9.0f ? IM_COL32(235, 200, 70, 255) : IM_COL32(80, 200, 110, 255);
-            dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + barW, bottom), col, 2.0f);
-            dl->AddText(ImVec2(x0 + barW * 0.5f - 4.0f, bottom + 1.0f), IM_COL32(150, 156, 170, 255), names[c]);
+            dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + barW, bottom), col, px(2.0f));
+            for (int d = 12; d < 60; d += 12)
+            {
+                const float ty = bottom - (1.0f - static_cast<float>(d) / 60.0f) * (bottom - top);
+                dl->AddLine(ImVec2(x0, ty), ImVec2(x0 + barW, ty), IM_COL32(15, 17, 22, 200), 1.0f);
+            }
         }
-        char b[24];
-        const float worst = std::max(peaks[0], peaks[1]);
-        std::snprintf(b, sizeof(b), "%.1f", worst > 0.0f ? 20.0f * std::log10(worst) : -100.0f);
-        dl->AddText(ImVec2(p0.x + w - 28.0f, p0.y + 2.0f), IM_COL32(200, 205, 215, 255), b);
-        dl->AddText(ImVec2(p0.x + w - 28.0f, p0.y + 18.0f), IM_COL32(110, 116, 130, 255), "dBFS");
+        const float tx = p0.x + px(2.0f) + 2.0f * barW + gap + px(8.0f);
+        const float lh = ImGui::GetTextLineHeight();
+        for (int c = 0; c < 2; ++c)
+        {
+            const float db = peaks[c] > 0.0f ? std::max(-99.9f, 20.0f * std::log10(peaks[c])) : -99.9f;
+            char b[24];
+            std::snprintf(b, sizeof(b), "%s %5.1f", names[c], db);
+            dl->AddText(ImVec2(tx, p0.y + px(4.0f) + static_cast<float>(c) * lh), IM_COL32(205, 210, 220, 255), b);
+        }
+        dl->AddText(ImVec2(tx, p0.y + px(4.0f) + 2.0f * lh), IM_COL32(110, 116, 130, 255), "dBFS peak");
     }
 
     void drawTone(AudioEngine& engine)
@@ -835,11 +868,11 @@ private:
         float freq = engine.getTestToneFreq();
         float db = engine.getTestToneDb();
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(px(96.0f));
         if (ImGui::SliderFloat("##f", &freq, 20.0f, 20000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic))
             engine.setTestToneFreq(freq);
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(80);
+        ImGui::SetNextItemWidth(px(84.0f));
         if (ImGui::SliderFloat("##l", &db, -60.0f, 0.0f, "%.0f dB"))
             engine.setTestToneDb(db);
 
@@ -858,18 +891,32 @@ private:
 
     // --- Controls: knobs, switches and choices on tabs ----------------------------------
 
+    /// Width of the segmented buttons of a choice (0 when it has too many options).
+    static float segmentWidth(const ParamDesc& pd)
+    {
+        if (pd.choices.empty() || pd.choices.size() > 3) return 0.0f;
+        float w = 0.0f;
+        for (const auto& c : pd.choices) w += ImGui::CalcTextSize(c.c_str()).x + px(16.0f);
+        return w;
+    }
+
+    /// Cells a control takes: knobs and switches one; a choice two when its
+    /// buttons or its list need the room.
     static int spanOf(const ParamDesc& pd)
     {
         if (pd.type != ParamDesc::Choice) return 1;
-        float widest = ImGui::CalcTextSize(pd.name.c_str()).x;
-        for (const auto& c : pd.choices) widest = std::max(widest, ImGui::CalcTextSize(c.c_str()).x + 34.0f);
-        return widest > kCellW - 10.0f ? 2 : 1;
+        const float inner = cellW() - px(12.0f);
+        const float seg = segmentWidth(pd);
+        if (seg > 0.0f) return seg <= inner ? 1 : 2;
+        float widest = 0.0f;
+        for (const auto& c : pd.choices) widest = std::max(widest, ImGui::CalcTextSize(c.c_str()).x + px(36.0f));
+        return widest > inner ? 2 : 1;
     }
 
     /// The rows of one tab laid out in a width, as the height they need.
     static float tabHeight(const EffectSlot& s, const std::string& tab, float width)
     {
-        const int cols = std::max(1, static_cast<int>(width / kCellW));
+        const int cols = std::max(1, static_cast<int>(width / cellW()));
         int col = 0, rows = 0;
         for (int i = 0; i < static_cast<int>(s.params.size()); ++i)
         {
@@ -886,9 +933,9 @@ private:
     {
         const auto tabs = s.tabs();
         float tallest = 0.0f;
-        for (const auto& t : tabs) tallest = std::max(tallest, tabHeight(s, t, width - 24.0f));
-        const float tabBar = tabs.size() > 1 ? ImGui::GetFrameHeight() + 8.0f : 0.0f;
-        return tallest + tabBar + 2.0f * ImGui::GetStyle().WindowPadding.y + 4.0f;
+        for (const auto& t : tabs) tallest = std::max(tallest, tabHeight(s, t, width - px(24.0f)));
+        const float tabBar = tabs.size() > 1 ? ImGui::GetFrameHeight() + px(10.0f) : 0.0f;
+        return tallest + tabBar + 2.0f * ImGui::GetStyle().WindowPadding.y + px(6.0f);
     }
 
     void drawControls(EffectSlot* sel)
@@ -920,7 +967,7 @@ private:
     void drawGrid(EffectSlot* sel, const std::string& tab)
     {
         const float width = ImGui::GetContentRegionAvail().x;
-        const int cols = std::max(1, static_cast<int>(width / kCellW));
+        const int cols = std::max(1, static_cast<int>(width / cellW()));
         const ImVec2 origin = ImGui::GetCursorPos();
         int col = 0, row = 0;
         for (int i = 0; i < static_cast<int>(sel->params.size()); ++i)
@@ -929,14 +976,14 @@ private:
             const auto& pd = sel->params[static_cast<size_t>(i)];
             const int sp = std::min(cols, spanOf(pd));
             if (col + sp > cols) { ++row; col = 0; }
-            ImGui::SetCursorPos(ImVec2(origin.x + static_cast<float>(col) * kCellW, origin.y + static_cast<float>(row) * cellH()));
+            const ImVec2 cell(origin.x + static_cast<float>(col) * cellW(), origin.y + static_cast<float>(row) * cellH());
             ImGui::PushID(i);
-            const float cellWidth = static_cast<float>(sp) * kCellW;
+            const float cellWidth = static_cast<float>(sp) * cellW();
             switch (pd.type)
             {
-                case ParamDesc::Slider: knob(sel, i, cellWidth); break;
-                case ParamDesc::Toggle: toggle(sel, i, cellWidth); break;
-                case ParamDesc::Choice: choice(sel, i, cellWidth); break;
+                case ParamDesc::Slider: knob(sel, i, cell, cellWidth); break;
+                case ParamDesc::Toggle: toggle(sel, i, cell, cellWidth); break;
+                case ParamDesc::Choice: choice(sel, i, cell, cellWidth); break;
             }
             ImGui::PopID();
             col += sp;
@@ -962,7 +1009,10 @@ private:
         else if (pd.unit.empty()) std::snprintf(b, sizeof(b), "%.2f", v);
         else if (pd.unit == "ms" && std::fabs(v) >= 100.0f) std::snprintf(b, sizeof(b), "%.0f ms", v);
         else std::snprintf(b, sizeof(b), "%.1f %s", v, pd.unit.c_str());
-        return b;
+        // A value that rounds to zero reads as 0, not as -0.
+        std::string out = b;
+        if (out.rfind("-0", 0) == 0 && out.find_first_of("123456789") == std::string::npos) out.erase(0, 1);
+        return out;
     }
 
     static float toNorm(const ParamDesc& pd, float v)
@@ -978,31 +1028,47 @@ private:
         return pd.min + t * (pd.max - pd.min);
     }
 
-    static void label(const std::string& text, float x, float w)
+    /// The name of a control over its cell, in up to two centred lines (a
+    /// short name sits on the lower one, next to the control).
+    static void drawName(ImDrawList* dl, const std::string& name, ImVec2 topLeft, float w, ImU32 col)
     {
-        const std::string shown = fitText(text, w - 6.0f);
-        const float tw = ImGui::CalcTextSize(shown.c_str()).x;
-        ImGui::SetCursorPosX(x + (w - tw) * 0.5f);
-        ImGui::TextUnformatted(shown.c_str());
+        const float lh = ImGui::GetTextLineHeight();
+        const auto lines = twoLines(name, w - px(8.0f));
+        for (int k = 0; k < 2; ++k)
+        {
+            const std::string& t = lines[static_cast<size_t>(k)];
+            if (t.empty()) continue;
+            const float tw = ImGui::CalcTextSize(t.c_str()).x;
+            dl->AddText(ImVec2(topLeft.x + (w - tw) * 0.5f, topLeft.y + static_cast<float>(k) * lh), col, t.c_str());
+        }
     }
 
-    void knob(EffectSlot* sel, int i, float w)
+    /// Screen position of a point of the window's content.
+    static ImVec2 toScreen(ImVec2 local)
+    {
+        const ImVec2 wp = ImGui::GetWindowPos();
+        return ImVec2(wp.x + local.x - ImGui::GetScrollX(), wp.y + local.y - ImGui::GetScrollY());
+    }
+
+    void knob(EffectSlot* sel, int i, ImVec2 cell, float w)
     {
         const auto& pd = sel->params[static_cast<size_t>(i)];
         float val = sel->values[static_cast<size_t>(i)];
-        const float x = ImGui::GetCursorPosX(), y = ImGui::GetCursorPosY();
-        label(pd.name, x, w);
-        const ImVec2 screen = ImGui::GetCursorScreenPos();
-        const ImVec2 centre(screen.x + w * 0.5f - (ImGui::GetCursorPosX() - x), screen.y + kKnobR + 2.0f);
-        ImGui::SetCursorPos(ImVec2(x, ImGui::GetCursorPosY()));
-        ImGui::InvisibleButton("##k", ImVec2(w, 2.0f * kKnobR + 6.0f));
+        const float lh = ImGui::GetTextLineHeight(), r = knobR();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 s0 = toScreen(cell);
+        drawName(dl, pd.name, s0, w, ImGui::GetColorU32(ImGuiCol_Text));
+
+        const float knobTop = cell.y + 2.0f * lh + px(4.0f);
+        ImGui::SetCursorPos(ImVec2(cell.x, knobTop));
+        ImGui::InvisibleButton("##k", ImVec2(w, 2.0f * r + px(4.0f)));
         const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
         const ImGuiIO& io = ImGui::GetIO();
         float t = toNorm(pd, val);
         bool changed = false;
         if (active && io.MouseDelta.y != 0.0f)
         {
-            t -= io.MouseDelta.y * (io.KeyShift ? 0.0012f : 0.0060f);
+            t -= io.MouseDelta.y / uiScale() * (io.KeyShift ? 0.0012f : 0.0060f);
             changed = true;
         }
         if (hovered && io.MouseWheel != 0.0f)
@@ -1014,7 +1080,6 @@ private:
         {
             val = pd.defaultVal;
             sel->applyParam(i, val);
-            changed = false;
         }
         else if (changed)
         {
@@ -1026,103 +1091,119 @@ private:
                               pd.name.c_str(), valueText(pd, val).c_str(), valueText(pd, pd.min).c_str(),
                               valueText(pd, pd.max).c_str(), valueText(pd, pd.defaultVal).c_str());
 
-        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 centre(s0.x + w * 0.5f, toScreen(ImVec2(0.0f, knobTop)).y + r + px(2.0f));
         const float a0 = 0.75f * 3.14159265f, a1 = 2.25f * 3.14159265f;
         const float tv = toNorm(pd, val);
         const bool bipolar = !pd.logarithmic && pd.min < 0.0f && pd.max > 0.0f;
         const float tz = bipolar ? toNorm(pd, 0.0f) : 0.0f;
-        dl->PathArcTo(centre, kKnobR, a0, a1, 40);
-        dl->PathStroke(IM_COL32(48, 53, 65, 255), ImDrawFlags_None, 4.0f);
+        const float thick = px(4.0f);
+        dl->PathArcTo(centre, r, a0, a1, 48);
+        dl->PathStroke(IM_COL32(48, 53, 65, 255), ImDrawFlags_None, thick);
         const float from = a0 + (a1 - a0) * std::min(tz, tv), to = a0 + (a1 - a0) * std::max(tz, tv);
         if (to - from > 0.01f)
         {
-            dl->PathArcTo(centre, kKnobR, from, to, 32);
-            dl->PathStroke(active ? IM_COL32(255, 214, 130, 255) : IM_COL32(255, 168, 60, 255), ImDrawFlags_None, 4.0f);
+            dl->PathArcTo(centre, r, from, to, 40);
+            dl->PathStroke(active ? IM_COL32(255, 214, 130, 255) : IM_COL32(255, 160, 50, 255), ImDrawFlags_None, thick);
         }
-        dl->AddCircleFilled(centre, kKnobR - 6.0f, hovered || active ? IM_COL32(52, 57, 70, 255) : IM_COL32(40, 44, 55, 255));
+        dl->AddCircleFilled(centre, r - px(6.0f), hovered || active ? IM_COL32(52, 57, 70, 255) : IM_COL32(40, 44, 55, 255), 32);
         const float av = a0 + (a1 - a0) * tv;
-        dl->AddLine(ImVec2(centre.x + std::cos(av) * (kKnobR - 14.0f), centre.y + std::sin(av) * (kKnobR - 14.0f)),
-                    ImVec2(centre.x + std::cos(av) * (kKnobR - 6.0f), centre.y + std::sin(av) * (kKnobR - 6.0f)),
-                    IM_COL32(240, 242, 246, 255), 2.5f);
+        dl->AddLine(ImVec2(centre.x + std::cos(av) * (r - px(14.0f)), centre.y + std::sin(av) * (r - px(14.0f))),
+                    ImVec2(centre.x + std::cos(av) * (r - px(6.0f)), centre.y + std::sin(av) * (r - px(6.0f))),
+                    IM_COL32(240, 242, 246, 255), px(2.5f));
 
-        const std::string vt = fitText(valueText(pd, val), w - 4.0f);
+        const std::string vt = fitText(valueText(pd, val), w - px(4.0f));
         const float tw = ImGui::CalcTextSize(vt.c_str()).x;
-        ImGui::SetCursorPos(ImVec2(x + (w - tw) * 0.5f, y + ImGui::GetTextLineHeightWithSpacing() + 2.0f * kKnobR + 6.0f));
-        ImGui::TextColored(active ? ImVec4(1.0f, 0.85f, 0.55f, 1.0f) : ImVec4(0.72f, 0.75f, 0.82f, 1.0f), "%s", vt.c_str());
+        dl->AddText(ImVec2(s0.x + (w - tw) * 0.5f, centre.y + r + px(4.0f)),
+                    active ? IM_COL32(255, 216, 140, 255) : IM_COL32(184, 191, 209, 255), vt.c_str());
     }
 
-    void toggle(EffectSlot* sel, int i, float w)
+    void toggle(EffectSlot* sel, int i, ImVec2 cell, float w)
     {
         const auto& pd = sel->params[static_cast<size_t>(i)];
-        const float val = sel->values[static_cast<size_t>(i)];
-        const bool on = val > 0.5f;
-        const float x = ImGui::GetCursorPosX(), y = ImGui::GetCursorPosY();
-        const float bw = w - 10.0f, bh = 2.0f * kKnobR + 4.0f;
-        ImGui::SetCursorPos(ImVec2(x + 5.0f, y + ImGui::GetTextLineHeightWithSpacing() * 0.5f + 2.0f));
-        ImGui::PushStyleColor(ImGuiCol_Button, on ? ImVec4(0.72f, 0.43f, 0.12f, 1.0f) : ImVec4(0.17f, 0.19f, 0.24f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? ImVec4(0.85f, 0.52f, 0.16f, 1.0f) : ImVec4(0.24f, 0.27f, 0.33f, 1.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
-        const std::string shown = fitText(pd.name, bw - 8.0f);
-        if (ImGui::Button((shown + "##t").c_str(), ImVec2(bw, bh)))
+        const bool on = sel->values[static_cast<size_t>(i)] > 0.5f;
+        const float lh = ImGui::GetTextLineHeight();
+        // A switch: a rounded box carrying the name in up to two lines,
+        // lit when on, with its state under it.
+        const float bw = w - px(12.0f), bh = 2.0f * lh + px(14.0f);
+        const ImVec2 local(cell.x + px(6.0f), cell.y + lh + px(2.0f));
+        ImGui::SetCursorPos(local);
+        if (ImGui::InvisibleButton("##t", ImVec2(bw, bh)))
             sel->applyParam(i, on ? 0.0f : 1.0f);
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
+        const bool hovered = ImGui::IsItemHovered();
         ImGui::SetItemTooltip("%s: %s (click to switch)", pd.name.c_str(), on ? "on" : "off");
-        ImGui::SetCursorPos(ImVec2(x, y + ImGui::GetTextLineHeightWithSpacing() * 0.5f + bh + 6.0f));
-        label(on ? "On" : "Off", x, w);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 a = toScreen(local), b(a.x + bw, a.y + bh);
+        const ImU32 fill = on ? (hovered ? IM_COL32(222, 136, 44, 255) : IM_COL32(190, 112, 34, 255))
+                              : (hovered ? IM_COL32(60, 66, 82, 255) : IM_COL32(44, 49, 61, 255));
+        dl->AddRectFilled(a, b, fill, px(6.0f));
+        const auto lines = twoLines(pd.name, bw - px(10.0f));
+        const int n = lines[0].empty() ? 1 : 2;
+        const float textTop = a.y + (bh - static_cast<float>(n) * lh) * 0.5f;
+        for (int k = 2 - n; k < 2; ++k)
+        {
+            const std::string& t = lines[static_cast<size_t>(k)];
+            const float tw = ImGui::CalcTextSize(t.c_str()).x;
+            dl->AddText(ImVec2(a.x + (bw - tw) * 0.5f, textTop + static_cast<float>(k - (2 - n)) * lh),
+                        on ? IM_COL32(25, 18, 8, 255) : IM_COL32(220, 224, 232, 255), t.c_str());
+        }
+        const char* state = on ? "On" : "Off";
+        const float sw = ImGui::CalcTextSize(state).x;
+        dl->AddText(ImVec2(a.x + (bw - sw) * 0.5f, b.y + px(4.0f)), IM_COL32(150, 156, 170, 255), state);
     }
 
-    void choice(EffectSlot* sel, int i, float w)
+    void choice(EffectSlot* sel, int i, ImVec2 cell, float w)
     {
         const auto& pd = sel->params[static_cast<size_t>(i)];
-        const int cur = std::clamp(static_cast<int>(sel->values[static_cast<size_t>(i)] + 0.5f), 0,
-                                   std::max(0, static_cast<int>(pd.choices.size()) - 1));
-        const float x = ImGui::GetCursorPosX();
-        label(pd.name, x, w);
         const int nOpts = static_cast<int>(pd.choices.size());
-        // Few short options: segmented buttons; otherwise a list.
-        float segW = 0.0f;
-        for (const auto& c : pd.choices) segW += ImGui::CalcTextSize(c.c_str()).x + 12.0f;
-        ImGui::SetCursorPosX(x + 5.0f);
-        if (nOpts <= 3 && segW <= w - 10.0f)
+        const int cur = std::clamp(static_cast<int>(sel->values[static_cast<size_t>(i)] + 0.5f), 0, std::max(0, nOpts - 1));
+        const float lh = ImGui::GetTextLineHeight();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        drawName(dl, pd.name, toScreen(cell), w, ImGui::GetColorU32(ImGuiCol_Text));
+
+        const float inner = w - px(12.0f);
+        const float seg = segmentWidth(pd);
+        const float controlTop = cell.y + 2.0f * lh + px(4.0f) + knobR() - ImGui::GetFrameHeight() * 0.5f;
+        ImGui::SetCursorPos(ImVec2(cell.x + px(6.0f), controlTop));
+        if (seg > 0.0f && seg <= inner)
         {
-            const float bw = (w - 10.0f) / static_cast<float>(nOpts);
-            const float bh = 2.0f * kKnobR - 6.0f;
+            // Few short options: segmented buttons, the chosen one lit.
+            const float bw = inner / static_cast<float>(nOpts);
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(2.0f), 0.0f));
             for (int c = 0; c < nOpts; ++c)
             {
-                if (c > 0) ImGui::SameLine(0, 0);
+                if (c > 0) ImGui::SameLine();
                 const bool isSel = c == cur;
-                ImGui::PushStyleColor(ImGuiCol_Button, isSel ? ImVec4(0.72f, 0.43f, 0.12f, 1.0f) : ImVec4(0.17f, 0.19f, 0.24f, 1.0f));
-                if (ImGui::Button((pd.choices[static_cast<size_t>(c)] + "##o" + std::to_string(c)).c_str(), ImVec2(bw, bh)) && !isSel)
+                ImGui::PushStyleColor(ImGuiCol_Button, isSel ? ImVec4(0.75f, 0.44f, 0.13f, 1.0f) : ImVec4(0.17f, 0.19f, 0.24f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, isSel ? ImVec4(0.10f, 0.07f, 0.03f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_Text]);
+                if (ImGui::Button((pd.choices[static_cast<size_t>(c)] + "##o" + std::to_string(c)).c_str(), ImVec2(bw - px(2.0f), 0.0f)) && !isSel)
                     sel->applyParam(i, static_cast<float>(c));
-                ImGui::PopStyleColor();
+                ImGui::PopStyleColor(2);
             }
+            ImGui::PopStyleVar();
+            return;
         }
-        else
+        ImGui::SetNextItemWidth(inner);
+        if (ImGui::BeginCombo("##c", nOpts > 0 ? pd.choices[static_cast<size_t>(cur)].c_str() : ""))
         {
-            ImGui::SetNextItemWidth(w - 10.0f);
-            if (ImGui::BeginCombo("##c", nOpts > 0 ? pd.choices[static_cast<size_t>(cur)].c_str() : ""))
+            for (int c = 0; c < nOpts; ++c)
             {
-                for (int c = 0; c < nOpts; ++c)
-                {
-                    const bool isSel = c == cur;
-                    if (ImGui::Selectable(pd.choices[static_cast<size_t>(c)].c_str(), isSel))
-                        sel->applyParam(i, static_cast<float>(c));
-                    if (isSel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
+                const bool isSel = c == cur;
+                if (ImGui::Selectable(pd.choices[static_cast<size_t>(c)].c_str(), isSel))
+                    sel->applyParam(i, static_cast<float>(c));
+                if (isSel) ImGui::SetItemDefaultFocus();
             }
-            if (ImGui::IsItemHovered())
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+        {
+            const float wh = ImGui::GetIO().MouseWheel;
+            if (wh != 0.0f)
             {
-                const float wh = ImGui::GetIO().MouseWheel;
-                if (wh != 0.0f)
-                {
-                    const int nc = std::clamp(cur + (wh > 0.0f ? -1 : 1), 0, nOpts - 1);
-                    if (nc != cur) sel->applyParam(i, static_cast<float>(nc));
-                }
-                ImGui::SetTooltip("%s: %s (wheel: next or previous)", pd.name.c_str(),
-                                  nOpts > 0 ? pd.choices[static_cast<size_t>(cur)].c_str() : "");
+                const int nc = std::clamp(cur + (wh > 0.0f ? -1 : 1), 0, nOpts - 1);
+                if (nc != cur) sel->applyParam(i, static_cast<float>(nc));
             }
+            ImGui::SetTooltip("%s: %s (wheel: next or previous)", pd.name.c_str(),
+                              nOpts > 0 ? pd.choices[static_cast<size_t>(cur)].c_str() : "");
         }
     }
 };

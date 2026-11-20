@@ -52,6 +52,14 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CreateRenderTarget();
         }
         return 0;
+    case WM_DPICHANGED:
+        // Moved to a monitor with another scale: take the size Windows
+        // suggests, so the window keeps its physical size (the text stays
+        // sharp: the process draws at the monitor's own resolution).
+        if (const RECT* r = reinterpret_cast<const RECT*>(lParam))
+            SetWindowPos(hWnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -61,8 +69,12 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 // --- Entry point -------------------------------------------------------------
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmdLine, int)
 {
+    // Draw at the monitor's own resolution: without this, Windows stretches
+    // the window as a bitmap on a scaled display and every text is blurred.
+    ImGui_ImplWin32_EnableDpiAwareness();
+
     // Register window class
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(wc);
@@ -77,6 +89,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
         WS_OVERLAPPEDWINDOW,
         80, 60, 1480, 940,
         nullptr, nullptr, wc.hInstance, nullptr);
+
+    // The scale of the monitor (1 at 96 dpi): the window, the fonts and every
+    // size of the layout follow it. The window takes 1480 x 940 at that
+    // scale, kept inside the monitor's work area and centred on it.
+    const float scale = std::max(1.0f, ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd));
+    {
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+        {
+            const RECT wa = mi.rcWork;
+            const int areaW = wa.right - wa.left, areaH = wa.bottom - wa.top;
+            const int w = std::min(static_cast<int>(1480.0f * scale), areaW - 40);
+            const int h = std::min(static_cast<int>(940.0f * scale), areaH - 40);
+            SetWindowPos(hwnd, nullptr, wa.left + (areaW - w) / 2, wa.top + (areaH - h) / 2, w, h,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
 
     if (!CreateDeviceD3D(hwnd))
     {
@@ -96,10 +126,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     io.IniFilename = nullptr;   // the layout is fixed: nothing to remember
     ImGui::StyleColorsDark();
     dsplab::Gui::applyTheme();
+    ImGui::GetStyle().ScaleAllSizes(scale);
+    dsplab::Gui::setScale(scale);
 
-    // Segoe UI from the system when it is there (the built-in font is small
-    // for a full-window layout), and its bold face for the titles.
+    // Segoe UI from the system when it is there, rasterized at the monitor's
+    // resolution (the size in pixels is the size in points times the scale),
+    // and its bold face for the titles; the built-in font otherwise.
     {
+        ImFontConfig cfg;
+        cfg.OversampleH = 2;
+        cfg.OversampleV = 2;
+        cfg.PixelSnapH = true;
+        bool loaded = false;
         char winDir[MAX_PATH] = {};
         const UINT len = GetWindowsDirectoryA(winDir, MAX_PATH);
         if (len > 0 && len < MAX_PATH)
@@ -108,10 +146,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
             const std::string body = fonts + "segoeui.ttf", bold = fonts + "segoeuib.ttf";
             if (GetFileAttributesA(body.c_str()) != INVALID_FILE_ATTRIBUTES)
             {
-                io.Fonts->AddFontFromFileTTF(body.c_str(), 16.0f);
-                if (GetFileAttributesA(bold.c_str()) != INVALID_FILE_ATTRIBUTES)
-                    dsplab::Gui::setTitleFont(io.Fonts->AddFontFromFileTTF(bold.c_str(), 21.0f));
+                loaded = io.Fonts->AddFontFromFileTTF(body.c_str(), std::round(16.0f * scale), &cfg) != nullptr;
+                if (loaded && GetFileAttributesA(bold.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    dsplab::Gui::setTitleFont(io.Fonts->AddFontFromFileTTF(bold.c_str(), std::round(21.0f * scale), &cfg));
             }
+        }
+        if (!loaded)
+        {
+            ImFontConfig def;
+            def.SizePixels = std::round(13.0f * scale);
+            io.Fonts->AddFontDefault(&def);
         }
     }
 
@@ -120,6 +164,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
 
     // Init DSParkLab
     auto effects = dsplab::createAllEffects();
+    // "DSParkLab.exe Compressor" opens with that effect shown (the name, any case).
+    if (cmdLine && *cmdLine)
+    {
+        std::string wanted;
+        for (const wchar_t* c = cmdLine; *c; ++c)
+            if (*c != L'"') wanted.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*c < 128 ? *c : L'?'))));
+        while (!wanted.empty() && wanted.back() == ' ') wanted.pop_back();
+        for (auto& e : effects)
+        {
+            std::string name = e.name;
+            for (auto& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (name == wanted) { e.selected = true; break; }
+        }
+    }
     dsplab::AudioEngine engine;
     engine.setEffects(&effects);
     dsplab::Gui gui;

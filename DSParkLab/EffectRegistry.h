@@ -2230,7 +2230,7 @@ inline EffectSlot makeResonanceSuppressor()
         const auto response = view->getResponse();
         for (int i = 0; i < n; ++i) mdb[i] = static_cast<float>(response.magnitudeDb(static_cast<double>(f[i])));
     };
-    s.curveNodes = { {14, 15, -1} };
+    s.curveNodes = { {14, 15, -1, 13} };   // shown while the sensitivity band is on
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getPeakReduction()); };
     s.liveLabel = "Reduction";
     s.secondaryLabel = "Reduction, 2nd channel";
@@ -2311,7 +2311,7 @@ inline EffectSlot makeSpectralDynamicEQ()
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
-    s.curveNodes = { {1, 5, 2}, {10, 14, 11} };
+    s.curveNodes = { {1, 5, 2, 0}, {10, 14, 11, 9} };   // shown while the band is on
     s.gainReductionDbFn = [p]() { return std::min(0.0f, static_cast<float>(p->getPeakGain())); };
     s.liveLabel = "Gain now";
     s.targetLabel = "Full range";

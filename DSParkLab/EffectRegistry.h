@@ -652,6 +652,8 @@ inline EffectSlot makeDeEsser()
     s.addToggle("Delta Listen", false);   // 6: what the de-esser takes out
     s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // 7: the cut bell as a normalized ladder
     s.addToggle("Mixed Bell", false);                        // 8: one fixed filter mixed by the reduction
+    s.addSlider("Attack", 0.1f, 20, 0.5f, "ms");             // 9
+    s.addSlider("Release", 1, 500, 20, "ms");                // 10: short releases show the mixed bell
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -666,6 +668,8 @@ inline EffectSlot makeDeEsser()
             case 6: p->setDelta(v > 0.5f); break;
             case 7: p->setStructure(static_cast<dspark::DeEsser<float>::Structure>(static_cast<int>(v))); break;
             case 8: p->setMixedBell(v > 0.5f); break;
+            case 9: p->setAttack(v); break;
+            case 10: p->setRelease(v); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

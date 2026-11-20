@@ -153,7 +153,8 @@ All notable user-facing changes to DSPark are documented here.
   threshold counts from the key's own recent peak (a reference that rises at
   once and falls 1 dB per second) instead of from full scale, so the
   compressor does the same on a take recorded 40 dB lower (with an absolute
-  threshold it would not act there at all). `setMaxLookahead(ms)`: a latency
+  threshold it would not act there at all). `getThresholdInUseDb()` reads the
+  threshold it is using (the recent peak plus the one set) from any thread. `setMaxLookahead(ms)`: a latency
   kept for the lookahead; the audio is always that late, `getLatency()`
   reports it, and `setLookahead()` moves inside it with the gain held back
   by the difference, so the lookahead can be automated under one delay
@@ -463,7 +464,9 @@ All notable user-facing changes to DSPark are documented here.
   while the noise at 600 Hz moves 0.2 dB; it costs 270 ns per stereo frame.
 - `SpectralDynamicEQ` (new, `Effects/SpectralDynamicEQ.h`): four dynamic
   bands (bell or shelves) that act cell by cell inside themselves: a band
-  is cut into up to 128 cells evenly in log frequency, each cell's level is
+  is cut into up to 128 cells placed by its weight (equal steps of its shape
+  integrated over log frequency: they crowd where the band acts); each
+  cell's level is
   the largest power of the key in it weighted by the band's shape, the
   threshold is relative to the band's recent peak, each cell has an attack
   and a release (faster in the upper cells), and the actions are projected
@@ -1447,6 +1450,18 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `AlgorithmicReverb`: the wet signal at full mix has the dry signal's level.
+  Its energy grows with the decay over the mean round trip of the loops (the
+  law the early field was already matched to); a gain from those two takes
+  that back, so on pink noise every type sits within -1.1 and +1.0 dB of the
+  dry level at its preset (it sat 7 to 16.5 dB under it: Room -16.5, Hall
+  -11.0, Cathedral -8.9) and a Hall stays within -1 to +3.5 dB as its decay
+  goes from 12 s down to 0.3 s at any size (it moved over 10 dB).
+- `AlgorithmicReverb`: a change of decay, size, bass or treble multiplier or
+  decay band glides the loop absorption to its new design over the same
+  ~20 ms as the other parameters while the tank holds signal (the loop gains
+  stepped, a click on every line's output); an empty tank, after `prepare()`
+  or once its content is under -120 dB, still takes the design at once.
 - `AlgorithmicReverb` runs its input diffusers one stage at a time over
   each chunk, in pieces that read only samples older than themselves and
   never cross the end of a line, so each piece is array arithmetic on the

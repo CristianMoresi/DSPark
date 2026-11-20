@@ -593,6 +593,8 @@ public:
         {
             envFastDb_[ch] = 0.0; // 0 dB gain change = neutral
             envSlowDb_[ch] = 0.0;
+            envMidDb_[ch] = 0.0;
+            envDeepDb_[ch] = 0.0;
             envHoldDb_[ch] = 0.0;
             upwardGuardDb_[ch] = T(-200);
             fbLastOutput_[ch] = T(0);
@@ -1088,6 +1090,37 @@ public:
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief The optical cell of the Opto character (see setOptoCell()). */
+    enum class OptoCell
+    {
+        TwoStage,   ///< A fast stage and one memory stage (default).
+        ThreeStage  ///< A fast stage, a medium memory and a deep memory.
+    };
+
+    /**
+     * @brief Chooses how the cell of the Opto character remembers.
+     *
+     * ThreeStage puts a medium memory between the fast stage and the deep
+     * one: it charges over one release time (30 ms to 1 s) and lets go over
+     * five, so a phrase of a second or two leaves a tail between the quick
+     * recovery of a short peak and the long one of sustained compression.
+     * The fast stage then releases over 0.725 release times so that, fully
+     * charged, half the reduction still recovers in one release time, and
+     * the deep stage keeps the complete release of 0.5 to 5 s. The three
+     * shares of the gain are 0.6 (fast), 0.25 (medium) and 0.15 (deep).
+     * Only Opto uses it. Thread-safe; applied at the next block.
+     *
+     * @param cell TwoStage (default) or ThreeStage.
+     */
+    void setOptoCell(OptoCell cell) noexcept
+    {
+        optoCell_.store(clampEnum(cell, OptoCell::ThreeStage), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return The cell set by setOptoCell(). */
+    [[nodiscard]] OptoCell getOptoCell() const noexcept { return optoCell_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Sets the amount of the character's harmonic signature (0 to 1).
      *
@@ -1353,6 +1386,7 @@ public:
         w.write("detector", static_cast<int32_t>(detectorType_.load(std::memory_order_relaxed)));
         w.write("topology", static_cast<int32_t>(topology_.load(std::memory_order_relaxed)));
         w.write("character", static_cast<int32_t>(character_.load(std::memory_order_relaxed)));
+        w.write("optoCell", static_cast<int32_t>(optoCell_.load(std::memory_order_relaxed)));
         w.write("characterColor", static_cast<float>(characterColor_.load(std::memory_order_relaxed)));
         w.write("cleanBallistics", static_cast<int32_t>(cleanBallistics_.load(std::memory_order_relaxed)));
         w.write("mode", static_cast<int32_t>(mode_.load(std::memory_order_relaxed)));
@@ -1397,6 +1431,7 @@ public:
         setDetector(static_cast<DetectorType>(r.read("detector", 0)));
         setTopology(static_cast<Topology>(r.read("topology", 0)));
         setCharacter(static_cast<Character>(r.read("character", 0)));
+        setOptoCell(static_cast<OptoCell>(r.read("optoCell", 0)));
         setCharacterColor(static_cast<T>(r.read("characterColor", 0.0f)));
         setCleanBallistics(static_cast<CleanBallistics>(r.read("cleanBallistics", 0)));
         setMode(static_cast<Mode>(r.read("mode", 0)));
@@ -2090,6 +2125,8 @@ protected:
         {
             envFastDb_[ch] = envFastDb_[0];
             envSlowDb_[ch] = envSlowDb_[0];
+            envMidDb_[ch] = envMidDb_[0];
+            envDeepDb_[ch] = envDeepDb_[0];
             envHoldDb_[ch] = envHoldDb_[0];
             upwardGuardDb_[ch] = upwardGuardDb_[0];
             holdCounters_[ch] = holdCounters_[0];
@@ -2130,6 +2167,8 @@ protected:
     {
         double fast = envFastDb_[ch];
         double slow = envSlowDb_[ch];
+        double mid = envMidDb_[ch];
+        double deep = envDeepDb_[ch];
         double hold = envHoldDb_[ch];
         T guard = upwardGuardDb_[ch];
         T held = heldGrDb_[ch];
@@ -2189,7 +2228,7 @@ protected:
                 else
                 {
                     const double c = charRelCoeff_;
-                    y = ballisticsStep(static_cast<double>(tgt), fast, slow, charAttCoeff_,
+                    y = ballisticsStep(static_cast<double>(tgt), fast, slow, mid, deep, charAttCoeff_,
                                        c + outputLevel * (c * c - c));
                 }
                 const T gr = static_cast<T>(y);
@@ -2216,13 +2255,15 @@ protected:
                 const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
                 const double y = ff.decoupled
                     ? decoupledStep(static_cast<double>(tgt), hold, fast, decHoldCoeff_)
-                    : ballisticsStep(static_cast<double>(tgt), fast, slow, charAttCoeff_, charRelCoeff_);
+                    : ballisticsStep(static_cast<double>(tgt), fast, slow, mid, deep, charAttCoeff_, charRelCoeff_);
                 out[k] = static_cast<T>(y);
             }
         }
 
         envFastDb_[ch] = fast;
         envSlowDb_[ch] = slow;
+        envMidDb_[ch] = mid;
+        envDeepDb_[ch] = deep;
         envHoldDb_[ch] = hold;
         upwardGuardDb_[ch] = guard;
         heldGrDb_[ch] = held;
@@ -2366,6 +2407,7 @@ protected:
         // are held to its limits first; a character without a memory stage
         // has the fast one stand in for it.
         const CharacterProfile& profile = profileOf(character_.load(std::memory_order_relaxed));
+        bool threeStageWanted = false;
         {
             const T att = std::clamp(attMs, profile.attackFloorMs, profile.attackCeilMs);
             const T rel = std::clamp(relMs, profile.releaseFloorMs, profile.releaseCeilMs);
@@ -2382,6 +2424,19 @@ protected:
                 charSlowRelCoeff_ = tc(std::min(rel * profile.slowRelease, profile.slowReleaseCeilMs));
                 charChargeCoeff_  = tc(std::clamp(rel * profile.chargeScale, profile.chargeFloorMs,
                                                   profile.chargeCeilMs));
+            }
+
+            // The three-stage cell of Opto (setOptoCell()): a faster fast
+            // stage and the medium memory; the deep memory is the one above.
+            threeStageWanted = character_.load(std::memory_order_relaxed) == Character::Opto
+                            && optoCell_.load(std::memory_order_relaxed) == OptoCell::ThreeStage;
+            if (threeStageWanted)
+            {
+                charRelCoeff_       = tc(rel * static_cast<T>(kOptoThreeFastRelease));
+                charMidRelCoeff_    = tc(rel * static_cast<T>(kOptoMidRelease));
+                charMidChargeCoeff_ = tc(std::clamp(rel * static_cast<T>(kOptoMidCharge),
+                                                    static_cast<T>(kOptoMidChargeFloorMs),
+                                                    static_cast<T>(kOptoMidChargeCeilMs)));
             }
 
             // Decoupled detector (Clean, feed-forward): the smoothing pole's
@@ -2424,6 +2479,8 @@ protected:
             subRelCoeff_       = eighth(charRelCoeff_);
             subSlowRelCoeff_   = eighth(charSlowRelCoeff_);
             subChargeCoeff_    = eighth(charChargeCoeff_);
+            subMidRelCoeff_    = eighth(charMidRelCoeff_);
+            subMidChargeCoeff_ = eighth(charMidChargeCoeff_);
             subDecHoldCoeff_   = eighth(decHoldCoeff_);
             subDecSmoothCoeff_ = eighth(decSmoothCoeff_);
         }
@@ -2441,10 +2498,24 @@ protected:
                 double& s = envSlowDb_[static_cast<size_t>(ch)];
                 const double shown = (w0 < 1.0) ? w0 * f + (1.0 - w0) * s : f;
                 if (w1 >= 1.0) { f = shown; continue; }
-                if (w0 >= 1.0) s = shown;
+                if (w0 >= 1.0)
+                {
+                    s = shown;
+                    envMidDb_[static_cast<size_t>(ch)] = shown;
+                    envDeepDb_[static_cast<size_t>(ch)] = shown;
+                }
                 f = (shown - (1.0 - w1) * s) / w1;
             }
         }
+
+        // The three-stage cell starts with both memories where the memory
+        // stage stands, so the gain does not jump when it engages.
+        if (threeStageWanted && !threeStage_)
+        {
+            envMidDb_ = envSlowDb_;
+            envDeepDb_ = envSlowDb_;
+        }
+        threeStage_ = threeStageWanted;
 
         // A feedback loop closes around the attack stage, which multiplies the
         // raw ballistics speed by (1 + loop gain). Re-derive the coefficient
@@ -2767,6 +2838,19 @@ protected:
     };
 
     static constexpr T kNoLimit = std::numeric_limits<T>::infinity();
+
+    // The three-stage cell of Opto (setOptoCell()). The memory share of 0.4
+    // splits 0.625 / 0.375 between the medium stage (charge over one release
+    // time, 30 ms to 1 s; release over five) and the deep one; with the fast
+    // stage at 0.725 release times, a fully charged cell recovers half its
+    // reduction in one release time: 0.6 e^(-1/0.725) + 0.4 (0.625 e^(-1/5)
+    // + 0.375 e^(-1/25)) = 0.500.
+    static constexpr double kOptoThreeFastRelease = 0.725;
+    static constexpr double kOptoMidShare = 0.625;
+    static constexpr double kOptoMidRelease = 5.0;
+    static constexpr double kOptoMidCharge = 1.0;
+    static constexpr double kOptoMidChargeFloorMs = 30.0;
+    static constexpr double kOptoMidChargeCeilMs = 1000.0;
 
     /** @brief The characters, in the order of Character. */
     static constexpr std::array<CharacterProfile, 5> kProfiles { {
@@ -3314,7 +3398,8 @@ protected:
     [[nodiscard]] T applyBallisticsFeedbackImplicit(T inDb, int ch, Character charType,
                                                     T thresh, T ratio, T knee) noexcept
     {
-        const LoopCoeffs coeffs { charAttCoeff_, charRelCoeff_, charChargeCoeff_, charSlowRelCoeff_ };
+        const LoopCoeffs coeffs { charAttCoeff_, charRelCoeff_, charChargeCoeff_, charSlowRelCoeff_,
+                                  charMidChargeCoeff_, charMidRelCoeff_ };
         return boundImplicit(stepImplicit(inDb, ch, charType, thresh, ratio, knee, coeffs), ch);
     }
 
@@ -3325,6 +3410,8 @@ protected:
         double release;      ///< Fast stage while it recovers.
         double charge;       ///< Memory stage while it charges.
         double slowRelease;  ///< Memory stage while it discharges.
+        double midCharge;    ///< Medium memory of the three-stage cell while it charges.
+        double midRelease;   ///< Medium memory while it discharges.
     };
 
     /** @brief One step of the semi-implicit loop on the channel's envelopes:
@@ -3351,9 +3438,22 @@ protected:
                 computeGain(inDb, thresh, ratio, knee, charType, Mode::Downward, T(0)),
                 -range, range);
             const double st = static_cast<double>(slowTarget);
-            const bool charging = st < slow;
-            slow = st + (charging ? coeffs.charge : coeffs.slowRelease) * (slow - st);
-            if (atRest(slow, st)) slow = 0.0;
+            if (threeStage_)
+            {
+                double& mid = envMidDb_[ch];
+                double& deep = envDeepDb_[ch];
+                mid = st + ((st < mid) ? coeffs.midCharge : coeffs.midRelease) * (mid - st);
+                if (atRest(mid, st)) mid = 0.0;
+                deep = st + ((st < deep) ? coeffs.charge : coeffs.slowRelease) * (deep - st);
+                if (atRest(deep, st)) deep = 0.0;
+                slow = kOptoMidShare * mid + (1.0 - kOptoMidShare) * deep;
+            }
+            else
+            {
+                const bool charging = st < slow;
+                slow = st + (charging ? coeffs.charge : coeffs.slowRelease) * (slow - st);
+                if (atRest(slow, st)) slow = 0.0;
+            }
         }
 
         // Branch on the direction the loop is about to move: attack while
@@ -3482,8 +3582,8 @@ protected:
             relCoeff = std::max(relCoeff, 1.0 - relAdvance / loop);
         }
 
-        return static_cast<T>(ballisticsStep(static_cast<double>(targetGrDb), envFastDb_[ch],
-                                             envSlowDb_[ch], attCoeff, relCoeff));
+        return static_cast<T>(ballisticsStep(static_cast<double>(targetGrDb), envFastDb_[ch], envSlowDb_[ch],
+                                             envMidDb_[ch], envDeepDb_[ch], attCoeff, relCoeff));
     }
 
     /**
@@ -3514,16 +3614,18 @@ protected:
      * comparison would invert the two in Upward mode and make the envelope
      * chase the huge boosts of the waveform's zero crossings.
      */
-    [[nodiscard]] double ballisticsStep(double tgt, double& fast, double& slow,
+    [[nodiscard]] double ballisticsStep(double tgt, double& fast, double& slow, double& mid, double& deep,
                                         double attCoeff, double relCoeff) const noexcept
     {
-        return ballisticsCore(tgt, fast, slow, attCoeff, relCoeff, charChargeCoeff_, charSlowRelCoeff_);
+        return ballisticsCore(tgt, fast, slow, mid, deep, attCoeff, relCoeff, charChargeCoeff_, charSlowRelCoeff_,
+                              charMidChargeCoeff_, charMidRelCoeff_);
     }
 
     /** @brief ballisticsStep() with the coefficients of the memory stage given too. */
-    [[nodiscard]] double ballisticsCore(double tgt, double& fast, double& slow, double attCoeff,
-                                        double relCoeff, double chargeCoeff,
-                                        double slowRelCoeff) const noexcept
+    [[nodiscard]] double ballisticsCore(double tgt, double& fast, double& slow, double& mid, double& deep,
+                                        double attCoeff, double relCoeff, double chargeCoeff,
+                                        double slowRelCoeff, double midChargeCoeff,
+                                        double midRelCoeff) const noexcept
     {
         fast = branchingStep(fast, tgt, attCoeff, relCoeff);
         if (atRest(fast, tgt)) fast = 0.0; // end the asymptotic dB tail
@@ -3534,8 +3636,20 @@ protected:
         // Opto / FET memory stage: charges toward the target over the history
         // time constant and discharges with the slow release, so its level
         // encodes how long (and how deep) the compressor has been working.
-        slow = branchingStep(slow, tgt, chargeCoeff, slowRelCoeff);
-        if (atRest(slow, tgt)) slow = 0.0;
+        // The three-stage cell blends a medium and a deep memory there.
+        if (threeStage_)
+        {
+            mid = branchingStep(mid, tgt, midChargeCoeff, midRelCoeff);
+            if (atRest(mid, tgt)) mid = 0.0;
+            deep = branchingStep(deep, tgt, chargeCoeff, slowRelCoeff);
+            if (atRest(deep, tgt)) deep = 0.0;
+            slow = kOptoMidShare * mid + (1.0 - kOptoMidShare) * deep;
+        }
+        else
+        {
+            slow = branchingStep(slow, tgt, chargeCoeff, slowRelCoeff);
+            if (atRest(slow, tgt)) slow = 0.0;
+        }
 
         const double w = static_cast<double>(charFastWeight_);
         return w * fast + (1.0 - w) * slow;
@@ -3792,7 +3906,8 @@ protected:
 
         if (cfg.fbImplicit)
         {
-            const LoopCoeffs coeffs { subAttCoeff_, subRelCoeff_, subChargeCoeff_, subSlowRelCoeff_ };
+            const LoopCoeffs coeffs { subAttCoeff_, subRelCoeff_, subChargeCoeff_, subSlowRelCoeff_,
+                                      subMidChargeCoeff_, subMidRelCoeff_ };
             double last = precLevel_[c];
             T shown = T(0);
             for (int j = 0; j < count; ++j)
@@ -3828,6 +3943,8 @@ protected:
         double& hold = envHoldDb_[c];
         double& fast = envFastDb_[c];
         double& slow = envSlowDb_[c];
+        double& mid = envMidDb_[c];
+        double& deep = envDeepDb_[c];
         double targets[kDetectorPoints] = {};
         double deepest = 0.0;
         for (int j = 0; j < count; ++j)
@@ -3854,7 +3971,8 @@ protected:
                 const double at = last + (to - last) * (s * share);
                 sum += cfg.decoupled
                     ? decoupledCore(at, hold, fast, subDecHoldCoeff_, subAttCoeff_, subDecSmoothCoeff_)
-                    : ballisticsCore(at, fast, slow, attack, release, subChargeCoeff_, subSlowRelCoeff_);
+                    : ballisticsCore(at, fast, slow, mid, deep, attack, release, subChargeCoeff_, subSlowRelCoeff_,
+                                     subMidChargeCoeff_, subMidRelCoeff_);
             }
             last = to;
         }
@@ -4024,6 +4142,9 @@ protected:
         double release = 0.0;       ///< Release coefficient.
         double charge = 0.0;        ///< Charge coefficient of the memory stage.
         double slowRelease = 0.0;   ///< Release coefficient of the memory stage.
+        double midCharge = 0.0;     ///< Charge coefficient of the medium memory (three-stage cell).
+        double midRelease = 0.0;    ///< Release coefficient of the medium memory.
+        bool threeStage = false;    ///< The memory stage is the three-stage cell.
         double hold = 0.0;          ///< Release coefficient of the decoupled hold stage.
         Character charType = Character::Clean;       ///< Character.
         Mode modeType = Mode::Downward;              ///< Direction.
@@ -4056,6 +4177,9 @@ protected:
         key.release = charRelCoeff_;
         key.charge = charChargeCoeff_;
         key.slowRelease = charSlowRelCoeff_;
+        key.midCharge = charMidChargeCoeff_;
+        key.midRelease = charMidRelCoeff_;
+        key.threeStage = threeStage_;
         key.hold = decHoldCoeff_;
         key.charType = charType;
         key.modeType = modeType;
@@ -4238,8 +4362,12 @@ protected:
             {
                 const double memory = key.loop
                     ? (1.0 - w) / (1.0 + w * (static_cast<double>(key.ratio) - 1.0)) : 1.0 - w;
-                settled = (1.0 - memory) * settled
-                        + memory * restingGain(target, weight, count, 1.0 - key.charge, 1.0 - key.slowRelease);
+                const double deep = restingGain(target, weight, count, 1.0 - key.charge, 1.0 - key.slowRelease);
+                const double rest = key.threeStage
+                    ? kOptoMidShare * restingGain(target, weight, count, 1.0 - key.midCharge, 1.0 - key.midRelease)
+                      + (1.0 - kOptoMidShare) * deep
+                    : deep;
+                settled = (1.0 - memory) * settled + memory * rest;
             }
         }
         const double makeup = -static_cast<double>(key.amount) * settled;
@@ -4342,6 +4470,7 @@ protected:
     std::atomic<DetectorType> detectorType_ { DetectorType::Peak }; ///< Selected detection method.
     std::atomic<Topology> topology_ { Topology::FeedForward };      ///< Selected topology.
     std::atomic<Character> character_ { Character::Clean };         ///< Selected ballistics.
+    std::atomic<OptoCell> optoCell_ { OptoCell::TwoStage };         ///< Cell of the Opto character.
     std::atomic<CleanBallistics> cleanBallistics_ { CleanBallistics::Branching }; ///< Clean feed-forward ballistics.
     std::atomic<Mode> mode_ { Mode::Downward };                     ///< Selected compression mode.
 
@@ -4358,6 +4487,9 @@ protected:
     double charAttCoeff_     = 0.0; ///< Attack coefficient of the fast envelope.
     double charRelCoeff_     = 0.0; ///< Release coefficient (fast stage).
     double charSlowRelCoeff_ = 0.0; ///< Release coefficient of the memory stage.
+    double charMidRelCoeff_ = 0.0;  ///< Release coefficient of the medium memory (three-stage cell).
+    double charMidChargeCoeff_ = 0.0; ///< Charge coefficient of the medium memory.
+    bool threeStage_ = false;       ///< The audio thread runs the three-stage cell.
     double charChargeCoeff_  = 0.0; ///< History charge coefficient of the memory stage.
     T charFastWeight_   = T(1); ///< Fast/slow blend (1 = single envelope).
 
@@ -4379,6 +4511,8 @@ protected:
     // at 192 kHz parked 0.57 dB short of its target.
     std::array<double, kMaxChannels> envFastDb_ {}; ///< Fast gain envelope per channel (dB).
     std::array<double, kMaxChannels> envSlowDb_ {}; ///< Slow memory envelope per channel (dB).
+    std::array<double, kMaxChannels> envMidDb_ {};  ///< Medium memory of the three-stage cell per channel (dB).
+    std::array<double, kMaxChannels> envDeepDb_ {}; ///< Deep memory of the three-stage cell per channel (dB).
     std::array<double, kMaxChannels> envHoldDb_ {}; ///< Decoupled hold stage per channel (dB).
     double decHoldCoeff_   = 0.0;  ///< Decoupled hold-stage release coefficient.
     double decSmoothCoeff_ = 0.0;  ///< Decoupled smoothing pole, release side.
@@ -4490,6 +4624,8 @@ protected:
     double subRelCoeff_ = 0.0;       ///< Release coefficient of an eighth of a sample.
     double subSlowRelCoeff_ = 0.0;   ///< Memory-stage release coefficient of an eighth of a sample.
     double subChargeCoeff_ = 0.0;    ///< Memory-stage charge coefficient of an eighth of a sample.
+    double subMidRelCoeff_ = 0.0;    ///< Medium-memory release coefficient of an eighth of a sample.
+    double subMidChargeCoeff_ = 0.0; ///< Medium-memory charge coefficient of an eighth of a sample.
     double subDecHoldCoeff_ = 0.0;   ///< Decoupled hold coefficient of an eighth of a sample.
     double subDecSmoothCoeff_ = 0.0; ///< Decoupled smoothing coefficient of an eighth of a sample.
 

@@ -597,6 +597,8 @@ inline EffectSlot makeLimiter()
     s.addToggle("True Peak High Precision", false);
     // A latency kept for the lookahead to move inside (0: the lookahead itself).
     s.addSlider("Max Lookahead", 0, 10, 0, "ms");
+    // The gain computer at eight points and steps per sample (sample-peak mode).
+    s.addToggle("Gain Precision High", false);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p, inputGainDb](auto b) {
         // Input Gain MUST be applied BEFORE the limiter - otherwise
@@ -627,6 +629,8 @@ inline EffectSlot makeLimiter()
             case 9: p->setTruePeakPrecision(v > 0.5f ? dspark::Limiter<float>::TruePeakPrecision::High
                                                      : dspark::Limiter<float>::TruePeakPrecision::Standard); break;
             case 10: p->setMaxLookahead(v); break;
+            case 11: p->setPrecision(v > 0.5f ? dspark::Limiter<float>::Precision::High
+                                              : dspark::Limiter<float>::Precision::Standard); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

@@ -134,6 +134,7 @@
 #include "../Core/FirBank.h"
 #include "../Core/FFT.h"
 #include "../Core/Hilbert.h"
+#include "../Core/NormalizedLadder.h"
 #include "../Core/Oversampling.h"
 #include "../Core/RingBuffer.h"
 #include "../Core/DenormalGuard.h"
@@ -526,6 +527,34 @@ public:
     /** @return How the stereo bands link the pair. */
     [[nodiscard]] LinkMode getLinkMode() const noexcept { return linkMode_.load(std::memory_order_relaxed); }
 
+    /** @brief How the band filter is realised (see setStructure()). */
+    enum class Structure
+    {
+        DirectForm,  ///< Direct form (the default).
+        Ladder       ///< Normalized ladder: passive while the gain moves the filter.
+    };
+
+    /**
+     * @brief Chooses how the filter of each band is realised in the default engine.
+     *
+     * The default engine designs each band again every 16 samples as its
+     * gain moves. Ladder runs that filter as a normalized ladder
+     * (NormalizedLadder): the same response, and a memory that cannot gain
+     * energy at the jumps however fast the gain swings, for about twice
+     * the arithmetic of the filter. The mixed engine (setMixedBands()) and
+     * the linear phase keep their own filters. Safe from any thread; the
+     * switch restarts the bands' memory at the next block.
+     *
+     * @param structure DirectForm (default) or Ladder.
+     */
+    void setStructure(Structure structure) noexcept
+    {
+        structure_.store(static_cast<Structure>(std::clamp(static_cast<int>(structure), 0, 1)), std::memory_order_relaxed);
+    }
+
+    /** @return How the filter of each band is realised. */
+    [[nodiscard]] Structure getStructure() const noexcept { return structure_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Linear phase: the bands change the level of the signal and nothing of its phase.
      *
@@ -785,6 +814,7 @@ public:
         w.write("lookahead", static_cast<float>(lookaheadMs_));
         w.write("mixed", isMixedBands());
         w.write("linkMode", static_cast<int32_t>(getLinkMode()));
+        w.write("structure", static_cast<int32_t>(getStructure()));
         w.write("linear", linearWanted_);
         w.write("linearTaps", linearTaps_);
         char key[28];
@@ -895,6 +925,7 @@ public:
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setMixedBands(r.read("mixed", false));
         setLinkMode(static_cast<LinkMode>(r.read("linkMode", 0)));
+        setStructure(static_cast<Structure>(r.read("structure", 0)));
         setLinearPhaseKernelLength(r.read("linearTaps", 0));
         setLinearPhase(r.read("linear", false));
         return true;
@@ -1001,6 +1032,19 @@ private:
                 for (double& v : c) if (std::abs(v) < 1e-30) v = 0.0;   // no subnormals in silence
         }
 
+        // A change of structure: the bands' filters restart in the new one.
+        const bool ladder = structure_.load(std::memory_order_relaxed) == Structure::Ladder;
+        if (ladder != ladderActive_)
+        {
+            ladderActive_ = ladder;
+            for (int b = 0; b < MaxBands; ++b)
+            {
+                bandFilter_[b].reset();
+                bandLadder_[static_cast<size_t>(b)].reset();
+                bandLadder_[static_cast<size_t>(b)].setCoeffs(bandFilter_[b].getCoeffs());
+            }
+        }
+
         // A change of engine: every band starts clean in the new one.
         const bool mixed = mixedWanted_.load(std::memory_order_relaxed) && mixedEngine_ != nullptr && !linear_;
         if (mixed != mixedActive_)
@@ -1054,6 +1098,21 @@ private:
             else if (mixedActive_) applyMixed(audio, chunkStart, chunkLen, nCh, laSamples);
             else applyRedesigned(audio, chunkStart, chunkLen, nCh, nb, laSamples, currentFs);
         }
+    }
+
+    /** The band filter takes a design (and its ladder, when it runs). */
+    void setBandCoeffs(int b, const BiquadCoeffs& c) noexcept
+    {
+        bandFilter_[b].setCoeffsNow(c);
+        if (ladderActive_) bandLadder_[static_cast<size_t>(b)].setCoeffs(c);
+    }
+
+    /** One sample of one channel through a band's filter, in the structure in use. */
+    T runBand(int b, T x, int ch) noexcept
+    {
+        if (ladderActive_)
+            return static_cast<T>(bandLadder_[static_cast<size_t>(b)].processSample(static_cast<double>(x), ch));
+        return bandFilter_[b].processSample(x, ch);
     }
 
     /**
@@ -1267,24 +1326,24 @@ private:
                         switch (states_[b].cfg.shape)
                         {
                         case BandShape::Bell:
-                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makePeakMatched(
+                            setBandCoeffs(b, BiquadCoeffs::makePeakMatched(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(states_[b].cfg.q), static_cast<double>(total)));
                             break;
                         case BandShape::LowShelf:
-                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeLowShelf(
+                            setBandCoeffs(b, BiquadCoeffs::makeLowShelf(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(total)));
                             break;
                         case BandShape::HighShelf:
-                            bandFilter_[b].setCoeffsNow(BiquadCoeffs::makeHighShelf(
+                            setBandCoeffs(b, BiquadCoeffs::makeHighShelf(
                                 currentFs, static_cast<double>(states_[b].cfg.frequency),
                                 static_cast<double>(total)));
                             break;
                         }
                     }
                     else
-                        bandFilter_[b].setCoeffsNow(BiquadCoeffs{}); // Bypass
+                        setBandCoeffs(b, BiquadCoeffs{}); // Bypass
                 }
 
                 if ((refreshCounter_ & 63u) == 0u) // Sub-sample metering update
@@ -1313,14 +1372,14 @@ private:
                 switch (states_[b].cfg.placement)
                 {
                 case Placement::Left:
-                    if (finite[0]) frame[0] = bandFilter_[b].processSample(frame[0], 0);
+                    if (finite[0]) frame[0] = runBand(b, frame[0], 0);
                     break;
                 case Placement::Right:
-                    if (finite[1]) frame[1] = bandFilter_[b].processSample(frame[1], 1);
+                    if (finite[1]) frame[1] = runBand(b, frame[1], 1);
                     break;
                 default:
                     for (int ch = 0; ch < nCh; ++ch)
-                        if (finite[ch]) frame[ch] = bandFilter_[b].processSample(frame[ch], ch);
+                        if (finite[ch]) frame[ch] = runBand(b, frame[ch], ch);
                     break;
                 }
             }
@@ -1338,9 +1397,9 @@ private:
                 {
                     const int b = second_[static_cast<size_t>(k)];
                     if (states_[b].cfg.placement == Placement::Mid)
-                        middle = bandFilter_[b].processSample(middle, 0);
+                        middle = runBand(b, middle, 0);
                     else
-                        sides = bandFilter_[b].processSample(sides, 0);
+                        sides = runBand(b, sides, 0);
                 }
                 if (nCh >= 2)
                 {
@@ -1820,6 +1879,7 @@ private:
     {
         bandDetector_[b].reset();
         bandFilter_[b].reset();
+        bandLadder_[static_cast<size_t>(b)].reset();
         currentGainDb_[b] = T(0);
         BandState& st = states_[b];
         st.fast = st.slow = st.heard = 0.0;
@@ -2322,6 +2382,9 @@ private:
     // out of bounds when processing 9..16-channel (surround/immersive) audio.
     std::array<Biquad<T, kMaxChannels>, MaxBands> bandDetector_ {};
     std::array<Biquad<T, kMaxChannels>, MaxBands> bandFilter_ {};
+    std::array<NormalizedLadder<T, kMaxChannels>, MaxBands> bandLadder_ {}; ///< The band filters as ladders (setStructure()).
+    std::atomic<Structure> structure_ { Structure::DirectForm };            ///< setStructure().
+    bool ladderActive_ = false;                                             ///< The audio thread runs the ladders.
     std::array<T, MaxBands> currentGainDb_ {};
     std::array<std::atomic<T>, MaxBands> meterGainDb_ {};
 

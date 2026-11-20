@@ -627,6 +627,31 @@ public:
         return matchedBells_.load(std::memory_order_relaxed);
     }
 
+    /** @brief How the sections of the bands are realised (FilterEngine::Structure). */
+    using Structure = typename FilterEngine<T>::Structure;
+
+    /**
+     * @brief Chooses how the bands' sections are realised in minimum phase.
+     *
+     * Ladder runs them as normalized ladders (FilterEngine::setStructure()):
+     * the same response, a memory that cannot gain energy while a band is
+     * automated, for about twice the arithmetic. It applies to the bands
+     * of the default minimum-phase engine (not to the analog response, the
+     * natural phase or the linear phase, whose filters do not move that
+     * way). Thread-safe; the switch restarts the bands' memory.
+     *
+     * @param structure DirectForm (default) or Ladder.
+     */
+    void setStructure(Structure structure) noexcept
+    {
+        structure = static_cast<Structure>(std::clamp(static_cast<int>(structure), 0, 1));
+        structure_.store(structure, std::memory_order_relaxed);
+        for (auto& band : bands_) band.setStructure(structure);
+    }
+
+    /** @return How the bands' sections are realised. */
+    [[nodiscard]] Structure getStructure() const noexcept { return structure_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Switches LowPass/HighPass, BandPass and slope-1 shelf bands to
      *        the analog-matched designs.
@@ -883,6 +908,7 @@ public:
         w.write("numBands", n);
         w.write("matchedBells", matchedBells_.load(std::memory_order_relaxed));
         w.write("matchedFilters", matchedFilters_.load(std::memory_order_relaxed));
+        w.write("structure", static_cast<int32_t>(getStructure()));
         w.write("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)));
         w.write("softMode", softMode_.load(std::memory_order_relaxed));
         w.write("analog", analogResponse_.load(std::memory_order_relaxed));
@@ -920,6 +946,7 @@ public:
         const int n = std::clamp(r.read("numBands", 0), 0, MaxBands);
         setMatchedBells(r.read("matchedBells", true));
         setMatchedFilters(r.read("matchedFilters", false));   // older blobs: bilinear, as before
+        setStructure(static_cast<Structure>(r.read("structure", 0)));
         // Older blobs carry no mode keys: keep the instance's current modes.
         setFilterMode(static_cast<FilterMode>(
             r.read("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)))));
@@ -2252,6 +2279,7 @@ protected:
     std::atomic<int> numBands_ { 0 };
 
     std::array<FilterEngine<T>, MaxBands> bands_ {};
+    std::atomic<Structure> structure_ { Structure::DirectForm }; ///< setStructure().
 
     /**
      * @brief One band's published configuration: a seqlock over atomic words.

@@ -46,6 +46,7 @@
 #include "../Core/Biquad.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/DspMath.h"
+#include "../Core/NormalizedLadder.h"
 #include "../Core/StateBlob.h"
 
 #include <algorithm>
@@ -143,6 +144,32 @@ public:
     /** @return Whether the output is the delta. */
     [[nodiscard]] bool isDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
 
+    /** @brief How the cut bell is realised (see setStructure()). */
+    enum class Structure
+    {
+        DirectForm,  ///< Direct form (the default).
+        Ladder       ///< Normalized ladder: passive while the reduction moves the bell.
+    };
+
+    /**
+     * @brief Chooses how the cut bell is realised.
+     *
+     * The bell is designed again every 16 samples as the reduction moves.
+     * Ladder runs it as a normalized ladder (NormalizedLadder): the same
+     * response, and a memory that cannot gain energy at the jumps, for
+     * about twice the arithmetic of the bell. Safe from any thread; the
+     * switch restarts the bell's memory at the next block.
+     *
+     * @param structure DirectForm (default) or Ladder.
+     */
+    void setStructure(Structure structure) noexcept
+    {
+        structure_.store(static_cast<Structure>(std::clamp(static_cast<int>(structure), 0, 1)), std::memory_order_relaxed);
+    }
+
+    /** @return How the cut bell is realised. */
+    [[nodiscard]] Structure getStructure() const noexcept { return structure_.load(std::memory_order_relaxed); }
+
 private:
     void processWet(AudioBufferView<T> buffer) noexcept
     {
@@ -152,6 +179,19 @@ private:
         DenormalGuard guard;
 
         updateFiltersIfDirty();
+
+        // A change of structure restarts the bell's memory.
+        const bool ladder = structure_.load(std::memory_order_relaxed) == Structure::Ladder;
+        if (ladder != ladderActive_)
+        {
+            ladderActive_ = ladder;
+            for (int ch = 0; ch < kMaxChannels; ++ch)
+            {
+                reduction_[ch].reset();
+                ladder_[ch].reset();
+                ladder_[ch].setCoeffs(reduction_[ch].getCoeffs());
+            }
+        }
 
         if (envCoefsDirty_.exchange(false, std::memory_order_acquire))
             updateEnvelopeCoeffs();
@@ -186,6 +226,7 @@ public:
         {
             detector_[ch].reset();
             reduction_[ch].reset();
+            ladder_[ch].reset();
             smoothedGrDb_[ch] = T(0);
             derivShift_[ch].fill(T(0));
         }
@@ -308,6 +349,7 @@ public:
         w.write("attack", static_cast<float>(attackMs_.load(std::memory_order_relaxed)));
         w.write("release", static_cast<float>(releaseMs_.load(std::memory_order_relaxed)));
         w.write("detection", static_cast<int32_t>(detectionMode_.load(std::memory_order_relaxed)));
+        w.write("structure", static_cast<int32_t>(getStructure()));
         w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
         return w.blob();
     }
@@ -326,6 +368,7 @@ public:
         setAttack(static_cast<T>(r.read("attack", 0.5f)));
         setRelease(static_cast<T>(r.read("release", 20.0f)));
         setDetectionMode(static_cast<DetectionMode>(r.read("detection", 0)));
+        setStructure(static_cast<Structure>(r.read("structure", 0)));
         setAutoThreshold(r.read("autoThreshold", false));
         return true;
     }
@@ -402,7 +445,10 @@ private:
                 {
                     // Channels share the linked gain: design once per frame.
                     if (ch > 0 && smoothedGr == smoothedGrDb_[0])
+                    {
                         reduction_[ch].setCoeffsNow(reduction_[0].getCoeffs());
+                        if (ladderActive_) ladder_[ch].setLadder(ladder_[0].getLadder());
+                    }
                     else
                         updateDynamicPeakCoeffs(ch, smoothedGr);
                 }
@@ -410,7 +456,9 @@ private:
                 T* channelData = buffer.getChannel(ch);
                 const T x = channelData[i];
                 // A non-finite sample passes without entering the filter state.
-                channelData[i] = std::isfinite(x) ? reduction_[ch].processSample(x, 0) : x;
+                if (!std::isfinite(x)) continue;
+                channelData[i] = ladderActive_ ? static_cast<T>(ladder_[ch].processSample(static_cast<double>(x), 0))
+                                               : reduction_[ch].processSample(x, 0);
             }
         }
     }
@@ -454,8 +502,9 @@ private:
     {
         // Stream-owner direct write: computed on the audio thread for its own
         // use, so it bypasses the staged cross-thread channel.
-        reduction_[ch].setCoeffsNow(BiquadCoeffs::makePeakMatched(
-            sampleRate_, peakFreq_, peakQ_, static_cast<double>(gainDb)));
+        const BiquadCoeffs c = BiquadCoeffs::makePeakMatched(sampleRate_, peakFreq_, peakQ_, static_cast<double>(gainDb));
+        reduction_[ch].setCoeffsNow(c);
+        if (ladderActive_) ladder_[ch].setCoeffs(c);
     }
 
     void updateEnvelopeCoeffs() noexcept
@@ -491,6 +540,9 @@ private:
 
     Biquad<T, 1> detector_[kMaxChannels]{};
     Biquad<T, 1> reduction_[kMaxChannels]{};
+    NormalizedLadder<T, 1> ladder_[kMaxChannels]{};      ///< The bell as a ladder (setStructure()).
+    std::atomic<Structure> structure_ { Structure::DirectForm }; ///< setStructure().
+    bool ladderActive_ = false;                          ///< The audio thread runs the ladder.
 
     // Automatic threshold (setAutoThreshold()).
     static constexpr double kAutoRefFallDb = 1.0;  ///< dB per second its reference falls.

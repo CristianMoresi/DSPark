@@ -1412,10 +1412,15 @@ All notable user-facing changes to DSPark are documented here.
   output moves at the level of rounding.
 - `LoudnessMeter`: the two K-weighting stages run side by side, stage 1 of a
   frame (both channels in one register) next to stage 2 of the frame before
-  it, and every call closes the pipeline on its last frame. Readings are the
-  same to the bit (each stage computes the same operations); the meter costs
-  0.91 to 0.975 of what it did per frame (the true-peak reader is most of the
-  rest).
+  it, and every call closes the pipeline on its last frame. Every frame goes
+  through the same two-lane step, the first and last of a call included, so
+  the readings do not depend on how the signal is split into calls (the step
+  fuses its multiply-adds explicitly where the target has them, so the
+  compiler has none left to fuse differently from one place to another).
+  They are the same to the bit as before on targets without fused
+  multiply-adds and move at the level of rounding on the others. The meter
+  costs 0.93 to 0.996 of what it did per frame (the true-peak reader is most
+  of the rest).
 - `DCBlocker`: pairs of channels run in the two lanes of one register (an
   odd last channel alone, 32-bit x86 one at a time), each lane computing the
   single-channel operations. In stereo it costs 0.26 to 0.80 of what it did

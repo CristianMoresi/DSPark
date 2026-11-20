@@ -96,7 +96,7 @@ public:
         sampleRate_ = spec.sampleRate;
         numChannels_ = spec.numChannels;
 
-        deltaScratch_.assign(static_cast<size_t>(std::min(numChannels_, kMaxChannels)),
+        removalScratch_.assign(static_cast<size_t>(std::min(numChannels_, kMaxChannels)),
                              std::vector<T>(static_cast<size_t>(std::max(1, spec.maxBlockSize)), T(0)));
         mixScratch_.assign(static_cast<size_t>(kMaxChannels),
                            std::vector<T>(static_cast<size_t>(std::max(1, spec.maxBlockSize)), T(0)));
@@ -118,22 +118,22 @@ public:
      */
     void processBlock(AudioBufferView<T> buffer) noexcept
     {
-        if (delta_.load(std::memory_order_relaxed) && !deltaScratch_.empty())
+        if (removalListen_.load(std::memory_order_relaxed) && !removalScratch_.empty())
         {
-            // Delta listen: the input minus the de-essed signal (no latency),
+            // Removal listen: the input minus the de-essed signal (no latency),
             // in chunks as long as the scratch.
-            const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(deltaScratch_.size()));
-            const int step = static_cast<int>(deltaScratch_[0].size());
+            const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(removalScratch_.size()));
+            const int step = static_cast<int>(removalScratch_[0].size());
             for (int off = 0; off < buffer.getNumSamples(); off += step)
             {
                 const int m = std::min(step, buffer.getNumSamples() - off);
                 auto part = buffer.getSubView(off, m);
-                for (int ch = 0; ch < nCh; ++ch) std::copy_n(part.getChannel(ch), m, deltaScratch_[static_cast<size_t>(ch)].data());
+                for (int ch = 0; ch < nCh; ++ch) std::copy_n(part.getChannel(ch), m, removalScratch_[static_cast<size_t>(ch)].data());
                 processWet(part);
                 for (int ch = 0; ch < nCh; ++ch)
                 {
                     T* d = part.getChannel(ch);
-                    const T* in = deltaScratch_[static_cast<size_t>(ch)].data();
+                    const T* in = removalScratch_[static_cast<size_t>(ch)].data();
                     for (int i = 0; i < m; ++i) d[i] = in[i] - d[i];
                 }
             }
@@ -143,12 +143,12 @@ public:
     }
 
     /**
-     * @brief Delta listen: the output is what the de-esser takes out. A
+     * @brief Removal listen: the output is what the de-esser takes out. A
      *        monitoring control, not in the state.
      */
-    void setDelta(bool on) noexcept { delta_.store(on, std::memory_order_relaxed); }
-    /** @return Whether the output is the delta. */
-    [[nodiscard]] bool isDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
+    void setRemovalListen(bool on) noexcept { removalListen_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the output is what the de-esser takes out. */
+    [[nodiscard]] bool isRemovalListen() const noexcept { return removalListen_.load(std::memory_order_relaxed); }
 
     /** @brief How the cut bell is realised (see setStructure()). */
     enum class Structure
@@ -700,8 +700,8 @@ private:
     static constexpr double kAutoRefFallDb = 1.0;  ///< dB per second its reference falls.
     static constexpr double kAutoRefFloor = 1e-5;  ///< The reference never goes under -100 dBFS.
     std::atomic<bool> autoThreshold_ { false };    ///< The threshold counts from the level of the input.
-    std::atomic<bool> delta_ { false };            ///< The output is what the de-esser takes out.
-    std::vector<std::vector<T>> deltaScratch_;     ///< The input of the block, for the delta.
+    std::atomic<bool> removalListen_ { false };            ///< The output is what the de-esser takes out.
+    std::vector<std::vector<T>> removalScratch_;     ///< The input of the block, for the removal listen.
     bool relative_ = false;                        ///< Its value for the block (audio thread).
     double autoRef_ = kAutoRefFloor;               ///< The reference (linear).
     double autoFall_ = 1.0;                        ///< Its fall per sample (a factor).

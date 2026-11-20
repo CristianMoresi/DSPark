@@ -84,7 +84,7 @@
  *   instead of from full scale, so the band acts the same on a quiet take
  *   and on a loud one. When the band is moved to another zone a second
  *   reference listens there for half a second and then takes over.
- * - BandConfig::placement: the band acts on every channel (linked by the
+ * - BandConfig::scope: the band acts on every channel (linked by the
  *   loudest), on the left or the right alone, or on the middle or the sides
  *   of the first pair, and listens to the same part of the sidechain.
  *
@@ -175,7 +175,7 @@ public:
     };
 
     /** @brief Where in a stereo pair a band acts and listens. */
-    enum class Placement
+    enum class Scope
     {
         Stereo, ///< Every channel, linked by the loudest. Default.
         Left,   ///< The first channel only.
@@ -208,7 +208,7 @@ public:
 
         T gain           = T(0);            ///< Gain of the band at rest, in dB (-24 to 24). The dynamic part moves from here.
         T knee           = T(0);            ///< Width of the knee around the threshold in dB (0 to 40); negative (kAutomaticKnee): from the band's width and range.
-        Placement placement = Placement::Stereo;   ///< The channels the band acts on and listens to.
+        Scope scope = Scope::Stereo;   ///< The channels the band acts on and listens to.
         Timing timing    = Timing::Manual;  ///< Program: the times come from the band, and the attack and release fields are not used.
         bool relativeThreshold = false;     ///< The threshold counts from the band's own recent level instead of from full scale.
 
@@ -319,7 +319,7 @@ public:
         updateLookahead();
         reset();
         for (int ch = 0; ch < std::min(spec.numChannels, kMaxChannels); ++ch)
-            deltaRing_[static_cast<size_t>(ch)].prepare(kDeltaCapacity + std::max(1, spec.maxBlockSize));
+            deltaRing_[static_cast<size_t>(ch)].prepare(kRemovalCapacity + std::max(1, spec.maxBlockSize));
         isPrepared_.store(true, std::memory_order_relaxed);
     }
 
@@ -340,12 +340,12 @@ public:
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
         if (!isPrepared_.load(std::memory_order_relaxed)) return;
-        if (!delta_.load(std::memory_order_relaxed))
+        if (!removalListen_.load(std::memory_order_relaxed))
         {
             processImpl(audio, sidechain);
             return;
         }
-        // Delta listen: the input, late by the latency, minus the output, in
+        // Removal listen: the input, late by the latency, minus the output, in
         // chunks of the prepared block.
         const bool selfKeyed = sidechain.getNumChannels() <= 0 || sidechain.getNumSamples() < audio.getNumSamples()
                             || sidechain.getChannel(0) == audio.getChannel(0);
@@ -360,7 +360,7 @@ public:
                 const T* d = part.getChannel(ch);
                 for (int i = 0; i < m; ++i) deltaRing_[static_cast<size_t>(ch)].push(d[i]);
             }
-            const int late = std::min(getLatency(), kDeltaCapacity);
+            const int late = std::min(getLatency(), kRemovalCapacity);
             processImpl(part, selfKeyed ? part : sidechain.getSubView(off, m));
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -372,13 +372,13 @@ public:
     }
 
     /**
-     * @brief Delta listen: the output is what the bands take out (or add),
+     * @brief Removal listen: the output is what the bands take out (or add),
      *        the input delayed by the latency minus the output. A monitoring
      *        control, not in the state.
      */
-    void setDelta(bool on) noexcept { delta_.store(on, std::memory_order_relaxed); }
-    /** @return Whether the output is the delta. */
-    [[nodiscard]] bool isDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
+    void setRemovalListen(bool on) noexcept { removalListen_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the output is what the bands change. */
+    [[nodiscard]] bool isRemovalListen() const noexcept { return removalListen_.load(std::memory_order_relaxed); }
 
 private:
     void processImpl(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
@@ -431,7 +431,7 @@ public:
      * Fields are sanitized on the way in: non-finite values keep the band's
      * previously published value (a NaN frequency/Q/time used to poison the
      * detector or the gain ballistics permanently), wild shape enums are
-     * clamped (a placement or a timing that is not one keeps the band's own),
+     * clamped (a scope or a timing that is not one keeps the band's own),
      * the gain at rest is held within 24 dB, the knee within 40 dB (any
      * negative knee is the automatic one), and the range fields are floored
      * at 0. Configuring a band at or
@@ -455,8 +455,8 @@ public:
         c.gain           = std::clamp(keep(c.gain, prev.gain), T(-24), T(24));
         c.knee           = std::min(keep(c.knee, prev.knee), T(40));
         if (c.knee < T(0)) c.knee = kAutomaticKnee;
-        if (static_cast<int>(c.placement) < 0 || static_cast<int>(c.placement) > static_cast<int>(Placement::Side))
-            c.placement = prev.placement;
+        if (static_cast<int>(c.scope) < 0 || static_cast<int>(c.scope) > static_cast<int>(Scope::Side))
+            c.scope = prev.scope;
         if (static_cast<int>(c.timing) < 0 || static_cast<int>(c.timing) > static_cast<int>(Timing::Program))
             c.timing = prev.timing;
         c.aboveRatio     = keep(c.aboveRatio, prev.aboveRatio);
@@ -515,7 +515,7 @@ public:
      * 20 ms make a covariance whose larger eigenvalue is read (see
      * dominantPairLevel()). A source reads the same wherever an equal-power
      * pan puts it, and uncorrelated channels read the louder 3 dB down. It
-     * applies to Placement::Stereo bands on two channels. Safe from any thread.
+     * applies to Scope::Stereo bands on two channels. Safe from any thread.
      *
      * @param mode Loudest (default) or Dominant.
      */
@@ -838,8 +838,8 @@ public:
             w.write(key, static_cast<float>(c.gain));
             std::snprintf(key, sizeof(key), "b%d.knee", i);
             w.write(key, static_cast<float>(c.knee));
-            std::snprintf(key, sizeof(key), "b%d.place", i);
-            w.write(key, static_cast<int>(c.placement));
+            std::snprintf(key, sizeof(key), "b%d.scope", i);
+            w.write(key, static_cast<int>(c.scope));
             std::snprintf(key, sizeof(key), "b%d.timing", i);
             w.write(key, static_cast<int>(c.timing));
             std::snprintf(key, sizeof(key), "b%d.relative", i);
@@ -892,8 +892,8 @@ public:
             c.gain = static_cast<T>(r.read(key, 0.0f));
             std::snprintf(key, sizeof(key), "b%d.knee", i);
             c.knee = static_cast<T>(r.read(key, 0.0f));
-            std::snprintf(key, sizeof(key), "b%d.place", i);
-            c.placement = static_cast<Placement>(std::clamp(r.read(key, 0), 0, static_cast<int>(Placement::Side)));
+            std::snprintf(key, sizeof(key), "b%d.scope", i);
+            c.scope = static_cast<Scope>(std::clamp(r.read(key, 0), 0, static_cast<int>(Scope::Side)));
             std::snprintf(key, sizeof(key), "b%d.timing", i);
             c.timing = static_cast<Timing>(std::clamp(r.read(key, 0), 0, static_cast<int>(Timing::Program)));
             std::snprintf(key, sizeof(key), "b%d.relative", i);
@@ -999,7 +999,7 @@ private:
 
     [[nodiscard]] static bool ofThePair(const BandConfig& cfg) noexcept
     {
-        return cfg.placement == Placement::Mid || cfg.placement == Placement::Side;
+        return cfg.scope == Scope::Mid || cfg.scope == Scope::Side;
     }
 
     /** @brief The factor the bands run at: the linear-phase mode runs at the host rate. */
@@ -1009,7 +1009,7 @@ private:
     [[nodiscard]] static bool plays(const BandConfig& cfg, int numChannels) noexcept
     {
         if (!cfg.enabled) return false;
-        return numChannels >= 2 || (cfg.placement != Placement::Right && cfg.placement != Placement::Side);
+        return numChannels >= 2 || (cfg.scope != Scope::Right && cfg.scope != Scope::Side);
     }
 
     void processCore(AudioBufferView<T>& audio, AudioBufferView<T>& sidechain, double currentFs) noexcept
@@ -1131,25 +1131,25 @@ private:
         std::fill(levels, levels + n, kMinLevelDb);
         if (program) std::fill(detLinear_.begin(), detLinear_.begin() + n, 0.0);
 
-        const Placement where = cfg.placement;
-        const int listeners = where == Placement::Stereo ? nCh : 1;
-        const bool dominant = dominantLink_ && where == Placement::Stereo;
+        const Scope where = cfg.scope;
+        const int listeners = where == Scope::Stereo ? nCh : 1;
+        const bool dominant = dominantLink_ && where == Scope::Stereo;
         for (int k = 0; k < listeners; ++k)
         {
             int slot = k;
             const T* first = sidechain.getChannel(std::min(k, scCh - 1)) + start;
             const T* second = nullptr;
             T sign = T(1);
-            if (where == Placement::Right)
+            if (where == Scope::Right)
             {
                 slot = 1;
                 first = sidechain.getChannel(std::min(1, scCh - 1)) + start;
             }
-            else if (where == Placement::Mid || where == Placement::Side)
+            else if (where == Scope::Mid || where == Scope::Side)
             {
                 if (scCh >= 2) second = sidechain.getChannel(1) + start;
-                else if (where == Placement::Side) break;   // one channel has no sides: silence
-                sign = where == Placement::Mid ? T(1) : T(-1);
+                else if (where == Scope::Side) break;   // one channel has no sides: silence
+                sign = where == Scope::Mid ? T(1) : T(-1);
             }
 
             if (second == nullptr)
@@ -1369,12 +1369,12 @@ private:
             for (int k = 0; k < numFirst_; ++k)
             {
                 const int b = first_[static_cast<size_t>(k)];
-                switch (states_[b].cfg.placement)
+                switch (states_[b].cfg.scope)
                 {
-                case Placement::Left:
+                case Scope::Left:
                     if (finite[0]) frame[0] = runBand(b, frame[0], 0);
                     break;
-                case Placement::Right:
+                case Scope::Right:
                     if (finite[1]) frame[1] = runBand(b, frame[1], 1);
                     break;
                 default:
@@ -1396,7 +1396,7 @@ private:
                 for (int k = 0; k < numSecond_; ++k)
                 {
                     const int b = second_[static_cast<size_t>(k)];
-                    if (states_[b].cfg.placement == Placement::Mid)
+                    if (states_[b].cfg.scope == Scope::Mid)
                         middle = runBand(b, middle, 0);
                     else
                         sides = runBand(b, sides, 0);
@@ -1454,14 +1454,14 @@ private:
         for (int k = 0; k < numFirst_; ++k)
         {
             const int b = first_[static_cast<size_t>(k)];
-            const Placement where = states_[b].cfg.placement;
-            if (where == Placement::Stereo)
+            const Scope where = states_[b].cfg.scope;
+            if (where == Scope::Stereo)
             {
                 mixBand(b, AudioBufferView<T>(channels, nCh, n), n);
             }
             else
             {
-                T* single[1] = { channels[where == Placement::Left ? 0 : 1] };
+                T* single[1] = { channels[where == Scope::Left ? 0 : 1] };
                 mixBand(b, AudioBufferView<T>(single, 1, n), n);
             }
         }
@@ -1473,7 +1473,7 @@ private:
             for (int k = 0; k < numSecond_; ++k)
             {
                 const int b = second_[static_cast<size_t>(k)];
-                T* single[1] = { channels[states_[b].cfg.placement == Placement::Mid ? 0 : 1] };
+                T* single[1] = { channels[states_[b].cfg.scope == Scope::Mid ? 0 : 1] };
                 mixBand(b, AudioBufferView<T>(single, 1, n), n);
             }
             if (nCh >= 2) MidSide<T>::decode(pair);
@@ -1600,12 +1600,12 @@ private:
     [[nodiscard]] unsigned linearMask(const BandConfig& cfg) const noexcept
     {
         const int channels = linear_->channels;
-        switch (cfg.placement)
+        switch (cfg.scope)
         {
-            case Placement::Left:  return 1u;
-            case Placement::Right: return channels >= 2 ? 2u : 0u;
-            case Placement::Mid:   return channels >= 2 ? 1u << channels : 1u;
-            case Placement::Side:  return channels >= 2 ? 1u << (channels + 1) : 0u;
+            case Scope::Left:  return 1u;
+            case Scope::Right: return channels >= 2 ? 2u : 0u;
+            case Scope::Mid:   return channels >= 2 ? 1u << channels : 1u;
+            case Scope::Side:  return channels >= 2 ? 1u << (channels + 1) : 0u;
             default:               return (1u << channels) - 1u;
         }
     }
@@ -1781,7 +1781,7 @@ private:
             for (int k = 0; k < numFirst_ + numSecond_; ++k)
             {
                 const int b = k < numFirst_ ? first_[static_cast<size_t>(k)] : second_[static_cast<size_t>(k - numFirst_)];
-                const Placement where = states_[b].cfg.placement;
+                const Scope where = states_[b].cfg.scope;
                 const T* sideWeights[kLinearBranches] = { nullptr, e.weights.data() + static_cast<size_t>(b * 2) * ring,
                                                           e.weights.data() + static_cast<size_t>(b * 2 + 1) * ring };
                 for (int branch = 0; branch < kLinearBranches; ++branch)
@@ -1803,13 +1803,13 @@ private:
                     };
                     switch (where)
                     {
-                        case Placement::Left:  add(0, 0, T(1)); break;
-                        case Placement::Right: add(1, 1, T(1)); break;
-                        case Placement::Mid:
+                        case Scope::Left:  add(0, 0, T(1)); break;
+                        case Scope::Right: add(1, 1, T(1)); break;
+                        case Scope::Mid:
                             add(pair ? e.channels : 0, 0, T(1));
                             if (pair) add(e.channels, 1, T(1));
                             break;
-                        case Placement::Side:
+                        case Scope::Side:
                             if (pair) { add(e.channels + 1, 0, T(1)); add(e.channels + 1, 1, T(-1)); }
                             break;
                         default:
@@ -2070,7 +2070,7 @@ private:
         // A band re-enabled after being disabled would replay arbitrarily old
         // filter history and gain state: start it clean. So does one that
         // moves to other channels, whose memory is of another signal.
-        if ((cfg.enabled && !old.enabled) || cfg.placement != old.placement)
+        if ((cfg.enabled && !old.enabled) || cfg.scope != old.scope)
             cleanBand(b);
 
         // The zone the band listens to has moved: with a relative threshold,
@@ -2204,7 +2204,7 @@ private:
         std::atomic<bool> enabled        { true };
         std::atomic<T>    gain           { T(0) };
         std::atomic<T>    knee           { T(0) };
-        std::atomic<int>  placement      { static_cast<int>(Placement::Stereo) };
+        std::atomic<int>  scope      { static_cast<int>(Scope::Stereo) };
         std::atomic<int>  timing         { static_cast<int>(Timing::Manual) };
         std::atomic<bool> relative       { false };
 
@@ -2244,7 +2244,7 @@ private:
             enabled.store(c.enabled, std::memory_order_relaxed);
             gain.store(c.gain, std::memory_order_relaxed);
             knee.store(c.knee, std::memory_order_relaxed);
-            placement.store(static_cast<int>(c.placement), std::memory_order_relaxed);
+            scope.store(static_cast<int>(c.scope), std::memory_order_relaxed);
             timing.store(static_cast<int>(c.timing), std::memory_order_relaxed);
             relative.store(c.relativeThreshold, std::memory_order_relaxed);
             aboveRatio.store(c.aboveRatio, std::memory_order_relaxed);
@@ -2282,7 +2282,7 @@ private:
             c.enabled        = enabled.load(std::memory_order_relaxed);
             c.gain           = gain.load(std::memory_order_relaxed);
             c.knee           = knee.load(std::memory_order_relaxed);
-            c.placement      = static_cast<Placement>(placement.load(std::memory_order_relaxed));
+            c.scope      = static_cast<Scope>(scope.load(std::memory_order_relaxed));
             c.timing         = static_cast<Timing>(timing.load(std::memory_order_relaxed));
             c.relativeThreshold = relative.load(std::memory_order_relaxed);
             c.aboveRatio     = aboveRatio.load(std::memory_order_relaxed);
@@ -2417,8 +2417,8 @@ private:
     int numFirst_ = 0, numSecond_ = 0;
 
     std::atomic<bool> mixedWanted_ { false };    ///< setMixedBands().
-    static constexpr int kDeltaCapacity = 32768; ///< Longest latency the delta lines up.
-    std::atomic<bool> delta_ { false };          ///< The output is what the bands take out.
+    static constexpr int kRemovalCapacity = 32768; ///< Longest latency the removal listen lines up.
+    std::atomic<bool> removalListen_ { false };          ///< The output is what the bands take out.
     std::array<RingBuffer<T>, kMaxChannels> deltaRing_ {};
     bool mixedActive_ = false;                   ///< The engine the audio thread is running.
     std::unique_ptr<MixedEngine> mixedEngine_;

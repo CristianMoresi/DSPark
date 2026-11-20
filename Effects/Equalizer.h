@@ -22,10 +22,10 @@
  * ramped: a parameter change glides (slowly for a small move, fast for a
  * jump) and a band at 0 dB leaves the path and costs nothing. It opens cuts
  * of any slope from 0 to 96 dB per octave and bells, shelves, notches and
- * band-passes of order 1 to 16. The all-pass, flat tilt and wall bands, and
+ * band-passes of order 1 to 16. The all-pass, constant tilt and wall bands, and
  * any band of order above 1, always run this way.
  *
- * Placement (BandConfig::placement): a band acts on every channel, on the
+ * Scope (BandConfig::scope): a band acts on every channel, on the
  * left or the right one alone, or on the middle or the sides of the first
  * pair. The left, right and stereo bands run first, then the pair is turned
  * into middle and sides for the bands placed there, and back. In LinearPhase
@@ -33,7 +33,7 @@
  * latency does not change. With a single channel the left and middle bands
  * act on it and the right and side bands do nothing.
  *
- * NaturalPhase: a minimum-phase digital filter that follows the magnitude of
+ * PrototypePhase: a minimum-phase digital filter that follows the magnitude of
  * an analog one does not have its phase, because the analog curve goes on
  * above Nyquist and the digital one folds there; the two differ by tens of
  * degrees in the top octave for bands near it. In this mode every band runs
@@ -141,7 +141,7 @@ public:
     {
         MinimumPhase, ///< IIR biquads (zero latency, minimum phase shift). Default.
         LinearPhase,  ///< Partitioned FFT convolution (fixed latency, see getLatency()).
-        NaturalPhase  ///< The bands from their analog prototypes plus a short correction: the phase of the analog curve, 32 samples late.
+        PrototypePhase  ///< The bands from their analog prototypes plus a short correction: the phase of the analog curve, 32 samples late.
     };
 
     /** @brief Non-virtual destructor to prevent vtable instantiation (zero virtual dispatch). */
@@ -159,13 +159,13 @@ public:
         BandPass,   ///< Bandpass around frequency.
         Tilt,       ///< Tilt EQ: pivots spectrum around frequency.
         AllPass,      ///< Turns the phase around frequency, 180 degrees per order; the level stays.
-        FlatTilt,     ///< The same slope across the whole band: gain is in dB per octave (-6 to +6), 0 dB at frequency.
+        ConstantTilt,     ///< The same slope across the whole band: gain is in dB per octave (-6 to +6), 0 dB at frequency.
         LowPassWall,  ///< Elliptic cut above frequency: flat to it, 100 dB down a quarter of an octave later.
         HighPassWall  ///< Elliptic cut below frequency.
     };
 
     /** @brief Where in a stereo pair a band acts. */
-    enum class Placement
+    enum class Scope
     {
         Stereo, ///< Every channel. Default.
         Left,   ///< The first channel only.
@@ -186,7 +186,7 @@ public:
         T slope         = T(12);            ///< Slope in dB/oct (LP/HP only): 6 to 48 in steps of 6, or any value from 0 to 96 with the analog response.
         int order       = 1;                ///< Order of a bell, shelf, notch, band-pass or all-pass (1 to 16; 6 dB/oct each). Above 1 the band runs with the analog response.
         bool enabled    = true;             ///< False to bypass this band.
-        Placement placement = Placement::Stereo;   ///< The channels the band acts on.
+        Scope scope = Scope::Stereo;   ///< The channels the band acts on.
     };
 
     static_assert(std::atomic<T>::is_always_lock_free,
@@ -230,27 +230,27 @@ public:
         {
             const BandConfig cfg = staged_[i].read();
             bandAnalog_[static_cast<size_t>(i)] = usesAnalog(cfg);
-            bandPlacement_[static_cast<size_t>(i)] = static_cast<int>(cfg.placement);
+            bandScope_[static_cast<size_t>(i)] = static_cast<int>(cfg.scope);
             if (bandAnalog_[static_cast<size_t>(i)]) designAnalogBand(i, cfg, true);
         }
 
-        // The natural-phase mode: the grid its correction is designed on, the
+        // The prototype-phase mode: the grid its correction is designed on, the
         // window that cuts it to length, and its filters at rest (the signal,
-        // late). natural_ gates the mode, so it is set last.
-        natural_.reset();
+        // late). prototype_ gates the mode, so it is set last.
+        prototype_.reset();
         {
-            auto engine = std::make_unique<NaturalEngine>();
-            NaturalEngine& e = *engine;
+            auto engine = std::make_unique<PrototypeEngine>();
+            PrototypeEngine& e = *engine;
             e.channels = spec.numChannels;
-            e.spectrum.assign(static_cast<size_t>(2 * kNaturalBins + 2), 0.0);
-            e.time.assign(static_cast<size_t>(2 * kNaturalBins), 0.0);
-            e.work.assign(static_cast<size_t>(e.channels) * static_cast<size_t>(kNaturalTaps - 1 + kNaturalGrid), T(0));
+            e.spectrum.assign(static_cast<size_t>(2 * kPrototypeBins + 2), 0.0);
+            e.time.assign(static_cast<size_t>(2 * kPrototypeBins), 0.0);
+            e.work.assign(static_cast<size_t>(e.channels) * static_cast<size_t>(kPrototypeTaps - 1 + kPrototypeGrid), T(0));
             const double nyquist = 0.5 * spec.sampleRate;
             const double top = std::min(designBand_.getHighHz(), 0.98 * nyquist);
-            for (int k = 0; k <= kNaturalBins; ++k)
+            for (int k = 0; k <= kPrototypeBins; ++k)
             {
                 const auto at = static_cast<size_t>(k);
-                const double theta = std::numbers::pi * k / kNaturalBins, hz = nyquist * k / kNaturalBins;
+                const double theta = std::numbers::pi * k / kPrototypeBins, hz = nyquist * k / kPrototypeBins;
                 e.omega[at] = 2.0 * std::numbers::pi * hz;
                 e.cosOne[at] = std::cos(theta);
                 e.sinOne[at] = std::sin(theta);
@@ -260,19 +260,19 @@ public:
                 const double fall = std::cos(0.5 * std::numbers::pi * past);
                 e.taper[at] = fall * fall;
             }
-            for (int m = 0; m < kNaturalTaps; ++m)
+            for (int m = 0; m < kPrototypeTaps; ++m)
             {
                 // Whole over the middle half, down to nothing at the first tap.
-                const double away = std::abs(m - kNaturalDelay) / static_cast<double>(kNaturalDelay);
+                const double away = std::abs(m - kPrototypeDelay) / static_cast<double>(kPrototypeDelay);
                 const double fall = std::cos(0.5 * std::numbers::pi * std::clamp(2.0 * away - 1.0, 0.0, 1.0));
                 e.window[static_cast<size_t>(m)] = fall * fall;
             }
-            e.fadeLength = kNaturalGrid * std::max(1, static_cast<int>(
-                std::lround(kNaturalFadeSeconds * spec.sampleRate / kNaturalGrid)));
-            natural_ = std::move(engine);
+            e.fadeLength = kPrototypeGrid * std::max(1, static_cast<int>(
+                std::lround(kPrototypeFadeSeconds * spec.sampleRate / kPrototypeGrid)));
+            prototype_ = std::move(engine);
         }
-        designNatural(true);
-        naturalWasActive_ = false;
+        designPrototype(true);
+        prototypeWasActive_ = false;
 
         // Rebuild the linear-phase engine. lpFft_ gates the LP audio path, so
         // it is torn down first and re-created last (basic guarantee if an
@@ -396,18 +396,18 @@ public:
         lpWasActive_ = false;
         processMinimumPhase(buffer);
 
-        if (currentMode == FilterMode::NaturalPhase && natural_)
+        if (currentMode == FilterMode::PrototypePhase && prototype_)
         {
             // Entering the mode: the correction lands at once on the bands as
             // they are, with nothing of an earlier stretch of audio in it.
-            if (!naturalWasActive_) clearNaturalStream();
-            refreshNatural(!naturalWasActive_);
-            naturalWasActive_ = true;
-            processNatural(buffer);
+            if (!prototypeWasActive_) clearPrototypeStream();
+            refreshPrototype(!prototypeWasActive_);
+            prototypeWasActive_ = true;
+            processPrototype(buffer);
         }
         else
         {
-            naturalWasActive_ = false;
+            prototypeWasActive_ = false;
         }
     }
 
@@ -421,7 +421,7 @@ public:
      * A band placed on the left or the right acts on channel 0 or 1 alone.
      * The bands of the middle and the sides need both channels of a frame
      * and only run in processBlock(), and so does the correction of the
-     * NaturalPhase mode: here that mode is its bands alone, with no latency.
+     * PrototypePhase mode: here that mode is its bands alone, with no latency.
      *
      * @param input   Input sample.
      * @param channel Channel index (out-of-range channels pass through).
@@ -450,11 +450,11 @@ public:
             // A band of one channel keeps its memory in the first slot of its
             // engine, as in the block form. Middle and sides need both
             // channels of a frame: those bands only run in processBlock().
-            const int placement = bandPlacement_[static_cast<size_t>(i)];
-            if (placement >= static_cast<int>(Placement::Mid)) continue;
-            if (placement != static_cast<int>(Placement::Stereo)
-                && channel != (placement == static_cast<int>(Placement::Left) ? 0 : 1)) continue;
-            const int slot = placement == static_cast<int>(Placement::Stereo) ? channel : 0;
+            const int scope = bandScope_[static_cast<size_t>(i)];
+            if (scope >= static_cast<int>(Scope::Mid)) continue;
+            if (scope != static_cast<int>(Scope::Stereo)
+                && channel != (scope == static_cast<int>(Scope::Left) ? 0 : 1)) continue;
+            const int slot = scope == static_cast<int>(Scope::Stereo) ? channel : 0;
             if (bandAnalog_[static_cast<size_t>(i)] && analog_)
             {
                 // Ramps move once per frame, on the first channel the band plays.
@@ -488,7 +488,7 @@ public:
         bandSnap_ = true;
         clearLinearPhaseStream();
         lpSnap_ = true;
-        clearNaturalStream();
+        clearPrototypeStream();
     }
 
     // -- API --------------------------------------------------------------------
@@ -549,8 +549,8 @@ public:
         if (!std::isfinite(cfg.slope))     cfg.slope     = prev.slope;
         if (static_cast<int>(cfg.type) < 0 || static_cast<int>(cfg.type) > static_cast<int>(BandType::HighPassWall))
             cfg.type = prev.type;
-        if (static_cast<int>(cfg.placement) < 0 || static_cast<int>(cfg.placement) > static_cast<int>(Placement::Side))
-            cfg.placement = prev.placement;
+        if (static_cast<int>(cfg.scope) < 0 || static_cast<int>(cfg.scope) > static_cast<int>(Scope::Side))
+            cfg.scope = prev.scope;
         cfg.slope = std::clamp(cfg.slope, T(0), T(96));
         cfg.order = std::clamp(cfg.order, 1, kMaxBandSections);
 
@@ -637,7 +637,7 @@ public:
      * the same response, a memory that cannot gain energy while a band is
      * automated, for about twice the arithmetic. It applies to the bands
      * of the default minimum-phase engine (not to the analog response, the
-     * natural phase or the linear phase, whose filters do not move that
+     * prototype phase or the linear phase, whose filters do not move that
      * way). Thread-safe; the switch restarts the bands' memory.
      *
      * @param structure DirectForm (default) or Ladder.
@@ -731,13 +731,13 @@ public:
     }
 
     /**
-     * @brief Sets the filter processing mode (minimum, linear or natural phase).
+     * @brief Sets the filter processing mode (minimum, linear or prototype phase).
      *
-     * Works before or after prepare() (the linear-phase and natural-phase
+     * Works before or after prepare() (the linear-phase and prototype-phase
      * engines are always pre-allocated by prepare()). Wild enum values clamp.
      * Switching modes changes getLatency(): hosts must be notified. The first
      * LinearPhase block after a switch completes any pending kernel design at
-     * once; going in or out of NaturalPhase, the bands that change engine
+     * once; going in or out of PrototypePhase, the bands that change engine
      * come in through the 20 ms band fade.
      *
      * @param mode Filter mode.
@@ -745,14 +745,14 @@ public:
     void setFilterMode(FilterMode mode) noexcept
     {
         const int m = std::clamp(static_cast<int>(mode), 0,
-                                 static_cast<int>(FilterMode::NaturalPhase));
-        const bool natural = static_cast<FilterMode>(m) == FilterMode::NaturalPhase;
-        const bool wasNatural = filterMode_.exchange(static_cast<FilterMode>(m), std::memory_order_acq_rel) == FilterMode::NaturalPhase;
+                                 static_cast<int>(FilterMode::PrototypePhase));
+        const bool prototype = static_cast<FilterMode>(m) == FilterMode::PrototypePhase;
+        const bool wasPrototype = filterMode_.exchange(static_cast<FilterMode>(m), std::memory_order_acq_rel) == FilterMode::PrototypePhase;
         if (static_cast<FilterMode>(m) == FilterMode::LinearPhase)
             lpDirty_.store(true, std::memory_order_release);
-        // NaturalPhase runs every band from its analog prototype: going in
+        // PrototypePhase runs every band from its analog prototype: going in
         // or out of it, the bands are looked at again.
-        if (natural != wasNatural)
+        if (prototype != wasPrototype)
             configDirty_.store(true, std::memory_order_release);
     }
 
@@ -765,7 +765,7 @@ public:
     /**
      * @brief Returns the latency in samples.
      *
-     * 0 for MinimumPhase; 32 for NaturalPhase at any rate; kernel/2 +
+     * 0 for MinimumPhase; 32 for PrototypePhase at any rate; kernel/2 +
      * kernel/16 for LinearPhase (the zero-phase kernel's centre plus one
      * partition of buffering: 18432 samples at the default 48 kHz kernel),
      * independent of the host block size. Reports 0 when the engine of the
@@ -775,7 +775,7 @@ public:
     [[nodiscard]] int getLatency() const noexcept
     {
         const FilterMode mode = filterMode_.load(std::memory_order_relaxed);
-        if (mode == FilterMode::NaturalPhase) return natural_ ? kNaturalDelay : 0;
+        if (mode == FilterMode::PrototypePhase) return prototype_ ? kPrototypeDelay : 0;
         return (mode == FilterMode::LinearPhase && lpFft_) ? lpKernelLength_ / 2 + lpPartition_ : 0;
     }
 
@@ -841,7 +841,7 @@ public:
      * @param numPoints   Number of frequency points.
      * @param where       Left, Right, Mid or Side (Stereo gives the stereo bands alone).
      */
-    void getMagnitudeForFrequencyArray(const T* frequencies, T* magnitudes, int numPoints, Placement where) const noexcept
+    void getMagnitudeForFrequencyArray(const T* frequencies, T* magnitudes, int numPoints, Scope where) const noexcept
     {
         magnitudeOfBands(frequencies, magnitudes, numPoints, static_cast<int>(where));
     }
@@ -858,7 +858,7 @@ protected:
         {
             const BandConfig cfg = staged_[b].read();
             if (!cfg.enabled) continue;
-            if (where >= 0 && cfg.placement != Placement::Stereo && static_cast<int>(cfg.placement) != where) continue;
+            if (where >= 0 && cfg.scope != Scope::Stereo && static_cast<int>(cfg.scope) != where) continue;
 
             BiquadCoeffs st[kMaxBandSections];
             const int ns = buildBandSections(cfg, st, kMaxBandSections);
@@ -932,8 +932,8 @@ public:
             w.write(key, static_cast<int32_t>(cfg.order));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             w.write(key, cfg.enabled);
-            std::snprintf(key, sizeof(key), "b%d.place", i);
-            w.write(key, static_cast<int32_t>(cfg.placement));
+            std::snprintf(key, sizeof(key), "b%d.scope", i);
+            w.write(key, static_cast<int32_t>(cfg.scope));
         }
         return w.blob();
     }
@@ -972,8 +972,8 @@ public:
             cfg.order = r.read(key, 1);
             std::snprintf(key, sizeof(key), "b%d.on", i);
             cfg.enabled = r.read(key, true);
-            std::snprintf(key, sizeof(key), "b%d.place", i);
-            cfg.placement = static_cast<Placement>(r.read(key, 0));
+            std::snprintf(key, sizeof(key), "b%d.scope", i);
+            cfg.scope = static_cast<Scope>(r.read(key, 0));
             setBand(i, cfg);
         }
         numBands_.store(n, std::memory_order_relaxed);
@@ -1033,9 +1033,9 @@ protected:
             }
 
             // A band that moves to other channels comes in through the band fade.
-            if (static_cast<int>(cfg.placement) != bandPlacement_[static_cast<size_t>(i)])
+            if (static_cast<int>(cfg.scope) != bandScope_[static_cast<size_t>(i)])
             {
-                bandPlacement_[static_cast<size_t>(i)] = static_cast<int>(cfg.placement);
+                bandScope_[static_cast<size_t>(i)] = static_cast<int>(cfg.scope);
                 bandMix_[static_cast<size_t>(i)] = T(0);
             }
 
@@ -1241,7 +1241,7 @@ protected:
     [[nodiscard]] bool usesAnalog(const BandConfig& cfg) const noexcept
     {
         return analogResponse_.load(std::memory_order_relaxed)
-            || filterMode_.load(std::memory_order_relaxed) == FilterMode::NaturalPhase
+            || filterMode_.load(std::memory_order_relaxed) == FilterMode::PrototypePhase
             || static_cast<int>(cfg.type) > static_cast<int>(BandType::Tilt)
             || cfg.order > 1;
     }
@@ -1281,7 +1281,7 @@ protected:
                 break;
             case BandType::Tilt:         one.add(AnalogSection::tilt(f, g)); break;
             case BandType::AllPass:      return FilterDesign::allPass(f, q, order);
-            case BandType::FlatTilt:     return FilterDesign::tilt(f, g);
+            case BandType::ConstantTilt:     return FilterDesign::tilt(f, g);
             case BandType::LowPassWall:  return FilterDesign::ellipticHighCut(f);
             case BandType::HighPassWall: return FilterDesign::ellipticLowCut(f);
         }
@@ -1318,7 +1318,7 @@ protected:
             case BandType::LowShelf:
             case BandType::HighShelf:
             case BandType::Tilt:      return gain < kRestDb;
-            case BandType::FlatTilt:  return gain < 0.1 * kRestDb;
+            case BandType::ConstantTilt:  return gain < 0.1 * kRestDb;
             default:                  return false;
         }
     }
@@ -1457,12 +1457,12 @@ protected:
         const int total = buffer.getNumSamples();
         const int slice = bandDryStride_ > 0 ? bandDryStride_ : std::max(total, 1);
         const bool pair = buffer.getNumChannels() >= 2;
-        const int firstOfThePair = static_cast<int>(Placement::Mid);
+        const int firstOfThePair = static_cast<int>(Scope::Mid);
 
         // Whether a band of the middle or the sides plays, or is still fading out.
         bool second = false;
         for (int i = 0; i < MaxBands; ++i)
-            if (bandPlacement_[static_cast<size_t>(i)] >= firstOfThePair
+            if (bandScope_[static_cast<size_t>(i)] >= firstOfThePair
                 && ((i < activeBands && bandEnabled_[i].load(std::memory_order_relaxed))
                     || bandMix_[static_cast<size_t>(i)] != T(0)))
                 second = true;
@@ -1472,12 +1472,12 @@ protected:
             const int n = std::min(slice, total - offset);
             AudioBufferView<T> view = buffer.getSubView(offset, n);
             for (int i = 0; i < MaxBands; ++i)
-                if (bandPlacement_[static_cast<size_t>(i)] < firstOfThePair) processBandSlice(i, view, n, activeBands);
+                if (bandScope_[static_cast<size_t>(i)] < firstOfThePair) processBandSlice(i, view, n, activeBands);
             if (second)
             {
                 if (pair) MidSide<T>::encode(view);
                 for (int i = 0; i < MaxBands; ++i)
-                    if (bandPlacement_[static_cast<size_t>(i)] >= firstOfThePair) processBandSlice(i, view, n, activeBands);
+                    if (bandScope_[static_cast<size_t>(i)] >= firstOfThePair) processBandSlice(i, view, n, activeBands);
                 if (pair) MidSide<T>::decode(view);
             }
             bandSnap_ = false;
@@ -1485,7 +1485,7 @@ protected:
     }
 
     /**
-     * @brief One band over one slice, on the channels of its placement, with
+     * @brief One band over one slice, on the channels of its scope, with
      *        its on/off fade. For a band of the middle or the sides the view
      *        is already in that form.
      */
@@ -1498,11 +1498,11 @@ protected:
 
         T* single[1] = { nullptr };
         AudioBufferView<T> where = view;
-        const int placement = bandPlacement_[static_cast<size_t>(i)];
-        if (placement != static_cast<int>(Placement::Stereo))
+        const int scope = bandScope_[static_cast<size_t>(i)];
+        if (scope != static_cast<int>(Scope::Stereo))
         {
-            const int channel = (placement == static_cast<int>(Placement::Left)
-                                 || placement == static_cast<int>(Placement::Mid)) ? 0 : 1;
+            const int channel = (scope == static_cast<int>(Scope::Left)
+                                 || scope == static_cast<int>(Scope::Mid)) ? 0 : 1;
             if (channel >= view.getNumChannels())
             {
                 mix = target;      // nothing to act on: a single channel has no right and no sides
@@ -1539,19 +1539,19 @@ protected:
         mix = moveTowards(start, target, bandFadeStep_ * static_cast<T>(n));
     }
 
-    // -- Natural-phase engine ---------------------------------------------------
+    // -- Prototype-phase engine ---------------------------------------------------
 
-    static constexpr int kNaturalTaps = 64;                 ///< Length of the correction.
-    static constexpr int kNaturalDelay = kNaturalTaps / 2;  ///< Its centre: the latency of the mode.
-    static constexpr int kNaturalBins = 128;                ///< The correction is designed on 129 frequencies up to Nyquist.
-    static constexpr int kNaturalSlots = 5;                 ///< Left to left, right to right, right to left, left to right, further channels.
-    static constexpr int kNaturalGroups = 5;                ///< One per Placement.
-    static constexpr int kNaturalGrid = 32;                 ///< Samples between two steps of a fade of the correction.
-    static constexpr double kNaturalFadeSeconds = 0.02;
-    static constexpr double kNaturalReach = 1.3815510557964274;   ///< Most the correction changes a level: 12 dB, in nepers.
+    static constexpr int kPrototypeTaps = 64;                 ///< Length of the correction.
+    static constexpr int kPrototypeDelay = kPrototypeTaps / 2;  ///< Its centre: the latency of the mode.
+    static constexpr int kPrototypeBins = 128;                ///< The correction is designed on 129 frequencies up to Nyquist.
+    static constexpr int kPrototypeSlots = 5;                 ///< Left to left, right to right, right to left, left to right, further channels.
+    static constexpr int kPrototypeGroups = 5;                ///< One per Scope.
+    static constexpr int kPrototypeGrid = 32;                 ///< Samples between two steps of a fade of the correction.
+    static constexpr double kPrototypeFadeSeconds = 0.02;
+    static constexpr double kPrototypeReach = 1.3815510557964274;   ///< Most the correction changes a level: 12 dB, in nepers.
 
     /** @brief What the correction of one band was designed from. */
-    struct NaturalSeen
+    struct PrototypeSeen
     {
         BandConfig config {};
         bool soft = false;
@@ -1559,36 +1559,36 @@ protected:
         int group = 0;
     };
 
-    /** @brief The state of the natural-phase mode, allocated in prepare(). */
-    struct NaturalEngine
+    /** @brief The state of the prototype-phase mode, allocated in prepare(). */
+    struct PrototypeEngine
     {
-        using Curve = std::array<double, kNaturalBins + 1>;
-        using Taps = std::array<T, kNaturalTaps>;
+        using Curve = std::array<double, kPrototypeBins + 1>;
+        using Taps = std::array<T, kPrototypeTaps>;
 
         std::array<Curve, MaxBands> bandLog {}, bandArg {};   ///< Analog over digital per band: level in nepers, phase in radians.
-        std::array<NaturalSeen, MaxBands> seen {};
-        std::array<Curve, kNaturalGroups> groupLog {}, groupArg {};
-        std::array<bool, kNaturalGroups> groupUsed {};
+        std::array<PrototypeSeen, MaxBands> seen {};
+        std::array<Curve, kPrototypeGroups> groupLog {}, groupArg {};
+        std::array<bool, kPrototypeGroups> groupUsed {};
 
         Curve omega {};                 ///< The grid, in rad/s.
         Curve cosOne {}, sinOne {};     ///< z^-1 on the grid ...
         Curve cosTwo {}, sinTwo {};     ///< ... and z^-2.
         Curve taper {};                 ///< 1 up to the top of the fitted band, down to 0 at Nyquist.
-        std::array<double, kNaturalTaps> window {};
+        std::array<double, kPrototypeTaps> window {};
 
-        std::array<Taps, kNaturalSlots> from {}, to {}, now {};   ///< Reversed, ready for a dot product.
+        std::array<Taps, kPrototypeSlots> from {}, to {}, now {};   ///< Reversed, ready for a dot product.
         bool crossFrom = false, crossTo = false;   ///< Whether the matrix has terms between the channels.
         int fadeLength = 1, fadeLeft = 0;
         unsigned clock = 0;             ///< Free-running, so a fade does not depend on the host's blocks.
 
-        FFTReal<double> fft { 2 * kNaturalBins };
+        FFTReal<double> fft { 2 * kPrototypeBins };
         std::vector<double> spectrum, time;
         std::vector<T> work;            ///< Per channel: the last taps - 1 samples, then the chunk.
         int channels = 0;
     };
 
     /** @brief Whether a band is one the correction covers: an elliptic wall is not (its digital form is itself). */
-    [[nodiscard]] static bool naturalCovers(const BandConfig& cfg) noexcept
+    [[nodiscard]] static bool prototypeCovers(const BandConfig& cfg) noexcept
     {
         return cfg.type != BandType::LowPassWall && cfg.type != BandType::HighPassWall;
     }
@@ -1600,9 +1600,9 @@ protected:
      * Ha(jw) / Hd(e^jw). Summing the phases of the sections keeps the total
      * unwrapped, since each of them is small.
      */
-    void naturalBandCurves(int index) noexcept
+    void prototypeBandCurves(int index) noexcept
     {
-        NaturalEngine& e = *natural_;
+        PrototypeEngine& e = *prototype_;
         const AnalogBand& band = (*analog_)[static_cast<size_t>(index)];
         auto& level = e.bandLog[static_cast<size_t>(index)];
         auto& phase = e.bandArg[static_cast<size_t>(index)];
@@ -1615,7 +1615,7 @@ protected:
         {
             const AnalogSection& a = proto.sections[static_cast<size_t>(s)];
             const BiquadCoeffs d = band.cascade.getTargetCoeffs(s);
-            for (int k = 0; k <= kNaturalBins; ++k)
+            for (int k = 0; k <= kPrototypeBins; ++k)
             {
                 const auto at = static_cast<size_t>(k);
                 const double w = e.omega[at], w2 = w * w;
@@ -1648,9 +1648,9 @@ protected:
      *
      * @param snap True to land on the new correction at once (entering the mode).
      */
-    void refreshNatural(bool snap) noexcept
+    void refreshPrototype(bool snap) noexcept
     {
-        NaturalEngine& e = *natural_;
+        PrototypeEngine& e = *prototype_;
         const int activeBands = numBands_.load(std::memory_order_relaxed);
         bool changed = snap;
 
@@ -1658,42 +1658,42 @@ protected:
         {
             const auto at = static_cast<size_t>(b);
             const AnalogBand& band = (*analog_)[at];
-            NaturalSeen want;
+            PrototypeSeen want;
             want.present = b < activeBands && bandEnabled_[b].load(std::memory_order_relaxed)
-                           && bandAnalog_[at] && band.configured && !band.resting && naturalCovers(band.config);
+                           && bandAnalog_[at] && band.configured && !band.resting && prototypeCovers(band.config);
             if (want.present)
             {
                 want.config = band.config;
                 want.soft = band.soft;
                 // One channel is its own left and its own middle, and has no right and no sides.
-                const Placement where = band.config.placement;
+                const Scope where = band.config.scope;
                 want.group = static_cast<int>(where);
                 if (e.channels < 2)
                 {
-                    if (where == Placement::Right || where == Placement::Side) want.present = false;
+                    if (where == Scope::Right || where == Scope::Side) want.present = false;
                     want.group = 0;
                 }
             }
 
-            NaturalSeen& seen = e.seen[at];
+            PrototypeSeen& seen = e.seen[at];
             const bool same = want.present == seen.present
                 && (!want.present || (want.group == seen.group && want.soft == seen.soft
                                       && sameDesign(want.config, seen.config)));
             if (same && !snap) continue;
-            if (want.present) naturalBandCurves(b);
+            if (want.present) prototypeBandCurves(b);
             seen = want;
             changed = true;
         }
-        if (changed) designNatural(snap);
+        if (changed) designPrototype(snap);
     }
 
     /** @brief Designs the correction filters from the curves of the bands and fades to them. */
-    void designNatural(bool snap) noexcept
+    void designPrototype(bool snap) noexcept
     {
-        NaturalEngine& e = *natural_;
+        PrototypeEngine& e = *prototype_;
 
         // One curve per place: what the bands placed there add up to.
-        for (int g = 0; g < kNaturalGroups; ++g)
+        for (int g = 0; g < kPrototypeGroups; ++g)
         {
             e.groupLog[static_cast<size_t>(g)].fill(0.0);
             e.groupArg[static_cast<size_t>(g)].fill(0.0);
@@ -1701,11 +1701,11 @@ protected:
         }
         for (int b = 0; b < MaxBands; ++b)
         {
-            const NaturalSeen& seen = e.seen[static_cast<size_t>(b)];
+            const PrototypeSeen& seen = e.seen[static_cast<size_t>(b)];
             if (!seen.present) continue;
             const auto g = static_cast<size_t>(seen.group);
             e.groupUsed[g] = true;
-            for (int k = 0; k <= kNaturalBins; ++k)
+            for (int k = 0; k <= kPrototypeBins; ++k)
             {
                 e.groupLog[g][static_cast<size_t>(k)] += e.bandLog[static_cast<size_t>(b)][static_cast<size_t>(k)];
                 e.groupArg[g][static_cast<size_t>(k)] += e.bandArg[static_cast<size_t>(b)][static_cast<size_t>(k)];
@@ -1724,7 +1724,7 @@ protected:
             // The correction of one place at one frequency: reduced towards
             // Nyquist, where no real filter can hold a phase, and bounded.
             const double t = e.taper[static_cast<size_t>(k)];
-            const double level = std::clamp(e.groupLog[static_cast<size_t>(g)][static_cast<size_t>(k)], -kNaturalReach, kNaturalReach);
+            const double level = std::clamp(e.groupLog[static_cast<size_t>(g)][static_cast<size_t>(k)], -kPrototypeReach, kPrototypeReach);
             return std::polar(std::exp(t * level), t * e.groupArg[static_cast<size_t>(g)][static_cast<size_t>(k)]);
         };
         const auto slot = [&](int index, bool used, bool unity, const auto& response) noexcept {
@@ -1733,30 +1733,30 @@ protected:
             if (!used)
             {
                 // No band of that place: the signal, late, to the bit (or nothing, between channels).
-                if (unity) taps[static_cast<size_t>(kNaturalTaps - 1 - kNaturalDelay)] = T(1);
+                if (unity) taps[static_cast<size_t>(kPrototypeTaps - 1 - kPrototypeDelay)] = T(1);
                 return;
             }
-            for (int k = 0; k <= kNaturalBins; ++k)
+            for (int k = 0; k <= kPrototypeBins; ++k)
             {
                 const std::complex<double> c = response(k);
                 e.spectrum[static_cast<size_t>(2 * k)] = c.real();
-                e.spectrum[static_cast<size_t>(2 * k + 1)] = (k == 0 || k == kNaturalBins) ? 0.0 : c.imag();
+                e.spectrum[static_cast<size_t>(2 * k + 1)] = (k == 0 || k == kPrototypeBins) ? 0.0 : c.imag();
             }
             const double atDc = e.spectrum[0];
             e.fft.inverse(e.spectrum.data(), e.time.data());
             // Centred on the delay and cut to length; what the cut takes from
             // the gain at DC goes back to the centre.
-            double h[kNaturalTaps];
+            double h[kPrototypeTaps];
             double sum = 0.0;
-            const int size = 2 * kNaturalBins;
-            for (int m = 0; m < kNaturalTaps; ++m)
+            const int size = 2 * kPrototypeBins;
+            for (int m = 0; m < kPrototypeTaps; ++m)
             {
-                h[m] = e.time[static_cast<size_t>((m - kNaturalDelay + size) % size)] * e.window[static_cast<size_t>(m)];
+                h[m] = e.time[static_cast<size_t>((m - kPrototypeDelay + size) % size)] * e.window[static_cast<size_t>(m)];
                 sum += h[m];
             }
-            h[kNaturalDelay] += atDc - sum;
-            for (int m = 0; m < kNaturalTaps; ++m)
-                taps[static_cast<size_t>(kNaturalTaps - 1 - m)] = static_cast<T>(h[m]);
+            h[kPrototypeDelay] += atDc - sum;
+            for (int m = 0; m < kPrototypeTaps; ++m)
+                taps[static_cast<size_t>(kPrototypeTaps - 1 - m)] = static_cast<T>(h[m]);
         };
 
         if (!placed)
@@ -1797,11 +1797,11 @@ protected:
     }
 
     /** @brief Clears what the correction remembers of the signal. */
-    void clearNaturalStream() noexcept
+    void clearPrototypeStream() noexcept
     {
-        if (!natural_) return;
-        std::fill(natural_->work.begin(), natural_->work.end(), T(0));
-        natural_->clock = 0;
+        if (!prototype_) return;
+        std::fill(prototype_->work.begin(), prototype_->work.end(), T(0));
+        prototype_->clock = 0;
     }
 
     /**
@@ -1809,25 +1809,25 @@ protected:
      *        filter, and with placed bands the other channel of the pair
      *        through the one that crosses.
      */
-    void processNatural(AudioBufferView<T> buffer) noexcept
+    void processPrototype(AudioBufferView<T> buffer) noexcept
     {
-        NaturalEngine& e = *natural_;
+        PrototypeEngine& e = *prototype_;
         const int nCh = std::min(buffer.getNumChannels(), e.channels);
         const int total = buffer.getNumSamples();
-        const size_t stride = static_cast<size_t>(kNaturalTaps - 1 + kNaturalGrid);
-        const size_t history = static_cast<size_t>(kNaturalTaps - 1);
+        const size_t stride = static_cast<size_t>(kPrototypeTaps - 1 + kPrototypeGrid);
+        const size_t history = static_cast<size_t>(kPrototypeTaps - 1);
 
         int offset = 0;
         while (offset < total)
         {
             // Steps of the fade fall on a grid of the stream, not of the block.
-            const int n = std::min(total - offset, kNaturalGrid - static_cast<int>(e.clock % static_cast<unsigned>(kNaturalGrid)));
-            if (e.fadeLeft > 0 && e.clock % static_cast<unsigned>(kNaturalGrid) == 0u)
+            const int n = std::min(total - offset, kPrototypeGrid - static_cast<int>(e.clock % static_cast<unsigned>(kPrototypeGrid)));
+            if (e.fadeLeft > 0 && e.clock % static_cast<unsigned>(kPrototypeGrid) == 0u)
             {
-                e.fadeLeft = std::max(0, e.fadeLeft - kNaturalGrid);
+                e.fadeLeft = std::max(0, e.fadeLeft - kPrototypeGrid);
                 const T share = static_cast<T>(1.0 - static_cast<double>(e.fadeLeft) / static_cast<double>(e.fadeLength));
-                for (int s = 0; s < kNaturalSlots; ++s)
-                    for (int m = 0; m < kNaturalTaps; ++m)
+                for (int s = 0; s < kPrototypeSlots; ++s)
+                    for (int m = 0; m < kPrototypeTaps; ++m)
                     {
                         const auto si = static_cast<size_t>(s), mi = static_cast<size_t>(m);
                         e.now[si][mi] = e.fadeLeft == 0 ? e.to[si][mi]
@@ -1846,13 +1846,13 @@ protected:
                 const T* taps = e.now[static_cast<size_t>(ch == 0 ? 0 : (ch == 1 ? 1 : 4))].data();
                 T* out = buffer.getChannel(ch) + offset;
                 for (int j = 0; j < n; ++j)
-                    out[j] = simd::dotProduct(own + j, taps, kNaturalTaps);
+                    out[j] = simd::dotProduct(own + j, taps, kPrototypeTaps);
                 if (cross && ch < 2)
                 {
                     const T* other = e.work.data() + static_cast<size_t>(1 - ch) * stride;
                     const T* across = e.now[static_cast<size_t>(ch == 0 ? 2 : 3)].data();
                     for (int j = 0; j < n; ++j)
-                        out[j] += simd::dotProduct(other + j, across, kNaturalTaps);
+                        out[j] += simd::dotProduct(other + j, across, kPrototypeTaps);
                 }
             }
 
@@ -1956,9 +1956,9 @@ protected:
                     if (!cfg.enabled) continue;
                     if (lpSlots_ > 1)
                     {
-                        lpBandGroup_[static_cast<size_t>(b)] = static_cast<int>(cfg.placement);
+                        lpBandGroup_[static_cast<size_t>(b)] = static_cast<int>(cfg.scope);
                     }
-                    else if (cfg.placement == Placement::Right || cfg.placement == Placement::Side)
+                    else if (cfg.scope == Scope::Right || cfg.scope == Scope::Side)
                     {
                         continue;       // a single channel has no right and no sides
                     }
@@ -2304,7 +2304,7 @@ protected:
         std::atomic<T>    slope     { BandConfig{}.slope };
         std::atomic<int>  order     { BandConfig{}.order };
         std::atomic<bool> enabled   { BandConfig{}.enabled };
-        std::atomic<int>  placement { static_cast<int>(BandConfig{}.placement) };
+        std::atomic<int>  scope { static_cast<int>(BandConfig{}.scope) };
         std::atomic<unsigned> seq   { 0 };
 
         /**
@@ -2330,7 +2330,7 @@ protected:
             slope.store(c.slope, std::memory_order_relaxed);
             order.store(c.order, std::memory_order_relaxed);
             enabled.store(c.enabled, std::memory_order_relaxed);
-            placement.store(static_cast<int>(c.placement), std::memory_order_relaxed);
+            scope.store(static_cast<int>(c.scope), std::memory_order_relaxed);
             seq.fetch_add(1, std::memory_order_release);   // -> even
         }
 
@@ -2356,7 +2356,7 @@ protected:
             c.slope     = slope.load(std::memory_order_relaxed);
             c.order     = order.load(std::memory_order_relaxed);
             c.enabled   = enabled.load(std::memory_order_relaxed);
-            c.placement = static_cast<Placement>(placement.load(std::memory_order_relaxed));
+            c.scope = static_cast<Scope>(scope.load(std::memory_order_relaxed));
         }
 
         /**
@@ -2449,11 +2449,11 @@ protected:
 
     // The engine of the analog response (allocated by prepare(), run by the audio thread).
     std::unique_ptr<std::array<AnalogBand, MaxBands>> analog_;
-    std::unique_ptr<NaturalEngine> natural_;     ///< The correction of the natural-phase mode.
-    bool naturalWasActive_ = false;              ///< The last block ran in that mode.
+    std::unique_ptr<PrototypeEngine> prototype_;     ///< The correction of the prototype-phase mode.
+    bool prototypeWasActive_ = false;              ///< The last block ran in that mode.
     FilterDesign::Band designBand_;
     std::array<bool, MaxBands> bandAnalog_ {};   ///< Which engine runs each band.
-    std::array<int, MaxBands> bandPlacement_ {}; ///< Where each band acts (audio thread's copy).
+    std::array<int, MaxBands> bandScope_ {}; ///< Where each band acts (audio thread's copy).
 
     // Linear-phase state
     std::atomic<FilterMode> filterMode_ { FilterMode::MinimumPhase };

@@ -50,8 +50,8 @@
  * File loading (loadIR from a path) is excluded when DSPARK_NO_FILE_IO is
  * defined; the raw-data overload keeps working on embedded targets.
  *
- * The wet signal can be ducked by the dry one and gated relative to it
- * (setDucking(), setGate(); see TailShaper), both off by default.
+ * The wet signal can dip under the dry one and be gated relative to it
+ * (setDryDip(), setGate(); see TailShaper), both off by default.
  *
  * Dependencies: Convolver.h, DryWetMixer.h, RingBuffer.h, AudioSpec.h,
  *               AudioBuffer.h, DspMath.h, Resampler.h, StateBlob.h,
@@ -1007,11 +1007,11 @@ public:
     [[nodiscard]] T getStretch() const noexcept { return stretch_.load(std::memory_order_relaxed); }
 
     /**
-     * @brief Ducks the wet signal while the dry one plays (see TailShaper):
+     * @brief Dips the wet signal under the dry one while it plays (see TailShaper):
      *        by up to `dB` (0 to 48; 0, the default, is off), in proportion to
      *        the dry level against its own recent peak. Any thread.
      */
-    void setDucking(T dB) noexcept { tail_.setDucking(dB); }
+    void setDryDip(T dB) noexcept { tail_.setDryDip(dB); }
 
     /**
      * @brief Gate on the wet signal (see TailShaper): it closes once the dry
@@ -1026,7 +1026,7 @@ public:
     /** @brief Release of the gate, 5 to 4000 ms (default 150). */
     void setGateRelease(T ms) noexcept { tail_.setGateRelease(ms); }
 
-    [[nodiscard]] T getDucking() const noexcept { return tail_.getDucking(); }
+    [[nodiscard]] T getDryDip() const noexcept { return tail_.getDryDip(); }
     [[nodiscard]] T getGate() const noexcept { return tail_.getGate(); }
     [[nodiscard]] T getGateHold() const noexcept { return tail_.getGateHold(); }
     [[nodiscard]] T getGateRelease() const noexcept { return tail_.getGateRelease(); }
@@ -1120,7 +1120,7 @@ public:
         w.write("preDelay", static_cast<float>(preDelayMs_.load(std::memory_order_relaxed)));
         w.write("decayScale", static_cast<float>(decayScale_.load(std::memory_order_relaxed)));
         w.write("stretch", static_cast<float>(stretch_.load(std::memory_order_relaxed)));
-        w.write("ducking", static_cast<float>(getDucking()));
+        w.write("dryDip", static_cast<float>(getDryDip()));
         w.write("gate", static_cast<float>(getGate()));
         w.write("gateHold", static_cast<float>(getGateHold()));
         w.write("gateRelease", static_cast<float>(getGateRelease()));
@@ -1140,7 +1140,7 @@ public:
         T preDelay = static_cast<T>(r.read("preDelay", 0.0f));
         T ds = static_cast<T>(r.read("decayScale", 1.0f));
         T st = static_cast<T>(r.read("stretch", 1.0f));
-        const T duck = static_cast<T>(r.read("ducking", 0.0f));
+        const T duck = static_cast<T>(r.read("dryDip", 0.0f));
         const T gate = static_cast<T>(r.read("gate", -200.0f));
         const T gateHold = static_cast<T>(r.read("gateHold", 100.0f));
         const T gateRelease = static_cast<T>(r.read("gateRelease", 150.0f));
@@ -1164,7 +1164,7 @@ public:
             preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);
             decayScale_.store(ds, std::memory_order_relaxed);
             stretch_.store(st, std::memory_order_relaxed);
-            tail_.setDucking(duck);
+            tail_.setDryDip(duck);
             tail_.setGate(gate);
             tail_.setGateHold(gateHold);
             tail_.setGateRelease(gateRelease);
@@ -1237,7 +1237,7 @@ protected:
         int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
         T mixVal = mix_.load(std::memory_order_relaxed);
 
-        // The dry level per frame for the ducking and the gate, read before
+        // The dry level per frame for the dip and the gate, read before
         // the convolution overwrites the buffer.
         tail_.sync();
         const bool shaping = tail_.isActive() && nS <= static_cast<int>(tailLevels_.size());
@@ -1633,7 +1633,7 @@ protected:
     Publisher bankPublisher_;
     std::vector<RingBuffer<T>> preDelayBuffers_;
     DryWetMixer<T> mixer_;
-    TailShaper<T> tail_;              ///< Ducking and gate of the wet signal.
+    TailShaper<T> tail_;              ///< Dip and gate of the wet signal.
     std::vector<T> tailLevels_;       ///< Audio owner: the dry level per frame of a part.
     Convolver<T> fallbackConvolver_; ///< Inert engine for getConvolver() with no bank.
 };

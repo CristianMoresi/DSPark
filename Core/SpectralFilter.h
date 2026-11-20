@@ -29,9 +29,12 @@
  * the overlap (2 to 16 frames per window) is its time resolution. With
  * setLinked(true) the callback runs once per hop on the mean power of the
  * channels and one filter serves them all (half the cost in stereo).
- * setDelta(true) applies one minus the filter: what it takes out. A key
+ * setRemovalListen(true) applies one minus the filter: what it takes out. A key
  * (processBlock(buffer, &key, design)) replaces the programme in the power
  * the callback reads; the filter still runs on the programme.
+ *
+ * SpectralReadout publishes a per-bin quantity of the last frame (a gain
+ * curve, a reduction) at 128 points for a display read from any thread.
  *
  * Threading: prepare() on the setup thread (allocates); processBlock(),
  * reset() and the setters on the audio thread (owner-managed).
@@ -48,6 +51,8 @@
 #include "WindowFunctions.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <memory>
@@ -120,8 +125,8 @@ public:
     void setLinked(bool on) noexcept { linked_ = on; }
     [[nodiscard]] bool isLinked() const noexcept { return linked_; }
     /** @brief Applies one minus the filter (what it takes out). */
-    void setDelta(bool on) noexcept { delta_ = on; }
-    [[nodiscard]] bool isDelta() const noexcept { return delta_; }
+    void setRemovalListen(bool on) noexcept { removalListen_ = on; }
+    [[nodiscard]] bool isRemovalListen() const noexcept { return removalListen_; }
 
     [[nodiscard]] int getLatency() const noexcept { return n_; }
     [[nodiscard]] int getWindowSize() const noexcept { return n_; }
@@ -307,7 +312,7 @@ private:
     {
         double* s = spectra_[static_cast<size_t>(ch)].data();
         const double* h = kernel_.data();
-        if (delta_)
+        if (removalListen_)
         {
             if (unity) std::fill(s, s + m_ + 2, 0.0);
             else
@@ -339,11 +344,113 @@ private:
     double fs_ = 48000.0, norm_ = 0.5;
     int n_ = 2048, pad_ = 2, m_ = 4096, hop_ = 512, bins_ = 2049, kernelLength_ = 2049, channels_ = 0;
     int writePos_ = 0, readPos_ = 0, hopCounter_ = 0;
-    bool prepared_ = false, linked_ = false, delta_ = false, keyActive_ = false;
+    bool prepared_ = false, linked_ = false, removalListen_ = false, keyActive_ = false;
     std::unique_ptr<FFTReal<double>> fft_;
     std::vector<double> window_, taper_, frame_, kernel_, keySpectrum_;
     std::vector<std::vector<double>> ring_, keyRing_, accum_, spectra_;
     std::vector<T> power_, gain_;
+};
+
+/**
+ * @class SpectralReadout
+ * @brief A per-bin quantity of the last frame (a gain curve, a reduction),
+ *        read at fixed points for a display from any thread.
+ *
+ * The points sit evenly in log frequency from 20 Hz to 20 kHz. Each point
+ * takes, from the bins within half a point of it, the value with the
+ * largest magnitude (its sign kept), so a narrow peak or notch between two
+ * points still shows. prepare() maps the points onto a transform (setup
+ * thread, no allocation); publish() runs on the audio thread once a frame;
+ * value() and extreme() on any thread. The points are relaxed atomics: a
+ * reader may see a curve whose points come from two consecutive frames.
+ *
+ * @tparam T Sample type (float or double).
+ */
+template <FloatType T>
+class SpectralReadout
+{
+public:
+    static constexpr int kPoints = 128;  ///< Points of each curve.
+    static constexpr int kChannels = 2;  ///< Curves (channels).
+
+    /** @return The frequency of a point, in hertz. */
+    [[nodiscard]] static double frequency(int point) noexcept
+    {
+        return 20.0 * std::pow(1000.0, static_cast<double>(std::clamp(point, 0, kPoints - 1)) / (kPoints - 1));
+    }
+
+    /** @brief Maps the points onto the bins of a transform and clears the curves. */
+    void prepare(double binHz, int bins) noexcept
+    {
+        bins_ = std::max(0, bins);
+        const double half = std::pow(1000.0, 0.5 / (kPoints - 1));
+        const int top = std::max(0, bins_ - 1);
+        for (int i = 0; i < kPoints; ++i)
+        {
+            const double f = frequency(i);
+            int first = static_cast<int>(std::ceil(f / half / binHz));
+            int last = static_cast<int>(std::floor(f * half / binHz));
+            if (last < first) first = last = static_cast<int>(std::lround(f / binHz));
+            first_[static_cast<size_t>(i)] = std::clamp(first, 0, top);
+            last_[static_cast<size_t>(i)] = std::clamp(last, first_[static_cast<size_t>(i)], top);
+        }
+        clear();
+    }
+
+    /** @brief Sets every point of every curve to zero. */
+    void clear() noexcept
+    {
+        for (auto& curve : values_)
+            for (auto& v : curve) v.store(0.0f, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Publishes one frame of a channel's per-bin values (audio thread).
+     * @param channel 0 or 1; others are ignored.
+     * @param perBin  One value per bin of the transform given to prepare().
+     * @param bins    Must match the transform; otherwise the frame is ignored.
+     */
+    template <typename V>
+    void publish(int channel, const V* perBin, int bins) noexcept
+    {
+        if (channel < 0 || channel >= kChannels || perBin == nullptr || bins != bins_ || bins <= 0) return;
+        auto& curve = values_[static_cast<size_t>(channel)];
+        for (int i = 0; i < kPoints; ++i)
+        {
+            double best = 0.0;
+            for (int k = first_[static_cast<size_t>(i)]; k <= last_[static_cast<size_t>(i)]; ++k)
+            {
+                const double v = static_cast<double>(perBin[k]);
+                if (std::abs(v) > std::abs(best)) best = v;
+            }
+            curve[static_cast<size_t>(i)].store(static_cast<float>(best), std::memory_order_relaxed);
+        }
+    }
+
+    /** @return The value of a point of a channel's curve (0 for indices out of range). */
+    [[nodiscard]] T value(int channel, int point) const noexcept
+    {
+        if (channel < 0 || channel >= kChannels || point < 0 || point >= kPoints) return T(0);
+        return static_cast<T>(values_[static_cast<size_t>(channel)][static_cast<size_t>(point)].load(std::memory_order_relaxed));
+    }
+
+    /** @return The value with the largest magnitude over both curves (its sign kept). */
+    [[nodiscard]] T extreme() const noexcept
+    {
+        float best = 0.0f;
+        for (const auto& curve : values_)
+            for (const auto& v : curve)
+            {
+                const float x = v.load(std::memory_order_relaxed);
+                if (std::abs(x) > std::abs(best)) best = x;
+            }
+        return static_cast<T>(best);
+    }
+
+private:
+    std::array<std::array<std::atomic<float>, kPoints>, kChannels> values_ {};
+    std::array<int, kPoints> first_ {}, last_ {};
+    int bins_ = 0;
 };
 
 } // namespace dspark

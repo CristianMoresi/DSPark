@@ -28,7 +28,7 @@
  * setGainRelease() gives the gains of each bin a release, slower in the low
  * end (by the square root of the frequency against 1 kHz); a sensitivity
  * curve (setSensitivityBand(), six bands: cuts, bells, shelves, tilt) weights
- * the reduction frequency by frequency; setDelta(true) outputs what is taken
+ * the reduction frequency by frequency; setRemovalListen(true) outputs what is taken
  * out; prepare(spec, 0) picks the transform size by the rate (2048 at 44.1
  * and 48 kHz, doubling by octaves); setFilterMode(true) applies the gains as
  * a minimum-phase filter designed every hop (SpectralFilter: no pre-echo, a
@@ -199,7 +199,7 @@ public:
     /** @return One band of the sensitivity curve. */
     [[nodiscard]] typename KeyEqualizer<T, 2>::Band getSensitivityBand(int index) const noexcept { return sensitivity_.getBand(index); }
     /** @brief Outputs what is taken out instead of what is kept. */
-    void setDelta(bool on) noexcept { delta_.store(on, std::memory_order_relaxed); }
+    void setRemovalListen(bool on) noexcept { removalListen_.store(on, std::memory_order_relaxed); }
     /** @brief Applies the gains as a minimum-phase filter (see the file comment). */
     void setFilterMode(bool on) noexcept { filterMode_.store(on, std::memory_order_relaxed); }
     /** @brief In filter mode, the gains of the channels mixed bin by bin, 0 to 1 (default 0). */
@@ -211,7 +211,7 @@ public:
 
     [[nodiscard]] T getSpectralSmoothing() const noexcept { return smoothing_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getGainRelease() const noexcept { return releaseMs_.load(std::memory_order_relaxed); }
-    [[nodiscard]] bool getDelta() const noexcept { return delta_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getRemovalListen() const noexcept { return removalListen_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool getFilterMode() const noexcept { return filterMode_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getLink() const noexcept { return link_.load(std::memory_order_relaxed); }
 
@@ -290,7 +290,7 @@ public:
             processFiltered(buffer, learning, floorGain, overSub, nChEff);
             return;
         }
-        const bool extras = weighted_ || smoothNow_ > 0.0f || releaseNow_ > 0.0f || delta_.load(std::memory_order_relaxed);
+        const bool extras = weighted_ || smoothNow_ > 0.0f || releaseNow_ > 0.0f || removalListen_.load(std::memory_order_relaxed);
         if (extras)
         {
             processWithOptions(buffer, learning, floorGain, overSub, nChEff);
@@ -429,7 +429,7 @@ private:
     /** @brief The STFT path with the options. */
     void processWithOptions(AudioBufferView<T> buffer, bool learning, float floorGain, float overSub, int nChEff) noexcept
     {
-        const bool delta = delta_.load(std::memory_order_relaxed);
+        const bool removal = removalListen_.load(std::memory_order_relaxed);
         const float reductionDb = static_cast<float>(reduction_.load(std::memory_order_relaxed));
         stft_.processBlock(buffer, [&](T* bins, int numBins)
         {
@@ -460,7 +460,7 @@ private:
                 const float power = re * re + im * im;
                 if (!std::isfinite(power)) { bins[2 * k] = T(0); bins[2 * k + 1] = T(0); continue; }
                 clean[static_cast<size_t>(k)] = g * g * power;
-                const float applied = delta ? 1.0f - g : g;
+                const float applied = removal ? 1.0f - g : g;
                 bins[2 * k] = static_cast<T>(re * applied);
                 bins[2 * k + 1] = static_cast<T>(im * applied);
             }
@@ -477,7 +477,7 @@ private:
         const float link = static_cast<float>(link_.load(std::memory_order_relaxed));
         const float reductionDb = static_cast<float>(reduction_.load(std::memory_order_relaxed));
         filter_.setLinked(link >= 1.0f && nChEff == 2);
-        filter_.setDelta(delta_.load(std::memory_order_relaxed));
+        filter_.setRemovalListen(removalListen_.load(std::memory_order_relaxed));
         // The profile is noise power in the STFT's bins and window: noise
         // reads 12 / N^2 of it through the filter's Hann window and power
         // scale, at filter bin 2k for STFT bin k.
@@ -530,7 +530,7 @@ private:
     double sampleRate_ = 48000.0;
     std::atomic<bool> prepared_ { false };
     std::atomic<T> smoothing_ { T(0) }, releaseMs_ { T(0) }, link_ { T(0) };
-    std::atomic<bool> delta_ { false }, filterMode_ { false }, weightDirty_ { true };
+    std::atomic<bool> removalListen_ { false }, filterMode_ { false }, weightDirty_ { true };
     bool weighted_ = false;
     float smoothNow_ = 0.0f, releaseNow_ = 0.0f, releaseFor_ = -1.0f;
     std::vector<std::vector<float>> filterClean_, heldGain_, linkedGains_;

@@ -5,13 +5,13 @@
 
 /**
  * @file TailShaper.h
- * @brief Ducking and a relative gate for the wet signal of a reverb or a
+ * @brief A dip under the dry signal and a relative gate for the wet signal of a reverb or a
  *        delay, driven by the dry signal.
  *
- * Ducking lowers the wet signal while the dry one plays and lets it back
+ * The dip lowers the wet signal while the dry one plays and lets it back
  * while the dry one rests. The dry level is followed (30 ms up, 400 ms down)
  * and read against its own recent peak (which rises at once and falls over
- * 10 s), so a phrase at any level ducks by the same amount: the wet signal
+ * 10 s), so a phrase at any level dips it by the same amount: the wet signal
  * is lowered by the depth set times that share (a steady dry signal takes
  * the whole depth).
  *
@@ -41,7 +41,7 @@ namespace dspark {
 
 /**
  * @class TailShaper
- * @brief Ducking and a relative gate driven by the dry signal.
+ * @brief A dip and a relative gate driven by the dry signal.
  *
  * @tparam T Sample type (float or double); the state is double.
  */
@@ -56,8 +56,8 @@ public:
     {
         if (!std::isfinite(sampleRate) || !(sampleRate > 0.0)) return;
         fs_ = sampleRate;
-        duckUp_ = coeff(30.0);
-        duckDown_ = coeff(400.0);
+        dipUp_ = coeff(30.0);
+        dipDown_ = coeff(400.0);
         gateUp_ = coeff(1.0);
         gateDown_ = coeff(50.0);
         refFall_ = coeff(10000.0);
@@ -66,18 +66,18 @@ public:
         sync();
     }
 
-    /** @brief Clears the followers; the gate starts open and the ducking released. */
+    /** @brief Clears the followers; the gate starts open and the dip released. */
     void reset() noexcept
     {
-        duckEnv_ = gateEnv_ = duckRef_ = gateRef_ = 0.0;
+        dipEnv_ = gateEnv_ = dipRef_ = gateRef_ = 0.0;
         hold_ = 0;
         g1_ = g2_ = 1.0;
     }
 
-    /** @brief Ducking depth in dB, 0 to 48 (0, the default, is off). */
-    void setDucking(T dB) noexcept
+    /** @brief Depth of the dip in dB, 0 to 48 (0, the default, is off). */
+    void setDryDip(T dB) noexcept
     {
-        if (std::isfinite(dB)) duckDb_.store(std::clamp(dB, T(0), T(48)), std::memory_order_relaxed);
+        if (std::isfinite(dB)) dipDb_.store(std::clamp(dB, T(0), T(48)), std::memory_order_relaxed);
     }
 
     /**
@@ -101,7 +101,7 @@ public:
         if (std::isfinite(ms)) releaseMs_.store(std::clamp(ms, T(5), T(4000)), std::memory_order_relaxed);
     }
 
-    [[nodiscard]] T getDucking() const noexcept { return duckDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getDryDip() const noexcept { return dipDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getGate() const noexcept { return gateDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getGateHold() const noexcept { return holdMs_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getGateRelease() const noexcept { return releaseMs_.load(std::memory_order_relaxed); }
@@ -109,7 +109,7 @@ public:
     /** @brief Takes the settings for the next block (audio thread). */
     void sync() noexcept
     {
-        duck_ = static_cast<double>(duckDb_.load(std::memory_order_relaxed)) * (2.302585092994046 / 20.0);
+        dip_ = static_cast<double>(dipDb_.load(std::memory_order_relaxed)) * (2.302585092994046 / 20.0);
         const double gateDb = static_cast<double>(gateDb_.load(std::memory_order_relaxed));
         gateOn_ = gateDb >= -80.0;
         gateLin_ = std::pow(10.0, gateDb / 20.0);
@@ -118,7 +118,7 @@ public:
     }
 
     /** @brief Whether next() can return anything but 1 (as of the last sync()). */
-    [[nodiscard]] bool isActive() const noexcept { return duck_ > 0.0 || gateOn_ || g2_ != 1.0; }
+    [[nodiscard]] bool isActive() const noexcept { return dip_ > 0.0 || gateOn_ || g2_ != 1.0; }
 
     /**
      * @brief One sample: the gain for the wet signal.
@@ -128,16 +128,16 @@ public:
     [[nodiscard]] T next(T dryLevel) noexcept
     {
         const double x = std::isfinite(dryLevel) ? std::abs(static_cast<double>(dryLevel)) : 0.0;
-        duckEnv_ = x + (x > duckEnv_ ? duckUp_ : duckDown_) * (duckEnv_ - x);
+        dipEnv_ = x + (x > dipEnv_ ? dipUp_ : dipDown_) * (dipEnv_ - x);
         gateEnv_ = x + (x > gateEnv_ ? gateUp_ : gateDown_) * (gateEnv_ - x);
         // Each follower against its own recent peak.
-        duckRef_ = duckEnv_ > duckRef_ ? duckEnv_ : duckRef_ * refFall_;
+        dipRef_ = dipEnv_ > dipRef_ ? dipEnv_ : dipRef_ * refFall_;
         gateRef_ = gateEnv_ > gateRef_ ? gateEnv_ : gateRef_ * refFall_;
-        if (duckRef_ < 1e-12) duckRef_ = 0.0;
+        if (dipRef_ < 1e-12) dipRef_ = 0.0;
         if (gateRef_ < 1e-12) gateRef_ = 0.0;
         double gain = 1.0;
-        if (duck_ > 0.0 && duckRef_ > 0.0)
-            gain = std::exp(-duck_ * std::min(1.0, duckEnv_ / duckRef_));
+        if (dip_ > 0.0 && dipRef_ > 0.0)
+            gain = std::exp(-dip_ * std::min(1.0, dipEnv_ / dipRef_));
         double target = 1.0;
         if (gateOn_)
         {
@@ -158,14 +158,14 @@ public:
 private:
     [[nodiscard]] double coeff(double ms) const noexcept { return std::exp(-1.0 / (ms * 0.001 * fs_)); }
 
-    std::atomic<T> duckDb_ { T(0) }, gateDb_ { T(-200) }, holdMs_ { T(100) }, releaseMs_ { T(150) };
+    std::atomic<T> dipDb_ { T(0) }, gateDb_ { T(-200) }, holdMs_ { T(100) }, releaseMs_ { T(150) };
 
     double fs_ = 48000.0;
-    double duckUp_ = 0.0, duckDown_ = 0.0, gateUp_ = 0.0, gateDown_ = 0.0, refFall_ = 0.0, open_ = 0.0, release_ = 0.0;
-    double duck_ = 0.0, gateLin_ = 0.0;
+    double dipUp_ = 0.0, dipDown_ = 0.0, gateUp_ = 0.0, gateDown_ = 0.0, refFall_ = 0.0, open_ = 0.0, release_ = 0.0;
+    double dip_ = 0.0, gateLin_ = 0.0;
     bool gateOn_ = false;
     int holdSamples_ = 0, hold_ = 0;
-    double duckEnv_ = 0.0, gateEnv_ = 0.0, duckRef_ = 0.0, gateRef_ = 0.0, g1_ = 1.0, g2_ = 1.0;
+    double dipEnv_ = 0.0, gateEnv_ = 0.0, dipRef_ = 0.0, gateRef_ = 0.0, g1_ = 1.0, g2_ = 1.0;
 };
 
 } // namespace dspark

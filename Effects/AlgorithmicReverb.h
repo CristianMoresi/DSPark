@@ -160,10 +160,10 @@
  *   0.5 dB), at about 55% of the CPU.
  *
  * Around the tank, all off by default (each one is described at its setter):
- * a parametric equalizer of the decay time (setDecayBand()), freeze
- * (setFreeze()), ducking and a relative gate driven by the dry signal
- * (setDucking(), setGate()), distance (setDistance()), thickness
- * (setThickness()), pre-delay and gate hold at a tempo (setTempo(),
+ * a parametric equalizer of the decay time (setDecayBand()), tail hold
+ * (setTailHold()), a dip under the dry signal and a relative gate driven by the dry signal
+ * (setDryDip(), setGate()), source depth (setSourceDepth()), tank leveling
+ * (setTankLeveling()), pre-delay and gate hold at a tempo (setTempo(),
  * setPreDelayNote(), setGateHoldNote()), input width and a width law that
  * keeps the power (setInputWidth(), setWidthLaw()), a parametric equalizer of
  * the wet signal (setPostEqBand()), modulation by random segments
@@ -326,8 +326,8 @@ public:
             shimBuf_.assign(static_cast<size_t>(size), T(0));
             shimMask_ = size - 1;
         }
-        thickUp_ = std::exp(-1.0 / (0.020 * sr));
-        thickDown_ = std::exp(-1.0 / (0.004 * sr));
+        levelUp_ = std::exp(-1.0 / (0.020 * sr));
+        levelDown_ = std::exp(-1.0 / (0.004 * sr));
 
         // Re-derive the sample counts stored at set-time: after a re-prepare
         // at a different rate they would keep the OLD rate's sample count.
@@ -538,13 +538,13 @@ public:
         shimLen_ = { 0.045, 0.045 };
         shimRng_ = 0x51ED27u;
         lastLateMono_ = T(0);
-        thickEnv_ = 0.0;
+        levelEnv_ = 0.0;
         distLp_ = { T(0), T(0) };
-        distMix_ = distance_.load(std::memory_order_relaxed) > T(0) ? T(1) : T(0);
+        distMix_ = sourceDepth_.load(std::memory_order_relaxed) > T(0) ? T(1) : T(0);
         tail_.reset();
         postEq_.reset();
-        freezeNow_ = freeze_.load(std::memory_order_relaxed) ? T(1) : T(0);
-        applyFreezeCoeffs();
+        holdNow_ = tailHold_.load(std::memory_order_relaxed) ? T(1) : T(0);
+        applyHoldCoeffs();
 
         const double sr = spec_.sampleRate > 0 ? spec_.sampleRate : 48000.0;
         const T rate = modRate_.load(std::memory_order_relaxed);
@@ -946,20 +946,20 @@ public:
     }
 
     /**
-     * @brief Freezes the tail: the input to the tank and the early field fade
+     * @brief Holds the tail: the input to the tank and the early field fade
      *        out over about 20 ms while every loop's absorption and decay band
      *        fade to unity, so the tail holds with its highs. Off fades back.
      */
-    void setFreeze(bool on) noexcept { freeze_.store(on, std::memory_order_relaxed); }
-    /** @return Whether the tail is frozen (as set). */
-    [[nodiscard]] bool isFrozen() const noexcept { return freeze_.load(std::memory_order_relaxed); }
+    void setTailHold(bool on) noexcept { tailHold_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the tail is held (as set). */
+    [[nodiscard]] bool isTailHeld() const noexcept { return tailHold_.load(std::memory_order_relaxed); }
 
     /**
-     * @brief Ducks the wet signal while the dry one plays (see TailShaper):
+     * @brief Dips the wet signal under the dry one while it plays (see TailShaper):
      *        by up to `dB` (0 to 48; 0, the default, is off), in proportion to
      *        the dry level against its own recent peak.
      */
-    void setDucking(T dB) noexcept { tail_.setDucking(dB); }
+    void setDryDip(T dB) noexcept { tail_.setDryDip(dB); }
 
     /**
      * @brief Gate on the wet signal (see TailShaper): it closes once the dry
@@ -980,7 +980,7 @@ public:
     void setGateRelease(T ms) noexcept { tail_.setGateRelease(ms); }
 
     /**
-     * @brief Distance of the source, 0 to 1 (0, the default, is off): one
+     * @brief Depth of the source in the room, 0 to 1 (0, the default, is off): one
      *        control that moves the balance from the early reflections (down
      *        to half) to the tail (up by half), shortens the pre-delay (to a
      *        fifth at 1), adds input diffusion (with its square, up to 0.25)
@@ -988,27 +988,27 @@ public:
      *        down (to 2.25 kHz at 1, further with a darker HF decay).
      *        Non-finite values are ignored.
      */
-    void setDistance(T amount) noexcept
+    void setSourceDepth(T amount) noexcept
     {
         if (!std::isfinite(amount)) return;
-        distance_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        sourceDepth_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
 
     /**
-     * @brief Thickness, 0 to 1 (0, the default, is off): a compressor on the
+     * @brief Leveling of the tank, 0 to 1 (0, the default, is off): a compressor on the
      *        tank's input (ratio 1 + 3 x amount over -30 dBFS with a 24 dB
      *        knee; its level rises over 20 ms and falls over 4 ms), its gain
      *        compensated at -18 dBFS: quiet passages feed the tail as much as
      *        loud ones. Non-finite values are ignored.
      */
-    void setThickness(T amount) noexcept
+    void setTankLeveling(T amount) noexcept
     {
-        if (std::isfinite(amount)) thickness_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        if (std::isfinite(amount)) tankLeveling_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
-    /** @brief Soft saturation after the thickness compressor (off by default). */
-    void setThicknessSaturation(bool on) noexcept { thickSat_.store(on, std::memory_order_relaxed); }
+    /** @brief Soft saturation after the leveling compressor (off by default). */
+    void setTankSaturation(bool on) noexcept { tankSat_.store(on, std::memory_order_relaxed); }
 
     /** @brief Tempo for the note values, 20 to 400 BPM (default 120). */
     void setTempo(T bpm) noexcept
@@ -1097,13 +1097,13 @@ public:
         if (std::isfinite(amount)) shimmer_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
-    [[nodiscard]] T getDucking() const noexcept { return tail_.getDucking(); }
+    [[nodiscard]] T getDryDip() const noexcept { return tail_.getDryDip(); }
     [[nodiscard]] T getGate() const noexcept { return tail_.getGate(); }
     [[nodiscard]] T getGateHold() const noexcept { return gateHoldMs_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getGateRelease() const noexcept { return tail_.getGateRelease(); }
-    [[nodiscard]] T getDistance() const noexcept { return distance_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getThickness() const noexcept { return thickness_.load(std::memory_order_relaxed); }
-    [[nodiscard]] bool isThicknessSaturated() const noexcept { return thickSat_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getSourceDepth() const noexcept { return sourceDepth_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getTankLeveling() const noexcept { return tankLeveling_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool isThicknessSaturated() const noexcept { return tankSat_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getTempo() const noexcept { return tempo_.load(std::memory_order_relaxed); }
     [[nodiscard]] NoteValue getPreDelayNote() const noexcept { return static_cast<NoteValue>(preNote_.load(std::memory_order_relaxed)); }
     [[nodiscard]] NoteValue getGateHoldNote() const noexcept { return static_cast<NoteValue>(gateNote_.load(std::memory_order_relaxed)); }
@@ -1174,14 +1174,14 @@ public:
             std::snprintf(key, sizeof(key), "db%d.q", b);     w.write(key, static_cast<float>(band.q));
             std::snprintf(key, sizeof(key), "db%d.mult", b);  w.write(key, static_cast<float>(band.multiplier));
         }
-        w.write("freeze", isFrozen());
-        w.write("ducking", static_cast<float>(getDucking()));
+        w.write("tailHold", isTailHeld());
+        w.write("dryDip", static_cast<float>(getDryDip()));
         w.write("gate", static_cast<float>(getGate()));
         w.write("gateHold", static_cast<float>(getGateHold()));
         w.write("gateRelease", static_cast<float>(getGateRelease()));
-        w.write("distance", static_cast<float>(getDistance()));
-        w.write("thickness", static_cast<float>(getThickness()));
-        w.write("thickSat", isThicknessSaturated());
+        w.write("sourceDepth", static_cast<float>(getSourceDepth()));
+        w.write("tankLeveling", static_cast<float>(getTankLeveling()));
+        w.write("tankSat", isThicknessSaturated());
         w.write("tempo", static_cast<float>(getTempo()));
         w.write("preNote", preNote_.load(std::memory_order_relaxed));
         w.write("preFeel", preFeel_.load(std::memory_order_relaxed));
@@ -1234,14 +1234,14 @@ public:
             std::snprintf(key, sizeof(key), "db%d.mult", b);  band.multiplier = static_cast<T>(r.read(key, 1.0f));
             setDecayBand(b, band);
         }
-        setFreeze(r.read("freeze", false));
-        setDucking(static_cast<T>(r.read("ducking", 0.0f)));
+        setTailHold(r.read("tailHold", false));
+        setDryDip(static_cast<T>(r.read("dryDip", 0.0f)));
         setGate(static_cast<T>(r.read("gate", -200.0f)));
         setGateHold(static_cast<T>(r.read("gateHold", 100.0f)));
         setGateRelease(static_cast<T>(r.read("gateRelease", 150.0f)));
-        setDistance(static_cast<T>(r.read("distance", 0.0f)));
-        setThickness(static_cast<T>(r.read("thickness", 0.0f)));
-        setThicknessSaturation(r.read("thickSat", false));
+        setSourceDepth(static_cast<T>(r.read("sourceDepth", 0.0f)));
+        setTankLeveling(static_cast<T>(r.read("tankLeveling", 0.0f)));
+        setTankSaturation(r.read("tankSat", false));
         setTempo(static_cast<T>(r.read("tempo", 120.0f)));
         setPreDelayNote(static_cast<NoteValue>(r.read("preNote", 0)), static_cast<NoteFeel>(r.read("preFeel", 0)));
         setGateHoldNote(static_cast<NoteValue>(r.read("gateNote", 0)), static_cast<NoteFeel>(r.read("gateFeel", 0)));
@@ -1773,12 +1773,12 @@ protected:
         T lateLevel  = T(1);
         T width      = T(1);
         T inputWidth = T(1);
-        T thickness  = T(0);
-        bool thickSat = false;
+        T tankLeveling = T(0);
+        bool tankSat = false;
         bool powerKept = false;
         bool segments = false;
         T shimmer    = T(0);
-        T distance   = T(0);
+        T sourceDepth = T(0);
     };
     CachedParams cachedParams_ {};
 
@@ -1791,8 +1791,8 @@ protected:
         std::atomic<T> multiplier { T(1) };
     };
     std::array<PublishedDecayBand, kDecayBands> decayBands_;
-    std::atomic<bool> freeze_ { false }, thickSat_ { false };
-    std::atomic<T> distance_ { T(0) }, thickness_ { T(0) }, tempo_ { T(120) }, inputWidth_ { T(1) };
+    std::atomic<bool> tailHold_ { false }, tankSat_ { false };
+    std::atomic<T> sourceDepth_ { T(0) }, tankLeveling_ { T(0) }, tempo_ { T(120) }, inputWidth_ { T(1) };
     std::atomic<T> shimmer_ { T(0) }, gateHoldMs_ { T(100) };
     std::atomic<int> preNote_ { 0 }, preFeel_ { 0 }, gateNote_ { 0 }, gateFeel_ { 0 };
     std::atomic<int> widthLaw_ { 0 }, modStyle_ { 0 }, layout_ { 0 };
@@ -1806,8 +1806,8 @@ protected:
     std::array<std::array<T, kMaxLines>, kDecayBands> dqZ1_ {}, dqZ2_ {};
     std::array<int, kDecayBands> dqList_ {};
     int dqCount_ = 0;
-    T freezeNow_ = T(0);
-    double thickEnv_ = 0.0, thickUp_ = 0.0, thickDown_ = 0.0;
+    T holdNow_ = T(0);
+    double levelEnv_ = 0.0, levelUp_ = 0.0, levelDown_ = 0.0;
     std::array<T, 2> distLp_ {};
     T distCoeff_ = T(1), distMix_ = T(0);
     std::array<SegmentLfo, kMaxLines> seg_ {};
@@ -1869,7 +1869,7 @@ protected:
     /// Puts every gliding parameter (levels, width, diffusion, tone) at its target.
     void snapGlides() noexcept
     {
-        const T d = distance_.load(std::memory_order_relaxed);
+        const T d = sourceDepth_.load(std::memory_order_relaxed);
         earlyCur_ = earlyLevel_.load(std::memory_order_relaxed) * (d > T(0) ? T(1) - T(0.5) * d : T(1));
         lateCur_  = lateLevel_.load(std::memory_order_relaxed) * (d > T(0) ? T(1) + T(0.5) * d : T(1));
         widthCur_ = width_.load(std::memory_order_relaxed);
@@ -1986,16 +1986,16 @@ protected:
         cachedParams_.lateLevel  = lateLevel_.load(std::memory_order_relaxed);
         cachedParams_.width      = width_.load(std::memory_order_relaxed);
         cachedParams_.inputWidth = inputWidth_.load(std::memory_order_relaxed);
-        cachedParams_.thickness  = thickness_.load(std::memory_order_relaxed);
-        cachedParams_.thickSat   = thickSat_.load(std::memory_order_relaxed);
+        cachedParams_.tankLeveling  = tankLeveling_.load(std::memory_order_relaxed);
+        cachedParams_.tankSat   = tankSat_.load(std::memory_order_relaxed);
         cachedParams_.powerKept  = widthLaw_.load(std::memory_order_relaxed) == 1;
         cachedParams_.segments   = modStyle_.load(std::memory_order_relaxed) == 1;
         cachedParams_.shimmer    = shimmer_.load(std::memory_order_relaxed);
-        cachedParams_.distance   = distance_.load(std::memory_order_relaxed);
-        const T d = cachedParams_.distance;
+        cachedParams_.sourceDepth   = sourceDepth_.load(std::memory_order_relaxed);
+        const T d = cachedParams_.sourceDepth;
         if (d > T(0))
         {
-            // Distance: from the early field to the tail, a shorter gap.
+            // Source depth: from the early field to the tail, a shorter gap.
             cachedParams_.earlyLevel *= T(1) - T(0.5) * d;
             cachedParams_.lateLevel  *= T(1) + T(0.5) * d;
             cachedParams_.preDelaySamples = static_cast<int>(static_cast<T>(cachedParams_.preDelaySamples)
@@ -2501,12 +2501,12 @@ protected:
         const T rampStep = T(1) / static_cast<T>(count);
         fresh_ = false;
 
-        // Freeze: the absorption fades to unity and the input out.
-        const T freeze0 = freezeNow_;
-        freezeNow_ = glideTo(freezeNow_, freeze_.load(std::memory_order_relaxed) ? T(1) : T(0), gc);
-        if (freezeNow_ != freeze0) applyFreezeCoeffs();
-        const bool freezing = freezeNow_ != T(0) || freeze0 != T(0);
-        const T in0 = T(1) - freeze0, in1 = T(1) - freezeNow_;
+        // Tail hold: the absorption fades to unity and the input out.
+        const T hold0 = holdNow_;
+        holdNow_ = glideTo(holdNow_, tailHold_.load(std::memory_order_relaxed) ? T(1) : T(0), gc);
+        if (holdNow_ != hold0) applyHoldCoeffs();
+        const bool holding = holdNow_ != T(0) || hold0 != T(0);
+        const T in0 = T(1) - hold0, in1 = T(1) - holdNow_;
 
         // Input width: the side of the input before the tank.
         alignas(64) T narrowL[kChunk];
@@ -2524,9 +2524,9 @@ protected:
             inR = narrowR;
         }
 
-        // Distance: the low-pass on the wet signal, crossfaded in and out.
+        // Source depth: the low-pass on the wet signal, crossfaded in and out.
         {
-            const T d = cachedParams_.distance;
+            const T d = cachedParams_.sourceDepth;
             distMix_ = glideTo(distMix_, d > T(0) ? T(1) : T(0), gc);
             if (d > T(0))
             {
@@ -2548,20 +2548,20 @@ protected:
             addTap(raw[c], pre, pd + 1 + last, T(1), count);
         }
 
-        // Thickness: a compressor on the tank's input, both sides linked.
-        if (cachedParams_.thickness > T(0))
+        // Tank leveling: a compressor on the tank's input, both sides linked.
+        if (cachedParams_.tankLeveling > T(0))
         {
-            const double ratio = 1.0 + 3.0 * static_cast<double>(cachedParams_.thickness);
+            const double ratio = 1.0 + 3.0 * static_cast<double>(cachedParams_.tankLeveling);
             const double slope = 1.0 / ratio - 1.0;
             constexpr double kThreshold = -30.0, kKnee = 24.0;
             const double makeup = -slope * 12.0;   // -18 dBFS sits on the knee's top
-            const bool saturate = cachedParams_.thickSat;
+            const bool saturate = cachedParams_.tankSat;
             for (int n = 0; n < count; ++n)
             {
                 const double level = std::max(static_cast<double>(raw[0][n]) * raw[0][n],
                                               static_cast<double>(raw[1][n]) * raw[1][n]);
-                thickEnv_ = level + (level > thickEnv_ ? thickUp_ : thickDown_) * (thickEnv_ - level);
-                const double over = 10.0 * std::log10(thickEnv_ + 1e-30) - kThreshold;
+                levelEnv_ = level + (level > levelEnv_ ? levelUp_ : levelDown_) * (levelEnv_ - level);
+                const double over = 10.0 * std::log10(levelEnv_ + 1e-30) - kThreshold;
                 const double gr = over <= -0.5 * kKnee ? 0.0
                                 : over >= 0.5 * kKnee ? slope * over
                                 : slope * (over + 0.5 * kKnee) * (over + 0.5 * kKnee) / (2.0 * kKnee);
@@ -2664,7 +2664,7 @@ protected:
             // --- Late field ---
             T lateL = T(0), lateR = T(0);
             const T a = static_cast<T>(n + 1) * rampStep;
-            const T inGain = freezing ? in0 + (in1 - in0) * a : T(1);
+            const T inGain = holding ? in0 + (in1 - in0) * a : T(1);
             if (spring_)
             {
                 const T rawN[2] = { raw[0][n] * inGain, raw[1][n] * inGain };
@@ -2682,7 +2682,7 @@ protected:
 
             const T earlyNow = early0 + (earlyCur_ - early0) * a;
             auto [yl, yr] = outputStage(lateL, lateR, early[0][n], early[1][n],
-                                        freezing ? earlyNow * inGain : earlyNow,
+                                        holding ? earlyNow * inGain : earlyNow,
                                         late0 + (lateCur_ - late0) * a,
                                         width0 + (widthCur_ - width0) * a,
                                         toneHP0 + (toneHPMix_ - toneHP0) * a,
@@ -2747,10 +2747,10 @@ protected:
         return 0.001 * (kShimmerMinMs + (kShimmerMaxMs - kShimmerMinMs) * u);
     }
 
-    /** @brief The absorption and decay bands in use: the designed ones moved toward unity by the freeze. */
-    void applyFreezeCoeffs() noexcept
+    /** @brief The absorption and decay bands in use: the designed ones moved toward unity by the tail hold. */
+    void applyHoldCoeffs() noexcept
     {
-        const T f = freezeNow_, k = T(1) - f;
+        const T f = holdNow_, k = T(1) - f;
         for (int i = 0; i < kMaxLines; ++i)
         {
             const auto l = static_cast<std::size_t>(i);
@@ -2914,7 +2914,7 @@ protected:
         const double diff = static_cast<double>(diffusion_.load(std::memory_order_relaxed));
         // Targets: the running coefficients glide to them chunk by chunk
         // (processChunk), and snap with reset().
-        const double dist = static_cast<double>(distance_.load(std::memory_order_relaxed));
+        const double dist = static_cast<double>(sourceDepth_.load(std::memory_order_relaxed));
         for (int st = 0; st < kInStages; ++st)
             inAPCoeffTarget_[static_cast<std::size_t>(st)] = dist > 0.0
                 ? static_cast<T>(std::min(0.8, kInDiffCoeffs_[st] * diff + 0.25 * dist * dist))
@@ -3024,7 +3024,7 @@ protected:
             bassBase_[0][l] = bassB0_[l]; bassBase_[1][l] = bassB1_[l]; bassBase_[2][l] = bassA1_[l];
         }
         designDecayBands(decay, t60H, t60B, Kh, Kb);
-        applyFreezeCoeffs();
+        applyHoldCoeffs();
     }
 
     /** |H(e^jw)| of ((1 + a) + (a - 1) z^-1) / ((1 + b) + (b - 1) z^-1). */

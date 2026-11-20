@@ -57,9 +57,9 @@
  *   and the delay as the head distance over the speed.
  * - setNoise() puts the hiss on the tape, before the reproduce head and its
  *   de-emphasis, so it has the colour of the speed and the standard;
- *   setHum() adds mains hum after the tape; setCrosstalk() leaks each channel
+ *   setHum() adds mains hum after the tape; setChannelBleed() leaks each channel
  *   of a pair into the other, rising with frequency.
- * - setAsymmetry() adds an even term before the tape; setTransformer() adds
+ * - setEvenHarmonics() adds an even term before the tape; setOutputIron() adds
  *   an output transformer as a parallel branch (low frequencies saturate it).
  * - setHeadModel(HeadModel::Contour): the reproduce head's low end as a
  *   chain of resonances; setElectronics(Electronics::Circuit): the record and
@@ -195,13 +195,13 @@ public:
     enum class TrackFormat { Half, Full, Quarter };
 
     /**
-     * @brief What the output monitors (setMonitor()). Repro, the default, is
-     *        the reproduce head; Sync reads through the record head, whose
+     * @brief What the output monitors (setMonitor()). PlayHead, the default, is
+     *        the reproduce head; RecordHead reads through the record head, whose
      *        wider gap (6 um against 3) and spacing lose more of the top end;
      *        Input is the input itself, delayed like the tape path. Changes
      *        fade over 20 ms.
      */
-    enum class Monitor { Repro, Sync, Input };
+    enum class Monitor { PlayHead, RecordHead, Source };
 
     /**
      * @brief The reproduce head's low end (setHeadModel()). Bump, the
@@ -300,7 +300,7 @@ public:
         recNet_.assign(channels, {});
         playNet_.assign(channels, {});
         {
-            // Crosstalk: a first-order high-pass at 10 kHz (its corner kept
+            // Channel bleed: a first-order high-pass at 10 kHz (its corner kept
             // in place), scaled to unity at 1 kHz. Transformer branch: a
             // one-pole low-pass at 60 Hz before the curve (flux follows
             // voltage over frequency) and its inverse, capped at 4 kHz, after.
@@ -652,32 +652,32 @@ public:
     }
 
     /**
-     * @brief Crosstalk between the channels of each pair (0 and 1, 2 and 3,
+     * @brief Bleed between the channels of each pair (0 and 1, 2 and 3,
      *        and so on): each takes the other through a first-order
      *        high-pass at 10 kHz (rising 6 dB per octave below it, as between
      *        the tracks of a head), its level gliding over 50 ms.
      *        Non-finite values are ignored.
      * @param dB Level at 1 kHz; -120 and below turn it off (the default).
      */
-    void setCrosstalk(T dB) noexcept
+    void setChannelBleed(T dB) noexcept
     {
-        if (std::isfinite(dB)) crosstalkDb_.store(std::clamp(dB, T(-200), T(-20)), std::memory_order_relaxed);
+        if (std::isfinite(dB)) channelBleedDb_.store(std::clamp(dB, T(-200), T(-20)), std::memory_order_relaxed);
     }
 
     /**
-     * @brief Even asymmetry of the record path, 0 to 1 (0, the default, is
+     * @brief Even harmonics of the record path, 0 to 1 (0, the default, is
      *        off): a share of the square of the recorded signal (less its
      *        mean) is added before the tape, so the second harmonic grows
      *        with the level; it glides over 20 ms. Non-finite values are
      *        ignored.
      */
-    void setAsymmetry(T amount) noexcept
+    void setEvenHarmonics(T amount) noexcept
     {
-        if (std::isfinite(amount)) asymmetry_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        if (std::isfinite(amount)) evenHarmonics_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /**
-     * @brief Output transformer, 0 to 1 (0, the default, is off): a parallel
+     * @brief Output iron, 0 to 1 (0, the default, is off): a parallel
      *        branch that takes the reproduced signal through a one-pole
      *        low-pass at 60 Hz (the flux of a transformer follows the voltage
      *        over the frequency), a curve with an even and an odd term, and
@@ -685,9 +685,9 @@ public:
      *        changed: the low end saturates first. The branch always runs and
      *        its share glides over 20 ms. Non-finite values are ignored.
      */
-    void setTransformer(T amount) noexcept
+    void setOutputIron(T amount) noexcept
     {
-        if (std::isfinite(amount)) transformer_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        if (std::isfinite(amount)) outputIron_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
     }
 
     /** @brief Reproduce head model (see HeadModel). Out-of-range values are clamped. */
@@ -761,9 +761,9 @@ public:
     [[nodiscard]] Transport getTransport() const noexcept { return static_cast<Transport>(transport_.load(std::memory_order_relaxed)); }
     [[nodiscard]] T getHum() const noexcept { return humDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] Mains getMains() const noexcept { return static_cast<Mains>(mains_.load(std::memory_order_relaxed)); }
-    [[nodiscard]] T getCrosstalk() const noexcept { return crosstalkDb_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getAsymmetry() const noexcept { return asymmetry_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getTransformer() const noexcept { return transformer_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getChannelBleed() const noexcept { return channelBleedDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getEvenHarmonics() const noexcept { return evenHarmonics_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getOutputIron() const noexcept { return outputIron_.load(std::memory_order_relaxed); }
     [[nodiscard]] HeadModel getHeadModel() const noexcept { return static_cast<HeadModel>(headModel_.load(std::memory_order_relaxed)); }
     [[nodiscard]] Electronics getElectronics() const noexcept { return static_cast<Electronics>(electronics_.load(std::memory_order_relaxed)); }
     [[nodiscard]] T getAlignmentHf() const noexcept { return alignHf_.load(std::memory_order_relaxed); }
@@ -817,9 +817,9 @@ public:
         w.write("transport", transport_.load(std::memory_order_relaxed));
         w.write("humDb", static_cast<float>(humDb_.load(std::memory_order_relaxed)));
         w.write("mains", mains_.load(std::memory_order_relaxed));
-        w.write("crosstalk", static_cast<float>(crosstalkDb_.load(std::memory_order_relaxed)));
-        w.write("asymmetry", static_cast<float>(asymmetry_.load(std::memory_order_relaxed)));
-        w.write("transformer", static_cast<float>(transformer_.load(std::memory_order_relaxed)));
+        w.write("channelBleed", static_cast<float>(channelBleedDb_.load(std::memory_order_relaxed)));
+        w.write("evenHarmonics", static_cast<float>(evenHarmonics_.load(std::memory_order_relaxed)));
+        w.write("outputIron", static_cast<float>(outputIron_.load(std::memory_order_relaxed)));
         w.write("headModel", headModel_.load(std::memory_order_relaxed));
         w.write("electronics", electronics_.load(std::memory_order_relaxed));
         w.write("alignHf", static_cast<float>(alignHf_.load(std::memory_order_relaxed)));
@@ -847,9 +847,9 @@ public:
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setTransport(static_cast<Transport>(r.read("transport", 0)));
         setHum(static_cast<T>(r.read("humDb", -200.0f)), static_cast<Mains>(r.read("mains", 0)));
-        setCrosstalk(static_cast<T>(r.read("crosstalk", -200.0f)));
-        setAsymmetry(static_cast<T>(r.read("asymmetry", 0.0f)));
-        setTransformer(static_cast<T>(r.read("transformer", 0.0f)));
+        setChannelBleed(static_cast<T>(r.read("channelBleed", -200.0f)));
+        setEvenHarmonics(static_cast<T>(r.read("evenHarmonics", 0.0f)));
+        setOutputIron(static_cast<T>(r.read("outputIron", 0.0f)));
         setHeadModel(static_cast<HeadModel>(r.read("headModel", 0)));
         setElectronics(static_cast<Electronics>(r.read("electronics", 0)));
         setAlignment(static_cast<T>(r.read("alignHf", 0.0f)), static_cast<T>(r.read("alignLf", 0.0f)));
@@ -1068,7 +1068,7 @@ private:
 
         // 4-6. Per frame: hiss onto the tape, loss FIR and head, transport,
         // playback EQ, over-bias, output coupling and transformer per channel;
-        // then crosstalk, hum, monitor and mix across the channels.
+        // then the channel bleed, hum, monitor and mix across the channels.
         for (int i = 0; i < nS; ++i)
         {
             // One shared transport per frame (all channels move together,
@@ -1270,7 +1270,7 @@ private:
         }
         const T humDb = humDb_.load(std::memory_order_relaxed);
         const double hum = humDb > T(-120) ? std::pow(10.0, static_cast<double>(humDb) / 20.0) : 0.0;
-        const T xtDb = crosstalkDb_.load(std::memory_order_relaxed);
+        const T xtDb = channelBleedDb_.load(std::memory_order_relaxed);
         const double xt = xtDb > T(-120) ? std::pow(10.0, static_cast<double>(xtDb) / 20.0) * xtNorm_ : 0.0;
         if (xt > 0.0 && !xt_.active())
             for (auto& s : xtHp_) s.clear();
@@ -1278,8 +1278,8 @@ private:
         hiss_.aim(hiss, 0.05 * fs);
         hum_.aim(hum, 0.05 * fs);
         xt_.aim(xt, 0.05 * fs);
-        tr_.aim(static_cast<double>(transformer_.load(std::memory_order_relaxed)), 0.02 * fs);
-        asym_.aim(static_cast<double>(asymmetry_.load(std::memory_order_relaxed)), 0.02 * fs * static_cast<double>(osFactor_));
+        tr_.aim(static_cast<double>(outputIron_.load(std::memory_order_relaxed)), 0.02 * fs);
+        asym_.aim(static_cast<double>(evenHarmonics_.load(std::memory_order_relaxed)), 0.02 * fs * static_cast<double>(osFactor_));
         monitorRamp_.aim(monitor, 0.02 * fs);
         if (land)
         {
@@ -1629,7 +1629,7 @@ private:
         else tapeTransport_.setSpeedNow(ips);
         speedIps_ = ips;
         const double v = ips * 0.0254;            // m/s
-        // The record head (sync monitoring) has the wider gap and spacing.
+        // The record head (record-head monitoring) has the wider gap and spacing.
         const bool sync = monitor_.load(std::memory_order_relaxed) == 1;
         const double gap = sync ? 6.0e-6 : 3.0e-6;           // playback head gap (m)
         const double spacing = sync ? 1.0e-6 : 0.5e-6;       // head-tape spacing (m)
@@ -1964,7 +1964,7 @@ private:
     // The machine around the tape (settings).
     std::atomic<int> transport_ { 0 }, mains_ { 0 }, headModel_ { 0 }, electronics_ { 0 };
     std::atomic<int> formulation_ { 0 }, trackFormat_ { 0 }, monitor_ { 0 };
-    std::atomic<T> humDb_ { T(-200) }, crosstalkDb_ { T(-200) }, asymmetry_ { T(0) }, transformer_ { T(0) };
+    std::atomic<T> humDb_ { T(-200) }, channelBleedDb_ { T(-200) }, evenHarmonics_ { T(0) }, outputIron_ { T(0) };
     std::atomic<T> alignHf_ { T(0) }, alignLf_ { T(0) }, calLevel_ { T(0) };
 
     // ... and its state (audio thread).

@@ -32,6 +32,8 @@
  * Threading: prepare() and setState() on the setup thread (allocate);
  * processBlock() and reset() on the audio thread; setBand() publishes
  * lock-free (the audio thread redesigns the band at its next block).
+ * getDisplayGain() and getPeakGain() read the last frame's gain curve from
+ * any thread.
  * Non-finite fields are ignored.
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h,
@@ -103,6 +105,7 @@ public:
             s.active = false;
         }
         gainDb_.assign(static_cast<size_t>(bins_), 0.0);
+        readout_.prepare(filter_.getBinHz(), bins_);
         for (auto& d : dirty_) d.store(true, std::memory_order_release);
         prepared_ = true;
     }
@@ -112,6 +115,7 @@ public:
     {
         filter_.reset();
         for (auto& s : state_) { s.action.fill(0.0); s.peak = -200.0; }
+        readout_.clear();
     }
 
     /** @brief Sets a band (out-of-range indices are ignored; fields are clamped). */
@@ -158,6 +162,15 @@ public:
         if (bins_ < 2) return 0.0;
         return gainDb_[static_cast<size_t>(std::clamp(static_cast<int>(std::lround(hz / filter_.getBinHz())), 0, bins_ - 1))];
     }
+
+    /** @brief Points of the display curve, evenly in log frequency from 20 Hz to 20 kHz. */
+    static constexpr int kDisplayPoints = SpectralReadout<T>::kPoints;
+    /** @return The frequency of a display point, in hertz. */
+    [[nodiscard]] static double getDisplayFrequency(int point) noexcept { return SpectralReadout<T>::frequency(point); }
+    /** @return The gain of the last frame around a display point, in dB (all bands; any thread). */
+    [[nodiscard]] T getDisplayGain(int point) const noexcept { return readout_.value(0, point); }
+    /** @return The gain of the last frame with the largest magnitude, in dB, its sign kept (any thread). */
+    [[nodiscard]] T getPeakGain() const noexcept { return readout_.extreme(); }
 
     /** @brief Processes the programme in place, its own level driving the bands. */
     void processBlock(AudioBufferView<T> buffer) noexcept { run(buffer, nullptr); }
@@ -340,12 +353,14 @@ private:
             }
         }
         for (int k = 0; k < bins; ++k) gain[k] = static_cast<T>(std::pow(10.0, gainDb_[static_cast<size_t>(k)] / 20.0));
+        readout_.publish(0, gainDb_.data(), bins);
     }
 
     AudioSpec spec_ {};
     int bins_ = 0;
     bool prepared_ = false;
     SpectralFilter<T> filter_;
+    SpectralReadout<T> readout_;
     std::array<Published, kBands> published_ {};
     std::array<std::atomic<bool>, kBands> dirty_ {};
     std::array<State, kBands> state_ {};

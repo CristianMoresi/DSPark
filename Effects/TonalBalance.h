@@ -28,8 +28,8 @@
  * balance) and the band against its trend (the local contrast). Two
  * soft-knee curves (hyperbolas, with a different slope on each side) turn a
  * deviation into a correction: setBalance() moves the trend toward the
- * reference, setBoost() raises bands that sit under their trend and
- * setTame() lowers those that stand over it. The corrections are limited
+ * reference, setFillDips() raises bands that sit under their trend and
+ * setTrimPeaks() lowers those that stand over it. The corrections are limited
  * (setRange()), faded at the edges of setFrequencyRange() over one Bark, and
  * then offset so the total loudness of the programme does not change (the
  * correction redistributes). setLevelCompensation(true) converts loudness
@@ -156,9 +156,9 @@ public:
     /** @brief How far the trend moves toward the reference shape, 0 to 1 (default 0.5). */
     void setBalance(T amount) noexcept { store(balance_, amount, T(0), T(1)); }
     /** @brief How much bands under their trend are raised, 0 to 1 (default 0.3). */
-    void setBoost(T amount) noexcept { store(boost_, amount, T(0), T(1)); }
+    void setFillDips(T amount) noexcept { store(fillDips_, amount, T(0), T(1)); }
     /** @brief How much bands over their trend are lowered, 0 to 1 (default 0.5). */
-    void setTame(T amount) noexcept { store(tame_, amount, T(0), T(1)); }
+    void setTrimPeaks(T amount) noexcept { store(trimPeaks_, amount, T(0), T(1)); }
     /** @brief Tilt of the reference shape in dB per octave around 1 kHz, -6 to +6 (default 0: flat loudness per Bark). */
     void setTilt(T dbPerOctave) noexcept { store(tilt_, dbPerOctave, T(-6), T(6)); }
     /** @brief Largest correction of a band, 0 to 24 dB (default 6). */
@@ -179,8 +179,8 @@ public:
     void setReferenceLevel(T dbSpl) noexcept { store(referenceSpl_, dbSpl, T(60), T(130)); refDirty_.store(true, std::memory_order_release); }
 
     [[nodiscard]] T getBalance() const noexcept { return balance_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getBoost() const noexcept { return boost_.load(std::memory_order_relaxed); }
-    [[nodiscard]] T getTame() const noexcept { return tame_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getFillDips() const noexcept { return fillDips_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getTrimPeaks() const noexcept { return trimPeaks_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getTilt() const noexcept { return tilt_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRange() const noexcept { return range_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getKnee() const noexcept { return knee_.load(std::memory_order_relaxed); }
@@ -218,8 +218,8 @@ public:
     {
         StateWriter w(stateId("TBAL"), 1);
         w.write("balance", static_cast<float>(getBalance()));
-        w.write("boost", static_cast<float>(getBoost()));
-        w.write("tame", static_cast<float>(getTame()));
+        w.write("fillDips", static_cast<float>(getFillDips()));
+        w.write("trimPeaks", static_cast<float>(getTrimPeaks()));
         w.write("tilt", static_cast<float>(getTilt()));
         w.write("range", static_cast<float>(getRange()));
         w.write("knee", static_cast<float>(getKnee()));
@@ -235,8 +235,8 @@ public:
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("TBAL")) return false;
         setBalance(static_cast<T>(r.read("balance", 0.5f)));
-        setBoost(static_cast<T>(r.read("boost", 0.3f)));
-        setTame(static_cast<T>(r.read("tame", 0.5f)));
+        setFillDips(static_cast<T>(r.read("fillDips", 0.3f)));
+        setTrimPeaks(static_cast<T>(r.read("trimPeaks", 0.5f)));
         setTilt(static_cast<T>(r.read("tilt", 0.0f)));
         setRange(static_cast<T>(r.read("range", 6.0f)));
         setKnee(static_cast<T>(r.read("knee", 3.0f)));
@@ -385,8 +385,8 @@ private:
         }
         meanDev = wsum > 0.0 ? meanDev / wsum : 0.0;
         const double balance = static_cast<double>(balance_.load(std::memory_order_relaxed));
-        const double boost = static_cast<double>(boost_.load(std::memory_order_relaxed));
-        const double tame = static_cast<double>(tame_.load(std::memory_order_relaxed));
+        const double fillDips = static_cast<double>(fillDips_.load(std::memory_order_relaxed));
+        const double trimPeaks = static_cast<double>(trimPeaks_.load(std::memory_order_relaxed));
         const double range = static_cast<double>(range_.load(std::memory_order_relaxed));
         const double knee = static_cast<double>(knee_.load(std::memory_order_relaxed));
         const auto soft = [knee](double d) { return std::copysign(std::sqrt(d * d + knee * knee) - knee, d); };
@@ -395,7 +395,7 @@ private:
             const auto i = static_cast<size_t>(b);
             const double global = tmpC_[i] - meanDev;
             const double local = level[i] - trend[i];
-            double c = -balance * soft(global) - (local > 0.0 ? tame : boost) * soft(local);
+            double c = -balance * soft(global) - (local > 0.0 ? trimPeaks : fillDips) * soft(local);
             c = std::clamp(c, -range, range) * weight[i];
             corr_[i] = c;
         }
@@ -425,7 +425,7 @@ private:
     int ringPos_ = 0, delayPos_ = 0, hopCounter_ = 0, hops_ = 0;
     bool prepared_ = false, warm_ = false;
 
-    std::atomic<T> balance_ { T(0.5) }, boost_ { T(0.3) }, tame_ { T(0.5) }, tilt_ { T(0) };
+    std::atomic<T> balance_ { T(0.5) }, fillDips_ { T(0.3) }, trimPeaks_ { T(0.5) }, tilt_ { T(0) };
     std::atomic<T> range_ { T(6) }, knee_ { T(3) }, loHz_ { T(40) }, hiHz_ { T(16000) }, referenceSpl_ { T(100) };
     std::atomic<bool> levelComp_ { false }, refDirty_ { false };
     std::array<std::atomic<T>, kBands> published_ {};

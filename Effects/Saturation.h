@@ -2316,35 +2316,35 @@ public:
      *
      * @note Thread-Safe. Smoothed over 20 ms; a value that is not finite is ignored.
      */
-    void setDynamics(SampleType amount) noexcept
+    void setLevelTracking(SampleType amount) noexcept
     {
         if (!std::isfinite(amount)) return;
-        dynamics_.store(std::clamp(amount, SampleType(-1), SampleType(1)), std::memory_order_relaxed);
+        levelTracking_.store(std::clamp(amount, SampleType(-1), SampleType(1)), std::memory_order_relaxed);
     }
 
-    /** @brief The dynamics around the curve (see setDynamics()). */
-    [[nodiscard]] SampleType getDynamics() const noexcept { return dynamics_.load(std::memory_order_relaxed); }
+    /** @brief The dynamics around the curve (see setLevelTracking()). */
+    [[nodiscard]] SampleType getLevelTracking() const noexcept { return levelTracking_.load(std::memory_order_relaxed); }
 
     /**
-     * @brief The band the follower of setDynamics() listens to.
+     * @brief The band the follower of setLevelTracking() listens to.
      *
      * Over 0 the follower reads the programme through a low-pass at this
-     * frequency: with a negative setDynamics() the low end then pushes the
+     * frequency: with a negative setLevelTracking() the low end then pushes the
      * whole signal into the curve (the threshold of the saturation moves
      * with the bass, as in a core whose low frequencies fill it first).
      *
      * @note Thread-Safe. A value that is not finite is ignored.
      * @param hz Corner of the low-pass, 20 to 2000 Hz; 0, the default, is the whole band.
      */
-    void setDynamicsFocus(SampleType hz) noexcept
+    void setTrackingCorner(SampleType hz) noexcept
     {
         if (!std::isfinite(hz)) return;
-        dynamicsFocusHz_.store(hz <= SampleType(0) ? SampleType(0) : std::clamp(hz, SampleType(20), SampleType(2000)),
+        trackingCornerHz_.store(hz <= SampleType(0) ? SampleType(0) : std::clamp(hz, SampleType(20), SampleType(2000)),
                                std::memory_order_relaxed);
     }
 
     /** @brief The band the dynamics follower listens to, in hertz (0: all of it). */
-    [[nodiscard]] SampleType getDynamicsFocus() const noexcept { return dynamicsFocusHz_.load(std::memory_order_relaxed); }
+    [[nodiscard]] SampleType getTrackingCorner() const noexcept { return trackingCornerHz_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Feeds the output of the curve back into it, inverted, one
@@ -2356,7 +2356,7 @@ public:
      * the curve sits inside, with dips on the frequency and its multiples
      * and peaks half way between them. The loop gain is the amount and
      * falls as the curve saturates, so it cannot run away. The delay cannot
-     * be shorter than the latency plus 16 samples: getFeedbackFrequency()
+     * be shorter than the latency plus 16 samples: getCombLoopFrequency()
      * gives the frequency in effect. While it is on the block is processed
      * in pieces no longer than the delay.
      *
@@ -2364,21 +2364,21 @@ public:
      * @param amount -0.95 to 0.95; 0, the default, is off.
      * @param hz     Frequency of the comb, from 20 Hz.
      */
-    void setFeedback(SampleType amount, SampleType hz) noexcept
+    void setCombLoop(SampleType amount, SampleType hz) noexcept
     {
         if (std::isfinite(amount))
-            feedback_.store(std::clamp(amount, SampleType(-0.95), SampleType(0.95)), std::memory_order_relaxed);
+            combLoop_.store(std::clamp(amount, SampleType(-0.95), SampleType(0.95)), std::memory_order_relaxed);
         if (std::isfinite(hz) && hz > SampleType(0))
-            feedbackHz_.store(std::clamp(hz, kMinFeedbackHz, SampleType(20000)), std::memory_order_relaxed);
+            combLoopHz_.store(std::clamp(hz, kMinFeedbackHz, SampleType(20000)), std::memory_order_relaxed);
     }
 
-    /** @brief The amount of the tuned feedback (see setFeedback()). */
-    [[nodiscard]] SampleType getFeedback() const noexcept { return feedback_.load(std::memory_order_relaxed); }
+    /** @brief The amount of the tuned feedback (see setCombLoop()). */
+    [[nodiscard]] SampleType getCombLoop() const noexcept { return combLoop_.load(std::memory_order_relaxed); }
 
     /** @brief The frequency of the tuned feedback as it runs: what the latency allows of the one asked for. */
-    [[nodiscard]] SampleType getFeedbackFrequency() const noexcept
+    [[nodiscard]] SampleType getCombLoopFrequency() const noexcept
     {
-        if (!(spec_.sampleRate > 0)) return feedbackHz_.load(std::memory_order_relaxed);
+        if (!(spec_.sampleRate > 0)) return combLoopHz_.load(std::memory_order_relaxed);
         return static_cast<SampleType>(spec_.sampleRate / static_cast<double>(feedbackDelayFor(getLatency()) + getLatency()));
     }
 
@@ -2614,10 +2614,10 @@ public:
         w.write("curveAsymmetry", static_cast<float>(getCurveAsymmetry()));
         w.write("asymmetry", static_cast<float>(getAsymmetry()));
         w.write("programNoise", static_cast<float>(getProgramNoise()));
-        w.write("dynamics", static_cast<float>(getDynamics()));
-        w.write("dynamicsFocus", static_cast<float>(getDynamicsFocus()));
-        w.write("feedback", static_cast<float>(getFeedback()));
-        w.write("feedbackHz", static_cast<float>(feedbackHz_.load(std::memory_order_relaxed)));
+        w.write("levelTracking", static_cast<float>(getLevelTracking()));
+        w.write("trackingCorner", static_cast<float>(getTrackingCorner()));
+        w.write("combLoop", static_cast<float>(getCombLoop()));
+        w.write("combLoopHz", static_cast<float>(combLoopHz_.load(std::memory_order_relaxed)));
         w.write("driveCompensation", driveCompensation_.load(std::memory_order_relaxed));
         return w.blob();
     }
@@ -2655,10 +2655,10 @@ public:
                       static_cast<SampleType>(r.read("curveAsymmetry", 0.0f)));
         setAsymmetry(static_cast<SampleType>(r.read("asymmetry", 0.0f)));
         setProgramNoise(static_cast<SampleType>(r.read("programNoise", -120.0f)));
-        setDynamics(static_cast<SampleType>(r.read("dynamics", 0.0f)));
-        setDynamicsFocus(static_cast<SampleType>(r.read("dynamicsFocus", 0.0f)));
-        setFeedback(static_cast<SampleType>(r.read("feedback", 0.0f)),
-                    static_cast<SampleType>(r.read("feedbackHz", 200.0f)));
+        setLevelTracking(static_cast<SampleType>(r.read("levelTracking", 0.0f)));
+        setTrackingCorner(static_cast<SampleType>(r.read("trackingCorner", 0.0f)));
+        setCombLoop(static_cast<SampleType>(r.read("combLoop", 0.0f)),
+                    static_cast<SampleType>(r.read("combLoopHz", 200.0f)));
         setDriveCompensation(r.read("driveCompensation", false));
         return true;
     }
@@ -3176,7 +3176,7 @@ protected:
     /** Samples the feedback line delays so that, with a latency, the loop is one period long. */
     [[nodiscard]] int feedbackDelayFor(int latency) const noexcept
     {
-        const double hz = static_cast<double>(feedbackHz_.load(std::memory_order_relaxed));
+        const double hz = static_cast<double>(combLoopHz_.load(std::memory_order_relaxed));
         const int period = static_cast<int>(std::lround(spec_.sampleRate / std::max(hz, 1.0)));
         return std::clamp(period - latency, kMinFeedbackDelay, std::max(kMinFeedbackDelay, feedbackSize_ / 2));
     }
@@ -3215,8 +3215,8 @@ protected:
         noisePeak_ = 0.0;
         noiseHoldLeft_ = 0;
         asymmetryNow_ = static_cast<double>(asymmetry_.load(std::memory_order_relaxed));
-        dynamicsNow_ = static_cast<double>(dynamics_.load(std::memory_order_relaxed));
-        feedbackNow_ = static_cast<double>(feedback_.load(std::memory_order_relaxed));
+        dynamicsNow_ = static_cast<double>(levelTracking_.load(std::memory_order_relaxed));
+        feedbackNow_ = static_cast<double>(combLoop_.load(std::memory_order_relaxed));
         gainTail_ = 0;
         stagesOn_ = false;
         feedingBefore_ = false;
@@ -3230,11 +3230,11 @@ protected:
     [[nodiscard]] int syncStages() noexcept
     {
         asymmetryTarget_ = static_cast<double>(asymmetry_.load(std::memory_order_relaxed));
-        dynamicsTarget_ = static_cast<double>(dynamics_.load(std::memory_order_relaxed));
-        feedbackTarget_ = static_cast<double>(feedback_.load(std::memory_order_relaxed));
+        dynamicsTarget_ = static_cast<double>(levelTracking_.load(std::memory_order_relaxed));
+        feedbackTarget_ = static_cast<double>(combLoop_.load(std::memory_order_relaxed));
         const SampleType noiseDb = programNoiseDb_.load(std::memory_order_relaxed);
         noiseGain_ = (noiseDb > kNoiseOffDb) ? static_cast<double>(decibelsToGain(noiseDb)) : 0.0;
-        const double focusHz = static_cast<double>(dynamicsFocusHz_.load(std::memory_order_relaxed));
+        const double focusHz = static_cast<double>(trackingCornerHz_.load(std::memory_order_relaxed));
         focusRate_ = (focusHz > 0.0) ? 1.0 - std::exp(-2.0 * std::numbers::pi * focusHz / spec_.sampleRate) : 0.0;
 
         stageLatency_ = getLatency();
@@ -3511,10 +3511,10 @@ protected:
 
     std::atomic<SampleType> asymmetry_ { SampleType(0) };
     std::atomic<SampleType> programNoiseDb_ { kNoiseOffDb };
-    std::atomic<SampleType> dynamics_ { SampleType(0) };
-    std::atomic<SampleType> dynamicsFocusHz_ { SampleType(0) };
-    std::atomic<SampleType> feedback_ { SampleType(0) };
-    std::atomic<SampleType> feedbackHz_ { SampleType(200) };
+    std::atomic<SampleType> levelTracking_ { SampleType(0) };
+    std::atomic<SampleType> trackingCornerHz_ { SampleType(0) };
+    std::atomic<SampleType> combLoop_ { SampleType(0) };
+    std::atomic<SampleType> combLoopHz_ { SampleType(200) };
 
     // Audio thread.
     bool stagesOn_ = false;

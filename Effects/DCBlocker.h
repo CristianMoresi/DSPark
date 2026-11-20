@@ -37,7 +37,7 @@
  * recursion with an exact zero in IEEE arithmetic, whatever the coefficients
  * round to, so steady DC always decays to true zero.
  *
- * Dependencies: Core/DspMath.h, Core/Biquad.h, Core/AudioSpec.h,
+ * Dependencies: Core/DspMath.h, Core/Biquad.h, Core/SimdOps.h, Core/AudioSpec.h,
  * Core/AudioBuffer.h, Core/StateBlob.h.
  *
  * Threading: prepare() belongs to the setup thread; the processing calls and
@@ -48,6 +48,7 @@
 
 #include "../Core/DspMath.h"
 #include "../Core/Biquad.h"
+#include "../Core/SimdOps.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/StateBlob.h"
@@ -69,8 +70,10 @@ namespace dspark {
  * @class DCBlocker
  * @brief DC blocking filter with configurable Butterworth order (1-10).
  *
- * Designed for strict real-time processing: zero allocations and tight scalar
- * inner loops (the recursive filter state rules out SIMD vectorization).
+ * Designed for strict real-time processing: zero allocations and tight inner
+ * loops. The recursion is serial along the samples, so the block path runs
+ * pairs of channels in the two lanes of one register (each lane computes the
+ * single-channel operations) and an odd last channel on its own.
  *
  * The filter core (coefficients, history and recursion) is always double
  * precision, independent of the sample type: see the file-level documentation for the
@@ -196,16 +199,20 @@ public:
         const int nS = buffer.getNumSamples();
         if (nS <= 0) return;
 
-        if (currentOrder <= 1)
+        // Pairs of channels share the two lanes of one register; an odd last
+        // channel runs alone. Each lane computes the single-channel operations.
+        int ch = 0;
+        if constexpr (kPairChannels)
         {
-            for (int ch = 0; ch < nCh; ++ch)
-                runOnePole(buffer.getChannel(ch), nS, ch);
+            for (; ch + 1 < nCh; ch += 2)
+                runPair<simd::kVecDoubleNarrow>(buffer.getChannel(ch), buffer.getChannel(ch + 1), nS, ch, ch + 1, currentOrder);
         }
-        else
+        for (; ch < nCh; ++ch)
         {
-            const int numStages = std::clamp(currentOrder / 2, 1, kMaxBiquadStages);
-            for (int ch = 0; ch < nCh; ++ch)
-                runCascade(buffer.getChannel(ch), nS, ch, numStages);
+            if (currentOrder <= 1)
+                runOnePole(buffer.getChannel(ch), nS, ch);
+            else
+                runCascade(buffer.getChannel(ch), nS, ch, std::clamp(currentOrder / 2, 1, kMaxBiquadStages));
         }
     }
 
@@ -240,7 +247,9 @@ public:
      * that a per-sample-only caller still sees setOrder()/setCutoff() (two
      * relaxed loads and two compares; a pending change pays the coefficient
      * rebuild on the sample that observes it, same @warning as the block path).
-     * Bit-identical to the block paths sample for sample, except that those
+     * Bit-identical to the block paths sample for sample (a channel processed
+     * in a pair computes the same operations in its lane, identical where the
+     * compiler does not fuse multiply-adds), except that those
      * flush a fully decayed state (below 1e-30, i.e. after seconds of silence)
      * to zero at the end of the block to keep the recursion out of denormal
      * territory; a per-sample caller owns that decision through its own loop.
@@ -456,6 +465,95 @@ protected:
         {
             flushDenormals(z[s]);
             sections_[static_cast<size_t>(s)].state[ch] = z[s];
+        }
+    }
+
+    // Two lanes of doubles in one register; on 32-bit x86 the eight vector
+    // registers do not hold a pair's cascade, so channels run one at a time.
+    static constexpr bool kPairChannels = simd::kVecDoubleNarrow == 2 && sizeof(void*) == 8;
+
+    /** @brief Two channels through the filter in the lanes of one register (W = 2). */
+    template <int W>
+    void runPair(T* left, T* right, int numSamples, int chLeft, int chRight, int order) noexcept
+    {
+        if (order <= 1)
+        {
+            runOnePolePair<W>(left, right, numSamples, chLeft, chRight);
+            return;
+        }
+        switch (std::clamp(order / 2, 1, kMaxBiquadStages))
+        {
+            case 1: runCascadePair<W, 1>(left, right, numSamples, chLeft, chRight); break;
+            case 2: runCascadePair<W, 2>(left, right, numSamples, chLeft, chRight); break;
+            case 3: runCascadePair<W, 3>(left, right, numSamples, chLeft, chRight); break;
+            case 4: runCascadePair<W, 4>(left, right, numSamples, chLeft, chRight); break;
+            default: runCascadePair<W, 5>(left, right, numSamples, chLeft, chRight); break;
+        }
+    }
+
+    static double finiteOrZero(T x) noexcept { return std::isfinite(x) ? static_cast<double>(x) : 0.0; }
+
+    template <int W>
+    void runOnePolePair(T* left, T* right, int numSamples, int chLeft, int chRight) noexcept
+    {
+        using O = simd::Vec<double, W>;
+        auto& zl = onePole_[static_cast<size_t>(chLeft)];
+        auto& zr = onePole_[static_cast<size_t>(chRight)];
+        const auto r = O::set1(onePoleR_);
+        auto x1 = O::set2(zl.x1, zr.x1);
+        auto y1 = O::set2(zl.y1, zr.y1);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const auto x = O::set2(finiteOrZero(left[i]), finiteOrZero(right[i]));
+            y1 = O::add(O::sub(x, x1), O::mul(r, y1));
+            x1 = x;
+            left[i] = static_cast<T>(O::lane0(y1));
+            right[i] = static_cast<T>(O::lane1(y1));
+        }
+        zl = { O::lane0(x1), O::lane0(y1) };
+        zr = { O::lane1(x1), O::lane1(y1) };
+        flushDenormals(zl);
+        flushDenormals(zr);
+    }
+
+    template <int W, int S>
+    void runCascadePair(T* left, T* right, int numSamples, int chLeft, int chRight) noexcept
+    {
+        using O = simd::Vec<double, W>;
+        using V = typename O::V;
+        const auto cl = static_cast<size_t>(chLeft), cr = static_cast<size_t>(chRight);
+        V b0[S], a1[S], a2[S], x1[S], x2[S], y1[S], y2[S];
+        for (int s = 0; s < S; ++s)
+        {
+            const auto& sec = sections_[static_cast<size_t>(s)];
+            b0[s] = O::set1(sec.b0); a1[s] = O::set1(sec.a1); a2[s] = O::set1(sec.a2);
+            x1[s] = O::set2(sec.state[cl].x1, sec.state[cr].x1);
+            x2[s] = O::set2(sec.state[cl].x2, sec.state[cr].x2);
+            y1[s] = O::set2(sec.state[cl].y1, sec.state[cr].y1);
+            y2[s] = O::set2(sec.state[cl].y2, sec.state[cr].y2);
+        }
+        for (int i = 0; i < numSamples; ++i)
+        {
+            V v = O::set2(finiteOrZero(left[i]), finiteOrZero(right[i]));
+            for (int s = 0; s < S; ++s)
+            {
+                // stepSection() in each lane, operation for operation.
+                const V d = O::sub(O::sub(v, x1[s]), O::sub(x1[s], x2[s]));
+                const V y = O::sub(O::sub(O::mul(b0[s], d), O::mul(a1[s], y1[s])), O::mul(a2[s], y2[s]));
+                x2[s] = x1[s]; x1[s] = v;
+                y2[s] = y1[s]; y1[s] = y;
+                v = y;
+            }
+            left[i] = static_cast<T>(O::lane0(v));
+            right[i] = static_cast<T>(O::lane1(v));
+        }
+        for (int s = 0; s < S; ++s)
+        {
+            auto& sec = sections_[static_cast<size_t>(s)];
+            sec.state[cl] = { O::lane0(x1[s]), O::lane0(x2[s]), O::lane0(y1[s]), O::lane0(y2[s]) };
+            sec.state[cr] = { O::lane1(x1[s]), O::lane1(x2[s]), O::lane1(y1[s]), O::lane1(y2[s]) };
+            flushDenormals(sec.state[cl]);
+            flushDenormals(sec.state[cr]);
         }
     }
 

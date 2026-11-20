@@ -1343,6 +1343,58 @@ DSPARK_TEST(DCBlocker_processSample_matches_processBlock)
     EXPECT_NEAR(static_cast<double>(blockPath.getCutoff()), 20.0, 1e-6);
 }
 
+// The block path runs channels in pairs (two lanes of one register). Every
+// order, with three channels (a pair and one alone) and a non-finite sample,
+// must give what one channel at a time gives.
+DSPARK_TEST(DCBlocker_channel_pairs_match_single_channels)
+{
+    constexpr int kN = 7000;
+    for (int order = 1; order <= 10; ++order)
+    {
+        DCBlocker<double> wide;
+        DCBlocker<double> alone[3];
+        wide.setOrder(order);
+        wide.prepare(48000.0, 3, 12.0);
+        for (auto& f : alone)
+        {
+            f.setOrder(order);
+            f.prepare(48000.0, 1, 12.0);
+        }
+        std::vector<double> data[3], single[3];
+        uint32_t rng = 777u + static_cast<uint32_t>(order);
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            data[ch].resize(kN);
+            for (int i = 0; i < kN; ++i)
+            {
+                rng = rng * 1664525u + 1013904223u;
+                data[ch][static_cast<size_t>(i)] = static_cast<double>(static_cast<int32_t>(rng)) / 2147483648.0 * 0.5 + 0.2 * ch;
+            }
+            single[ch] = data[ch];
+        }
+        data[1][3000] = std::numeric_limits<double>::quiet_NaN();
+        single[1][3000] = std::numeric_limits<double>::quiet_NaN();
+        double worst = 0.0;
+        for (int i = 0; i < kN; i += 333)
+        {
+            const int n = std::min(333, kN - i);
+            double* ptrs[3] = { data[0].data() + i, data[1].data() + i, data[2].data() + i };
+            wide.processBlock(AudioBufferView<double>(ptrs, 3, n));
+            for (int ch = 0; ch < 3; ++ch)
+            {
+                double* one[1] = { single[ch].data() + i };
+                alone[ch].processBlock(AudioBufferView<double>(one, 1, n));
+                for (int k = 0; k < n; ++k)
+                    worst = std::max(worst, std::abs(data[ch][static_cast<size_t>(i + k)] - single[ch][static_cast<size_t>(i + k)]));
+            }
+        }
+        // Rounding only: where the compiler fuses multiply-adds, it may fuse the
+        // lane form and the single form differently.
+        EXPECT_LT(worst, 1e-9);
+        EXPECT_TRUE(std::isfinite(data[1][kN - 1]));
+    }
+}
+
 // ============================================================================
 // Tilt EQ (via Biquad + Equalizer)
 // ============================================================================

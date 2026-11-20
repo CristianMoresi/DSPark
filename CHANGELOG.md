@@ -6,6 +6,30 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Limiter::setPrecision(Precision::High)`: the sample-peak signal read at
+  eight points per sample (a 16-tap Kaiser-windowed sinc gives the seven
+  between the samples) and the gain computer's sliding minimum, hold,
+  release and both moving averages run at eight steps per sample, so the
+  corners of the gain fall where the crests are rather than on the sample
+  grid; a crest within 0.01 dB of the reduction held restarts the hold.
+  On a tone 6 dB over a -6 dB ceiling at 48 kHz (release 20 and 100 ms,
+  with the default hold and without), the largest line that is no harmonic
+  of the tone goes from -62 to -108 dBc to -145 to -146 at 100 Hz, from
+  -75 to -85 to -117 to -126 at 1 kHz and to -123 to -128 at 5 kHz; the
+  tone's level moves by 0.03 dB at most. Readings with only the steps, or
+  with the eight points but no tolerance on the hold, left the lines at
+  1 and 5 kHz, or at 100 Hz, where they were. The points concern the
+  sample 7 frames back, so `getLatency()` is 7 samples longer; every sample
+  still leaves at or below the ceiling; the per-sample path is the block
+  path to the bit for mono; it can be switched during playback. With true
+  peak on the true-peak reading feeds the gain computer and the precision
+  does not apply. A stereo frame costs 105 to 159 ns (10 to 17 in
+  Standard); `prepare()` sizes the gain computer's histories for eight
+  steps per sample whatever the precision. State key `precision`. The
+  expander and the gate were measured the same way and need neither part:
+  the expander's analytic detector already leaves its lines at -111 to
+  -152 dBc, and the gate's gain does not move on a steady tone.
+
 - `FilterDesign` (new, `Core/FilterDesign.h`, with `AnalogSection` and
   `AnalogCascade`): filters described as analog sections and turned into the
   biquads whose magnitude stays on the analog curve up to Nyquist, for every
@@ -1450,6 +1474,33 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `KeyDetector` reads recorded music with an analysis of its own, the new
+  default `Profile::Recorded`: the spectral peaks of a ~186 ms window (8192
+  samples at 44.1 and 48 kHz, the power of two nearest that length at other
+  rates, a quarter of it between frames), each placed to a third of a
+  semitone by parabolic interpolation between 26 Hz and 5 kHz; the tuning of
+  the programme read from where those peaks fall within the semitone; every
+  note crediting the peaks of its first five harmonics (0.6, 0.36 ... from
+  the second); the pitch classes of MIDI 36 to 83 taken per frame relative
+  to the strongest, classes under 0.3 of it left out; and the key named by
+  the cosine of the cube root of their sum with degree weights
+  (`kRecordedMajor`, `kRecordedMinor`) set on the measurements. On annotated
+  recordings, a fifth, a relative or a parallel key counted 0.5, 0.3 and
+  0.2: 70.9 in 100 on 604 electronic tracks (it read 44.2), 68.8 on 1159
+  electronic tracks no weight was chosen on (42.3), 70.4 on 360 solo-guitar
+  takes (55.3), 73.1 on 837 excerpts of ten genres (49.6) and 94.0 on 48 art
+  songs (65.8), the same at the files' own 22.05 kHz. The best of three
+  classical estimators run on the same audio reads 69.5, 67.7, 66.6, 71.2
+  and 94.6 on those sets; the one that reads 94.6 on the art songs reads 10
+  to 18 points under this analysis on the other four. A cadence 40 cents
+  flat is named in all 24 keys (the published profiles over the note
+  chroma: 5). `Profile::KrumhanslKessler` and `Profile::Temperley`
+  are unchanged, on the note chroma as before; both front ends run on every
+  stream, so a switch re-reads evidence from the start, and `chroma()`,
+  `getFrameCount()` and `getWindowSize()` report the front end of the
+  profile in effect. A stereo frame costs 16 to 24 ns with both front ends
+  (3 to 4 with the note chroma alone): an FFT of the window every quarter
+  window, 8192 points every 2048 samples at 48 kHz.
 - `AlgorithmicReverb`: the wet signal at full mix has the dry signal's level.
   Its energy grows with the decay over the mean round trip of the loops (the
   law the early field was already matched to); a gain from those two takes

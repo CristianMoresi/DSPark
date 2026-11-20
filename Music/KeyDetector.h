@@ -31,7 +31,9 @@
  * Schmuckler method with the published profiles: the chroma is correlated
  * (Pearson) against the profile. Both front ends run on every stream, so a
  * profile switch re-reads evidence gathered from the start; chroma() and
- * getFrameCount() report the front end of the profile in effect.
+ * getFrameCount() report the front end of the profile in effect. Together
+ * they cost 16 to 24 ns per stereo frame at 48 kHz (the note chroma alone,
+ * 3 to 4).
  *
  * The published profiles read their chroma from `ChordDetector`, which owns
  * the framework's note chroma front end: the Hann-windowed DTFT at each
@@ -131,10 +133,13 @@ public:
      * - Recorded (the default): the spectral-peak chroma described in the file
      *   comment, compared by cosine (after a cube root) with the degree
      *   weights kRecordedMajor / kRecordedMinor. Measured on annotated
-     *   recordings it names the key, with a fifth, a relative or a parallel
-     *   key counted 0.5, 0.3 and 0.2, about 70 times in 100 on electronic and
-     *   solo-guitar material, 73 on mixed genres and 94 on art song, where the
-     *   published profiles over the note chroma reach 44 to 66.
+     *   recordings, with a fifth, a relative or a parallel key counted 0.5,
+     *   0.3 and 0.2: 70.9 in 100 on 604 electronic tracks, 68.8 on 1159
+     *   electronic tracks no weight was chosen on, 70.4 on 360 solo-guitar
+     *   takes, 73.1 on 837 excerpts of ten genres and 94.0 on 48 art songs
+     *   (the same at their own 22.05 kHz), where KrumhanslKessler over the
+     *   note chroma reads 44.2, 42.3, 55.3, 49.6 and 65.8; a programme 40
+     *   cents flat is read as in tune.
      *
      * The two published profiles are different objects, not two spellings of one:
      *
@@ -469,8 +474,10 @@ public:
      * major third 0.55, the leading tone 0.35, the other diatonic degrees
      * (second, fourth, sixth) 0.3, and the five chromatic degrees, the flat
      * seventh among them, 0.04. Chosen in the middle of a plateau of the
-     * measurements on annotated recordings: moving any weight by a step
-     * (0.05) moves no set by more than about two points.
+     * measurements on annotated recordings: moving a third or the fifth by
+     * 0.05 moves no set by more than 1.2 points; a step of the other
+     * diatonic weight or of the chromatic one costs the 48 art songs about
+     * one song.
      */
     static constexpr std::array<double, 12> kRecordedMajor {
         1.0, 0.04, 0.3, 0.04, 0.55, 0.3, 0.04, 0.85, 0.04, 0.3, 0.04, 0.35

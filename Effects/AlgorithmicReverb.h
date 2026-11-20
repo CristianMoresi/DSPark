@@ -2421,6 +2421,53 @@ protected:
             simd::addWithGain(acc + first, b, gain, count - first);
     }
 
+    /** @brief Pushes `count` samples into a line, in pieces that stop at its end. */
+    static void writeSpan(Line& l, const T* src, int count) noexcept
+    {
+        for (int s = 0; s < count;)
+        {
+            const int m = std::min(count - s, l.mask + 1 - l.w);
+            T* DSPARK_RESTRICT dst = l.buf.data() + l.w;
+            for (int k = 0; k < m; ++k) dst[k] = src[s + k];
+            l.w = (l.w + m) & l.mask;
+            s += m;
+        }
+    }
+
+    /**
+     * @brief One Schroeder allpass stage over a chunk: w = x + g d, out =
+     *        d - g w, with g = g0 + gDelta ramp[n] at sample n of the chunk.
+     *
+     * The stage runs in pieces that read only samples older than themselves
+     * (no longer than its delay), touch neither end of the ring, and read
+     * and write apart (no longer than the ring minus the delay), so each
+     * piece is plain array arithmetic on the line itself.
+     */
+    static void diffuseSpans(Line& ap, int len, T g0, T gDelta, const T* ramp, T* x, int count) noexcept
+    {
+        const int size = ap.mask + 1;
+        const int delay = std::max(1, len);
+        for (int s = 0; s < count;)
+        {
+            const int readAt = (ap.w - delay) & ap.mask;
+            const int m = std::max(1, std::min({ delay, count - s, size - readAt, size - ap.w, size - delay }));
+            const T* DSPARK_RESTRICT rd = ap.buf.data() + readAt;
+            T* DSPARK_RESTRICT wr = ap.buf.data() + ap.w;
+            T* DSPARK_RESTRICT xs = x + s;
+            const T* rs = ramp + s;
+            for (int k = 0; k < m; ++k)
+            {
+                const T g = g0 + gDelta * rs[k];
+                const T d = rd[k];
+                const T w = xs[k] + g * d;
+                wr[k] = w;
+                xs[k] = d - g * w;
+            }
+            ap.w = (ap.w + m) & ap.mask;
+            s += m;
+        }
+    }
+
     /**
      * @brief Core processing of up to kChunk samples: stereo in, wet stereo out.
      *
@@ -2528,26 +2575,25 @@ protected:
             }
         }
 
+        // The input diffusers, one stage at a time over the chunk: a stage
+        // reads its line for a whole span before writing it, which holds
+        // while the span is no longer than its delay, so each span runs as
+        // array arithmetic (the same operations, in the same order, as one
+        // sample through all four stages).
+        alignas(64) T ramp[kChunk];
+        for (int n = 0; n < count; ++n) ramp[n] = static_cast<T>(n + 1) * rampStep;
         for (int c = 0; c < 2; ++c)
         {
-            Line& ring = ring_[static_cast<std::size_t>(c)];
+            alignas(64) T x[kChunk];
+            std::copy_n(raw[c], count, x);
             auto& aps = inAP_[static_cast<std::size_t>(c)];
-            for (int n = 0; n < count; ++n)
+            for (int st = 0; st < kInStages; ++st)
             {
-                T x = raw[c][n];
-                const T a = static_cast<T>(n + 1) * rampStep;
-                for (int st = 0; st < kInStages; ++st)
-                {
-                    Line& ap = aps[static_cast<std::size_t>(st)];
-                    const T g0 = inAP0[static_cast<std::size_t>(st)];
-                    const T g = g0 + (inAPCoeff_[static_cast<std::size_t>(st)] - g0) * a;
-                    const T d = ap.at(inAPLen_[static_cast<std::size_t>(c)][static_cast<std::size_t>(st)]);
-                    const T w = x + g * d;
-                    ap.push(w);
-                    x = d - g * w;
-                }
-                ring.push(x);
+                const T g0 = inAP0[static_cast<std::size_t>(st)];
+                diffuseSpans(aps[static_cast<std::size_t>(st)], inAPLen_[static_cast<std::size_t>(c)][static_cast<std::size_t>(st)],
+                             g0, inAPCoeff_[static_cast<std::size_t>(st)] - g0, ramp, x, count);
             }
+            writeSpan(ring_[static_cast<std::size_t>(c)], x, count);
         }
 
         // The early gains follow size and decay changes in a ~20 ms glide

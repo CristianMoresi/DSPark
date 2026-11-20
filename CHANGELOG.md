@@ -516,11 +516,22 @@ All notable user-facing changes to DSPark are documented here.
   without moving it on. A resonant low-pass swept by the signal itself
   (nonlinearity 1, Q 18, noise at three times full scale) peaks at 9.2
   against 10.9 in direct form. Per stereo frame it costs 12 to 18 ns at rest
-  and 21 to 28 ns moving (direct form 10 to 17 and 12 to 22).
+  and 21 to 28 ns moving (the direct form, now run in one pass, 4 to 10 ns
+  at rest).
 - `SpectrumAnalyzer::WindowType::AsymmetricHann`: the weight on the recent
   samples (the fall over the last eighth of the frame). A tone 1024 samples
   after it starts reads -8.3 dB against -12.0 under a Hann window, and a
   steady tone reads its level (-6.02 dB for 0.5).
+- `setStructure(Structure::Ladder)` in `Equalizer` (its minimum-phase
+  bands), `DynamicEQ` (the band filter of the default engine, designed again
+  every 16 samples as the gain moves) and `DeEsser` (the cut bell), opt-in
+  with the state key `structure`: the filters as normalized ladders, whose
+  memory cannot gain energy at a change of coefficients. Where a dynamic
+  band jumps in from rest the ladder starts from the signal's history
+  instead of an empty memory, so it enters more smoothly. Per stereo frame,
+  direct form against ladder: four bands of the equalizer 16 to 42 and 47 to
+  77 ns, a dynamic band 63 to 143 and 65 to 148 ns, the de-esser 22 to 35
+  and 26 to 42 ns.
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it
@@ -1369,6 +1380,16 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `FilterEngine` and `CrossoverFilter` (and with it `MultibandCompressor`
+  and `MultibandSaturation`) run their sections in one pass
+  (`BiquadCascade`: every section and a pair of channels together, the
+  memory in double), at rest and through their ramps and glides. Against the
+  sections run sample by sample one after another the pass costs, per frame,
+  0.26 to 0.58 of it in stereo and 0.39 to 0.99 in mono (1.14 for five
+  sections with one compiler) for one to five sections. A 24 dB/oct low-pass
+  in stereo costs 4.1 to 9.8 ns per frame (10.1 to 17.1 before) and a
+  four-band equalizer 16 to 42 (38 to 86). The response is the same; the
+  output moves at the level of rounding.
 - `PitchShifter::prepare(spec, 0)`: every engine takes the power of two
   nearest 43 ms, as Studio did (Standard and High kept 2048 at any rate):
   2048 at 44.1 and 48 kHz as before, 4096 at 88.2 and 96 kHz and 8192 at

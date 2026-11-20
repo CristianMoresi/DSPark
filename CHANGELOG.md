@@ -1474,6 +1474,24 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `TonalBalance` weighs each band by how audible it is (nothing under its
+  threshold in quiet, in full from 10 dB over it), and reads a dip as a band
+  under the audible bands both below and above it and a peak as a band over
+  both. In the bands at the ends, where the threshold climbs, a programme's
+  loudness is almost nothing: it read as a hole of tens of decibels, so Fill
+  Dips raised 20 to 50 Hz and 12 to 20 kHz to the range (+3.3 to +6 dB on a
+  mix-like programme), the loudness offset raised them after Trim Peaks,
+  and the fall of the content at an end read as a dip. Those ends now move
+  0.07 dB at most with Fill Dips or Trim Peaks alone and 0.8 dB at most at
+  the defaults, on pink noise and on a mix-like programme at two levels. The same ends set the mean the reference is measured
+  against, so the tilt hardly moved the curve (+0.08 dB/oct of correction
+  between 200 Hz and 5 kHz for a tilt of +3); it is now -0.98 and +1.10
+  dB/oct for -3 and +3 at Balance 0.5 (it acts through Balance). A peak is
+  measured against its sides without itself, so Trim Peaks takes off more of
+  it (a 3 kHz tone over noise: -5.2 dB at the default 0.5, -3.2 before); the
+  auditory model's total loudness stays within 0.15 dB, while the RMS and
+  the integrated loudness of that programme, carried by the tone, fall 1.9
+  dB and 2.3 LU.
 - `KeyDetector` reads recorded music with an analysis of its own, the new
   default `Profile::Recorded`: the spectral peaks of a ~186 ms window (8192
   samples at 44.1 and 48 kHz, the power of two nearest that length at other

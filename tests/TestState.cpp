@@ -89,6 +89,8 @@ DSPARK_TEST(State_roundtrip_dynamics)
         c.setSidechainBand(4, band);
         c.setGainSmoothing(7.5f);
         c.setOptoCell(Compressor<float>::OptoCell::ThreeStage);
+        c.setCharacterStage(Compressor<float>::StagePosition::After);
+        c.setCharacterStageSettings({ 9.0f, 4.0f, 0.6f, 0.5f, 0.4f, -90.0f });
     })));
     EXPECT_TRUE((roundTrip<Limiter<float>>([](auto& l) {
         l.setCeiling(-1.2f); l.setRelease(60.0f); l.setTruePeak(true);
@@ -113,6 +115,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         d.setDetectionMode(DeEsser<float>::DetectionMode::Derivative);
         d.setAutoThreshold(true);
         d.setStructure(DeEsser<float>::Structure::Ladder);
+        d.setMixedBell(true);
     })));
     EXPECT_TRUE((roundTrip<TransientDesigner<float>>([](auto& t) {
         t.setAttack(40.0f); t.setSustain(-30.0f);   // percent units
@@ -168,6 +171,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         c.setRate(1.8f); c.setDepthMs(5.0f); c.setVoices(3);
         c.setFeedback(0.2f);
         c.setModWaveform(Oscillator<float>::Waveform::Triangle);
+        c.setInterpolation(Chorus<float>::Interpolation::Linear);
     })));
     EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
         c.setModel(Chorus<float>::Model::Analog); c.setAnalogMode(Chorus<float>::AnalogMode::Fast);

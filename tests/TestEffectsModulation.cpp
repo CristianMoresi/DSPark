@@ -2170,6 +2170,47 @@ DSPARK_TEST(Chorus_analog_hiss_and_modes)
     EXPECT_TRUE(c.getModel() == Chorus<float>::Model::Digital);
 }
 
+// New: linear reads (setInterpolation(Linear)). Half way between samples a
+// linear read is the mean of its neighbours, cos(w / 2): -5.1 dB at 15 kHz at
+// 48 kHz, where the cubic read loses 2.5 dB; a low tone passes alike.
+DSPARK_TEST(Chorus_linear_reads_lose_the_highs)
+{
+    using C = Chorus<float>;
+    const size_t n = 48000;
+    const auto level = [&](C::Interpolation interp, double hz) {
+        auto c = std::make_unique<C>();
+        c->setInterpolation(interp);
+        c->setVoices(1);
+        c->setDepthMs(0.0f);
+        c->setFeedback(0.0f);
+        c->setMix(1.0f);
+        c->setStereoSpread(0.0f);
+        c->setCenterDelay(240.5f / 48.0f);   // half way between samples at 48 kHz
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        std::vector<float> l(n), r(n);
+        for (size_t i = 0; i < n; ++i)
+            l[i] = r[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0));
+        for (size_t off = 0; off < n; off += 512)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            c->processBlock(AudioBufferView<float>(ch, 2, static_cast<int>(std::min<size_t>(512, n - off))));
+        }
+        return l12Line(l, hz, 48000.0, 24000, 24000) - 20.0 * std::log10(0.25);
+    };
+    const double cubic15 = level(C::Interpolation::Hermite, 15000.0), linear15 = level(C::Interpolation::Linear, 15000.0);
+    const double cubic1 = level(C::Interpolation::Hermite, 1000.0), linear1 = level(C::Interpolation::Linear, 1000.0);
+    std::cout << "  [linear reads] 15 kHz cubic " << cubic15 << " linear " << linear15
+              << " dB, 1 kHz cubic " << cubic1 << " linear " << linear1 << " dB\n";
+    EXPECT_NEAR(linear15, 20.0 * std::log10(std::cos(3.14159265358979323846 * 15000.0 / 48000.0)), 0.3);
+    EXPECT_LT(linear15, cubic15 - 2.0);
+    EXPECT_NEAR(linear1, cubic1, 0.1);
+    C c;
+    c.setInterpolation(C::Interpolation::Linear);
+    EXPECT_TRUE(c.getInterpolation() == C::Interpolation::Linear);
+    c.setInterpolation(static_cast<C::Interpolation>(7));
+    EXPECT_TRUE(c.getInterpolation() == C::Interpolation::Hermite);
+}
+
 // New: the bucket-brigade line delays by N / (2 f_clk): an impulse comes out
 // at the delay set, and a tone below its corner passes at its level.
 DSPARK_TEST(BucketBrigade_delays_by_its_stages_over_its_clock)

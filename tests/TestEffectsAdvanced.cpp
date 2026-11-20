@@ -7857,6 +7857,31 @@ DSPARK_TEST(AlgoReverb_oversize_block_matches_conforming_blocks)
     EXPECT_EQ(reverb_audit::maxAbsDiff(big, small), 0.0);
 }
 
+// New: the input diffusers run one stage at a time over spans no longer than
+// the stage's delay (each span read before it is written). In blocks of one
+// sample every span is that sample, the sample-by-sample form; in blocks of
+// 64 the spans are as long as each stage allows. Once the glides of the
+// preset have landed, the two give the same output.
+DSPARK_TEST(AlgoReverb_input_diffusers_by_spans_match_sample_by_sample)
+{
+    const auto render = [](int block) {
+        auto rev = std::make_unique<AlgorithmicReverb<float>>();
+        rev->setType(AlgorithmicReverb<float>::Type::Room);
+        rev->prepare(spec(48000.0, 64, 2));
+        rev->setMix(1.0f);
+        std::vector<float> settleL(9600, 0.0f), settleR(9600, 0.0f);
+        for (size_t off = 0; off < settleL.size(); off += 64)
+        {
+            float* ch[2] = { settleL.data() + off, settleR.data() + off };
+            rev->processBlock(AudioBufferView<float>(ch, 2, 64));
+        }
+        return reverb_audit::renderBurst(*rev, 12000, block);
+    };
+    const double diff = reverb_audit::maxAbsDiff(render(1), render(64));
+    std::cout << "  [diffuser spans] blocks of 1 against 64: " << diff << "\n";
+    EXPECT_LT(diff, 1e-6);
+}
+
 // setState() left the tone filters as they were when the blob had them off,
 // so recalling a preset did not undo a high cut. Old header: 0.044 of
 // difference to the blob's source instance.
@@ -8329,6 +8354,60 @@ DSPARK_TEST(SpectralDenoiser_options_delta_and_filter_mode)
     bool finite = true;
     for (float x : f.first) finite = finite && std::isfinite(x);
     EXPECT_TRUE(finite);
+}
+
+namespace {
+
+// Power through a band-pass (cookbook, 0 dB at its centre), in dB, over [from, to).
+double l13BandDb(const std::vector<float>& v, double hz, double q, size_t from, size_t to)
+{
+    const double w0 = 2.0 * 3.14159265358979323846 * hz / 48000.0, al = std::sin(w0) / (2.0 * q), a0 = 1.0 + al;
+    const double b0 = al / a0, b2 = -al / a0, a1 = -2.0 * std::cos(w0) / a0, a2 = (1.0 - al) / a0;
+    double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0, s = 0.0;
+    for (size_t i = 0; i < to; ++i)
+    {
+        const double x = v[i];
+        const double y = b0 * x + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x; y2 = y1; y1 = y;
+        if (i >= from) s += y * y;
+    }
+    return 10.0 * std::log10(std::max(s / static_cast<double>(to - from), 1e-30));
+}
+
+} // namespace
+
+// New: the sensitivity curve of the denoiser weighs its reduction by
+// frequency (gain / 12 + 1): a bell at -12 dB is a weight of 0 at its
+// centre, so the learned noise there stays, and is reduced elsewhere.
+DSPARK_TEST(SpectralDenoiser_sensitivity_band_spares_its_band)
+{
+    const size_t n = 48000 * 3;
+    const std::vector<float> noise = l13Noise(n, 0.05f, 21u);
+    const auto learnThen = [&](SpectralDenoiser<float>& d) {
+        d.prepare(spec(48000.0, 256, 2));
+        d.setLearning(true);
+        (void)l13Run(d, noise, noise);
+        d.setLearning(false);
+        return l13Run(d, noise, noise);
+    };
+    auto plain = std::make_unique<SpectralDenoiser<float>>();
+    const auto a = learnThen(*plain);
+    auto spared = std::make_unique<SpectralDenoiser<float>>();
+    KeyEqualizer<float, 2>::Band bell;
+    bell.shape = KeyEqualizer<float, 2>::Shape::Bell;
+    bell.frequency = 4000.0f; bell.gainDb = -12.0f; bell.q = 1.0f;
+    spared->setSensitivityBand(0, bell);
+    const auto b = learnThen(*spared);
+    const size_t from = 72000;
+    const double in4k = l13BandDb(noise, 4000.0, 6.0, from, n), in1k = l13BandDb(noise, 1000.0, 6.0, from, n);
+    const double plain4k = l13BandDb(a.first, 4000.0, 6.0, from, n) - in4k;
+    const double spared4k = l13BandDb(b.first, 4000.0, 6.0, from, n) - in4k;
+    const double spared1k = l13BandDb(b.first, 1000.0, 6.0, from, n) - in1k;
+    std::cout << "  [sensitivity] 4 kHz plain " << plain4k << " spared " << spared4k << " dB, 1 kHz spared " << spared1k << " dB\n";
+    EXPECT_LT(plain4k, -6.0);
+    EXPECT_GT(spared4k, -3.0);
+    EXPECT_LT(spared1k, -6.0);
+    EXPECT_TRUE((spared->getSensitivityBand(0).shape == KeyEqualizer<float, 2>::Shape::Bell));
 }
 
 DSPARK_TEST(PitchShifter_default_frame_follows_the_rate)

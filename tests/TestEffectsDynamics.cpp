@@ -6305,6 +6305,122 @@ DSPARK_TEST(DeEsser_non_finite_sample_does_not_latch)
     EXPECT_LT(md, 1e-4);
 }
 
+// New: the mixed bell (setMixedBell()). With no reduction it returns its
+// input bit for bit, and its output does not depend on how the stream is cut.
+DSPARK_TEST(DeEsser_mixed_bell_at_rest_and_any_partition)
+{
+    const int n = 24000;
+    const Vec quiet = makeSine(7000.0, 0.001, 48000.0, n);
+    {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->setMixedBell(true);
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        d->setThreshold(-20.0f);
+        std::vector<Vec> x { quiet, quiet };
+        processInBlocks(x, 480, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        EXPECT_TRUE(std::memcmp(x[0].data(), quiet.data(), sizeof(float) * static_cast<size_t>(n)) == 0);
+        EXPECT_TRUE(d->isMixedBell());
+    }
+    Vec a(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = i / 48000.0;
+        const double env = 0.1 + 0.8 * std::exp(-std::fmod(t, 0.2) * 25.0);
+        a[static_cast<size_t>(i)] = static_cast<float>(env * (0.4 * std::sin(2.0 * kPiD * 7100.0 * t) + 0.2 * std::sin(2.0 * kPiD * 300.0 * t)));
+    }
+    auto run = [&](int block) {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->setMixedBell(true);
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        d->setFrequency(7000.0f);
+        d->setThreshold(-40.0f);
+        d->setReduction(12.0f);
+        std::vector<Vec> x { a, a };
+        processInBlocks(x, block, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        return x[0];
+    };
+    const Vec ref = run(512);
+    for (int block : { 7, 33, 100, 1024 })
+    {
+        const Vec x = run(block);
+        double md = 0;
+        for (int i = 0; i < n; ++i) md = std::max(md, std::abs(static_cast<double>(x[static_cast<size_t>(i)]) - ref[static_cast<size_t>(i)]));
+        EXPECT_EQ(md, 0.0);
+    }
+}
+
+// New: at the centre the mixed bell cuts exactly the reduction, as the
+// default bell does.
+DSPARK_TEST(DeEsser_mixed_bell_cuts_the_centre_by_the_reduction)
+{
+    for (bool mixed : { false, true })
+    {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->setMixedBell(mixed);
+        d->prepare(AudioSpec{ 48000.0, 512, 1 });
+        d->setFrequency(7000.0f);
+        d->setBandwidth(1.0f);
+        d->setThreshold(-40.0f);
+        d->setReduction(12.0f);
+        const int n = 48000;
+        std::vector<Vec> x { makeSine(7000.0, 0.5, 48000.0, n) };
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        const double g = toDb(toneAmplitude(x[0].data() + n - 9600, 9600, 7000.0, 48000.0) / 0.5);
+        EXPECT_NEAR(d->getGainReductionDb(), 12.0f, 0.1f);
+        EXPECT_NEAR(g, -12.0, 0.3);
+    }
+}
+
+// Defect of the default bell that the mixed one does not have: designed
+// again every 16 samples, its gain moves in steps, and a tone under a bell
+// that moves fast grows lines 3 kHz away (48000 / 16). A 6 kHz tone that jumps
+// 28 dB 25 times a second, on edges of 4 ms (smooth: its own spectrum is down
+// by then 3 kHz away), under a bell with a 5 ms release. Measured: -46 to
+// -52 dBc stepped for releases of 1 and 5 ms whatever the attack, -64 to -96
+// mixed (the floor of the signal's own edges); with the 20 ms default both
+// sit on that floor.
+DSPARK_TEST(DeEsser_mixed_bell_moves_without_steps)
+{
+    const int n = 96000;
+    auto lines = [&](bool mixed) {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->setMixedBell(mixed);
+        d->prepare(AudioSpec{ 48000.0, 512, 1 });
+        d->setFrequency(6000.0f);
+        d->setBandwidth(1.0f);
+        d->setThreshold(-30.0f);
+        d->setReduction(12.0f);
+        d->setAttack(0.5f);
+        d->setRelease(5.0f);
+        Vec s(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = i / 48000.0;
+            const double phase = std::fmod(t, 0.04);              // 40 ms: 16 low, 4 up, 16 high, 4 down
+            double up = 0.0;
+            if (phase < 0.016) up = 0.0;
+            else if (phase < 0.020) up = 0.5 - 0.5 * std::cos(kPiD * (phase - 0.016) / 0.004);
+            else if (phase < 0.036) up = 1.0;
+            else up = 0.5 + 0.5 * std::cos(kPiD * (phase - 0.036) / 0.004);
+            const double amp = 0.02 + 0.48 * up;
+            s[static_cast<size_t>(i)] = static_cast<float>(amp * std::sin(2.0 * kPiD * 6000.0 * t));
+        }
+        std::vector<Vec> x { s };
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        const float* y = x[0].data() + 48000;
+        const double carrier = toneAmplitude(y, 48000, 6000.0, 48000.0);
+        double worst = 0.0;
+        for (int k = -4; k <= 4; ++k)
+            for (double centre : { 3000.0, 9000.0 })
+                worst = std::max(worst, toneAmplitude(y, 48000, centre + 25.0 * k, 48000.0));
+        return toDb(worst / carrier);
+    };
+    const double stepped = lines(false), mixed = lines(true);
+    std::cout << "  [mixed bell] lines 3 kHz away: stepped " << stepped << " dBc, mixed " << mixed << " dBc\n";
+    EXPECT_LT(mixed, -80.0);
+    EXPECT_LT(mixed, stepped - 25.0);
+}
+
 // ============================================================================
 // NoiseGate
 // ============================================================================
@@ -7674,4 +7790,213 @@ DSPARK_TEST(DynamicEQ_and_DeEsser_ladder_structure_matches_the_direct_form)
         EXPECT_LT(worst / peak, 2e-2);
         EXPECT_LT(std::abs(energyDb), 0.2);
     }
+}
+
+// ============================================================================
+// CharacterStage (Core/CharacterStage.h) and the colour stage of the Compressor
+// ============================================================================
+
+namespace {
+
+// One tone through a fresh stage with these settings, in blocks of 512.
+Vec stageRun(const CharacterStage<float>::Settings& s, double hz, double amp, int n, double fs = 48000.0)
+{
+    auto st = std::make_unique<CharacterStage<float>>();
+    st->setSettings(s);
+    st->prepare(AudioSpec{ fs, 512, 1 });
+    std::vector<Vec> x { makeSine(hz, amp, fs, n) };
+    processInBlocks(x, 512, [&](AudioBufferView<float> v) { st->process(v); });
+    return x[0];
+}
+
+// Level of harmonic h of a tone at hz over the last 9600 samples, against the tone, in dB.
+double stageHarmonicDb(const Vec& y, double hz, int h, double fs = 48000.0)
+{
+    const int n = static_cast<int>(y.size());
+    const float* tail = y.data() + n - 9600;
+    return toDb(toneAmplitude(tail, 9600, hz * h, fs) / toneAmplitude(tail, 9600, hz, fs));
+}
+
+} // namespace
+
+// New: at a low level the stage has unity gain at every frequency: the
+// saturators are divided by their small-signal gain and the de-emphasis
+// undoes the emphasis.
+DSPARK_TEST(CharacterStage_is_transparent_at_a_low_level)
+{
+    const CharacterStage<float>::Settings s {};
+    for (double hz : { 100.0, 1000.0, 10000.0, 18000.0 })
+    {
+        const Vec y = stageRun(s, hz, 0.001, 48000);
+        const double g = toDb(toneAmplitude(y.data() + 48000 - 9600, 9600, hz, 48000.0) / 0.001);
+        EXPECT_NEAR(g, 0.0, 0.05);
+    }
+}
+
+// New: the colour grows with the drive; the asymmetry is what brings the
+// even harmonics; the emphasis makes the highs saturate first.
+DSPARK_TEST(CharacterStage_colour_follows_drive_asymmetry_and_emphasis)
+{
+    using S = CharacterStage<float>::Settings;
+    double h3[3];
+    for (int k = 0; k < 3; ++k)
+    {
+        S s; s.driveDb = static_cast<float>(12 * k);
+        h3[k] = stageHarmonicDb(stageRun(s, 1000.0, 0.5, 48000), 1000.0, 3);
+    }
+    std::cout << "  [stage] H3 at drive 0/12/24: " << h3[0] << " " << h3[1] << " " << h3[2] << " dBc\n";
+    EXPECT_LT(h3[0], h3[1] - 6.0);
+    EXPECT_LT(h3[1], h3[2] - 1.0);   // near its ceiling the curve grows slower
+
+    S even; even.driveDb = 12.0f; even.asymmetry = 0.6f;
+    S odd = even; odd.asymmetry = 0.0f;
+    const double h2even = stageHarmonicDb(stageRun(even, 1000.0, 0.5, 48000), 1000.0, 2);
+    const double h2odd = stageHarmonicDb(stageRun(odd, 1000.0, 0.5, 48000), 1000.0, 2);
+    std::cout << "  [stage] H2 with asymmetry 0.6 / 0: " << h2even << " / " << h2odd << " dBc\n";
+    EXPECT_GT(h2even, -60.0);
+    EXPECT_LT(h2odd, -100.0);
+
+    S flat; flat.driveDb = 12.0f; flat.emphasisDb = 0.0f;
+    S bright = flat; bright.emphasisDb = 12.0f;
+    const double highFlat = stageHarmonicDb(stageRun(flat, 6000.0, 0.25, 48000), 6000.0, 3);
+    const double highBright = stageHarmonicDb(stageRun(bright, 6000.0, 0.25, 48000), 6000.0, 3);
+    const double lowFlat = stageHarmonicDb(stageRun(flat, 200.0, 0.25, 48000), 200.0, 3);
+    const double lowBright = stageHarmonicDb(stageRun(bright, 200.0, 0.25, 48000), 200.0, 3);
+    std::cout << "  [stage] H3 of 6 kHz with emphasis 0 / 12: " << highFlat << " / " << highBright
+              << " dBc; of 200 Hz: " << lowFlat << " / " << lowBright << " dBc\n";
+    EXPECT_GT(highBright, highFlat + 2.0);   // measured +3.8 dB
+    EXPECT_NEAR(lowBright, lowFlat, 2.0);
+}
+
+// New: the noise follows the signal: silence stays silent, and under a tone
+// the noise sits at its setting from the tone's envelope (its mean
+// magnitude, 2 / pi of the peak).
+DSPARK_TEST(CharacterStage_noise_follows_the_signal)
+{
+    using S = CharacterStage<float>::Settings;
+    S quiet; quiet.noiseDb = -140.0f;
+    S noisy; noisy.noiseDb = -60.0f;
+    const Vec silent = stageRun(noisy, 1000.0, 0.0, 24000);
+    double peak = 0.0;
+    for (float v : silent) peak = std::max(peak, std::abs(static_cast<double>(v)));
+    EXPECT_EQ(peak, 0.0);
+
+    const Vec a = stageRun(quiet, 1000.0, 0.1, 48000);
+    const Vec b = stageRun(noisy, 1000.0, 0.1, 48000);
+    Vec residual(a.size());
+    for (size_t i = 0; i < a.size(); ++i) residual[i] = b[i] - a[i];
+    const double noise = toDb(rmsOf(residual.data() + 24000, 24000) / (0.1 / std::sqrt(2.0)));
+    const double expected = -60.0 + toDb(2.0 / kPiD * std::sqrt(2.0));
+    std::cout << "  [stage] noise under a tone " << noise << " dB (expected " << expected << ")\n";
+    EXPECT_NEAR(noise, expected, 1.5);
+}
+
+// New: the internal rate is the host's times 4, 2 or 1 (about 176 kHz or
+// more), and the delay reported is where an impulse comes out.
+DSPARK_TEST(CharacterStage_rate_latency_and_settings)
+{
+    for (double fs : { 48000.0, 96000.0, 192000.0 })
+    {
+        auto st = std::make_unique<CharacterStage<float>>();
+        st->prepare(AudioSpec{ fs, 512, 1 });
+        EXPECT_EQ(st->getFactor(), fs < 90000.0 ? 4 : fs < 150000.0 ? 2 : 1);
+        std::vector<Vec> x { Vec(2048, 0.0f) };
+        x[0][100] = 0.001f;
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { st->process(v); });
+        int at = 0;
+        for (int i = 0; i < 2048; ++i)
+            if (std::abs(x[0][static_cast<size_t>(i)]) > std::abs(x[0][static_cast<size_t>(at)])) at = i;
+        EXPECT_NEAR(at - 100, st->getLatency(), 1);
+    }
+    CharacterStage<float> st;
+    CharacterStage<float>::Settings s;
+    s.driveDb = 99.0f; s.emphasisDb = std::numeric_limits<float>::quiet_NaN(); s.noiseDb = -500.0f;
+    st.setSettings(s);
+    const auto back = st.settings();
+    EXPECT_EQ(back.driveDb, 24.0f);
+    EXPECT_EQ(back.emphasisDb, 6.0f);
+    EXPECT_EQ(back.noiseDb, -140.0f);
+}
+
+// New: drift is reproducible and moves the colour a little; sag adds colour
+// as the level rises.
+DSPARK_TEST(CharacterStage_drift_and_sag)
+{
+    using S = CharacterStage<float>::Settings;
+    S drifting; drifting.driveDb = 12.0f; drifting.drift = 1.0f;
+    const Vec a = stageRun(drifting, 1000.0, 0.5, 96000), b = stageRun(drifting, 1000.0, 0.5, 96000);
+    EXPECT_TRUE(std::memcmp(a.data(), b.data(), sizeof(float) * a.size()) == 0);
+    S still = drifting; still.drift = 0.0f;
+    const Vec c = stageRun(still, 1000.0, 0.5, 96000);
+    double moved = 0.0;
+    for (size_t i = 48000; i < a.size(); ++i) moved = std::max(moved, std::abs(static_cast<double>(a[i] - c[i])));
+    std::cout << "  [stage] drift moves the output by up to " << moved << "\n";
+    EXPECT_GT(moved, 1e-4);
+    EXPECT_LT(moved, 0.1);
+
+    S light; light.driveDb = 0.0f;
+    S sagging = light; sagging.sag = 1.0f;
+    const double h3 = stageHarmonicDb(stageRun(light, 1000.0, 0.5, 48000), 1000.0, 3);
+    const double h3sag = stageHarmonicDb(stageRun(sagging, 1000.0, 0.5, 48000), 1000.0, 3);
+    std::cout << "  [stage] H3 without and with sag: " << h3 << " / " << h3sag << " dBc\n";
+    EXPECT_GT(h3sag, h3 + 2.0);
+}
+
+// New: the colour stage of the Compressor. Under the threshold the
+// compressor passes the tone; the stage in place delays it by the latency it
+// reports and colours a loud one; off, there is neither.
+DSPARK_TEST(Compressor_character_stage_colours_and_reports_its_delay)
+{
+    using C = Compressor<float>;
+    const auto run = [](C::StagePosition position, double amp, int& latency) {
+        auto c = std::make_unique<C>();
+        c->setThreshold(0.0f);
+        c->setCharacterStage(position);
+        C::StageSettings s; s.driveDb = 12.0f;
+        c->setCharacterStageSettings(s);
+        c->prepare(AudioSpec{ 48000.0, 512, 1 });
+        latency = c->getLatency();
+        std::vector<Vec> x { makeSine(1000.0, amp, 48000.0, 48000) };
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { c->processBlock(v); });
+        return x[0];
+    };
+    int off = -1, before = -1, after = -1;
+    const Vec plain = run(C::StagePosition::Off, 0.5, off);
+    const Vec coloured = run(C::StagePosition::After, 0.5, after);
+    const Vec quietIn = run(C::StagePosition::Before, 0.001, before);
+    EXPECT_EQ(off, 0);
+    EXPECT_GT(after, 0);
+    EXPECT_EQ(before, after);
+    EXPECT_NEAR(toDb(toneAmplitude(quietIn.data() + 38400, 9600, 1000.0, 48000.0) / 0.001), 0.0, 0.05);
+    const double h3plain = stageHarmonicDb(plain, 1000.0, 3), h3coloured = stageHarmonicDb(coloured, 1000.0, 3);
+    std::cout << "  [compressor stage] latency " << after << ", H3 off " << h3plain << " / after " << h3coloured << " dBc\n";
+    EXPECT_LT(h3plain, -100.0);
+    EXPECT_GT(h3coloured, -60.0);
+}
+
+// New: a change of place of the colour stage fades over 20 ms: no step in
+// the output larger than the tone's own.
+DSPARK_TEST(Compressor_character_stage_moves_without_a_click)
+{
+    using C = Compressor<float>;
+    auto c = std::make_unique<C>();
+    c->setThreshold(0.0f);
+    c->prepare(AudioSpec{ 48000.0, 256, 1 });
+    const int n = 48000;
+    std::vector<Vec> x { makeSine(1000.0, 0.25, 48000.0, n) };
+    int block = 0;
+    processInBlocks(x, 256, [&](AudioBufferView<float> v) {
+        if (block == 40) c->setCharacterStage(C::StagePosition::Before);
+        if (block == 80) c->setCharacterStage(C::StagePosition::After);
+        if (block == 120) c->setCharacterStage(C::StagePosition::Off);
+        ++block;
+        c->processBlock(v);
+    });
+    const double natural = 0.25 * 2.0 * kPiD * 1000.0 / 48000.0;
+    double worst = 0.0;
+    for (int i = 1; i < n; ++i)
+        worst = std::max(worst, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)] - x[0][static_cast<size_t>(i - 1)])));
+    std::cout << "  [compressor stage] largest step " << worst << " (tone " << natural << ")\n";
+    EXPECT_LT(worst, natural * 1.2);
+    EXPECT_TRUE(c->getCharacterStage() == C::StagePosition::Off);
 }

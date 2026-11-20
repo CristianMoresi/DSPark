@@ -460,6 +460,7 @@
  * | `FirBank<T>`             | Core/FirBank.h            | Many long FIR kernels over shared inputs, by one partitioned convolution; kernels replaced with a crossfade |
  * | `KeyEqualizer<T>`        | Core/KeyEqualizer.h       | Six bands of cuts, bells, shelves and tilts over the key of a dynamics processor |
  * | `CabinetModel<T>`        | Core/CabinetModel.h       | A loudspeaker cabinet with no latency: colour filters, sparse reflections, two diffusers |
+ * | `CharacterStage<T>`      | Core/CharacterStage.h     | An analog colour stage: emphasis, static saturators, de-emphasis, with drift, sag and noise |
  * | `TailShaper<T>`          | Core/TailShaper.h         | Ducking and a relative gate for a wet signal, driven by the dry one |
  * | `TapeTransport<T>`       | Core/TapeTransport.h      | A tape transport as a speed state: the delay of a moving tape, with inertia, wow and flutter |
  * | `AuditoryBands<T>`       | Core/AuditoryBands.h      | Bands uniform in Bark over a power spectrum, the loudness law, the dominant level of a pair |
@@ -712,6 +713,7 @@
 #include "Core/FirBank.h"
 #include "Core/KeyEqualizer.h"
 #include "Core/CabinetModel.h"
+#include "Core/CharacterStage.h"
 #include "Core/TailShaper.h"
 #include "Core/TapeTransport.h"
 #include "Core/AuditoryBands.h"

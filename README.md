@@ -128,7 +128,7 @@ for complete programs.
 | Filters and equalization | `Biquad`, `BiquadCascade`, `NormalizedLadder`, `FilterDesign`, `FirBank`, `KeyEqualizer`, `LaneCascade`, `GraphicBank`, `CabinetModel`, `StateVariableFilter`, `LadderFilter`, `FilterEngine`, `Equalizer`, `CrossoverFilter` |
 | Dynamics and level control | `Compressor`, `Limiter`, `NoiseGate`, `Expander`, `DynamicEQ`, `MultibandCompressor`, `DeEsser` |
 | Offline dynamics, clipping, stereo and analysis | `OfflineLeveler`, `OfflineBeatCompressor`, `OfflinePeakCompressor`, `OfflinePunch`, `OfflineSoftClipper`, `OfflineHardClipper`, `OfflineStereoGenerator`, `OfflineStereoBalance`, `OfflineEnergyAnalyzer`, `OfflineTransientAnalyzer`, `OfflineTempoAnalyzer` ([worker API](docs/offline-processing.md)) |
-| Nonlinear and analog modeling | `Saturation`, `MultibandSaturation`, `LoFi`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `wdf::*` |
+| Nonlinear and analog modeling | `Saturation`, `MultibandSaturation`, `LoFi`, `Clipper`, `TapeMachine`, `TubePreamp`, `TransformerModel`, `CharacterStage`, `wdf::*` |
 | Time, pitch, and spatial processing | `Delay`, `BucketBrigade`, `TapeTransport`, `AlgorithmicReverb`, `Reverb`, `TailShaper`, `PitchShifter`, `TimeStretch`, `PitchCorrector`, `GranularProcessor` |
 | Spectral processing | `FFTReal`, `Convolver`, `ZeroLatencyConvolver`, `SpectralProcessor`, `SpectralFilter`, `SpectralEnvelope`, `AuditoryBands`, `SpectralFreeze`, `SpectralDenoiser`, `TonalBalance`, `ResonanceSuppressor`, `SpectralDynamicEQ` |
 | Analysis and metering | `SpectrumAnalyzer`, `LoudnessMeter`, `AudioIntervalAnalyzer`, `LoudnessNormalizer`, `PitchDetector`, `OnsetDetector`, `BeatTracker`, `DownbeatEstimator`, `LoopFinder`, `DelayEstimator` |

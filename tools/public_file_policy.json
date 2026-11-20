@@ -20,9 +20,9 @@
   },
   "counts": {
     "binary_exact": 184,
-    "first_party_ascii_text": 327,
+    "first_party_ascii_text": 328,
     "third_party_utf8_exact": 84,
-    "total": 595
+    "total": 596
   },
   "gitattributes_required_lines": [
     "* text=auto",
@@ -182,6 +182,10 @@
     {
       "kind": "first_party_ascii_text",
       "path": "Core/CabinetModel.h"
+    },
+    {
+      "kind": "first_party_ascii_text",
+      "path": "Core/CharacterStage.h"
     },
     {
       "kind": "first_party_ascii_text",

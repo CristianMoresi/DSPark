@@ -51,6 +51,7 @@ void instantiate()
     [[maybe_unused]] LaneCascade<T, 8> laneCascade;
     [[maybe_unused]] GraphicBank<T, 8> graphicBank;
     [[maybe_unused]] CabinetModel<T> cabinetModel;
+    [[maybe_unused]] CharacterStage<T> characterStage;
     Oversampling<T> ov(2);
     OversamplingDryPath<T> ovDry;
     [[maybe_unused]] const int ovFactor = Oversampling<T>::factorForRate(48000.0);

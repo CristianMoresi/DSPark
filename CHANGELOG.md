@@ -552,6 +552,45 @@ All notable user-facing changes to DSPark are documented here.
   100 ms and 4:1 at 0 dBFS, after a 150 ms phrase 1.82 dB are left at 0.3 s
   (two stages 1.28) and 0.65 at 1 s (0.92); after 4 s of compression 0.61 dB
   are left at 3 s (two stages 1.61). The analytic makeup models it too.
+- `Core/CharacterStage.h` (`CharacterStage<T>`), and
+  `Compressor::setCharacterStage(StagePosition)` with
+  `setCharacterStageSettings()` (opt-in; state keys `stage`, `stageDrive`,
+  `stageEmphasis`, `stageAsymmetry`, `stageDrift`, `stageSag`,
+  `stageNoise`): the colour circuit around a gain element. An emphasis
+  shelf (0 to 12 dB, centred on 3 kHz) and its exact inverse after two static
+  saturators (the first biased for even harmonics), divided by the chain's
+  small-signal gain, so a quiet signal passes at unity (within 0.05 dB from
+  100 Hz to 18 kHz); slow random drift of drive and bias; a sag that raises
+  the drive with a slow envelope of the input; a noise floor that follows a
+  50 ms envelope (silence stays silent, the floor under a tone lands within
+  0.1 dB of its setting). It runs at about 176 kHz (4x at 44.1 and 48 kHz,
+  polyphase IIR half-bands, 4 samples of delay at 48 kHz). A 1 kHz tone at
+  -6 dBFS carries its third harmonic at -26.8, -14.5 and -12.1 dBc with 0,
+  12 and 24 dB of drive and its second at -39.4 dBc with an asymmetry of 0.6
+  (none without); 12 dB of emphasis raises the third harmonic of a 6 kHz tone
+  by 3.8 dB and leaves that of 200 Hz; full sag raises it by 7.3 dB at 0 dB
+  of drive. In the Compressor the stage sits before the compression (the
+  detector hears it) or after it; a change of place fades over 20 ms (the
+  largest step of a 1 kHz tone through three changes is the tone's own) and
+  the stage adds its delay to `getLatency()`. It costs 198 to 618 ns per
+  stereo frame at 48 kHz.
+- `DeEsser::setMixedBell()` (opt-in; state key `mixedBell`): the cut as one
+  fixed filter at the end of the range mixed by the reduction sample by
+  sample, `y = x + w (end(x) - x)`, with the end chosen as `DynamicEQ`'s
+  mixed bands choose theirs, so the centre sits on the reduction of the
+  moment and nothing is designed while it moves; at rest the output is the
+  input bit for bit, and it does not depend on how the stream is cut. On a
+  6 kHz tone that jumps 28 dB 25 times a second, with a release of 1 or 5 ms,
+  the default bell (designed again every 16 samples) leaves lines 3 kHz away
+  at -46 to -52 dBc and the mixed one at -64 to -96; with the default 20 ms
+  both sit on the floor of the measurement. 41 to 81 ns per stereo frame
+  against 18 to 34.
+- `Chorus::Interpolation::Linear`: two-point reads of the digital lines,
+  whose loss of highs belongs to the sound of many chorus units: half way
+  between samples a 15 kHz tone at 48 kHz loses 5.1 dB (the cubic read
+  2.5 dB), a 1 kHz tone 0.02 dB. 0.61 to 0.84 of the cubic read's cost with
+  three voices (62 to 143 against 81 to 184 ns per stereo frame). The state
+  key `interp` takes the value 2.
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it
@@ -1400,6 +1439,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `AlgorithmicReverb` runs its input diffusers one stage at a time over
+  each chunk, in pieces that read only samples older than themselves and
+  never cross the end of a line, so each piece is array arithmetic on the
+  line itself. The output is the same to the bit (and in blocks of one
+  sample, where every piece is one sample, the same as in blocks of 64). Per
+  frame it costs 0.93 to 1.05 of the sample-by-sample form across the
+  machines measured (0.93 to 0.96 on one, within the spread of the others).
 - `FilterEngine` and `CrossoverFilter` (and with it `MultibandCompressor`
   and `MultibandSaturation`) run their sections in one pass
   (`BiquadCascade`: every section and a pair of channels together, the

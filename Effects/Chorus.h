@@ -31,13 +31,20 @@
  * - setModel(Model::Analog) (off by default) runs a bucket-brigade chorus:
  *   the channels summed to mono, high-passed at 5 Hz, into two bucket-brigade
  *   lines of 512 stages (Core/BucketBrigade.h) whose clocks a triangle wave
- *   moves in opposition (left and right taps half a cycle apart; in phase in
- *   the Vibrato mode), each with the device's anti-alias and reconstruction
- *   filters at a fifth of the slowest clock, and the line's hiss, which grows
- *   with the delay (a slower clock). The dry signal keeps its stereo; there is
- *   no feedback and the voices, feedback and interpolation settings do not
- *   apply. setAnalogMode() loads three presets of rate, depth and centre.
- *   From 176.4 kHz the analog engine runs at half the rate.
+ *   moves in opposition (the right tap is the left one inverted, so the two
+ *   delays always add up to twice the centre; in phase in the Vibrato mode),
+ *   each with the device's anti-alias and reconstruction filters at a fifth
+ *   of the slowest clock (one input low-pass shared by the two lines), and
+ *   the line's hiss, which grows with the delay (a slower clock). The dry
+ *   signal keeps its stereo; there is no feedback and the voices, feedback
+ *   and interpolation settings do not apply. setAnalogMode() loads three
+ *   presets of rate, depth and centre; the centre, the depth and the taps'
+ *   offset glide (50 ms) instead of stepping at the block rate, and the
+ *   filters' corner moves at most an octave in a quarter of a second. The
+ *   lines run with their high precision (BucketBrigade::Precision::High) and,
+ *   below 88.2 kHz, at twice the rate, so the images of their clock are
+ *   filtered as in the device instead of folding into the band; from
+ *   176.4 kHz the analog engine runs at half the rate.
  *
  * Threading: prepare() belongs to the setup thread (allocates; never call it
  * concurrently with processing). processBlock() and reset() belong to the
@@ -159,11 +166,19 @@ public:
         smoothedCenterSamples_ = centerDelayMs_.load(std::memory_order_relaxed) * static_cast<T>(spec.sampleRate) / T(1000);
         smoothedDepthSamples_  = depthMs_.load(std::memory_order_relaxed) * static_cast<T>(spec.sampleRate) / T(1000);
 
-        // The analog engine: at half the rate from 176.4 kHz.
+        // The analog engine: at half the rate from 176.4 kHz; below 88.2 kHz
+        // its lines run at twice the rate, so the images of their clock are
+        // filtered as in the device instead of folding into the band.
         halfRate_ = spec.sampleRate >= 176400.0;
         engineRate_ = halfRate_ ? 0.5 * spec.sampleRate : spec.sampleRate;
-        for (auto& b : bbd_) b.prepare(engineRate_, kAnalogStages, 4000.0);
+        const int lineFactor = engineRate_ < 88200.0 ? 2 : 1;
+        for (auto& b : bbd_)
+        {
+            b.setPrecision(BucketBrigade<T>::Precision::High);
+            b.prepare(engineRate_, kAnalogStages, 4000.0, lineFactor);
+        }
         analogCornerFor_ = -1.0;
+        analogGlide_ = 1.0 - std::exp(-1.0 / (kAnalogGlideSeconds * engineRate_));
         {
             static constexpr double kQ4[2] = { 0.5411961001461970, 1.3065629648763764 };
             for (int k = 0; k < 2; ++k)
@@ -220,6 +235,7 @@ public:
         mixer_.reset();
         for (auto& b : bbd_) b.reset();
         analogPhase_ = 0.0;
+        analogPrimed_ = false;
         hpX1_ = hpY1_ = 0.0;
         for (auto& s : decimateState_) s = {};
         engineOut_ = {};
@@ -361,8 +377,11 @@ public:
 
     /**
      * @brief Loads a preset of the analog model: rate, depth and centre (through
-     *        their setters, so they glide) and whether the taps move in
-     *        opposition or in phase. Out-of-range values are clamped.
+     *        their setters) and whether the taps move in opposition or in
+     *        phase. In the analog model the centre, the depth and the taps'
+     *        offset glide to a new setting with a 50 ms time constant (the
+     *        rate only changes the sweep's speed, so it needs none).
+     *        Out-of-range values are clamped.
      */
     void setAnalogMode(AnalogMode mode) noexcept
     {
@@ -688,21 +707,45 @@ protected:
 
     /**
      * @brief The analog model on one block: the mono sum, high-passed, into
-     *        two bucket-brigade lines whose delays a slightly asymmetric
-     *        triangle moves (in opposition, or in phase for the Vibrato mode),
-     *        each with its hiss; the even channels take the first line, the
-     *        odd ones the second. At half rate the sum is low-passed and every
-     *        other sample runs the engine; between them the output is the mean
-     *        of the last two.
+     *        two bucket-brigade lines (sharing their input low-pass) whose
+     *        delays a slightly asymmetric triangle moves, each with its hiss;
+     *        the even channels take the first line, the odd ones the second.
+     *
+     * The asymmetry lives in the speed of one phase (slower on the way up),
+     * and both taps read the same symmetric triangle of that phase, half a
+     * turn apart in opposition: the second is then the first inverted, so the
+     * two delays always add up to twice the centre, as with a triangle and an
+     * inverter; in phase (Vibrato) they are the same. The centre and the depth
+     * ramp across the block toward the values set and then glide with the
+     * taps' offset (kAnalogGlideSeconds). At half rate the sum is low-passed
+     * and every other sample runs the engine; the sample after a run is that
+     * run's output and the run's own sample the mean of it and the one
+     * before, so the output keeps one sample's delay throughout.
      */
     void processAnalog(AudioBufferView<T> buffer, int nCh, int nS) noexcept
     {
         const double rate = static_cast<double>(rate_.load(std::memory_order_relaxed));
-        const double centre = static_cast<double>(centerDelayMs_.load(std::memory_order_relaxed)) * 1e-3;
-        const double depth = std::min(static_cast<double>(depthMs_.load(std::memory_order_relaxed)) * 1e-3, 0.9 * centre);
-        const bool inPhase = analogMode_.load(std::memory_order_relaxed) == 2;
-        // The filters sit at a fifth of the slowest clock the sweep needs.
-        const double slowest = (centre + depth) > 0.0 ? static_cast<double>(kAnalogStages) / (2.0 * (centre + depth)) : 1e5;
+        const double centreSet = static_cast<double>(centerDelayMs_.load(std::memory_order_relaxed)) * 1e-3;
+        const double depthSet = std::min(static_cast<double>(depthMs_.load(std::memory_order_relaxed)) * 1e-3, 0.9 * centreSet);
+        const double offsetSet = analogMode_.load(std::memory_order_relaxed) == 2 ? 0.0 : 0.5;
+        if (!analogPrimed_)
+        {
+            centreFrom_ = centreNow_ = centreSet;
+            depthFrom_ = depthNow_ = depthSet;
+            offsetNow_ = offsetSet;
+            analogPrimed_ = true;
+        }
+        // The filters sit at a fifth of the slowest clock the sweep needs,
+        // where it is or where it is going, whichever is longer.
+        // The corner moves at most an octave in a quarter of a second: a jump
+        // of the filters' coefficients would leave a step in their output.
+        const double reach = std::max(centreNow_ + std::min(depthNow_, 0.9 * centreNow_), centreSet + depthSet);
+        double slowest = reach > 0.0 ? static_cast<double>(kAnalogStages) / (2.0 * reach) : 1e5;
+        if (analogCornerFor_ > 0.0)
+        {
+            const double most = std::exp2(static_cast<double>(nS) / (kCornerOctaveSeconds * spec_.sampleRate));
+            slowest = std::clamp(slowest, analogCornerFor_ / most, analogCornerFor_ * most);
+        }
         if (std::abs(slowest - analogCornerFor_) > 1e-3 * slowest)
         {
             for (auto& b : bbd_) b.setCorner(0.2 * slowest);
@@ -717,11 +760,15 @@ protected:
                   * 1.7320508075688772 / std::sqrt(std::max(1e-9, noiseCoeff_ / (2.0 - noiseCoeff_)))
             : 0.0;
         const double step = rate / engineRate_;
-        static constexpr double kRise = 0.53;   // the triangle's rising share
         const auto triangle = [](double p) noexcept {
             p -= std::floor(p);
-            return p < kRise ? -1.0 + 2.0 * p / kRise : 1.0 - 2.0 * (p - kRise) / (1.0 - kRise);
+            return p < 0.5 ? 4.0 * p - 1.0 : 3.0 - 4.0 * p;
         };
+        const auto glide = [this](double& now, double goal) noexcept {
+            now += analogGlide_ * (goal - now);
+            if (std::abs(goal - now) < 1e-12) now = goal;
+        };
+        const double perSample = 1.0 / static_cast<double>(std::max(1, nS));
         const int channels = std::max(1, nCh);
         for (int i = 0; i < nS; ++i)
         {
@@ -749,35 +796,69 @@ protected:
             }
             if (run)
             {
-                analogPhase_ += step;
-                if (analogPhase_ >= 1.0) analogPhase_ -= 1.0;
-                const double dA = centre + depth * triangle(analogPhase_);
-                const double dB = centre + depth * triangle(analogPhase_ + (inPhase ? 0.0 : 0.5));
-                const double d[2] = { dA, dB };
+                const double u = static_cast<double>(i + 1) * perSample;
+                glide(centreNow_, centreFrom_ + u * (centreSet - centreFrom_));
+                glide(depthNow_, depthFrom_ + u * (depthSet - depthFrom_));
+                glide(offsetNow_, offsetSet);
+                advanceAnalogPhase(step);
+                const double centre = centreNow_;
+                const double depth = std::min(depthNow_, 0.9 * centre);
+                const double d[2] = { centre + depth * triangle(analogPhase_),
+                                      centre + depth * triangle(analogPhase_ + offsetNow_) };
+                double y[2];
+                bbd_[0].processPair(bbd_[1], static_cast<T>(x), d[0], d[1], y[0], y[1]);
                 for (size_t k = 0; k < 2; ++k)
                 {
-                    double y = static_cast<double>(bbd_[k].processSample(static_cast<T>(x), d[k]));
                     if (noiseAmp > 0.0)
                     {
                         noiseRng_ = noiseRng_ * 1664525u + 1013904223u;
                         const double n = static_cast<double>(noiseRng_ >> 8) / 8388608.0 - 1.0;
                         noiseLp_[k] += noiseCoeff_ * (n - noiseLp_[k]);
-                        y += noiseAmp * (d[k] / std::max(centre, 1e-4)) * noiseLp_[k];
+                        y[k] += noiseAmp * (d[k] / std::max(centre, 1e-4)) * noiseLp_[k];
                     }
                     engineLast_[k] = engineOut_[k];
-                    engineOut_[k] = y;
+                    engineOut_[k] = y[k];
                 }
             }
             for (int ch = 0; ch < nCh; ++ch)
             {
                 const size_t k = static_cast<size_t>(ch & 1);
-                const double out = (halfRate_ && !run) ? 0.5 * (engineOut_[k] + engineLast_[k]) : engineOut_[k];
+                const double out = (halfRate_ && run) ? 0.5 * (engineOut_[k] + engineLast_[k]) : engineOut_[k];
                 buffer.getChannel(ch)[i] = static_cast<T>(out);
             }
+        }
+        centreFrom_ = centreSet;
+        depthFrom_ = depthSet;
+    }
+
+    /**
+     * @brief Moves the sweep's phase by @p step periods of time: the phase
+     *        runs at 0.5 / kRise per period on its rising half and at
+     *        0.5 / (1 - kRise) on its falling half, so the rise takes kRise of
+     *        the period.
+     */
+    void advanceAnalogPhase(double step) noexcept
+    {
+        double t = step;
+        for (int edge = 0; edge < 4 && t > 0.0; ++edge)
+        {
+            const bool rising = analogPhase_ < 0.5;
+            const double speed = rising ? 0.5 / kRise : 0.5 / (1.0 - kRise);
+            const double need = ((rising ? 0.5 : 1.0) - analogPhase_) / speed;
+            if (t < need)
+            {
+                analogPhase_ += t * speed;
+                return;
+            }
+            t -= need;
+            analogPhase_ = rising ? 0.5 : 0.0;
         }
     }
 
     static constexpr int kAnalogStages = 512;   ///< Stages of each analog line.
+    static constexpr double kRise = 0.53;       ///< The sweep's rising share of its period.
+    static constexpr double kAnalogGlideSeconds = 0.05;   ///< Glide of the analog centre, depth and offset.
+    static constexpr double kCornerOctaveSeconds = 0.25;  ///< The analog filters' corner moves an octave in this time at most.
 
     static constexpr T kMaxGlideHz = T(0.5);   ///< Phase glide: half a cycle per second.
 
@@ -823,6 +904,9 @@ protected:
     bool halfRate_ = false;
     double engineRate_ = 48000.0, analogCornerFor_ = -1.0, hpCoeff_ = 0.0, noiseCoeff_ = 0.0;
     double analogPhase_ = 0.0, hpX1_ = 0.0, hpY1_ = 0.0;
+    double analogGlide_ = 1.0, centreNow_ = 0.0, depthNow_ = 0.0, offsetNow_ = 0.5;
+    double centreFrom_ = 0.0, depthFrom_ = 0.0;
+    bool analogPrimed_ = false;
     std::array<BiquadCoeffs, 2> decimate_ {};
     std::array<std::array<double, 2>, 2> decimateState_ {};
     std::array<double, 2> engineOut_ {}, engineLast_ {}, noiseLp_ {};

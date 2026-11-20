@@ -21,8 +21,10 @@
  * The two K-weighting stages run side by side: stage 1 of a frame in one
  * register (both channels) next to stage 2 of the frame before it, so the two
  * recursions overlap instead of waiting on each other. Every call closes the
- * pipeline on its last frame, so a call accounts for all of its samples, and
- * the stages compute the same operations as one after the other.
+ * pipeline on its last frame, so a call accounts for all of its samples.
+ * Every frame of every stage, the first and last of a call included, goes
+ * through the same two-lane step, so the readings do not depend on how the
+ * signal is split into calls, on any target.
  *
  * Threading:
  * - prepare() / reset(): setup thread / stream owner (not concurrent with
@@ -175,36 +177,53 @@ public:
                                            truePeakMax_.load(std::memory_order_relaxed)),
                            std::memory_order_relaxed);
         // One register holds stage 1 of frame i (lane 0) and stage 2 of frame
-        // i - 1 (lane 1); the first frame's stage 1 and the last frame's
-        // stage 2 run on their own.
+        // i - 1 (lane 1). The first frame's stage 1 and the last frame's
+        // stage 2 run through the same step with the other lane on a copy
+        // that is thrown away, so every frame rounds the same way wherever
+        // a call starts or ends.
         using L = KLane;
-        double pre = applyBiquad(static_cast<double>(data[0]), pre_, preState_[0]);
-        if (numSamples > 1)
+        using V = typename L::V;
+        const V b0 = L::set(pre_.b0, rlb_.b0), b1 = L::set(pre_.b1, rlb_.b1);
+        const V b2 = L::set(pre_.b2, rlb_.b2), a1 = L::set(pre_.a1, rlb_.a1);
+        const V a2 = L::set(pre_.a2, rlb_.a2);
+        V z1 = L::set(preState_[0].z1, rlbState_[0].z1);
+        V z2 = L::set(preState_[0].z2, rlbState_[0].z2);
+        const auto stageOne = [&](double x) noexcept
         {
-            const auto b0 = L::set(pre_.b0, rlb_.b0), b1 = L::set(pre_.b1, rlb_.b1);
-            const auto b2 = L::set(pre_.b2, rlb_.b2), a1 = L::set(pre_.a1, rlb_.a1);
-            const auto a2 = L::set(pre_.a2, rlb_.a2);
-            auto z1 = L::set(preState_[0].z1, rlbState_[0].z1);
-            auto z2 = L::set(preState_[0].z2, rlbState_[0].z2);
-            for (int i = 1; i < numSamples; ++i)
+            V t1 = z1, t2 = z2;
+            const V y = L::step(b0, b1, b2, a1, a2, L::set(x, 0.0), t1, t2);
+            z1 = L::set(L::first(t1), L::second(z1));
+            z2 = L::set(L::first(t2), L::second(z2));
+            return L::first(y);
+        };
+        double pre = stageOne(static_cast<double>(data[0]));
+        // The last pass closes the pipeline: its lane 0 runs on a copy, and
+        // every frame's power is added at this one place.
+        for (int i = 1; i <= numSamples; ++i)
+        {
+            const bool more = i < numSamples;
+            const V kept1 = z1, kept2 = z2;
+            const V y = L::step(b0, b1, b2, a1, a2,
+                                L::set(more ? static_cast<double>(data[i]) : 0.0, pre), z1, z2);
+            pre = L::first(y);
+            const double filtered = L::second(y);
+            if (accumulate(filtered * filtered))
             {
-                const auto y = L::step(b0, b1, b2, a1, a2, L::set(static_cast<double>(data[i]), pre), z1, z2);
-                pre = L::first(y);
-                const double filtered = L::second(y);
-                if (accumulate(filtered * filtered))
-                {
-                    // A non-finite block cleared the states: frame i restarts
-                    // from them, as it would one stage after the other.
-                    pre = applyBiquad(static_cast<double>(data[i]), pre_, preState_[0]);
-                    z1 = L::set(preState_[0].z1, 0.0);
-                    z2 = L::set(preState_[0].z2, 0.0);
-                }
+                // A non-finite block cleared the states: frame i restarts
+                // from them, as it would one stage after the other.
+                z1 = L::set(0.0, 0.0);
+                z2 = L::set(0.0, 0.0);
+                if (more)
+                    pre = stageOne(static_cast<double>(data[i]));
             }
-            preState_[0] = { L::first(z1), L::first(z2) };
-            rlbState_[0] = { L::second(z1), L::second(z2) };
+            else if (!more)
+            {
+                z1 = L::set(L::first(kept1), L::second(z1));
+                z2 = L::set(L::first(kept2), L::second(z2));
+            }
         }
-        const double filtered = applyBiquad(pre, rlb_, rlbState_[0]);
-        (void)accumulate(filtered * filtered);
+        preState_[0] = { L::first(z1), L::first(z2) };
+        rlbState_[0] = { L::second(z1), L::second(z2) };
     }
 
     /**
@@ -224,52 +243,53 @@ public:
         truePeakMax_.store(measureTruePeak(right, 1, numSamples, peakLeft), std::memory_order_relaxed);
         // Two registers, both channels in each: stage 1 of frame i next to
         // stage 2 of frame i - 1, which has no wait on it. The first frame's
-        // stage 1 and the last frame's stage 2 run on their own.
+        // stage 1 and the last frame's stage 2 run through the same steps,
+        // so every frame rounds the same way wherever a call starts or ends.
         using L = KLane;
-        double preL = applyBiquad(static_cast<double>(left[0]), pre_, preState_[0]);
-        double preR = applyBiquad(static_cast<double>(right[0]), pre_, preState_[1]);
-        if (numSamples > 1)
+        using V = typename L::V;
+        const V pb0 = L::set(pre_.b0, pre_.b0), pb1 = L::set(pre_.b1, pre_.b1);
+        const V pb2 = L::set(pre_.b2, pre_.b2), pa1 = L::set(pre_.a1, pre_.a1);
+        const V pa2 = L::set(pre_.a2, pre_.a2);
+        const V rb0 = L::set(rlb_.b0, rlb_.b0), rb1 = L::set(rlb_.b1, rlb_.b1);
+        const V rb2 = L::set(rlb_.b2, rlb_.b2), ra1 = L::set(rlb_.a1, rlb_.a1);
+        const V ra2 = L::set(rlb_.a2, rlb_.a2);
+        V pz1 = L::set(preState_[0].z1, preState_[1].z1);
+        V pz2 = L::set(preState_[0].z2, preState_[1].z2);
+        V rz1 = L::set(rlbState_[0].z1, rlbState_[1].z1);
+        V rz2 = L::set(rlbState_[0].z2, rlbState_[1].z2);
+        V pending = L::step(pb0, pb1, pb2, pa1, pa2,
+                            L::set(static_cast<double>(left[0]), static_cast<double>(right[0])),
+                            pz1, pz2);
+        // The last pass closes the pipeline with stage 2 alone, and every
+        // frame's power is added at this one place.
+        for (int i = 1; i <= numSamples; ++i)
         {
-            const auto pb0 = L::set(pre_.b0, pre_.b0), pb1 = L::set(pre_.b1, pre_.b1);
-            const auto pb2 = L::set(pre_.b2, pre_.b2), pa1 = L::set(pre_.a1, pre_.a1);
-            const auto pa2 = L::set(pre_.a2, pre_.a2);
-            const auto rb0 = L::set(rlb_.b0, rlb_.b0), rb1 = L::set(rlb_.b1, rlb_.b1);
-            const auto rb2 = L::set(rlb_.b2, rlb_.b2), ra1 = L::set(rlb_.a1, rlb_.a1);
-            const auto ra2 = L::set(rlb_.a2, rlb_.a2);
-            auto pz1 = L::set(preState_[0].z1, preState_[1].z1);
-            auto pz2 = L::set(preState_[0].z2, preState_[1].z2);
-            auto rz1 = L::set(rlbState_[0].z1, rlbState_[1].z1);
-            auto rz2 = L::set(rlbState_[0].z2, rlbState_[1].z2);
-            auto pending = L::set(preL, preR);
-            for (int i = 1; i < numSamples; ++i)
+            const bool more = i < numSamples;
+            const V k = L::step(rb0, rb1, rb2, ra1, ra2, pending, rz1, rz2);
+            V x {};
+            if (more)
             {
-                const auto x = L::set(static_cast<double>(left[i]), static_cast<double>(right[i]));
-                const auto k = L::step(rb0, rb1, rb2, ra1, ra2, pending, rz1, rz2);
+                x = L::set(static_cast<double>(left[i]), static_cast<double>(right[i]));
                 pending = L::step(pb0, pb1, pb2, pa1, pa2, x, pz1, pz2);
-                const double filtL = L::first(k);
-                const double filtR = L::second(k);
-                if (accumulate(filtL * filtL + filtR * filtR))
-                {
-                    // A non-finite block cleared the states: frame i restarts
-                    // from them, as it would one stage after the other.
-                    pending = L::set(applyBiquad(static_cast<double>(left[i]), pre_, preState_[0]),
-                                     applyBiquad(static_cast<double>(right[i]), pre_, preState_[1]));
-                    pz1 = L::set(preState_[0].z1, preState_[1].z1);
-                    pz2 = L::set(preState_[0].z2, preState_[1].z2);
-                    rz1 = L::set(0.0, 0.0);
-                    rz2 = L::set(0.0, 0.0);
-                }
             }
-            preState_[0] = { L::first(pz1), L::first(pz2) };
-            preState_[1] = { L::second(pz1), L::second(pz2) };
-            rlbState_[0] = { L::first(rz1), L::first(rz2) };
-            rlbState_[1] = { L::second(rz1), L::second(rz2) };
-            preL = L::first(pending);
-            preR = L::second(pending);
+            const double filtL = L::first(k);
+            const double filtR = L::second(k);
+            if (accumulate(filtL * filtL + filtR * filtR))
+            {
+                // A non-finite block cleared the states: frame i restarts
+                // from them, as it would one stage after the other.
+                pz1 = L::set(0.0, 0.0);
+                pz2 = L::set(0.0, 0.0);
+                rz1 = L::set(0.0, 0.0);
+                rz2 = L::set(0.0, 0.0);
+                if (more)
+                    pending = L::step(pb0, pb1, pb2, pa1, pa2, x, pz1, pz2);
+            }
         }
-        const double filtL = applyBiquad(preL, rlb_, rlbState_[0]);
-        const double filtR = applyBiquad(preR, rlb_, rlbState_[1]);
-        (void)accumulate(filtL * filtL + filtR * filtR);
+        preState_[0] = { L::first(pz1), L::first(pz2) };
+        preState_[1] = { L::second(pz1), L::second(pz2) };
+        rlbState_[0] = { L::first(rz1), L::first(rz2) };
+        rlbState_[1] = { L::second(rz1), L::second(rz2) };
     }
 
     /**
@@ -588,18 +608,11 @@ private:
         rlb_ = { rlb.b0, rlb.b1, rlb.b2, rlb.a1, rlb.a2 };
     }
 
-    double applyBiquad(double input, const BiquadCoeff& c, BiquadState& s) noexcept
-    {
-        // Adding 1e-18 protects against denormal numbers (Flush-To-Zero fallback)
-        double output = c.b0 * input + s.z1;
-        s.z1 = c.b1 * input - c.a1 * output + s.z2;
-        s.z2 = c.b2 * input - c.a2 * output + 1e-18;
-        return output;
-    }
-
-    /// Two lanes of the K-weighting recursion: one register of two doubles
-    /// where the target has one, two scalars otherwise. Each lane computes
-    /// applyBiquad()'s operations in the same order.
+    /// Two lanes of the K-weighting recursion (transposed direct form II):
+    /// one register of two doubles where the target has one, two scalars
+    /// otherwise. Every frame of both stages goes through step(), so each
+    /// frame rounds the same way however the signal is split into calls.
+    /// Adding 1e-18 to the second state keeps it out of denormals.
     template <int W, typename D = double> struct KPair
     {
         struct V { D a, b; };
@@ -621,11 +634,14 @@ private:
         static V set(D a, D b) noexcept { return O::set2(a, b); }
         static D first(V v) noexcept { return O::lane0(v); }
         static D second(V v) noexcept { return O::lane1(v); }
+        // No product here feeds a plain addition: where the target fuses
+        // multiply-adds these are fused explicitly, so the compiler has none
+        // left to fuse, and a step whose other lane it drops rounds the same.
         static V step(V b0, V b1, V b2, V a1, V a2, V x, V& z1, V& z2) noexcept
         {
-            const V y = O::add(O::mul(b0, x), z1);
-            z1 = O::add(O::sub(O::mul(b1, x), O::mul(a1, y)), z2);
-            z2 = O::add(O::sub(O::mul(b2, x), O::mul(a2, y)), O::set1(D(1e-18)));
+            const V y = O::madd(b0, x, z1);
+            z1 = O::add(O::mulSub(b1, x, a1, y), z2);
+            z2 = O::add(O::mulSub(b2, x, a2, y), O::set1(D(1e-18)));
             return y;
         }
     };

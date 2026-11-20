@@ -1432,7 +1432,9 @@ DSPARK_TEST(LoudnessMeter_louder_signal_higher_LUFS)
 // The two K-weighting stages run overlapped (stage 1 of a frame next to stage 2
 // of the frame before it). Fed in chunks of every length, with a non-finite
 // sample that clears the states in the middle, the meter must read what the
-// two stages one after the other read, after every call.
+// two stages one after the other read, after every call; and a second meter fed
+// the same signal in other chunks must read the same to the bit, on targets
+// that fuse multiply-adds too.
 namespace
 {
 struct SerialKMeter
@@ -1501,7 +1503,7 @@ DSPARK_TEST(LoudnessMeter_overlapped_k_stages_read_as_one_after_the_other)
             return static_cast<double>(seed >> 8) / 8388608.0 - 1.0;
         };
 
-        std::vector<double> left, right;
+        std::vector<double> left, right, allLeft, allRight;
         int position = 0;
         double worst = 0.0;
         int checks = 0;
@@ -1520,6 +1522,8 @@ DSPARK_TEST(LoudnessMeter_overlapped_k_stages_read_as_one_after_the_other)
                     const double frame[2] = { left[static_cast<size_t>(i)], right[static_cast<size_t>(i)] };
                     reference.push(frame, channels);
                 }
+                allLeft.insert(allLeft.end(), left.begin(), left.end());
+                allRight.insert(allRight.end(), right.begin(), right.end());
                 if (channels == 2)
                     meter.process(left.data(), right.data(), length);
                 else
@@ -1531,6 +1535,23 @@ DSPARK_TEST(LoudnessMeter_overlapped_k_stages_read_as_one_after_the_other)
         EXPECT_GT(static_cast<int>(reference.blocks.size()), 20);
         EXPECT_GT(checks, 60);
         EXPECT_LT(worst, 1e-9);
+
+        // The same signal in chunks of 4096 reads the same to the bit.
+        LoudnessMeter<double> other;
+        other.prepare(48000.0, channels);
+        for (size_t offset = 0; offset < allLeft.size(); offset += 4096)
+        {
+            const int count = static_cast<int>(std::min<size_t>(4096, allLeft.size() - offset));
+            if (channels == 2)
+                other.process(allLeft.data() + offset, allRight.data() + offset, count);
+            else
+                other.process(allLeft.data() + offset, count);
+        }
+        auto same = [](double a, double b) { return a == b || (std::isnan(a) && std::isnan(b)); };
+        EXPECT_TRUE(same(other.getMomentaryLUFS(), meter.getMomentaryLUFS()));
+        EXPECT_TRUE(same(other.getShortTermLUFS(), meter.getShortTermLUFS()));
+        EXPECT_TRUE(same(other.getIntegratedLUFS(), meter.getIntegratedLUFS()));
+        EXPECT_TRUE(same(other.getLoudnessRange(), meter.getLoudnessRange()));
     }
 }
 

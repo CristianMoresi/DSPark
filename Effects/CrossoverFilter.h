@@ -94,6 +94,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
 #include "../Core/DspMath.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/FFT.h"
@@ -470,11 +471,11 @@ public:
     {
         for (auto& sp : splits_)
         {
-            for (auto& b : sp.lp) b.reset();
-            for (auto& b : sp.hp) b.reset();
+            sp.lp.reset();
+            sp.hp.reset();
         }
         for (auto& apChain : allpassFlat_)
-            for (auto& b : apChain.stages) b.reset();
+            apChain.stages.reset();
 
         std::fill(lpRing_.begin(), lpRing_.end(), T(0));
         std::fill(lpFdl_.begin(), lpFdl_.end(), T(0));
@@ -571,13 +572,13 @@ private:
 
     struct SplitPoint
     {
-        std::array<Biquad<T, 16>, kMaxStagesPerFilter> lp;
-        std::array<Biquad<T, 16>, kMaxStagesPerFilter> hp;
+        BiquadCascade<T, kMaxStagesPerFilter, 16> lp;   ///< The low branch's sections, run in one pass.
+        BiquadCascade<T, kMaxStagesPerFilter, 16> hp;   ///< The high branch's sections.
     };
 
     struct AllPassChain
     {
-        std::array<Biquad<T, 16>, kMaxStagesPerFilter> stages;
+        BiquadCascade<T, kMaxStagesPerFilter, 16> stages;   ///< The phase correction's sections.
     };
 
     /**
@@ -648,10 +649,10 @@ private:
         {
             for (int s = lastNumSplits_; s < numSplits; ++s)
             {
-                for (auto& b : splits_[s].lp) b.reset();
-                for (auto& b : splits_[s].hp) b.reset();
+                splits_[s].lp.reset();
+                splits_[s].hp.reset();
                 for (int b = 0; b < s; ++b)
-                    for (auto& st : allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages) st.reset();
+                    allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.reset();
             }
         }
         lastNumSplits_ = numSplits;
@@ -685,12 +686,12 @@ private:
                     hpC0.b1 = -hpC0.b1;
                     hpC0.b2 = -hpC0.b2;
 
-                    splits_[s].lp[0].setCoeffs(lpC);
-                    splits_[s].lp[1].setCoeffs(lpC);
-                    splits_[s].hp[0].setCoeffs(hpC0);
-                    splits_[s].hp[1].setCoeffs(hpC);
+                    splits_[s].lp.setCoeffs(0, lpC);
+                    splits_[s].lp.setCoeffs(1, lpC);
+                    splits_[s].hp.setCoeffs(0, hpC0);
+                    splits_[s].hp.setCoeffs(1, hpC);
                     for (int b = 0; b < s; ++b)
-                        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages[0].setCoeffs(apC);
+                        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setCoeffs(0, apC);
                 }
                 break;
 
@@ -709,11 +710,11 @@ private:
 
                     for (int st = 0; st < 2; ++st)
                     {
-                        splits_[s].lp[st].setCoeffs(lpC);
-                        splits_[s].hp[st].setCoeffs(hpC);
+                        splits_[s].lp.setCoeffs(st, lpC);
+                        splits_[s].hp.setCoeffs(st, hpC);
                     }
                     for (int b = 0; b < s; ++b)
-                        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages[0].setCoeffs(apC);
+                        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setCoeffs(0, apC);
                 }
                 break;
 
@@ -734,20 +735,28 @@ private:
 
                     for (int st = 0; st < 4; ++st)
                     {
-                        splits_[s].lp[st].setCoeffs(BiquadCoeffs::makeLowPass(sr, f, qArr[st]));
-                        splits_[s].hp[st].setCoeffs(BiquadCoeffs::makeHighPass(sr, f, qArr[st]));
+                        splits_[s].lp.setCoeffs(st, BiquadCoeffs::makeLowPass(sr, f, qArr[st]));
+                        splits_[s].hp.setCoeffs(st, BiquadCoeffs::makeHighPass(sr, f, qArr[st]));
                     }
                     for (int b = 0; b < s; ++b)
                     {
                         auto& chain = allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)];
-                        chain.stages[0].setCoeffs(BiquadCoeffs::makeAllPass(sr, f, q1));
-                        chain.stages[1].setCoeffs(BiquadCoeffs::makeAllPass(sr, f, q2));
+                        chain.stages.setCoeffs(0, BiquadCoeffs::makeAllPass(sr, f, q1));
+                        chain.stages.setCoeffs(1, BiquadCoeffs::makeAllPass(sr, f, q2));
                     }
                 }
                 break;
             }
 
             default: break;
+        }
+
+        for (int s = 0; s < numSplits; ++s)
+        {
+            splits_[s].lp.setNumSections(numStagesPerFilter_);
+            splits_[s].hp.setNumSections(numStagesPerFilter_);
+            for (int b = 0; b < s; ++b)
+                allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setNumSections(numStagesAllpass_);
         }
     }
 
@@ -806,29 +815,22 @@ private:
                 dst[i] = std::isfinite(src[i]) ? src[i] : T(0);
         }
 
+        // Each split: its low band from what is left, and what is left above
+        // it, every section of a filter and every channel in one pass (the
+        // memory in double: re-quantising to T between sections would put
+        // the reconstruction error back where the double memory removed it).
+        T* work[16] = {};
+        for (int ch = 0; ch < nCh; ++ch) work[ch] = getWorkBufChannel(ch);
         for (int s = 0; s < numSplits; ++s)
         {
-            for (int i = 0; i < blockLen; ++i)
+            T* low[16] = {};
+            for (int ch = 0; ch < nCh; ++ch)
             {
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    T* workCh = getWorkBufChannel(ch);
-                    const double sample = static_cast<double>(workCh[i]);
-
-                    // The cascade stays in the biquad core's own precision:
-                    // re-quantising to T between stages would put the
-                    // reconstruction error back where the double core removed it.
-                    double lpSample = sample;
-                    for (int st = 0; st < numStagesPerFilter_; ++st)
-                        lpSample = splits_[s].lp[st].processSampleCore(lpSample, ch);
-                    outputs[s].getChannel(ch)[offset + i] = static_cast<T>(lpSample);
-
-                    double hpSample = sample;
-                    for (int st = 0; st < numStagesPerFilter_; ++st)
-                        hpSample = splits_[s].hp[st].processSampleCore(hpSample, ch);
-                    workCh[i] = static_cast<T>(hpSample);
-                }
+                low[ch] = outputs[s].getChannel(ch) + offset;
+                std::copy(work[ch], work[ch] + blockLen, low[ch]);
             }
+            splits_[s].lp.processBlock(AudioBufferView<T>(low, nCh, blockLen));
+            splits_[s].hp.processBlock(AudioBufferView<T>(work, nCh, blockLen));
         }
 
         for (int ch = 0; ch < nCh; ++ch)
@@ -842,16 +844,10 @@ private:
         {
             for (int b = 0; b < s; ++b)
             {
-                for (int i = 0; i < blockLen; ++i)
-                {
-                    for (int ch = 0; ch < nCh; ++ch)
-                    {
-                        double sample = static_cast<double>(outputs[b].getChannel(ch)[offset + i]);
-                        for (int st = 0; st < numStagesAllpass_; ++st)
-                            sample = allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages[st].processSampleCore(sample, ch);
-                        outputs[b].getChannel(ch)[offset + i] = static_cast<T>(sample);
-                    }
-                }
+                T* band[16] = {};
+                for (int ch = 0; ch < nCh; ++ch) band[ch] = outputs[b].getChannel(ch) + offset;
+                allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.processBlock(
+                    AudioBufferView<T>(band, nCh, blockLen));
             }
         }
     }

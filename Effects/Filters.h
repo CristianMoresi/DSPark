@@ -54,6 +54,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
 #include "../Core/DspMath.h"
 #include "../Core/NormalizedLadder.h"
 #include "../Core/Smoothers.h"
@@ -129,6 +130,7 @@ public:
     void reset() noexcept
     {
         for (auto& stage : stages_) stage.reset();
+        cascade_.reset();
         for (auto& ladder : ladders_) ladder.reset();
         // A pinned drift restarts from its seed, so a reset render replays it.
         if (const std::uint64_t seed = driftSeed_.load(std::memory_order_relaxed); seed != 0)
@@ -586,6 +588,7 @@ public:
         if (ladder != ladderActive_)
         {
             ladderActive_ = ladder;
+            cascade_.reset();
             for (int s = 0; s < kMaxStages; ++s)
             {
                 stages_[s].reset();
@@ -648,20 +651,11 @@ public:
                     }
                     return;
                 }
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    T* channelData = buffer.getChannel(ch);
-                    for (int i = 0; i < nS; ++i)
-                    {
-                        // The cascade stays in the biquad core's own precision:
-                        // re-quantising to T between stages would put back part
-                        // of the error the double core exists to remove.
-                        double sample = static_cast<double>(channelData[i]);
-                        for (int s = 0; s < ns; ++s)
-                            sample = stages_[s].processSampleCore(sample, ch);
-                        channelData[i] = static_cast<T>(sample);
-                    }
-                }
+                // One pass: every section on every channel together, the
+                // memory in double (re-quantising to T between sections would
+                // put back part of the error the double memory removes).
+                (void)ns;
+                cascade_.processBlock(buffer);
             }
         }
         else
@@ -727,48 +721,28 @@ public:
                     }
                 }
 
-                // Coefficient path of this segment: sample k uses
-                // from + (rampPos_ + k + 1) / kChunkSize * (to - from).
+                // The segment, with the coefficients ramping linearly from
+                // one design to the next over the 16-sample grid.
                 const int ns = activeStages();
                 const bool ramping = rampPos_ < kChunkSize;
-                std::array<BiquadCoeffs, kMaxStages> c0 {}, step {};
-                for (int s = 0; s < ns; ++s)
+                if (ladder)
                 {
-                    if (ramping)
+                    std::array<double, kChunkSize> tmp;
+                    for (int ch = 0; ch < nCh; ++ch)
                     {
-                        const BiquadCoeffs& a = rampFrom_[s];
-                        const BiquadCoeffs& b = rampTo_[s];
-                        const double t = static_cast<double>(rampPos_) * (1.0 / kChunkSize);
-                        constexpr double kStep = 1.0 / kChunkSize;
-                        c0[s] = { a.b0 + t * (b.b0 - a.b0), a.b1 + t * (b.b1 - a.b1),
-                                  a.b2 + t * (b.b2 - a.b2), a.a1 + t * (b.a1 - a.a1),
-                                  a.a2 + t * (b.a2 - a.a2) };
-                        step[s] = { kStep * (b.b0 - a.b0), kStep * (b.b1 - a.b1), kStep * (b.b2 - a.b2),
-                                    kStep * (b.a1 - a.a1), kStep * (b.a2 - a.a2) };
-                    }
-                    else
-                    {
-                        c0[s] = stages_[s].getCoeffs();
-                        step[s] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
-                    }
-                }
-
-                // The cascade stays in the biquad core's own precision.
-                std::array<double, kChunkSize> tmp;
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    T* d = buffer.getChannel(ch) + i;
-                    for (int j = 0; j < seg; ++j) tmp[static_cast<size_t>(j)] = static_cast<double>(d[j]);
-                    if (ladder)
+                        T* d = buffer.getChannel(ch) + i;
+                        for (int j = 0; j < seg; ++j) tmp[static_cast<size_t>(j)] = static_cast<double>(d[j]);
                         for (int s = 0; s < ns; ++s)
                             ladders_[s].processSegment(tmp.data(), seg, ch);
-                    else
-                        for (int s = 0; s < ns; ++s)
-                            stages_[s].processRampCore(tmp.data(), seg, ch, c0[s], step[s]);
-                    for (int j = 0; j < seg; ++j) d[j] = static_cast<T>(tmp[static_cast<size_t>(j)]);
-                }
-                if (ladder)
+                        for (int j = 0; j < seg; ++j) d[j] = static_cast<T>(tmp[static_cast<size_t>(j)]);
+                    }
                     for (int s = 0; s < ns; ++s) ladders_[s].advanceRamp(seg);
+                }
+                else
+                {
+                    // One pass over the segment (the ramps advance inside).
+                    cascade_.processBlock(buffer.getSubView(i, seg));
+                }
 
                 if (ramping)
                 {
@@ -810,8 +784,7 @@ public:
                 sample = ladders_[s].processSample(sample, channel);
             return static_cast<T>(sample);
         }
-        for (int s = 0; s < ns; ++s)
-            sample = stages_[s].processSampleCore(sample, channel);
+        sample = cascade_.processSample(sample, channel);
         return static_cast<T>(sample);
     }
 
@@ -968,7 +941,11 @@ protected:
     {
         const int n = designCoefficients(freq, Q, gainDb, rampTo_);
         for (int s = 0; s < n; ++s)
+        {
             stages_[s].setCoeffsNow(rampTo_[s]);
+            cascade_.setCoeffs(s, rampTo_[s]);
+        }
+        cascade_.setNumSections(n);
         numStages_ = n;
         rampPos_ = kChunkSize;   // a ramp in flight ends on this exact design
     }
@@ -993,7 +970,10 @@ protected:
         {
             rampFrom_[s] = stages_[s].getCoeffs();
             if (!sameTopology) stages_[s].setCoeffsNow(rampTo_[s]);
+            if (sameTopology) cascade_.rampCoeffs(s, rampTo_[s], kChunkSize);
+            else cascade_.setCoeffs(s, rampTo_[s]);
         }
+        cascade_.setNumSections(n);
         numStages_ = n;
         rampPos_ = sameTopology ? 0 : kChunkSize;
     }
@@ -1097,7 +1077,8 @@ protected:
     std::atomic<bool> matchedPeak_ { false };
     std::atomic<bool> matchedFilters_ { false };
 
-    std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};
+    std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};   ///< The coefficients in use (their record for the ramps).
+    BiquadCascade<T, kMaxStages, MaxChannels> cascade_;           ///< The sections, run in one pass.
     std::array<NormalizedLadder<T, MaxChannels>, kMaxStages> ladders_ {}; ///< The sections as ladders (setStructure()).
     std::atomic<Structure> structure_ { Structure::DirectForm };
     bool ladderActive_ = false;      ///< The audio thread runs the ladders.

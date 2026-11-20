@@ -380,6 +380,13 @@ inline EffectSlot makeCompressor()
     s.addToggle("Delta Listen", false);   // 33: what the compression takes out
     s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // 34: the pair read as its dominant component
     s.addChoice("Opto Cell", {"Two stages","Three stages"}, 0); // 35: the Opto character with a medium memory
+    s.addChoice("Colour Stage", {"Off","Before","After"}, 0);   // 36: the analog colour stage
+    s.addSlider("Stage Drive", 0, 24, 6, "dB");                 // 37
+    s.addSlider("Stage Emphasis", 0, 12, 6, "dB");              // 38
+    s.addSlider("Stage Asymmetry", 0, 1, 0.3f, "");             // 39
+    s.addSlider("Stage Drift", 0, 1, 0, "");                    // 40
+    s.addSlider("Stage Sag", 0, 1, 0, "");                      // 41
+    s.addSlider("Stage Noise", -140, -40, -140, "dB");          // 42
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -438,6 +445,19 @@ inline EffectSlot makeCompressor()
             case 33: p->setDelta(v > 0.5f); break;
             case 34: p->setLinkMode(static_cast<dspark::Compressor<float>::LinkMode>(static_cast<int>(v))); break;
             case 35: p->setOptoCell(static_cast<dspark::Compressor<float>::OptoCell>(static_cast<int>(v))); break;
+            case 36: p->setCharacterStage(static_cast<dspark::Compressor<float>::StagePosition>(static_cast<int>(v))); break;
+            case 37: case 38: case 39: case 40: case 41: case 42:
+            {
+                auto st = p->getCharacterStageSettings();
+                if (i == 37) st.driveDb = v;
+                if (i == 38) st.emphasisDb = v;
+                if (i == 39) st.asymmetry = v;
+                if (i == 40) st.drift = v;
+                if (i == 41) st.sag = v;
+                if (i == 42) st.noiseDb = v;
+                p->setCharacterStageSettings(st);
+                break;
+            }
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -631,6 +651,7 @@ inline EffectSlot makeDeEsser()
     s.addToggle("Auto Threshold", false);
     s.addToggle("Delta Listen", false);   // 6: what the de-esser takes out
     s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // 7: the cut bell as a normalized ladder
+    s.addToggle("Mixed Bell", false);                        // 8: one fixed filter mixed by the reduction
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -644,6 +665,7 @@ inline EffectSlot makeDeEsser()
             case 5: p->setAutoThreshold(v > 0.5f); break;
             case 6: p->setDelta(v > 0.5f); break;
             case 7: p->setStructure(static_cast<dspark::DeEsser<float>::Structure>(static_cast<int>(v))); break;
+            case 8: p->setMixedBell(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -935,6 +957,7 @@ inline EffectSlot makeChorus()
     s.addChoice("Model", {"Digital","Analog"}, 0);                      // 8
     s.addChoice("Analog Mode", {"Slow","Fast","Vibrato"}, 0);           // 9
     s.addSlider("Analog Hiss", -120, -50, -84, "dBFS");                 // 10
+    s.addChoice("Interpolation", {"Cubic","Sinc","Linear"}, 0);         // 11: the reads of the digital lines
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
@@ -952,6 +975,7 @@ inline EffectSlot makeChorus()
             case 8: p->setModel(static_cast<CH::Model>(static_cast<int>(v))); break;
             case 9: p->setAnalogMode(static_cast<CH::AnalogMode>(static_cast<int>(v))); break;
             case 10: p->setAnalogNoise(v); break;
+            case 11: p->setInterpolation(static_cast<CH::Interpolation>(static_cast<int>(v))); break;
         }
     };
     // A mode loads rate, depth and centre: show them.

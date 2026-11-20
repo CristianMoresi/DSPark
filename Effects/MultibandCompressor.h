@@ -15,9 +15,10 @@
  * Threading model:
  *  - prepare() / reset() / getState() / setState(): setup thread only (never
  *    concurrent with processBlock()).
- *  - setNumBands() / setCrossoverFrequency() / setOrder() / setCrossoverMode()
- *    and the per-band convenience setters: safe from any thread (they delegate
- *    to the atomic publications of CrossoverFilter / Compressor).
+ *  - setNumBands() / setCrossoverFrequency() / setOrder() / setCrossoverMode() /
+ *    setCrossoverStructure() and the per-band convenience setters: safe from
+ *    any thread (they delegate to the atomic publications of CrossoverFilter /
+ *    Compressor).
  *  - getBandCompressor(): the returned Compressor's parameter setters are
  *    safe from any thread; its prepare()/reset()/setState() are setup-thread
  *    (this class already prepares and resets every band for you).
@@ -219,6 +220,16 @@ public:
         crossover_.setFilterMode(mode);
     }
 
+    /**
+     * @brief How the sections of the minimum-phase crossover are realised
+     *        (see CrossoverFilter::setStructure(); any thread).
+     * @param structure DirectForm (default) or Ladder.
+     */
+    void setCrossoverStructure(typename CrossoverFilter<T, MaxBands>::Structure structure) noexcept
+    {
+        crossover_.setStructure(structure);
+    }
+
     // -- Per-band compressor access ------------------------------------------
 
     /**
@@ -326,6 +337,12 @@ public:
         return crossover_.getFilterMode();
     }
 
+    /** @brief Returns the structure of the minimum-phase crossover. */
+    [[nodiscard]] typename CrossoverFilter<T, MaxBands>::Structure getCrossoverStructure() const noexcept
+    {
+        return crossover_.getStructure();
+    }
+
     /** @brief Returns the total latency of the multi-band system. */
     [[nodiscard]] int getLatency() const noexcept
     {
@@ -354,6 +371,7 @@ public:
         w.write("numBands", n);
         w.write("order", crossover_.getOrder());
         w.write("xoverMode", static_cast<int32_t>(crossover_.getFilterMode()));
+        w.write("xoverStructure", static_cast<int32_t>(crossover_.getStructure()));
         char key[24];
         for (int i = 0; i < n - 1; ++i)
         {
@@ -378,6 +396,8 @@ public:
         setOrder(r.read("order", 24));
         setCrossoverMode(static_cast<typename CrossoverFilter<T, MaxBands>::FilterMode>(
             r.read("xoverMode", 0)));
+        setCrossoverStructure(static_cast<typename CrossoverFilter<T, MaxBands>::Structure>(
+            std::clamp(r.read("xoverStructure", 0), 0, 1)));
         char key[24];
         for (int i = 0; i < n - 1; ++i)
         {

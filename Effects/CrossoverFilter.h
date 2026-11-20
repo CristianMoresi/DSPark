@@ -79,7 +79,7 @@
  * Threading model:
  * - prepare() / reset() / getState() / setState(): setup or UI threads only
  *   (prepare and getState allocate), never concurrently with processBlock().
- * - setNumBands / setCrossoverFrequency / setOrder / setFilterMode: RT-safe
+ * - setNumBands / setCrossoverFrequency / setOrder / setFilterMode / setStructure: RT-safe
  *   atomic publications from any thread; the audio thread applies them at
  *   the next block. Frequency changes are smoothed (5 ms) in IIR mode, with
  *   the coefficients refreshed on a 32-sample grid that runs across blocks
@@ -87,8 +87,9 @@
  *   the following blocks in linear-phase mode (see above).
  * - getLatency() and the getters are safe from any thread.
  *
- * Dependencies: Biquad.h, AudioBuffer.h, AudioSpec.h, DspMath.h, FFT.h,
- *               SimdOps.h, DenormalGuard.h, SmoothedValue.h, StateBlob.h.
+ * Dependencies: Biquad.h, BiquadCascade.h, NormalizedLadder.h, AudioBuffer.h,
+ *               AudioSpec.h, DspMath.h, FFT.h, SimdOps.h, DenormalGuard.h,
+ *               SmoothedValue.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -98,6 +99,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/FFT.h"
+#include "../Core/NormalizedLadder.h"
 #include "../Core/SimdOps.h"
 #include "../Core/SmoothedValue.h"
 #include "../Core/StateBlob.h"
@@ -240,6 +242,12 @@ public:
         // Access via: band * kMaxSplits + split
         allpassFlat_.resize(static_cast<size_t>(MaxBands * kMaxSplits));
 
+        // The ladders of setStructure(Ladder), allocated whatever the current
+        // structure so a later switch never allocates.
+        ladders_.assign(static_cast<size_t>(kLadderCount), NormalizedLadder<T, 16> {});
+        ladderTmp_.assign(static_cast<size_t>(spec.maxBlockSize), 0.0);
+        ladderActive_ = false;
+
         // Re-sync smoothers to the CURRENT targets. prepare() used to reset
         // all split frequencies to the log-spaced defaults, silently discarding
         // any configuration made before prepare().
@@ -321,6 +329,24 @@ public:
                 for (int i = 0; i < kMaxSplits; ++i)
                     freqSmoothers_[i].setTargetValue(targetFrequencies_[i].load(std::memory_order_relaxed));
             }
+        }
+
+        // A change of structure restarts the memory of the sections; the
+        // ladders take the coefficients in use.
+        const bool ladder = structure_.load(std::memory_order_relaxed) == Structure::Ladder && !ladders_.empty();
+        if (!lpActive && ladder != ladderActive_)
+        {
+            ladderActive_ = ladder;
+            for (auto& sp : splits_)
+            {
+                sp.lp.reset();
+                sp.hp.reset();
+            }
+            for (auto& apChain : allpassFlat_)
+                apChain.stages.reset();
+            for (auto& l : ladders_)
+                l.reset();
+            if (ladder) updateCoefficients();
         }
 
         // The IIR coefficients are only rebuilt while the IIR engine runs; in
@@ -441,6 +467,42 @@ public:
         lpMagDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief How the minimum-phase sections are realised (see setStructure()). */
+    enum class Structure
+    {
+        DirectForm,  ///< Direct form with a double memory, all sections in one pass (default).
+        Ladder       ///< Normalized ladders: passive under any movement of the splits.
+    };
+
+    /**
+     * @brief Chooses how the sections of the minimum-phase engine are realised.
+     *
+     * Ladder runs every section of the splits and of the phase correction as
+     * a normalized ladder (NormalizedLadder): the same band responses (to
+     * 4e-9), and a memory that can only lose energy however its coefficients
+     * move. During a glide the ladders' coefficients ramp linearly from one
+     * refresh of the 32-sample grid to the next instead of stepping. Measured
+     * on four bands in stereo it costs 2.4 to 6.3 times the direct form. The
+     * 5 ms glide of the splits already keeps the direct form's memory
+     * consistent with its coefficients: with a split jumping between 100 Hz
+     * and 10 kHz every 64 samples, the band sum of 0.3 of noise peaks at 0.65
+     * either way at LR24 (0.70 ladder, 0.64 direct at LR48), so the ladder is
+     * for those who want the guarantee rather than a lower peak. The ladders are allocated by prepare() on the
+     * heap, so the switch itself never allocates. Thread-safe; the switch
+     * restarts the sections' memory at the next block, which may click:
+     * choose it before playback. The linear-phase engine is unaffected.
+     *
+     * @param structure DirectForm (default) or Ladder.
+     */
+    void setStructure(Structure structure) noexcept
+    {
+        structure_.store(static_cast<Structure>(std::clamp(static_cast<int>(structure), 0, 1)),
+                         std::memory_order_relaxed);
+    }
+
+    /** @brief The structure set by setStructure(). */
+    [[nodiscard]] Structure getStructure() const noexcept { return structure_.load(std::memory_order_relaxed); }
+
     // -- Queries -------------------------------------------------------------
 
     [[nodiscard]] int getNumBands() const noexcept { return numBands_.load(std::memory_order_relaxed); }
@@ -476,6 +538,8 @@ public:
         }
         for (auto& apChain : allpassFlat_)
             apChain.stages.reset();
+        for (auto& l : ladders_)
+            l.reset();
 
         std::fill(lpRing_.begin(), lpRing_.end(), T(0));
         std::fill(lpFdl_.begin(), lpFdl_.end(), T(0));
@@ -504,6 +568,7 @@ public:
         w.write("numBands", n);
         w.write("order", getOrder());
         w.write("mode", static_cast<int32_t>(getFilterMode()));
+        w.write("structure", static_cast<int32_t>(getStructure()));
         char key[16];
         for (int i = 0; i < n - 1; ++i)
         {
@@ -521,6 +586,7 @@ public:
         setNumBands(std::clamp(r.read("numBands", 2), 2, MaxBands));
         setOrder(r.read("order", 24));
         setFilterMode(static_cast<FilterMode>(std::clamp(r.read("mode", 0), 0, 1)));
+        setStructure(static_cast<Structure>(std::clamp(r.read("structure", 0), 0, 1)));
         const int n = getNumBands();
         char key[16];
         for (int i = 0; i < n - 1; ++i)
@@ -636,7 +702,7 @@ private:
         return std::clamp(f, 20.0, sr * 0.499);
     }
 
-    void updateCoefficients() noexcept
+    void updateCoefficients(int ladderRamp = 0) noexcept
     {
         if (spec_.sampleRate <= 0) return;
 
@@ -653,6 +719,17 @@ private:
                 splits_[s].hp.reset();
                 for (int b = 0; b < s; ++b)
                     allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.reset();
+                if (!ladders_.empty())
+                {
+                    for (int st = 0; st < kMaxStagesPerFilter; ++st)
+                    {
+                        ladders_[static_cast<size_t>(ladderLow(s, st))].reset();
+                        ladders_[static_cast<size_t>(ladderHigh(s, st))].reset();
+                    }
+                    for (int b = 0; b < s; ++b)
+                        for (int st = 0; st < 2; ++st)
+                            ladders_[static_cast<size_t>(ladderAllpass(b, s, st))].reset();
+                }
             }
         }
         lastNumSplits_ = numSplits;
@@ -686,12 +763,10 @@ private:
                     hpC0.b1 = -hpC0.b1;
                     hpC0.b2 = -hpC0.b2;
 
-                    splits_[s].lp.setCoeffs(0, lpC);
-                    splits_[s].lp.setCoeffs(1, lpC);
-                    splits_[s].hp.setCoeffs(0, hpC0);
-                    splits_[s].hp.setCoeffs(1, hpC);
+                    setSplitSection(s, 0, lpC, hpC0, ladderRamp);
+                    setSplitSection(s, 1, lpC, hpC, ladderRamp);
                     for (int b = 0; b < s; ++b)
-                        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setCoeffs(0, apC);
+                        setAllpassSection(b, s, 0, apC, ladderRamp);
                 }
                 break;
 
@@ -709,12 +784,9 @@ private:
                     auto apC = BiquadCoeffs::makeAllPass(sr, f, qB);
 
                     for (int st = 0; st < 2; ++st)
-                    {
-                        splits_[s].lp.setCoeffs(st, lpC);
-                        splits_[s].hp.setCoeffs(st, hpC);
-                    }
+                        setSplitSection(s, st, lpC, hpC, ladderRamp);
                     for (int b = 0; b < s; ++b)
-                        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setCoeffs(0, apC);
+                        setAllpassSection(b, s, 0, apC, ladderRamp);
                 }
                 break;
 
@@ -734,15 +806,14 @@ private:
                     double f = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
 
                     for (int st = 0; st < 4; ++st)
-                    {
-                        splits_[s].lp.setCoeffs(st, BiquadCoeffs::makeLowPass(sr, f, qArr[st]));
-                        splits_[s].hp.setCoeffs(st, BiquadCoeffs::makeHighPass(sr, f, qArr[st]));
-                    }
+                        setSplitSection(s, st, BiquadCoeffs::makeLowPass(sr, f, qArr[st]),
+                                        BiquadCoeffs::makeHighPass(sr, f, qArr[st]), ladderRamp);
+                    const auto ap1 = BiquadCoeffs::makeAllPass(sr, f, q1);
+                    const auto ap2 = BiquadCoeffs::makeAllPass(sr, f, q2);
                     for (int b = 0; b < s; ++b)
                     {
-                        auto& chain = allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)];
-                        chain.stages.setCoeffs(0, BiquadCoeffs::makeAllPass(sr, f, q1));
-                        chain.stages.setCoeffs(1, BiquadCoeffs::makeAllPass(sr, f, q2));
+                        setAllpassSection(b, s, 0, ap1, ladderRamp);
+                        setAllpassSection(b, s, 1, ap2, ladderRamp);
                     }
                 }
                 break;
@@ -758,6 +829,62 @@ private:
             for (int b = 0; b < s; ++b)
                 allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setNumSections(numStagesAllpass_);
         }
+    }
+
+    static constexpr int kLadderSplitStride = 2 * kMaxStagesPerFilter;
+    static constexpr int kLadderAllpassBase = kMaxSplits * kLadderSplitStride;
+    static constexpr int kLadderCount = kLadderAllpassBase + MaxBands * kMaxSplits * 2;
+
+    /// Ladder index of section `st` of split `s`, low branch.
+    [[nodiscard]] static constexpr int ladderLow(int s, int st) noexcept { return s * kLadderSplitStride + st; }
+    /// Ladder index of section `st` of split `s`, high branch.
+    [[nodiscard]] static constexpr int ladderHigh(int s, int st) noexcept
+    {
+        return s * kLadderSplitStride + kMaxStagesPerFilter + st;
+    }
+    /// Ladder index of section `st` of the correction of band `b` for split `s`.
+    [[nodiscard]] static constexpr int ladderAllpass(int b, int s, int st) noexcept
+    {
+        return kLadderAllpassBase + (b * kMaxSplits + s) * 2 + st;
+    }
+
+    /// One section of the two branches of a split: to the one-pass cascades
+    /// and, while the ladders run, to the ladders (ramping over `ramp` samples).
+    void setSplitSection(int s, int st, const BiquadCoeffs& low, const BiquadCoeffs& high, int ramp) noexcept
+    {
+        splits_[static_cast<size_t>(s)].lp.setCoeffs(st, low);
+        splits_[static_cast<size_t>(s)].hp.setCoeffs(st, high);
+        if (ladderActive_)
+        {
+            ladders_[static_cast<size_t>(ladderLow(s, st))].rampCoeffs(low, ramp);
+            ladders_[static_cast<size_t>(ladderHigh(s, st))].rampCoeffs(high, ramp);
+        }
+    }
+
+    /// One section of the phase correction of band `b` for split `s`.
+    void setAllpassSection(int b, int s, int st, const BiquadCoeffs& c, int ramp) noexcept
+    {
+        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.setCoeffs(st, c);
+        if (ladderActive_)
+            ladders_[static_cast<size_t>(ladderAllpass(b, s, st))].rampCoeffs(c, ramp);
+    }
+
+    /// `count` ladders from `first` over one channel: src to dst (may be the
+    /// same), in double between the sections. advanceLadders() moves the ramps on.
+    void runLadders(const T* src, T* dst, int length, int first, int count, int channel) noexcept
+    {
+        double* tmp = ladderTmp_.data();
+        for (int i = 0; i < length; ++i) tmp[i] = static_cast<double>(src[i]);
+        for (int k = 0; k < count; ++k)
+            ladders_[static_cast<size_t>(first + k)].processSegment(tmp, length, channel);
+        for (int i = 0; i < length; ++i) dst[i] = static_cast<T>(tmp[i]);
+    }
+
+    /// Moves the ramps of `count` ladders from `first` on, once every channel has run.
+    void advanceLadders(int first, int count, int length) noexcept
+    {
+        for (int k = 0; k < count; ++k)
+            ladders_[static_cast<size_t>(first + k)].advanceRamp(length);
     }
 
     void processIIR(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nS, int nCh) noexcept
@@ -784,7 +911,8 @@ private:
                         (void)freqSmoothers_[i].getNextValue();
                     frequencies_[i] = freqSmoothers_[i].getCurrentValue();
                 }
-                updateCoefficients();
+                // The ladders ramp to the new coefficients over the segment.
+                updateCoefficients(kGlideGrid);
                 glideRemain_ = kGlideGrid;
             }
             const int len = std::min(glideRemain_, nS - offset);
@@ -821,6 +949,11 @@ private:
         // the reconstruction error back where the double memory removed it).
         T* work[16] = {};
         for (int ch = 0; ch < nCh; ++ch) work[ch] = getWorkBufChannel(ch);
+        if (ladderActive_)
+        {
+            processLadderRange(work, outputs, numBands, nCh, offset, blockLen);
+            return;
+        }
         for (int s = 0; s < numSplits; ++s)
         {
             T* low[16] = {};
@@ -848,6 +981,44 @@ private:
                 for (int ch = 0; ch < nCh; ++ch) band[ch] = outputs[b].getChannel(ch) + offset;
                 allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.processBlock(
                     AudioBufferView<T>(band, nCh, blockLen));
+            }
+        }
+    }
+
+    /// processIIRRange() with the ladders: the same splits, residual and
+    /// phase correction, one channel after another through each filter.
+    void processLadderRange(T* const* work, AudioBufferView<T>* outputs, int numBands, int nCh, int offset,
+                            int blockLen) noexcept
+    {
+        const int numSplits = numBands - 1;
+        const int perFilter = numStagesPerFilter_;
+        for (int s = 0; s < numSplits; ++s)
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                runLadders(work[ch], outputs[s].getChannel(ch) + offset, blockLen, ladderLow(s, 0), perFilter, ch);
+                runLadders(work[ch], work[ch], blockLen, ladderHigh(s, 0), perFilter, ch);
+            }
+            advanceLadders(ladderLow(s, 0), perFilter, blockLen);
+            advanceLadders(ladderHigh(s, 0), perFilter, blockLen);
+        }
+
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* dst = outputs[numBands - 1].getChannel(ch) + offset;
+            std::copy(work[ch], work[ch] + blockLen, dst);
+        }
+
+        for (int s = 1; s < numSplits; ++s)
+        {
+            for (int b = 0; b < s; ++b)
+            {
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    T* band = outputs[b].getChannel(ch) + offset;
+                    runLadders(band, band, blockLen, ladderAllpass(b, s, 0), numStagesAllpass_, ch);
+                }
+                advanceLadders(ladderAllpass(b, s, 0), numStagesAllpass_, blockLen);
             }
         }
     }
@@ -1299,6 +1470,14 @@ private:
     // Flattened data structures for cache locality
     std::vector<AllPassChain> allpassFlat_;
     std::vector<T> workBuf_;
+
+    // The same sections as normalized ladders (setStructure()): per split the
+    // low then the high branch (kMaxStagesPerFilter each), then two per
+    // phase-correction chain [band * kMaxSplits + split]. Heap, from prepare().
+    std::vector<NormalizedLadder<T, 16>> ladders_;
+    std::vector<double> ladderTmp_;   ///< One channel of a range, in double.
+    std::atomic<Structure> structure_ { Structure::DirectForm };
+    bool ladderActive_ = false;       ///< The audio thread runs the ladders.
 
     // Linear-phase state (uniformly partitioned convolution)
     std::unique_ptr<FFTReal<T>> lpFft_;        // partition transforms (2 x lpPart_); the engine gate

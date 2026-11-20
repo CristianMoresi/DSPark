@@ -26,8 +26,9 @@
  *  - prepare() / reset() / setOversampling() / setOversamplingMode() /
  *    setAntialiasing() / getState() / setState(): setup thread only.
  *  - setNumBands() / setCrossoverFrequency() / setOrder() /
- *    setCrossoverMode() and the band setters (level, pan, mute, solo, and
- *    the convenience drive and algorithm setters): safe from any thread.
+ *    setCrossoverMode() / setCrossoverStructure() and the band setters
+ *    (level, pan, mute, solo, and the convenience drive and algorithm
+ *    setters): safe from any thread.
  *  - getBandSaturation(): the returned Saturation's parameter setters are
  *    safe from any thread; its prepare(), setOversampling() and setState()
  *    are setup-thread.
@@ -152,11 +153,14 @@ public:
     void setOrder(int order) noexcept { crossover_.setOrder(order); }
     /** @brief Minimum-phase (IIR) or linear-phase crossover (any thread; see CrossoverFilter). */
     void setCrossoverMode(typename Crossover::FilterMode mode) noexcept { crossover_.setFilterMode(mode); }
+    /** @brief Direct-form or ladder sections in the minimum-phase crossover (any thread; see CrossoverFilter::setStructure()). */
+    void setCrossoverStructure(typename Crossover::Structure structure) noexcept { crossover_.setStructure(structure); }
 
     [[nodiscard]] int getNumBands() const noexcept { return crossover_.getNumBands(); }
     [[nodiscard]] T getCrossoverFrequency(int index) const noexcept { return crossover_.getCrossoverFrequency(index); }
     [[nodiscard]] int getOrder() const noexcept { return crossover_.getOrder(); }
     [[nodiscard]] typename Crossover::FilterMode getCrossoverMode() const noexcept { return crossover_.getFilterMode(); }
+    [[nodiscard]] typename Crossover::Structure getCrossoverStructure() const noexcept { return crossover_.getStructure(); }
 
     // -- Bands ---------------------------------------------------------------
 
@@ -248,6 +252,7 @@ public:
         w.write("numBands", n);
         w.write("order", crossover_.getOrder());
         w.write("xoverMode", static_cast<int32_t>(crossover_.getFilterMode()));
+        w.write("xoverStructure", static_cast<int32_t>(crossover_.getStructure()));
         char key[32];
         for (int i = 0; i < n - 1; ++i)
         {
@@ -279,6 +284,7 @@ public:
         setNumBands(n);
         setOrder(r.read("order", int32_t(24)));
         setCrossoverMode(static_cast<typename Crossover::FilterMode>(std::clamp(static_cast<int>(r.read("xoverMode", int32_t(0))), 0, 1)));
+        setCrossoverStructure(static_cast<typename Crossover::Structure>(std::clamp(static_cast<int>(r.read("xoverStructure", int32_t(0))), 0, 1)));
         char key[32];
         for (int i = 0; i < n - 1; ++i)
         {

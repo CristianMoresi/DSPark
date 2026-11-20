@@ -544,6 +544,8 @@ public:
         tail_.reset();
         postEq_.reset();
         holdNow_ = tailHold_.load(std::memory_order_relaxed) ? T(1) : T(0);
+        quietSamples_ = 1e300;
+        snapAbsorption();
         applyHoldCoeffs();
 
         const double sr = spec_.sampleRate > 0 ? spec_.sampleRate : 48000.0;
@@ -652,7 +654,14 @@ public:
         paramsDirty_.store(true, std::memory_order_release);
     }
 
-    /** @brief Dry/wet mix (0 = dry, 1 = wet). */
+    /**
+     * @brief Dry/wet mix (0 = dry, 1 = wet). The wet signal is calibrated to
+     *        the dry one's level: on pink noise at full mix it sits within
+     *        about a decibel of it at every type's preset, and within
+     *        -1 to +3.5 dB as the decay goes from 12 s down to 0.3 s and the
+     *        size changes (its energy grows with the decay; a gain from the
+     *        decay and the mean round trip takes that back).
+     */
     void setMix(T dryWet) noexcept
     {
         if (!std::isfinite(dryWet)) return;
@@ -1320,6 +1329,12 @@ protected:
     /// Wet output scale: calibrated so the steady-state level matches the
     /// previous engine's (and Full matches Eco within a fraction of a dB).
     static constexpr T kOutGain = T(0.25);
+    /// The wet signal's level at full mix against the dry one (see
+    /// updateDecayParams()): measured on pink noise, the types with a delay
+    /// network land within -1.1 and +1.0 dB of the dry level at their
+    /// presets, the spring with its own constant (its loops disperse).
+    static constexpr double kWetCalibration = 5.25;
+    static constexpr double kWetCalibrationSpring = 2.95;
 
     // FDN base delay times in ms (at size = 1); lengths are rounded to primes.
     // About 3.7 s of delay in all: the modal density (modes per Hz equals the
@@ -1632,6 +1647,7 @@ protected:
     std::array<std::array<T, kERGroups>, 2> erLP_ {};
     std::array<std::array<T, kERGroups>, 2> erShadowLP_ {};
     double meanLoopSec_ = 0.1;   ///< mean FDN round trip (s), for the early/late energy match
+    T wetLevel_ = T(1);          ///< the wet signal's level against the decay (see updateDecayParams())
     T shadowCoeff_ = T(0);
 
     // FDN
@@ -1802,6 +1818,13 @@ protected:
     // ... and their state (audio thread).
     std::array<std::array<T, kMaxLines>, 3> jotBase_ {}, bassBase_ {};
     std::array<std::array<std::array<T, kMaxLines>, kDecayBands>, 5> dqBase_ {};
+    // The designed absorption the above glide to after a change of decay,
+    // size or band while the tank holds signal (see updateDecayParams()).
+    std::array<std::array<T, kMaxLines>, 3> jotGoal_ {}, bassGoal_ {};
+    std::array<std::array<std::array<T, kMaxLines>, kDecayBands>, 5> dqGoal_ {};
+    bool absorbGlide_ = false;
+    double quietSamples_ = 1e300;    ///< samples since input last entered the tank
+    double tankEmptyAfter_ = 0.0;    ///< quiet samples after which the tank is under -120 dB
     std::array<std::array<T, kMaxLines>, kDecayBands> dqB0_ {}, dqB1_ {}, dqB2_ {}, dqA1_ {}, dqA2_ {};
     std::array<std::array<T, kMaxLines>, kDecayBands> dqZ1_ {}, dqZ2_ {};
     std::array<int, kDecayBands> dqList_ {};
@@ -1870,8 +1893,8 @@ protected:
     void snapGlides() noexcept
     {
         const T d = sourceDepth_.load(std::memory_order_relaxed);
-        earlyCur_ = earlyLevel_.load(std::memory_order_relaxed) * (d > T(0) ? T(1) - T(0.5) * d : T(1));
-        lateCur_  = lateLevel_.load(std::memory_order_relaxed) * (d > T(0) ? T(1) + T(0.5) * d : T(1));
+        earlyCur_ = earlyLevel_.load(std::memory_order_relaxed) * wetLevel_ * (d > T(0) ? T(1) - T(0.5) * d : T(1));
+        lateCur_  = lateLevel_.load(std::memory_order_relaxed) * wetLevel_ * (d > T(0) ? T(1) + T(0.5) * d : T(1));
         widthCur_ = width_.load(std::memory_order_relaxed);
         inAPCoeff_ = inAPCoeffTarget_;
         loopAPCoeff_ = loopAPCoeffTarget_;
@@ -1982,8 +2005,8 @@ protected:
     {
         cachedParams_.preDelaySamples = preDelaySamples_.load(std::memory_order_relaxed);
         cachedParams_.erToLateSamples = erToLateSamples_.load(std::memory_order_relaxed);
-        cachedParams_.earlyLevel = earlyLevel_.load(std::memory_order_relaxed);
-        cachedParams_.lateLevel  = lateLevel_.load(std::memory_order_relaxed);
+        cachedParams_.earlyLevel = earlyLevel_.load(std::memory_order_relaxed) * wetLevel_;
+        cachedParams_.lateLevel  = lateLevel_.load(std::memory_order_relaxed) * wetLevel_;
         cachedParams_.width      = width_.load(std::memory_order_relaxed);
         cachedParams_.inputWidth = inputWidth_.load(std::memory_order_relaxed);
         cachedParams_.tankLeveling  = tankLeveling_.load(std::memory_order_relaxed);
@@ -2504,7 +2527,15 @@ protected:
         // Tail hold: the absorption fades to unity and the input out.
         const T hold0 = holdNow_;
         holdNow_ = glideTo(holdNow_, tailHold_.load(std::memory_order_relaxed) ? T(1) : T(0), gc);
-        if (holdNow_ != hold0) applyHoldCoeffs();
+        const bool absorbMoved = absorbGlide_;
+        if (absorbMoved) glideAbsorption(gc);
+        if (holdNow_ != hold0 || absorbMoved) applyHoldCoeffs();
+        {
+            // Input entering the tank (for the empty-tank test of updateDecayParams()).
+            T peak = T(0);
+            for (int n = 0; n < count; ++n) peak = std::max(peak, std::max(std::abs(inL[n]), std::abs(inR[n])));
+            quietSamples_ = peak > T(1e-6) ? 0.0 : quietSamples_ + count;
+        }
         const bool holding = holdNow_ != T(0) || hold0 != T(0);
         const T in0 = T(1) - hold0, in1 = T(1) - holdNow_;
 
@@ -3017,14 +3048,91 @@ protected:
             }
         }
         meanLoopSec_ = loopSum / std::max(1, nLines_) / sr;
+        // The wet signal's energy grows with the decay over the mean round
+        // trip (tau / meanLoop, the same law the early field is matched to):
+        // this gain takes it back, so the wet signal at full mix has the
+        // dry signal's level whatever the type, decay and size.
+        wetLevel_ = static_cast<T>((spring_ ? kWetCalibrationSpring : kWetCalibration) * std::sqrt(meanLoopSec_ * 2.0 * 6.907755278982137 / std::max(0.05, decay)));
         for (int i = 0; i < kMaxLines; ++i)
         {
             const auto l = static_cast<std::size_t>(i);
-            jotBase_[0][l] = jotB0_[l]; jotBase_[1][l] = jotB1_[l]; jotBase_[2][l] = jotA1_[l];
-            bassBase_[0][l] = bassB0_[l]; bassBase_[1][l] = bassB1_[l]; bassBase_[2][l] = bassA1_[l];
+            jotGoal_[0][l] = jotB0_[l]; jotGoal_[1][l] = jotB1_[l]; jotGoal_[2][l] = jotA1_[l];
+            bassGoal_[0][l] = bassB0_[l]; bassGoal_[1][l] = bassB1_[l]; bassGoal_[2][l] = bassA1_[l];
         }
+        const auto prevList = dqList_;
+        const int prevCount = dqCount_;
         designDecayBands(decay, t60H, t60B, Kh, Kb);
+
+        // With signal in the tank the loop gains glide to the new design (a
+        // step of them is a step of every line's output: a click); an empty
+        // tank, after prepare() or once its content is under -120 dB, takes
+        // the design at once.
+        const bool empty = fresh_ || (holdNow_ == T(0) && quietSamples_ > tankEmptyAfter_);
+        double longest = std::max({ decay, t60H, t60B });
+        for (int q = 0; q < dqCount_; ++q)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+            longest = std::max(longest, decay * static_cast<double>(getDecayBand(static_cast<int>(b)).multiplier));
+            const bool known = std::find(prevList.begin(), prevList.begin() + prevCount, static_cast<int>(b))
+                               != prevList.begin() + prevCount;
+            if (!known && !empty)
+                for (int i = 0; i < kMaxLines; ++i)
+                {
+                    // A band coming in glides from a flat filter, its state cleared.
+                    const auto l = static_cast<std::size_t>(i);
+                    dqBase_[0][b][l] = T(1);
+                    for (int r = 1; r < 5; ++r) dqBase_[static_cast<std::size_t>(r)][b][l] = T(0);
+                    dqZ1_[b][l] = dqZ2_[b][l] = T(0);
+                }
+        }
+        // Content decays 60 dB per T60; the pre-delay and the ER-to-late gap
+        // (up to 0.6 s together) hold input back before the tank.
+        tankEmptyAfter_ = (2.0 * longest + 0.6) * sr;
+        if (empty) snapAbsorption();
+        else absorbGlide_ = true;
         applyHoldCoeffs();
+    }
+
+    /// The absorption at its design at once (no glide).
+    void snapAbsorption() noexcept
+    {
+        jotBase_ = jotGoal_;
+        bassBase_ = bassGoal_;
+        for (int q = 0; q < dqCount_; ++q)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+            for (int r = 0; r < 5; ++r)
+                dqBase_[static_cast<std::size_t>(r)][b] = dqGoal_[static_cast<std::size_t>(r)][b];
+        }
+        absorbGlide_ = false;
+    }
+
+    /// One chunk of the absorption glide (the ~20 ms one of every parameter);
+    /// a first-order shelf and a biquad stay stable along the way, since
+    /// their stable coefficient sets are convex.
+    void glideAbsorption(T gc) noexcept
+    {
+        bool moving = false;
+        const auto step = [&](T& cur, T goal) {
+            cur = glideTo(cur, goal, gc);
+            moving = moving || cur != goal;
+        };
+        for (int r = 0; r < 3; ++r)
+            for (int i = 0; i < kMaxLines; ++i)
+            {
+                const auto rr = static_cast<std::size_t>(r), l = static_cast<std::size_t>(i);
+                step(jotBase_[rr][l], jotGoal_[rr][l]);
+                step(bassBase_[rr][l], bassGoal_[rr][l]);
+            }
+        for (int q = 0; q < dqCount_; ++q)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+            for (int r = 0; r < 5; ++r)
+                for (int i = 0; i < kMaxLines; ++i)
+                    step(dqBase_[static_cast<std::size_t>(r)][b][static_cast<std::size_t>(i)],
+                         dqGoal_[static_cast<std::size_t>(r)][b][static_cast<std::size_t>(i)]);
+        }
+        absorbGlide_ = moving;
     }
 
     /** |H(e^jw)| of ((1 + a) + (a - 1) z^-1) / ((1 + b) + (b - 1) z^-1). */
@@ -3133,11 +3241,11 @@ protected:
                 const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(k)]);
                 const auto l = static_cast<std::size_t>(i);
                 const BiquadCoeffs& c = coeffs[static_cast<std::size_t>(k)];
-                dqBase_[0][b][l] = static_cast<T>(c.b0);
-                dqBase_[1][b][l] = static_cast<T>(c.b1);
-                dqBase_[2][b][l] = static_cast<T>(c.b2);
-                dqBase_[3][b][l] = static_cast<T>(c.a1);
-                dqBase_[4][b][l] = static_cast<T>(c.a2);
+                dqGoal_[0][b][l] = static_cast<T>(c.b0);
+                dqGoal_[1][b][l] = static_cast<T>(c.b1);
+                dqGoal_[2][b][l] = static_cast<T>(c.b2);
+                dqGoal_[3][b][l] = static_cast<T>(c.a1);
+                dqGoal_[4][b][l] = static_cast<T>(c.a2);
             }
         }
     }

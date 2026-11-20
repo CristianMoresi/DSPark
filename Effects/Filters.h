@@ -129,7 +129,6 @@ public:
      */
     void reset() noexcept
     {
-        for (auto& stage : stages_) stage.reset();
         cascade_.reset();
         for (auto& ladder : ladders_) ladder.reset();
         // A pinned drift restarts from its seed, so a reset render replays it.
@@ -591,9 +590,8 @@ public:
             cascade_.reset();
             for (int s = 0; s < kMaxStages; ++s)
             {
-                stages_[s].reset();
                 ladders_[s].reset();
-                ladders_[s].setCoeffs(stages_[s].getCoeffs());
+                ladders_[s].setCoeffs(stageCoeffs_[s]);
             }
         }
 
@@ -753,7 +751,7 @@ public:
                         // by rounding).
                         rampPos_ = kChunkSize;
                         for (int s = 0; s < ns; ++s)
-                            stages_[s].setCoeffsNow(rampTo_[s]);
+                            stageCoeffs_[s] = rampTo_[s];
                     }
                 }
                 chunkPhase_ = (chunkPhase_ + static_cast<unsigned>(seg)) & (kChunkSize - 1);
@@ -933,7 +931,7 @@ protected:
     void syncLadders() noexcept
     {
         const int n = activeStages();
-        for (int s = 0; s < n; ++s) ladders_[s].setCoeffs(stages_[s].getCoeffs());
+        for (int s = 0; s < n; ++s) ladders_[s].setCoeffs(stageCoeffs_[s]);
     }
 
     /** @brief Designs and installs the coefficients at once (static path). */
@@ -942,7 +940,7 @@ protected:
         const int n = designCoefficients(freq, Q, gainDb, rampTo_);
         for (int s = 0; s < n; ++s)
         {
-            stages_[s].setCoeffsNow(rampTo_[s]);
+            stageCoeffs_[s] = rampTo_[s];
             cascade_.setCoeffs(s, rampTo_[s]);
         }
         cascade_.setNumSections(n);
@@ -968,8 +966,7 @@ protected:
         rampSlopeDb_ = sdb;
         for (int s = 0; s < n; ++s)
         {
-            rampFrom_[s] = stages_[s].getCoeffs();
-            if (!sameTopology) stages_[s].setCoeffsNow(rampTo_[s]);
+            if (!sameTopology) stageCoeffs_[s] = rampTo_[s];
             if (sameTopology) cascade_.rampCoeffs(s, rampTo_[s], kChunkSize);
             else cascade_.setCoeffs(s, rampTo_[s]);
         }
@@ -1077,7 +1074,7 @@ protected:
     std::atomic<bool> matchedPeak_ { false };
     std::atomic<bool> matchedFilters_ { false };
 
-    std::array<Biquad<T, MaxChannels>, kMaxStages> stages_ {};   ///< The coefficients in use (their record for the ramps).
+    std::array<BiquadCoeffs, kMaxStages> stageCoeffs_ {};   ///< The coefficients in use (their record for the ramps and the ladders).
     BiquadCascade<T, kMaxStages, MaxChannels> cascade_;           ///< The sections, run in one pass.
     std::array<NormalizedLadder<T, MaxChannels>, kMaxStages> ladders_ {}; ///< The sections as ladders (setStructure()).
     std::atomic<Structure> structure_ { Structure::DirectForm };
@@ -1114,7 +1111,6 @@ protected:
     unsigned chunkPhase_ = 0;        ///< Stream position in the 16-sample refresh grid.
 
     // Per-sample coefficient ramp between chunk designs (audio thread).
-    std::array<BiquadCoeffs, kMaxStages> rampFrom_ {};
     std::array<BiquadCoeffs, kMaxStages> rampTo_ {};
     int rampPos_ = kChunkSize;       ///< Samples into the ramp; kChunkSize = settled on rampTo_.
     Shape rampShape_ = Shape::LowPass;

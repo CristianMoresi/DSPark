@@ -211,6 +211,12 @@ Start with the [plugin guide](docs/plugins.md) and the
 `DSParkLab/` is a Windows-only Win32/Direct3D 11 application for interactive
 processor testing. Its bundled Dear ImGui and miniaudio sources are confined to
 the application and are not dependencies of the DSPark framework.
+For the selected effect it draws the spectrum under the effect's response or its
+live gain curves (with what a spectral processor detects), the gain reduction
+over time, the output meters and a test tone with its THD+N, and lays the
+controls out as knobs on tabs. Space plays and pauses, B switches between the
+processed and the dry signal, E puts the selected effect in or out of the
+chain and R resets its controls.
 Build it with `DSParkLab\build.bat` (Visual Studio 2019 or later, any edition).
 
 ## Documentation

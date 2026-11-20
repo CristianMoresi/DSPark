@@ -82,7 +82,7 @@ All notable user-facing changes to DSPark are documented here.
   48), and a bell, shelf, notch or band-pass takes an order from 1 to 16
   (`BandConfig::order`: flat top and 6 dB per octave of side per order).
   Four band types are new and always run this way: `AllPass` (180 degrees
-  per order), `FlatTilt` (gain in dB per octave, a straight line across the
+  per order), `ConstantTilt` (gain in dB per octave, a straight line across the
   band), `LowPassWall` and `HighPassWall` (elliptic, order 12: within
   0.05 dB up to the corner and 100 dB down from 1.17 times it; as biquads
   they go through the bilinear transform with the corner held, which keeps
@@ -91,21 +91,21 @@ All notable user-facing changes to DSPark are documented here.
   `analog`, and `order` and `slopeDb` per band; older states load as before.
   A band type that is not one now keeps the band's own type instead of
   clamping to the last.
-- `Equalizer` bands take a place in the stereo pair
-  (`BandConfig::placement`: `Stereo`, the default, `Left`, `Right`, `Mid` or
+- `Equalizer` bands take a scope in the stereo pair
+  (`BandConfig::scope`: `Stereo`, the default, `Left`, `Right`, `Mid` or
   `Side`), in either engine and in both phase modes. The left, right and
   stereo bands run first; then the pair is turned into middle and sides
   for the bands placed there, and back. In LinearPhase the same is one
   matrix of four kernels between the two channels, built in the background
   like the single kernel, so the latency does not change and a set of bands
-  with no placement costs what it did. A band that changes place comes in
+  with no scope costs what it did. A band that changes place comes in
   through the 20 ms band fade. With one channel the left and middle bands
   act on it and the right and side bands do nothing; `processSample()` runs
   the left and right bands and leaves the middle and side ones to
   `processBlock()`, which sees both channels of a frame.
-  `getMagnitudeForFrequencyArray()` takes the place to draw (the stereo
-  bands and the ones placed there). The state carries `place` per band.
-- `Equalizer::FilterMode::NaturalPhase` (new mode): the phase of the analog
+  `getMagnitudeForFrequencyArray()` takes the scope to draw (the stereo
+  bands and the ones placed there). The state carries `scope` per band.
+- `Equalizer::FilterMode::PrototypePhase` (new mode): the phase of the analog
   curve, 32 samples late. A minimum-phase digital filter that follows the
   magnitude of an analog one does not have its phase, because the analog
   curve goes on above Nyquist and the digital one folds there. In this mode
@@ -229,13 +229,13 @@ All notable user-facing changes to DSPark are documented here.
   7.5 ips moves its pitch by 0.09 % at most.
   `setHum(dBFS, mains)` adds mains hum after the tape (50 or 60 Hz with its
   second harmonic 6 dB down, in phase on every channel).
-  `setCrosstalk(dB)` leaks each channel of a pair into the other through a
+  `setChannelBleed(dB)` leaks each channel of a pair into the other through a
   first-order high-pass at 10 kHz: -50 dB at 1 kHz is -70.0 at 100 Hz, -40.6
   at 3 kHz and -31.6 at 10 kHz.
-  `setAsymmetry(0..1)` adds an even term before the tape: a 1 kHz tone at
+  `setEvenHarmonics(0..1)` adds an even term before the tape: a 1 kHz tone at
   -12 dBFS carries its second harmonic at -40.3 and -34.3 dBc at 0.5 and 1
   (-118 without), 12 dB lower at -24 dBFS.
-  `setTransformer(0..1)` adds an output transformer as a parallel branch (a
+  `setOutputIron(0..1)` adds an output transformer as a parallel branch (a
   one-pole low-pass at 60 Hz, a curve with an even and an odd term, the
   inverse filter capped at 4 kHz): at 1, a 40 Hz tone at -6 dBFS carries
   its second harmonic at -41 dBc (-116 without) and its third at -28.7
@@ -262,11 +262,11 @@ All notable user-facing changes to DSPark are documented here.
   level: at -12 dBFS the THD is 0.16, 0.31, 0.60 and 1.14 % at 0, 3, 6 and
   9 dB (6 dB gives the 0.4 to 0.8 % tape machines are specified at their
   reference level), and the hiss falls by as much.
-  `setMonitor()` (Repro, Sync, Input): Sync reads through the record head
-  (0.66 dB lower at 16 kHz), Input is the input delayed like the tape path,
+  `setMonitor()` (PlayHead, RecordHead, Source): RecordHead reads through the record head
+  (0.66 dB lower at 16 kHz), Source is the input delayed like the tape path,
   to the bit. With everything on the machine costs 6 % more.
-  State keys `transport`, `humDb`, `mains`, `crosstalk`, `asymmetry`,
-  `transformer`, `headModel`, `electronics`, `alignHf`, `alignLf`,
+  State keys `transport`, `humDb`, `mains`, `channelBleed`, `evenHarmonics`,
+  `outputIron`, `headModel`, `electronics`, `alignHf`, `alignLf`,
   `formulation`, `trackFormat`, `calibrationLevel` and `monitor`.
 - `AlgorithmicReverb`, around the tank, all off by default; the defaults and
   every earlier control give the same output as before, to the bit (Room,
@@ -279,26 +279,26 @@ All notable user-facing changes to DSPark are documented here.
   passes 0.9995. A 1.5 s hall measures 2.71 s at 2 kHz with a bell there at
   x2 (1.48 without), 0.78 s at 8 kHz with a high shelf at 4 kHz at x0.5
   (1.47) and 2.58 s at 125 Hz with a low shelf at 250 Hz at x2 (1.63).
-  `setFreeze(true)` fades the tank's input and the early field out over
+  `setTailHold(true)` fades the tank's input and the early field out over
   20 ms while every loop's absorption and decay band fade to unity: the tail
   holds its level within 0.01 dB from one second to six and the balance of
   its 6 kHz and 500 Hz thirds of an octave within 0.8 dB.
-  `setDucking(dB)`, `setGate(threshold)`, `setGateHold()` and
+  `setDryDip(dB)`, `setGate(threshold)`, `setGateHold()` and
   `setGateRelease()` shape the wet signal from the dry one (`TailShaper`):
-  the tail ducks by the amount set while noise plays (-6.00, -11.99 and
+  the tail dips by the amount set while noise plays (-6.00, -11.99 and
   -23.98 dB at 6, 12 and 24) and comes back over a second and a half (-0.13,
   -0.27 and -0.53 dB 1.5 s after the noise stops); the gate closes once the
   dry signal has stayed under its recent peak by the threshold for the hold
   time (a 2 s hall under -70 dBFS 0.44 s after the noise stops, with -30 dB,
   50 ms and 40 ms).
-  `setDistance(0..1)` moves the balance from the early reflections to the
+  `setSourceDepth(0..1)` moves the balance from the early reflections to the
   tail, shortens the pre-delay, adds input diffusion and darkens the wet
   signal: the first 80 ms of a hall against the rest go from +0.72 to
   -3.71 dB and 8 kHz against 500 Hz from -7.5 to -22.8 dB.
-  `setThickness(0..1)` compresses the tank's input (ratio up to 4 over
+  `setTankLeveling(0..1)` compresses the tank's input (ratio up to 4 over
   -30 dBFS, a 24 dB knee, gain compensated at -18 dBFS): at 1 a quiet
   passage at -40 dBFS feeds a tail 8.7 dB louder and a loud one at -12 dBFS
-  one 2.0 dB quieter; `setThicknessSaturation(true)` adds a soft saturation
+  one 2.0 dB quieter; `setTankSaturation(true)` adds a soft saturation
   after it.
   `setTempo()`, `setPreDelayNote()` and `setGateHoldNote()` set the
   pre-delay (up to 500 ms) and the gate hold (up to 4 s) as note values,
@@ -324,18 +324,18 @@ All notable user-facing changes to DSPark are documented here.
   The bands of the decay equalizer cost 3 % each (six: 17 %), the others up to
   11 % of the tank. Processing the tank in blocks was tried and dropped on
   measurement (blocks of 64 cost 7 % more than sample by sample). State keys
-  `db0.shape` to `db5.mult`, `freeze`, `ducking`, `gate`, `gateHold`,
-  `gateRelease`, `distance`, `thickness`, `thickSat`, `tempo`, `preNote`,
+  `db0.shape` to `db5.mult`, `tailHold`, `dryDip`, `gate`, `gateHold`,
+  `gateRelease`, `sourceDepth`, `tankLeveling`, `tankSat`, `tempo`, `preNote`,
   `preFeel`, `gateNote`, `gateFeel`, `inWidth`, `widthLaw`, `modStyle`,
   `layout`, `shimmer` and the wet equalizer's bands.
-- `Reverb` (convolution): `setDucking()`, `setGate()`, `setGateHold()` and
+- `Reverb` (convolution): `setDryDip()`, `setGate()`, `setGateHold()` and
   `setGateRelease()`, the same shaping of the wet signal from the dry one.
-  State keys `ducking`, `gate`, `gateHold` and `gateRelease`.
-- `TailShaper` (new, `Core/TailShaper.h`): ducking and a relative gate for a
+  State keys `dryDip`, `gate`, `gateHold` and `gateRelease`.
+- `TailShaper` (new, `Core/TailShaper.h`): a dip under the dry signal and a relative gate for a
   wet signal, driven by the dry one. Each follower's reference is the peak
-  of its own envelope (the ducking's falls over ten seconds), so the
-  ducking and the threshold are relative to the programme's own level; the
-  ducking's gain is exp(-depth x min(1, level / reference)) with a 30 ms
+  of its own envelope (the dip's falls over ten seconds), so the
+  dip and the threshold are relative to the programme's own level; the
+  dip's gain is exp(-depth x min(1, level / reference)) with a 30 ms
   attack and a 400 ms release, the gate's gain is smoothed twice, with a
   hold.
 - `BucketBrigade` (new, `Core/BucketBrigade.h`): a bucket-brigade delay
@@ -416,7 +416,7 @@ All notable user-facing changes to DSPark are documented here.
   input late by the window; the energy that comes out before an impulse
   through a cut is more than 300 dB under the total (no pre-echo); a key
   can replace the power the design reads; one filter can serve linked
-  channels; setDelta() applies one minus the filter.
+  channels; setRemovalListen() applies one minus the filter.
 - `LaneCascade` (new, `Core/LaneCascade.h`): a long cascade of biquads on
   one channel spread over the lanes of a vector, each lane running its own
   stretch one sample behind the lane before it: the serial cascade, late by
@@ -442,8 +442,8 @@ All notable user-facing changes to DSPark are documented here.
   of the dominant component, and turned into specific loudness. A broad
   trend across the bands is compared with a reference shape (a tilt) and
   each band with the trend; soft-knee curves with a slope on each side turn
-  those deviations into corrections (`setBalance()`, `setBoost()`,
-  `setTame()`, `setRange()`, `setKnee()`, `setFrequencyRange()` with edges
+  those deviations into corrections (`setBalance()`, `setFillDips()`,
+  `setTrimPeaks()`, `setRange()`, `setKnee()`, `setFrequencyRange()` with edges
   one Bark wide, 40 Hz to 16 kHz by default), offset so the total loudness
   stays, and drive a GraphicBank. `setLevelCompensation()` converts loudness
   to decibels with each band's exponent. A key can drive it (with a fade).
@@ -457,8 +457,8 @@ All notable user-facing changes to DSPark are documented here.
   attack and a release per bin that are slower in the low end, smoothed
   across bins and applied by a SpectralFilter (no pre-echo). The window is
   about 46 ms at any rate; stereo per bin with a link (one detector and one
-  filter at full link) or mid and side with a balance; a key can drive it;
-  delta and band solo listening; an offline quality (eight times padding,
+  filter at full link) or mid and side with a side weight; a key can drive it;
+  removal and focus listening; an offline quality (eight times padding,
   sixteen frames per window). A 2 kHz line in white noise comes down 11.2 dB
   while the noise at 600 Hz moves 0.2 dB; it costs 270 ns per stereo frame.
 - `SpectralDynamicEQ` (new, `Effects/SpectralDynamicEQ.h`): four dynamic
@@ -471,16 +471,24 @@ All notable user-facing changes to DSPark are documented here.
   response, and applied as a minimum-phase filter. A loud tone at 2.5 kHz in
   a bell at 2 kHz comes down 6.5 dB while a quiet one at 1.5 kHz in the
   same bell does not move; it costs 190 ns per stereo frame.
+- `SpectralReadout` (in `Core/SpectralFilter.h`): a per-bin quantity of the
+  last frame published at 128 points, evenly in log frequency from 20 Hz to
+  20 kHz, each point keeping the largest magnitude of the bins within half a
+  point of it (a notch one bin wide still shows), for a display read from
+  any thread. `ResonanceSuppressor::getDisplayReduction()` (the reduction as
+  it is applied), `getDisplayExcess()` (what the detector found over the
+  threshold) and `getPeakReduction()`; `SpectralDynamicEQ::getDisplayGain()`
+  and `getPeakGain()`.
 - `SpectralDenoiser`: options, all off by default (the output is then the
   same as before, to the bit): `setSpectralSmoothing()` across bins,
   `setGainRelease()` per bin (slower in the low end), a sensitivity curve
-  (`setSensitivityBand()`) weighting the reduction, `setDelta()`,
+  (`setSensitivityBand()`) weighting the reduction, `setRemovalListen()`,
   `setFilterMode()` (the gains applied as a minimum-phase filter, the same
   latency, the same reduction of learned noise: -18.0 dB, as the STFT)
   with `setLink()` between channels, and `prepare(spec, 0)` choosing the
   transform size by the rate. State keys `smoothing`, `release`,
   `filterMode`, `link` and the sensitivity bands (`sens*`).
-- Delta listening (`setDelta()`, a monitoring control outside the state):
+- Removal listening (`setRemovalListen()`, a monitoring control outside the state):
   `Compressor` (the aligned input minus the compressed signal before the
   makeup gain), `DeEsser` and `DynamicEQ` (the input late by the latency
   minus the output).
@@ -622,20 +630,20 @@ All notable user-facing changes to DSPark are documented here.
   shapes it: at -40 the noise under a tone measures 45.2 dB under its peak,
   is 5e-5 half a second after the tone stops and under 1e-11 after three
   seconds.
-  `setDynamics(-1..1)` moves the level into the curve with a follower of the
+  `setLevelTracking(-1..1)` moves the level into the curve with a follower of the
   programme (10 ms up, 150 ms down, smoothed over 5 ms) and takes it back
   after the curve, in time with the wet path: at +1 a 1 kHz tone through
   SoftClip with 12 dB of drive carries its third harmonic at -32.8 dBc and
   comes out 11.40 dB up at -36, -24, -12 and -6 dBFS alike (without it,
   -69.6, -45.7, -23.5 and -15.5 dBc); at -1 the level moves twice as far
-  (-107, -59, -16.2 and -10.0 dBc). `setDynamicsFocus(hz)` has the follower
+  (-107, -59, -16.2 and -10.0 dBc). `setTrackingCorner(hz)` has the follower
   hear only the programme under a frequency.
-  `setFeedback(amount, hz)` returns the output of the curve to its input,
+  `setCombLoop(amount, hz)` returns the output of the curve to its input,
   inverted, one period of the frequency later (the latency of the
   processor included): at 0.8 and 200 Hz the gain is -5.11 dB at 200 and
   400 Hz and +13.95 dB at 300 Hz, 1/(1 + a) and 1/(1 - a); while it is on
   the block is processed in pieces no longer than the delay, and the output
-  does not depend on the host's block size. `getFeedbackFrequency()` gives
+  does not depend on the host's block size. `getCombLoopFrequency()` gives
   the frequency the latency allows.
   `setDriveCompensation(true)` measures the gain of the curve on pink noise
   at -18 dBFS through a twin of the processor (against the same noise 40 dB
@@ -646,8 +654,8 @@ All notable user-facing changes to DSPark are documented here.
   17.39 dB at 0, 12, 24 and 36 dB of drive without it, and from -1.07 to
   1.56, 2.95 and 3.31 dB with it.
   State keys `curveHardness`, `curveCurvature`, `curveAsymmetry`,
-  `asymmetry`, `programNoise`, `dynamics`, `dynamicsFocus`, `feedback`,
-  `feedbackHz` and `driveCompensation`.
+  `asymmetry`, `programNoise`, `levelTracking`, `trackingCorner`, `combLoop`,
+  `combLoopHz` and `driveCompensation`.
 - `MultibandSaturation` (new, `Effects/MultibandSaturation.h`): a
   Linkwitz-Riley crossover of 2 to 6 bands, a `Saturation` per band, and a
   level, a pan, a mute and a solo per band before the bands are summed. The
@@ -721,7 +729,7 @@ All notable user-facing changes to DSPark are documented here.
   to the audio of a compressor that never listened. It is a monitoring
   switch and is not part of the state. State keys `key<band>.shape`,
   `.freq`, `.gain`, `.q` and `.slope`.
-- `Compressor::Character::Smooth`: two layers in feed-forward. One levels,
+- `Compressor::Character::Layered`: two layers in feed-forward. One levels,
   with half the slope of the ratio from 6 dB under the threshold, eight
   times the attack (30 ms at least) and six times the release; over it, one
   on the knobs catches what rises, with the other half of the slope from
@@ -844,7 +852,7 @@ All notable user-facing changes to DSPark are documented here.
   carries a hop takes 58 to 73 us, and a moved band is designed one kernel
   per block within that. With no band acting the output is the input, late,
   to the bit. All the band fields work in the mode (gain at rest, knee,
-  placement, program timing, relative threshold); oversampling is not used
+  scope, program timing, relative threshold); oversampling is not used
   with it. The state carries `linear` and `linearTaps`.
 - `FirBank<T>` (new, `Core/FirBank.h`): many long FIR kernels over shared
   input lines, by one uniformly partitioned convolution in the frequency
@@ -860,7 +868,7 @@ All notable user-facing changes to DSPark are documented here.
   rests at (the dynamic part moves from there); `knee`, a soft knee around
   the threshold in dB, or `kAutomaticKnee` for one that grows with the
   width of the band and with the root of its range (7.2 dB for a bell of
-  Q 1 and 12 dB of range); `placement` (`Stereo`, `Left`, `Right`, `Mid`,
+  Q 1 and 12 dB of range); `scope` (`Stereo`, `Left`, `Right`, `Mid`,
   `Side`): where the band acts and what part of the sidechain it listens
   to; `timing = Program`: the band listens through a filter 1.5 times
   narrower and three followers of the level replace the attack and release

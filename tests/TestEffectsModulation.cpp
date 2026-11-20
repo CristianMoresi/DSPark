@@ -16,12 +16,15 @@
 #include "../Effects/DeEsser.h"
 #include "../Effects/NoiseGenerator.h"
 #include "../Core/BucketBrigade.h"
+#include "../Core/FFT.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -2170,6 +2173,186 @@ DSPARK_TEST(Chorus_analog_hiss_and_modes)
     EXPECT_TRUE(c.getModel() == Chorus<float>::Model::Digital);
 }
 
+namespace {
+
+// The analog model on a stereo copy of `in`, with depth and centre set and a
+// hook before each block.
+std::pair<std::vector<float>, std::vector<float>> l12AnalogRun(double fs, const std::vector<float>& in, float depthMs,
+                                                               float centreMs, int block,
+                                                               const std::function<void(Chorus<float>&, size_t)>& before = {})
+{
+    auto c = std::make_unique<Chorus<float>>();
+    c->setModel(Chorus<float>::Model::Analog);
+    c->setAnalogMode(Chorus<float>::AnalogMode::Slow);
+    c->setAnalogNoise(-200.0f);
+    c->setMix(1.0f);
+    c->setDepthMs(depthMs);
+    c->setCenterDelay(centreMs);
+    c->prepare(spec(fs, block, 2));
+    std::vector<float> l = in, r = in;
+    for (size_t off = 0; off < l.size(); off += static_cast<size_t>(block))
+    {
+        if (before) before(*c, off);
+        const int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(block), l.size() - off));
+        float* p[2] = { l.data() + off, r.data() + off };
+        c->processBlock(AudioBufferView<float>(p, 2, n));
+    }
+    return { l, r };
+}
+
+// The strongest line of a Blackman-Harris spectrum of 32768 samples from
+// `from`, between 100 Hz and 20 kHz and away from `hz` (+-80 Hz), against
+// the line at `hz`, in dB.
+double l12WorstLineDbc(const std::vector<float>& v, size_t from, double fs, double hz)
+{
+    const size_t n = 32768;
+    std::vector<double> frame(n), spec(n + 2);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double a = 2.0 * 3.14159265358979323846 * static_cast<double>(i) / static_cast<double>(n);
+        frame[i] = (0.35875 - 0.48829 * std::cos(a) + 0.14128 * std::cos(2.0 * a) - 0.01168 * std::cos(3.0 * a))
+                 * static_cast<double>(v[from + i]);
+    }
+    FFTReal<double> fft(n);
+    fft.forward(frame.data(), spec.data());
+    const double binHz = fs / static_cast<double>(n);
+    const auto mag = [&](size_t k) { return std::hypot(spec[2 * k], spec[2 * k + 1]); };
+    double tone = 0.0, worst = 0.0;
+    for (size_t k = 1; k <= n / 2; ++k)
+    {
+        const double f = static_cast<double>(k) * binHz;
+        if (std::abs(f - hz) <= 80.0) tone = std::max(tone, mag(k));
+        else if (f >= 100.0 && f <= std::min(20000.0, 0.45 * fs)) worst = std::max(worst, mag(k));
+    }
+    return 20.0 * std::log10(std::max(worst, 1e-300) / std::max(tone, 1e-300));
+}
+
+} // namespace
+
+// New: the two taps of the analog model move against each other: the right
+// one is the left one inverted, as with a triangle and an inverter, so the two
+// delays always add up to twice the centre (before, the right tap was the
+// asymmetric triangle half a cycle on, and twice a cycle both rose together:
+// the sum swung by some 17 samples). Read on clicks 20 ms apart: the energy
+// centroids of each click through the two lines.
+DSPARK_TEST(Chorus_analog_taps_add_up_to_twice_the_centre)
+{
+    for (const auto mode : { Chorus<float>::AnalogMode::Slow, Chorus<float>::AnalogMode::Fast })
+    {
+        const size_t period = 960, n = 48000 * 4;
+        std::vector<float> clicks(n, 0.0f);
+        for (size_t i = 0; i < n; i += period) clicks[i] = 0.5f;
+        const auto out = l12Chorus(48000.0, clicks, mode, -200.0f);
+        std::vector<double> sums;
+        for (size_t k = 48000 / period; (k + 1) * period <= n; ++k)
+        {
+            double c[2] = { 0.0, 0.0 }, e[2] = { 0.0, 0.0 };
+            for (size_t i = 0; i < period; ++i)
+            {
+                const double a = out.first[k * period + i], b = out.second[k * period + i];
+                c[0] += a * a * static_cast<double>(i); e[0] += a * a;
+                c[1] += b * b * static_cast<double>(i); e[1] += b * b;
+            }
+            sums.push_back(c[0] / e[0] + c[1] / e[1]);
+        }
+        double mean = 0.0;
+        for (double s : sums) mean += s;
+        mean /= static_cast<double>(sums.size());
+        double var = 0.0;
+        for (double s : sums) var += (s - mean) * (s - mean);
+        const double sd = std::sqrt(var / static_cast<double>(sums.size()));
+        std::cout << "  [analog taps] mode " << static_cast<int>(mode) << " spread of the sum " << sd << " samples\n";
+        EXPECT_LT(sd, 0.5);
+    }
+}
+
+// New: the analog lines run with their high precision (the input read by a
+// quintic, the held output through a quadratic B-spline) and below 88.2 kHz
+// at twice the rate, so the images of their clock (which in the device lie
+// above the band and are filtered there) no longer fold into the band. At
+// the longest delay of the Slow mode (6.6 ms: a 38.8 kHz clock) and no depth,
+// a tone leaves no other line within 85 dB of it at 44.1, 48 and 96 kHz
+// (before: 35 to 81 dB).
+DSPARK_TEST(Chorus_analog_clock_images_stay_out_of_the_band)
+{
+    for (const double fs : { 44100.0, 48000.0, 96000.0 })
+        for (const double hz : { 1000.0, 3000.0, 5000.0 })
+        {
+            std::vector<float> in(static_cast<size_t>(1.5 * fs));
+            for (size_t i = 0; i < in.size(); ++i)
+                in[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / fs));
+            const auto out = l12AnalogRun(fs, in, 0.0f, 6.6f, 256);
+            const double worst = l12WorstLineDbc(out.first, static_cast<size_t>(0.5 * fs), fs, hz);
+            std::cout << "  [analog images] " << fs << " Hz, tone " << hz << ": worst line " << worst << " dBc\n";
+            EXPECT_LT(worst, -85.0);
+        }
+}
+
+// New: the analog model glides. The centre, set once per block, is ramped
+// across the block and then glides (50 ms), so automating it no longer
+// steps the clock at the block rate (lines at the tone +- fs / 512 when it
+// is swept over a second in blocks of 512); a change of mode glides the
+// taps' offset, centre and depth instead of jumping (the largest second
+// difference of the output after Slow -> Vibrato stays within a few times
+// that of the steady sweep). At 192 kHz the half-rate engine's output keeps
+// one sample's delay throughout: the image of a 5 kHz tone at 91 kHz is the
+// linear interpolation's (about -43 dB), where it was -16 dB.
+DSPARK_TEST(Chorus_analog_glides_and_keeps_its_time)
+{
+    const double fs = 48000.0;
+    std::vector<float> in(static_cast<size_t>(2.0 * fs));
+    for (size_t i = 0; i < in.size(); ++i)
+        in[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / fs));
+    const auto swept = l12AnalogRun(fs, in, 0.0f, 5.0f, 512, [&](Chorus<float>& c, size_t off) {
+        const double t = std::clamp(static_cast<double>(off) / fs - 0.5, 0.0, 1.0);
+        c.setCenterDelay(static_cast<float>(5.0 + 2.0 * t));
+    });
+    const size_t from = static_cast<size_t>(0.75 * fs), len = static_cast<size_t>(0.5 * fs);
+    const double f0 = 1000.0 * (1.0 - 0.002);   // the sweep lengthens the delay by 2 ms a second
+    const double tone = l12Line(swept.first, f0, fs, from, len);
+    const double side = std::max(l12Line(swept.first, f0 + fs / 512.0, fs, from, len),
+                                 l12Line(swept.first, f0 - fs / 512.0, fs, from, len)) - tone;
+    std::cout << "  [analog sweep] lines at the block rate " << side << " dBc\n";
+    EXPECT_LT(side, -70.0);
+
+    std::vector<float> a440(static_cast<size_t>(3.0 * fs));
+    for (size_t i = 0; i < a440.size(); ++i)
+        a440[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * static_cast<double>(i) / fs));
+    const size_t at = static_cast<size_t>(1.5 * fs) / 256 * 256;
+    auto c = std::make_unique<Chorus<float>>();
+    c->setModel(Chorus<float>::Model::Analog);
+    c->setAnalogMode(Chorus<float>::AnalogMode::Slow);
+    c->setAnalogNoise(-200.0f);
+    c->setMix(1.0f);
+    c->prepare(spec(fs, 256, 2));
+    std::vector<float> l = a440, r = a440;
+    for (size_t off = 0; off < l.size(); off += 256)
+    {
+        if (off == at) c->setAnalogMode(Chorus<float>::AnalogMode::Vibrato);
+        float* p[2] = { l.data() + off, r.data() + off };
+        c->processBlock(AudioBufferView<float>(p, 2, static_cast<int>(std::min<size_t>(256, l.size() - off))));
+    }
+    double steady = 0.0, around = 0.0;
+    for (size_t i = 2; i < r.size(); ++i)
+    {
+        const double d2 = std::abs(static_cast<double>(r[i]) - 2.0 * r[i - 1] + r[i - 2]);
+        if (i > static_cast<size_t>(0.5 * fs) && i + 512 < at) steady = std::max(steady, d2);
+        if (i >= at && i < at + static_cast<size_t>(0.3 * fs)) around = std::max(around, d2);
+    }
+    std::cout << "  [analog mode switch] second difference x" << around / steady << " of the steady sweep\n";
+    EXPECT_LT(around, 3.0 * steady);
+
+    const double hi = 192000.0;
+    std::vector<float> t5(static_cast<size_t>(hi));
+    for (size_t i = 0; i < t5.size(); ++i)
+        t5[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * 5000.0 * static_cast<double>(i) / hi));
+    const auto half = l12AnalogRun(hi, t5, 0.0f, 5.0f, 256);
+    const size_t hFrom = static_cast<size_t>(0.5 * hi), hLen = static_cast<size_t>(0.5 * hi);
+    const double image = l12Line(half.first, 91000.0, hi, hFrom, hLen) - l12Line(half.first, 5000.0, hi, hFrom, hLen);
+    std::cout << "  [analog 192 kHz] image at 91 kHz " << image << " dBc\n";
+    EXPECT_LT(image, -40.0);
+}
+
 // New: linear reads (setInterpolation(Linear)). Half way between samples a
 // linear read is the mean of its neighbours, cos(w / 2): -5.1 dB at 15 kHz at
 // 48 kHz, where the cubic read loses 2.5 dB; a low tone passes alike.
@@ -2229,6 +2412,63 @@ DSPARK_TEST(BucketBrigade_delays_by_its_stages_over_its_clock)
     for (size_t i = 0; i < tone.size(); ++i) tone[i] = static_cast<float>(0.3 * std::sin(2.0 * 3.14159265358979323846 * 400.0 * static_cast<double>(i) / 48000.0));
     for (size_t i = 0; i < tone.size(); ++i) y[i] = b.processSample(tone[i], 0.010);
     EXPECT_NEAR(l12Line(y, 400.0, 48000.0, 24000, 24000), 20.0 * std::log10(0.3), 1.0);
+}
+
+// New: a line can run at twice the host's rate (prepare(..., 2)): it delays
+// by the same N / (2 f_clk) and passes a tone at its level. Two lines on the
+// same input and corner can share the input low-pass (processPair()): each
+// gives, to the bit, what it gives alone, at either rate.
+DSPARK_TEST(BucketBrigade_runs_at_twice_the_rate_and_in_pairs)
+{
+    BucketBrigade<float> b;
+    b.prepare(48000.0, 1024, 6000.0, 2);
+    EXPECT_EQ(b.getFactor(), 2);
+    std::vector<float> out(4800);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = b.processSample(i == 0 ? 1.0f : 0.0f, 0.040);
+    size_t peak = 0;
+    for (size_t i = 0; i < out.size(); ++i) if (std::abs(out[i]) > std::abs(out[peak])) peak = i;
+    EXPECT_NEAR(static_cast<double>(peak), 0.040 * 48000.0, 0.002 * 48000.0);
+    b.reset();
+    std::vector<float> tone(48000), y(48000);
+    for (size_t i = 0; i < tone.size(); ++i) tone[i] = static_cast<float>(0.3 * std::sin(2.0 * 3.14159265358979323846 * 400.0 * static_cast<double>(i) / 48000.0));
+    for (size_t i = 0; i < tone.size(); ++i) y[i] = b.processSample(tone[i], 0.010);
+    EXPECT_NEAR(l12Line(y, 400.0, 48000.0, 24000, 24000), 20.0 * std::log10(0.3), 1.0);
+    BucketBrigade<float> odd;
+    odd.prepare(48000.0, 512, 6000.0, 3);
+    EXPECT_EQ(odd.getFactor(), 1);
+    odd.setPrecision(static_cast<BucketBrigade<float>::Precision>(7));
+    EXPECT_TRUE(odd.getPrecision() == BucketBrigade<float>::Precision::Standard);
+
+    // High precision delays by the same amount (three steps more)
+    // and passes a tone at its level.
+    BucketBrigade<float> high;
+    high.setPrecision(BucketBrigade<float>::Precision::High);
+    high.prepare(48000.0, 1024, 6000.0, 2);
+    std::vector<float> hOut(4800);
+    for (size_t i = 0; i < hOut.size(); ++i) hOut[i] = high.processSample(i == 0 ? 1.0f : 0.0f, 0.040);
+    size_t hPeak = 0;
+    for (size_t i = 0; i < hOut.size(); ++i) if (std::abs(hOut[i]) > std::abs(hOut[hPeak])) hPeak = i;
+    EXPECT_NEAR(static_cast<double>(hPeak), 0.040 * 48000.0, 0.002 * 48000.0);
+    high.reset();
+    for (size_t i = 0; i < tone.size(); ++i) y[i] = high.processSample(tone[i], 0.010);
+    EXPECT_NEAR(l12Line(y, 400.0, 48000.0, 24000, 24000), 20.0 * std::log10(0.3), 1.0);
+
+    for (const int factor : { 1, 2 })
+    {
+        BucketBrigade<float> a, twin, alone, aloneTwin;
+        for (auto* line : { &a, &twin, &alone, &aloneTwin }) line->prepare(48000.0, 512, 7000.0, factor);
+        double worst = 0.0;
+        for (int i = 0; i < 24000; ++i)
+        {
+            const float x = static_cast<float>(0.3 * std::sin(0.05 * i) + 0.1 * std::sin(0.71 * i));
+            const double da = 0.005 + 0.0016 * std::sin(2.0 * 3.14159265358979323846 * 0.5 * i / 48000.0), db = 0.01 - da;
+            double ya = 0.0, yb = 0.0;
+            a.processPair(twin, x, da, db, ya, yb);
+            worst = std::max({ worst, std::abs(ya - static_cast<double>(alone.processSample(x, da))),
+                               std::abs(yb - static_cast<double>(aloneTwin.processSample(x, db))) });
+        }
+        EXPECT_EQ(worst, 0.0);
+    }
 }
 
 namespace {

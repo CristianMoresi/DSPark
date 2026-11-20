@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -16,16 +17,20 @@ namespace {
 struct Residual {
     double peak = 0.0;
     double sumSquares = 0.0;
+    double wetSquares = 0.0;
     std::uint64_t count = 0;
     bool finite = true;
-    void add(double first, double second) {
+    void add(double first, double second, double wet) {
         finite = finite && std::isfinite(first) && std::isfinite(second);
         const double error = first - second;
         peak = std::max(peak, std::abs(error));
         sumSquares += error * error;
+        wetSquares += wet * wet;
         ++count;
     }
     double rms() const { return std::sqrt(sumSquares / static_cast<double>(count)); }
+    // RMS of the wet part of the reference output (the output less its dry share).
+    double wetRms() const { return std::sqrt(wetSquares / static_cast<double>(count)); }
 };
 
 template<class T>
@@ -45,7 +50,7 @@ Residual sensitivity(int rate, int type, int quality, bool endpoints = false) {
         if (endpoints) room->setModulation(T(1));
         room->prepare({ static_cast<double>(rate), block, 2 });
     }
-    std::array<std::array<T, block>, 4> data{};
+    std::array<std::array<T, block>, 6> data{};
     std::array<T*, 2> first{ data[0].data(), data[1].data() };
     std::array<T*, 2> second{ data[2].data(), data[3].data() };
     std::uint32_t seed = 0x2641825u;
@@ -61,14 +66,18 @@ Residual sensitivity(int rate, int type, int quality, bool endpoints = false) {
             const int code = static_cast<int>(seed & 65535u) - 32768;
             const T value = at + i < 3 * rate ? T(code) / T(131072) : T(0);
             first[c][i] = value;
+            data[static_cast<std::size_t>(4 + c)][static_cast<std::size_t>(i)] = value;
             const auto ordinal = static_cast<std::uint64_t>(at + i) * 2u + static_cast<unsigned>(c);
             second[c][i] = ordinal % 997u == 123u && value != T(0)
                 ? std::nextafter(value, T(1)) : value;
         }
         reference.processBlock({ first.data(), 2, count });
         perturbed.processBlock({ second.data(), 2, count });
+        // The mix is linear: the wet part is the output less (1 - mix) of the input.
         for (int i = 0; i < count; ++i) for (int c = 0; c < 2; ++c)
-            residual.add(static_cast<double>(first[c][i]), static_cast<double>(second[c][i]));
+            residual.add(static_cast<double>(first[c][i]), static_cast<double>(second[c][i]),
+                         static_cast<double>(first[c][i]) - (1.0 - static_cast<double>(T(0.145f)))
+                             * static_cast<double>(data[static_cast<std::size_t>(4 + c)][static_cast<std::size_t>(i)]));
     }
     return residual;
 }
@@ -83,12 +92,20 @@ DSPARK_TEST(AlgoReverb_float_small_input_perturbation_stays_small) {
     }
 }
 
+// In double the residual is the roundoff of the wet path, so it scales with
+// the wet signal: the bounds are relative to its RMS. They were 1e-12 peak and
+// 1e-13 RMS while the wet part of this output sat at an RMS of 3.47e-3 at most
+// (before the wet signal was calibrated to the dry one's level); divided by
+// that and rounded down they are as strict as before. Measured against the wet
+// part, the residual is the same before and after the calibration (RMS
+// 6.1e-13 and 6.4e-13 of it at 44.1 kHz, 5.6e-12 and 5.7e-12 at 192 kHz).
 DSPARK_TEST(AlgoReverb_double_small_input_perturbation_stays_small) {
     for (int rate : { 44100, 48000, 96000, 192000 }) {
         const auto result = sensitivity<double>(rate, 0, 0);
         EXPECT_TRUE(result.finite);
-        EXPECT_LT(result.peak, 1e-12);
-        EXPECT_LT(result.rms(), 1e-13);
+        EXPECT_TRUE(result.wetRms() > 5e-3);
+        EXPECT_LT(result.peak, 2.5e-10 * result.wetRms());
+        EXPECT_LT(result.rms(), 2.5e-11 * result.wetRms());
     }
 }
 

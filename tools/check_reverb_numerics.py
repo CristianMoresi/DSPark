@@ -36,11 +36,23 @@ def residual(first, second):
             math.sqrt(math.fsum(x * x for x in differences) / len(differences)))
 
 
-def acceptable(kind, peak, rms):
+# Bounds relative to the RMS of the fixture's output: roundoff scales with the
+# signal it rounds. They were absolute (float 1e-6 peak and 1e-7 RMS, double
+# 1e-12 and 1e-13) while this output sat at an RMS of 0.0193 at most; divided
+# by that level and rounded down they are as strict as before relative to the
+# signal, whatever level the reverb's wet signal is calibrated to.
+RELATIVE_BOUNDS = {"float": (5e-5, 5e-6), "double": (5e-11, 5e-12)}
+
+
+def acceptable(kind, peak, rms, level):
     # Frozen bounds, comfortably rejecting the original ~-92 dBFS float error.
     # Double builds retain ordinary libm roundoff rather than requiring hashes.
-    return (peak <= 1e-6 and rms <= 1e-7) if kind == "float" else (
-        peak <= 1e-12 and rms <= 1e-13)
+    peak_bound, rms_bound = RELATIVE_BOUNDS[kind]
+    return peak <= peak_bound * level and rms <= rms_bound * level
+
+
+def level_of(values):
+    return math.sqrt(math.fsum(float(x) * float(x) for x in values) / len(values))
 
 
 def db(value):
@@ -64,13 +76,17 @@ def compare(directories):
             outputs.append(output)
         if any(source != sources[0] for source in sources[1:]):
             raise ValueError(f"{name}: input bytes differ")
+        level = level_of(outputs[0])
+        if not level > 0:
+            raise ValueError(f"{name}: silent output")
         for a, b in itertools.combinations(range(len(directories)), 2):
             peak, rms = residual(outputs[a], outputs[b])
-            success = acceptable(kind, peak, rms)
+            success = acceptable(kind, peak, rms, level)
             passed &= success
             print(f"{'PASS' if success else 'FAIL'} {name} "
                   f"{directories[a].name}/{directories[b].name}: "
-                  f"peak={db(peak)} dBFS rms={db(rms)} dBFS")
+                  f"peak={db(peak)} dBFS rms={db(rms)} dBFS "
+                  f"(output rms {db(level)} dBFS)")
     return passed
 
 
@@ -82,10 +98,14 @@ def main():
     if args.self_test:
         # A narrow peak and a distributed sub-peak error must each fail their
         # own criterion; zero residual is accepted in both sample formats.
-        for kind, limit in (("float", 1e-6), ("double", 1e-12)):
-            if not acceptable(kind, 0, 0): return 1
-            if acceptable(kind, 2 * limit, 0): return 1
-            if acceptable(kind, 0.5 * limit, 0.2 * limit): return 1
+        # The bounds follow the output level: twice the level doubles them.
+        for kind in ("float", "double"):
+            limit = RELATIVE_BOUNDS[kind][0]
+            for level in (1.0, 0.25):
+                if not acceptable(kind, 0, 0, level): return 1
+                if acceptable(kind, 2 * limit * level, 0, level): return 1
+                if acceptable(kind, 0.5 * limit * level, 0.2 * limit * level, level): return 1
+            if not acceptable(kind, 1.5 * limit, 0, 2.0): return 1
         print("PASS reverb residual threshold controls")
         return 0
     if len(args.directories) < 2:

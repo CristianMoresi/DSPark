@@ -3819,11 +3819,11 @@ DSPARK_TEST(TapeMachine_hiss_is_read_off_the_tape_and_hum_comes_after)
 
 // New: crosstalk leaks each channel of a pair into the other at the level set
 // at 1 kHz, rising 6 dB per octave up to 10 kHz; off, nothing leaks.
-DSPARK_TEST(TapeMachine_crosstalk_rises_with_frequency)
+DSPARK_TEST(TapeMachine_channel_bleed_rises_with_frequency)
 {
     const std::vector<float> silence(72000, 0.0f);
     const auto leak = [&](double hz, bool on) {
-        const auto out = l10Run([=](Tape10& t) { if (on) t.setCrosstalk(-50.0f); }, l10Tone(hz, 0.25, 72000), silence);
+        const auto out = l10Run([=](Tape10& t) { if (on) t.setChannelBleed(-50.0f); }, l10Tone(hz, 0.25, 72000), silence);
         return l10Line(out.second, hz) - l10Line(out.first, hz);
     };
     EXPECT_NEAR(leak(1000.0, true), -50.0, 1.0);
@@ -3839,7 +3839,7 @@ DSPARK_TEST(TapeMachine_asymmetry_and_transformer_add_their_harmonics)
 {
     const auto tone = l10Tone(1000.0, 0.25, 72000);
     const auto h2 = [&](float a) {
-        const auto out = l10Run([=](Tape10& t) { t.setAsymmetry(a); }, tone, tone).first;
+        const auto out = l10Run([=](Tape10& t) { t.setEvenHarmonics(a); }, tone, tone).first;
         return l10Line(out, 2000.0) - l10Line(out, 1000.0);
     };
     const double none = h2(0.0f), half = h2(0.5f), full = h2(1.0f);
@@ -3852,25 +3852,25 @@ DSPARK_TEST(TapeMachine_asymmetry_and_transformer_add_their_harmonics)
     // as they were.
     const auto h2Of = [&](double hz, float a) {
         const auto in = l10Tone(hz, 0.5, 96000);
-        const auto out = l10Run([=](Tape10& t) { t.setTransformer(a); }, in, in).first;
+        const auto out = l10Run([=](Tape10& t) { t.setOutputIron(a); }, in, in).first;
         return l10Line(out, 2.0 * hz) - l10Line(out, hz);
     };
     EXPECT_GT(h2Of(40.0, 1.0f), h2Of(40.0, 0.0f) + 40.0);
     EXPECT_GT(h2Of(40.0, 1.0f), h2Of(1000.0, 1.0f) + 15.0);
     const auto mid = l10Tone(1000.0, 0.5, 72000);
     const auto plainMid = l10Run([](Tape10&) {}, mid, mid).first;
-    const auto bentMid = l10Run([](Tape10& t) { t.setTransformer(1.0f); }, mid, mid).first;
+    const auto bentMid = l10Run([](Tape10& t) { t.setOutputIron(1.0f); }, mid, mid).first;
     EXPECT_NEAR(l10Line(bentMid, 1000.0), l10Line(plainMid, 1000.0), 0.1);
     EXPECT_NEAR(l10Line(bentMid, 3000.0), l10Line(plainMid, 3000.0), 0.5);
 
     auto a = std::make_unique<Tape10>(), b = std::make_unique<Tape10>();
-    a->setTransformer(1.0f);
+    a->setOutputIron(1.0f);
     a->prepare(spec(48000.0, 512, 2));
     b->prepare(spec(48000.0, 512, 2));
     std::vector<float> la = l10Tone(60.0, 0.4, 96000), ra = la, lb = la, rb = la;
     for (size_t off = 0; off < la.size(); off += 512)
     {
-        if (off == 512 * 40) a->setTransformer(0.0f);
+        if (off == 512 * 40) a->setOutputIron(0.0f);
         float* pa[2] = { la.data() + off, ra.data() + off };
         float* pb[2] = { lb.data() + off, rb.data() + off };
         a->processBlock(AudioBufferView<float>(pa, 2, static_cast<int>(std::min<size_t>(512, la.size() - off))));
@@ -3930,7 +3930,7 @@ DSPARK_TEST(TapeMachine_calibration_formulation_and_monitor)
     uint32_t seed = 5u;
     for (auto& x : prog) { seed = seed * 1664525u + 1013904223u; x = 0.2f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
     auto input = std::make_unique<Tape10>();
-    input->setMonitor(Tape10::Monitor::Input);
+    input->setMonitor(Tape10::Monitor::Source);
     input->prepare(spec(48000.0, 512, 2));
     const auto monitored = l10Render(*input, prog, prog).first;
     const size_t lat = static_cast<size_t>(input->getLatency());
@@ -3942,7 +3942,7 @@ DSPARK_TEST(TapeMachine_calibration_formulation_and_monitor)
         const auto in = l10Tone(15000.0, 0.0316, 36000);
         return l10Line(l10Run(setup, in, in).first, 15000.0);
     };
-    EXPECT_LT(top([](Tape10& t) { t.setMonitor(Tape10::Monitor::Sync); }), top([](Tape10&) {}) - 0.3);
+    EXPECT_LT(top([](Tape10& t) { t.setMonitor(Tape10::Monitor::RecordHead); }), top([](Tape10&) {}) - 0.3);
 }
 
 // New: the controls of the machine around the tape clamp what is out of range
@@ -3952,9 +3952,9 @@ DSPARK_TEST(TapeMachine_machine_controls_clamp_and_ignore_invalid_values)
     Tape10 t;
     const float nan = std::numeric_limits<float>::quiet_NaN();
     t.setHum(nan);
-    t.setCrosstalk(std::numeric_limits<float>::infinity());
-    t.setAsymmetry(nan);
-    t.setTransformer(-1.0f);
+    t.setChannelBleed(std::numeric_limits<float>::infinity());
+    t.setEvenHarmonics(nan);
+    t.setOutputIron(-1.0f);
     t.setAlignment(nan, 2.0f);
     t.setCalibrationLevel(20.0f);
     t.setTransport(static_cast<Tape10::Transport>(7));
@@ -3964,14 +3964,14 @@ DSPARK_TEST(TapeMachine_machine_controls_clamp_and_ignore_invalid_values)
     t.setHeadModel(static_cast<Tape10::HeadModel>(4));
     t.setElectronics(static_cast<Tape10::Electronics>(-1));
     EXPECT_EQ(t.getHum(), -200.0f);
-    EXPECT_EQ(t.getCrosstalk(), -200.0f);
-    EXPECT_EQ(t.getAsymmetry(), 0.0f);
-    EXPECT_EQ(t.getTransformer(), 0.0f);
+    EXPECT_EQ(t.getChannelBleed(), -200.0f);
+    EXPECT_EQ(t.getEvenHarmonics(), 0.0f);
+    EXPECT_EQ(t.getOutputIron(), 0.0f);
     EXPECT_EQ(t.getAlignmentHf(), 0.0f);
     EXPECT_EQ(t.getAlignmentLf(), 0.0f);
     EXPECT_EQ(t.getCalibrationLevel(), 9.0f);
     EXPECT_TRUE(t.getTransport() == Tape10::Transport::Speed);
-    EXPECT_TRUE(t.getMonitor() == Tape10::Monitor::Repro);
+    EXPECT_TRUE(t.getMonitor() == Tape10::Monitor::PlayHead);
     EXPECT_TRUE(t.getFormulation() == Tape10::Formulation::Vintage);
     EXPECT_TRUE(t.getTrackFormat() == Tape10::TrackFormat::Quarter);
     EXPECT_TRUE(t.getHeadModel() == Tape10::HeadModel::Contour);
@@ -4490,7 +4490,7 @@ DSPARK_TEST(Equalizer_analog_bands_of_any_order_and_the_new_types)
         EXPECT_LT(eqWorstAgainst(FilterDesign::bandPass(3000.0, 2.0, 3), eqBand(Type::BandPass, 3000.0, 0.0, 2.0, 12.0, 3), analog, bell), 0.7);
         EXPECT_LT(eqWorstAgainst(FilterDesign::bandStop(3000.0, 2.0, 2), eqBand(Type::Notch, 3000.0, 0.0, 2.0, 12.0, 2), analog,
                                  { 300, 1000, 2000, 2400, 3700, 5000, 10000, 18000 }), 0.1);
-        EXPECT_LT(eqWorstAgainst(FilterDesign::tilt(1000.0, 3.0), eqBand(Type::FlatTilt, 1000.0, 3.0, 0.7071), analog,
+        EXPECT_LT(eqWorstAgainst(FilterDesign::tilt(1000.0, 3.0), eqBand(Type::ConstantTilt, 1000.0, 3.0, 0.7071), analog,
                                  { 30, 100, 250, 1000, 4000, 10000, 16000, 19000 }), 0.1);
         EXPECT_LT(eqWorstAgainst(FilterDesign::ellipticHighCut(8000.0), eqBand(Type::LowPassWall, 8000.0, 0.0, 0.7071), analog,
                                  { 100, 1000, 4000, 6000, 7000, 7600, 7900, 8000 }), 0.06);    // inside its ripple of 0.05 dB
@@ -4610,7 +4610,7 @@ DSPARK_TEST(Equalizer_analog_band_at_zero_gain_leaves_the_path)
     eq.setAnalogResponse(true);
     eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 2.0));
     eq.setBand(1, eqBand(Type::HighShelf, 6000.0, 0.01, 0.7071));
-    eq.setBand(2, eqBand(Type::FlatTilt, 1000.0, 0.0, 0.7071));
+    eq.setBand(2, eqBand(Type::ConstantTilt, 1000.0, 0.0, 0.7071));
     eq.prepare({ fs, 256, 1 });
     uint32_t seed = 77u;
     const auto noise = [&]() { seed = seed * 1664525u + 1013904223u; return (static_cast<double>(seed >> 8) / 8388608.0 - 1.0) * 0.4; };
@@ -4742,9 +4742,9 @@ double eqWorstDiff(const std::vector<double>& a, const std::vector<double>& b)
     return worst;
 }
 
-AnalogEq::BandConfig eqPlaced(AnalogEq::BandConfig cfg, AnalogEq::Placement where)
+AnalogEq::BandConfig eqPlaced(AnalogEq::BandConfig cfg, AnalogEq::Scope where)
 {
-    cfg.placement = where;
+    cfg.scope = where;
     return cfg;
 }
 
@@ -4753,10 +4753,10 @@ AnalogEq::BandConfig eqPlaced(AnalogEq::BandConfig cfg, AnalogEq::Placement wher
 // A band placed on the left, the right, the middle or the sides acts there and
 // nowhere else, in both engines: the same samples as running the band on that
 // signal alone.
-DSPARK_TEST(Equalizer_band_placement_acts_where_it_is_placed)
+DSPARK_TEST(Equalizer_band_scope_acts_where_it_is_set)
 {
     using Type = AnalogEq::BandType;
-    using Place = AnalogEq::Placement;
+    using Place = AnalogEq::Scope;
     const AnalogEq::BandConfig bell = eqBand(Type::Peak, 1000.0, 12.0, 1.5);
     const AnalogEq::BandConfig shelf = eqBand(Type::HighShelf, 5000.0, -9.0, 0.7071);
     for (const bool analog : { false, true })
@@ -4860,10 +4860,10 @@ DSPARK_TEST(Equalizer_band_placement_acts_where_it_is_placed)
 
 // In LinearPhase the placement is one matrix of kernels: the latency is the
 // same, and each kernel has the response the two steps would give.
-DSPARK_TEST(Equalizer_band_placement_in_linear_phase_is_one_matrix)
+DSPARK_TEST(Equalizer_band_scope_in_linear_phase_is_one_matrix)
 {
     using Type = AnalogEq::BandType;
-    using Place = AnalogEq::Placement;
+    using Place = AnalogEq::Scope;
     const double fs = 48000.0;
     const auto make = [&](std::initializer_list<AnalogEq::BandConfig> bands, AnalogEq& eq) {
         eq.setFilterMode(AnalogEq::FilterMode::LinearPhase);
@@ -4912,10 +4912,10 @@ DSPARK_TEST(Equalizer_band_placement_in_linear_phase_is_one_matrix)
     }
 }
 
-DSPARK_TEST(Equalizer_band_placement_state_and_curves)
+DSPARK_TEST(Equalizer_band_scope_state_and_curves)
 {
     using Type = AnalogEq::BandType;
-    using Place = AnalogEq::Placement;
+    using Place = AnalogEq::Scope;
     auto eqHeap = std::make_unique<AnalogEq>();
     AnalogEq& eq = *eqHeap;
     eq.setBand(0, eqPlaced(eqBand(Type::Peak, 1000.0, 6.0, 1.0), Place::Side));
@@ -4925,16 +4925,16 @@ DSPARK_TEST(Equalizer_band_placement_state_and_curves)
     AnalogEq other;
     const std::vector<uint8_t> blob = eq.getState();
     EXPECT_TRUE(other.setState(blob.data(), blob.size()));
-    EXPECT_TRUE(other.getBandConfig(0).placement == Place::Side);
-    EXPECT_TRUE(other.getBandConfig(1).placement == Place::Left);
-    EXPECT_TRUE(other.getBandConfig(2).placement == Place::Stereo);
+    EXPECT_TRUE(other.getBandConfig(0).scope == Place::Side);
+    EXPECT_TRUE(other.getBandConfig(1).scope == Place::Left);
+    EXPECT_TRUE(other.getBandConfig(2).scope == Place::Stereo);
     EXPECT_TRUE(other.getState() == blob);
 
     // A placement that is not one keeps the band's own.
     AnalogEq::BandConfig wild = eq.getBandConfig(0);
-    wild.placement = static_cast<Place>(42);
+    wild.scope = static_cast<Place>(42);
     eq.setBand(0, wild);
-    EXPECT_TRUE(eq.getBandConfig(0).placement == Place::Side);
+    EXPECT_TRUE(eq.getBandConfig(0).scope == Place::Side);
 
     // The curve of each place: the stereo bands and the ones placed there.
     const double hz[1] = { 1000.0 };
@@ -5008,12 +5008,12 @@ EqDistance eqDistance(const AnalogCascade& proto, const AnalogEq::BandConfig& cf
 
 // New mode: with no band at work the natural-phase mode is the signal, 32
 // samples late, to the bit, in double and in float.
-DSPARK_TEST(Equalizer_natural_phase_at_rest_is_the_signal_late_to_the_bit)
+DSPARK_TEST(Equalizer_prototype_phase_at_rest_is_the_signal_late_to_the_bit)
 {
     using Type = AnalogEq::BandType;
     auto eqHeap = std::make_unique<AnalogEq>();
     AnalogEq& eq = *eqHeap;
-    eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    eq.setFilterMode(AnalogEq::FilterMode::PrototypePhase);
     eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 1.0));
     eq.setBand(1, eqBand(Type::HighShelf, 8000.0, 0.0, 0.7071));
     eq.prepare({ 48000.0, 256, 2 });
@@ -5033,7 +5033,7 @@ DSPARK_TEST(Equalizer_natural_phase_at_rest_is_the_signal_late_to_the_bit)
     EXPECT_EQ(eq.getLatency(), 0);
 
     Equalizer<float> single;
-    single.setFilterMode(Equalizer<float>::FilterMode::NaturalPhase);
+    single.setFilterMode(Equalizer<float>::FilterMode::PrototypePhase);
     single.setBand(0, 3000.0f, 0.0f, 1.0f);
     single.prepare({ 44100.0, 128, 1 });
     std::vector<float> in(4096), out;
@@ -5054,13 +5054,13 @@ DSPARK_TEST(Equalizer_natural_phase_at_rest_is_the_signal_late_to_the_bit)
 // The mode keeps the guarantees of the others: the output does not depend on
 // how the host cuts the stream, and a change of a band is faded in (a 15 kHz
 // tone under a shelf that jumps 6 dB leaves nothing 60 dB under it at 3 kHz).
-DSPARK_TEST(Equalizer_natural_phase_does_not_depend_on_the_blocks_and_fades_a_change)
+DSPARK_TEST(Equalizer_prototype_phase_does_not_depend_on_the_blocks_and_fades_a_change)
 {
     using Type = AnalogEq::BandType;
     auto make = [](AnalogEq& eq) {
-        eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+        eq.setFilterMode(AnalogEq::FilterMode::PrototypePhase);
         eq.setBand(0, eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071));
-        eq.setBand(1, eqPlaced(eqBand(Type::Peak, 14000.0, -6.0, 2.0), AnalogEq::Placement::Mid));
+        eq.setBand(1, eqPlaced(eqBand(Type::Peak, 14000.0, -6.0, 2.0), AnalogEq::Scope::Mid));
         eq.setBand(2, eqBand(Type::LowPass, 17000.0, 0.0, 0.7071, 18.0));
         eq.prepare({ 48000.0, 512, 2 });
     };
@@ -5082,7 +5082,7 @@ DSPARK_TEST(Equalizer_natural_phase_does_not_depend_on_the_blocks_and_fades_a_ch
 
     auto eqHeap = std::make_unique<AnalogEq>();
     AnalogEq& eq = *eqHeap;
-    eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    eq.setFilterMode(AnalogEq::FilterMode::PrototypePhase);
     eq.setBand(0, eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071));
     eq.prepare({ 48000.0, 256, 1 });
     const int n = 48000;
@@ -5112,23 +5112,23 @@ DSPARK_TEST(Equalizer_natural_phase_does_not_depend_on_the_blocks_and_fades_a_ch
 // band on the left leaves the right channel alone (the signal, late, to the
 // bit) and gives the left what a one-channel equalizer gives; a band on the
 // middle gives the middle that, and leaves the sides alone.
-DSPARK_TEST(Equalizer_natural_phase_with_placed_bands_is_one_matrix)
+DSPARK_TEST(Equalizer_prototype_phase_with_scoped_bands_is_one_matrix)
 {
     using Type = AnalogEq::BandType;
-    using Place = AnalogEq::Placement;
+    using Place = AnalogEq::Scope;
     const AnalogEq::BandConfig band = eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071);
     const EqStereo x = eqStereoNoise(8192, 23u);
     const size_t n = x.l.size();
 
     AnalogEq one;
-    one.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    one.setFilterMode(AnalogEq::FilterMode::PrototypePhase);
     one.setBand(0, band);
     one.prepare({ 48000.0, 256, 1 });
     std::vector<double> alone = x.l;
     eqRun(one, alone);
 
     AnalogEq left;
-    left.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    left.setFilterMode(AnalogEq::FilterMode::PrototypePhase);
     left.setBand(0, eqPlaced(band, Place::Left));
     left.prepare({ 48000.0, 256, 2 });
     EqStereo y = x;
@@ -5145,7 +5145,7 @@ DSPARK_TEST(Equalizer_natural_phase_with_placed_bands_is_one_matrix)
     eqRun(one, middleAlone);
 
     AnalogEq mid;
-    mid.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
+    mid.setFilterMode(AnalogEq::FilterMode::PrototypePhase);
     mid.setBand(0, eqPlaced(band, Place::Mid));
     mid.prepare({ 48000.0, 256, 2 });
     EqStereo z = x;
@@ -5164,7 +5164,7 @@ DSPARK_TEST(Equalizer_natural_phase_with_placed_bands_is_one_matrix)
 // one does not have its phase near Nyquist. The natural-phase mode brings the
 // bands the rest of the way: the phase of the analog curve up to 20 kHz, and
 // what was left of the level.
-DSPARK_TEST(Equalizer_natural_phase_follows_the_phase_of_the_analog_curve)
+DSPARK_TEST(Equalizer_prototype_phase_follows_the_phase_of_the_analog_curve)
 {
     using Type = AnalogEq::BandType;
     using Mode = AnalogEq::FilterMode;
@@ -5178,7 +5178,7 @@ DSPARK_TEST(Equalizer_natural_phase_follows_the_phase_of_the_analog_curve)
     for (const Case& c : cases)
     {
         const EqDistance minimum = eqDistance(c.proto, c.cfg, Mode::MinimumPhase);
-        const EqDistance natural = eqDistance(c.proto, c.cfg, Mode::NaturalPhase);
+        const EqDistance natural = eqDistance(c.proto, c.cfg, Mode::PrototypePhase);
         EXPECT_GT(minimum.phase, 15.0);                 // 17 to 178 degrees: what the mode is for
         EXPECT_LT(natural.phase, 1.5);                  // 0.08 to 1.05
         EXPECT_LT(natural.phase, 0.1 * minimum.phase);
@@ -5189,19 +5189,19 @@ DSPARK_TEST(Equalizer_natural_phase_follows_the_phase_of_the_analog_curve)
     // steep cut near the top keeps a few degrees.
     {
         const EqDistance bell = eqDistance(eqOne(AnalogSection::peak(15000.0, 1.0, -18.0)),
-                                           eqBand(Type::Peak, 15000.0, -18.0, 1.0), Mode::NaturalPhase, 44100.0);
+                                           eqBand(Type::Peak, 15000.0, -18.0, 1.0), Mode::PrototypePhase, 44100.0);
         EXPECT_LT(bell.phase, 2.0);                     // minimum phase: 38
         EXPECT_LT(bell.level, 0.1);
         const EqDistance cut = eqDistance(FilterDesign::highCut(10000.0, 24.0),
                                           eqBand(Type::LowPass, 10000.0, 0.0, 0.7071067811865476, 24.0),
-                                          Mode::NaturalPhase, 44100.0);
+                                          Mode::PrototypePhase, 44100.0);
         EXPECT_LT(cut.phase, 8.0);                      // minimum phase: 179
         EXPECT_LT(cut.level, 1.0);
     }
 
     // A band in the middle of the spectrum needs no correction and takes no harm from one.
     const AnalogEq::BandConfig low = eqBand(Type::Peak, 1000.0, 12.0, 1.0);
-    const EqDistance natural = eqDistance(eqOne(AnalogSection::peak(1000.0, 1.0, 12.0)), low, Mode::NaturalPhase);
+    const EqDistance natural = eqDistance(eqOne(AnalogSection::peak(1000.0, 1.0, 12.0)), low, Mode::PrototypePhase);
     EXPECT_LT(natural.phase, 0.3);
     EXPECT_LT(natural.level, 0.05);
 }
@@ -5485,7 +5485,7 @@ DSPARK_TEST(Saturation_program_noise_follows_the_programme_and_leaves_silence_si
     EXPECT_EQ(s.getProgramNoise(), -20.0f);
 }
 
-// New: setDynamics(). At +1 a quiet and a loud tone saturate alike and come
+// New: setLevelTracking(). At +1 a quiet and a loud tone saturate alike and come
 // out at the level they went in at; at -1 the loud one saturates far more;
 // with a focus the follower hears only the low end.
 DSPARK_TEST(Saturation_dynamics_hold_the_amount_of_saturation_whatever_the_level)
@@ -5495,8 +5495,8 @@ DSPARK_TEST(Saturation_dynamics_hold_the_amount_of_saturation_whatever_the_level
         const Sat8Vec out = sat8Run(in, [=](Sat8& s) {
             s.setAlgorithm(Sat8::Algorithm::SoftClip);
             s.setDrive(12.0f);
-            s.setDynamics(dynamics);
-            s.setDynamicsFocus(focus);
+            s.setLevelTracking(dynamics);
+            s.setTrackingCorner(focus);
         });
         third = sat8Line(out, 3.0 * hz) - sat8Line(out, hz);
         return sat8Line(out, hz) - sat8Line(in, hz);
@@ -5523,15 +5523,15 @@ DSPARK_TEST(Saturation_dynamics_hold_the_amount_of_saturation_whatever_the_level
     EXPECT_LT(deaf, heard - 6.0);
 
     Sat8 s;
-    s.setDynamics(-3.0f);
-    EXPECT_EQ(s.getDynamics(), -1.0f);
-    s.setDynamicsFocus(5.0f);
-    EXPECT_EQ(s.getDynamicsFocus(), 20.0f);
-    s.setDynamicsFocus(-1.0f);
-    EXPECT_EQ(s.getDynamicsFocus(), 0.0f);
+    s.setLevelTracking(-3.0f);
+    EXPECT_EQ(s.getLevelTracking(), -1.0f);
+    s.setTrackingCorner(5.0f);
+    EXPECT_EQ(s.getTrackingCorner(), 20.0f);
+    s.setTrackingCorner(-1.0f);
+    EXPECT_EQ(s.getTrackingCorner(), 0.0f);
 }
 
-// New: setFeedback(). The output of the curve returns to its input, inverted,
+// New: setCombLoop(). The output of the curve returns to its input, inverted,
 // one period of the frequency later: dips at the frequency and its
 // multiples, peaks half way, the other way round for a negative amount; any
 // block size gives the same output, and it stays bounded at full drive.
@@ -5541,7 +5541,7 @@ DSPARK_TEST(Saturation_feedback_tunes_a_comb_inside_the_curve)
         const Sat8Vec in = sat8Sine(hz, 0.01, 48000);
         const Sat8Vec out = sat8Run(in, [=](Sat8& s) {
             s.setAlgorithm(Sat8::Algorithm::SoftClip);
-            s.setFeedback(amount, 200.0f);
+            s.setCombLoop(amount, 200.0f);
         }, block);
         return sat8Line(out, hz) - sat8Line(in, hz);
     };
@@ -5553,20 +5553,20 @@ DSPARK_TEST(Saturation_feedback_tunes_a_comb_inside_the_curve)
     EXPECT_NEAR(gain(-0.8f, 300.0, 512), dip, 0.3);
 
     Sat8 s;
-    s.setFeedback(0.5f, 200.0f);
+    s.setCombLoop(0.5f, 200.0f);
     s.prepare(AudioSpec{ 48000.0, 512, 1 });
-    EXPECT_NEAR(static_cast<double>(s.getFeedbackFrequency()), 200.0, 0.01);
-    s.setFeedback(0.5f, 20000.0f);
-    EXPECT_NEAR(static_cast<double>(s.getFeedbackFrequency()), 48000.0 / (16.0 + s.getLatency()), 0.01);
-    s.setFeedback(3.0f, std::numeric_limits<float>::quiet_NaN());
-    EXPECT_NEAR(static_cast<double>(s.getFeedback()), 0.95, 1e-6);
+    EXPECT_NEAR(static_cast<double>(s.getCombLoopFrequency()), 200.0, 0.01);
+    s.setCombLoop(0.5f, 20000.0f);
+    EXPECT_NEAR(static_cast<double>(s.getCombLoopFrequency()), 48000.0 / (16.0 + s.getLatency()), 0.01);
+    s.setCombLoop(3.0f, std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(static_cast<double>(s.getCombLoop()), 0.95, 1e-6);
 
     const Sat8Vec in = sat8Sine(330.0, 0.5, 48000);
     const auto render = [&](int block) {
         return sat8Run(in, [](Sat8& x) {
             x.setAlgorithm(Sat8::Algorithm::SoftClip);
             x.setDrive(24.0f);
-            x.setFeedback(0.95f, 150.0f);
+            x.setCombLoop(0.95f, 150.0f);
         }, block);
     };
     const Sat8Vec small = render(64), large = render(2048);

@@ -139,8 +139,8 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     EXPECT_TRUE((roundTrip<Saturation<float>>([](auto& s) {
         s.setAlgorithm(Saturation<float>::Algorithm::Curve);
         s.setCurveShape(0.3f, 2.0f, -0.4f); s.setAsymmetry(0.25f);
-        s.setProgramNoise(-60.0f); s.setDynamics(0.5f); s.setDynamicsFocus(150.0f);
-        s.setFeedback(-0.3f, 330.0f); s.setDriveCompensation(true);
+        s.setProgramNoise(-60.0f); s.setLevelTracking(0.5f); s.setTrackingCorner(150.0f);
+        s.setCombLoop(-0.3f, 330.0f); s.setDriveCompensation(true);
         s.setOversamplingMode(Saturation<float>::OversamplingMode::MinimumPhase);
     })));
     {
@@ -239,8 +239,8 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
     EXPECT_TRUE((roundTrip<AR>([](auto& r) {
         r.setDecayBand(0, { AR::DecayShape::Bell, 2500.0f, 1.2f, 1.8f });
         r.setDecayBand(3, { AR::DecayShape::LowShelf, 180.0f, 0.7f, 0.6f });
-        r.setFreeze(true); r.setDucking(6.0f); r.setGate(-40.0f); r.setGateHold(220.0f); r.setGateRelease(90.0f);
-        r.setDistance(0.4f); r.setThickness(0.5f); r.setThicknessSaturation(true);
+        r.setTailHold(true); r.setDryDip(6.0f); r.setGate(-40.0f); r.setGateHold(220.0f); r.setGateRelease(90.0f);
+        r.setSourceDepth(0.4f); r.setTankLeveling(0.5f); r.setTankSaturation(true);
         r.setTempo(98.0f); r.setPreDelayNote(AR::NoteValue::Eighth, AR::NoteFeel::Dotted);
         r.setGateHoldNote(AR::NoteValue::Quarter); r.setInputWidth(0.6f); r.setWidthLaw(AR::WidthLaw::PowerKept);
         r.setModulationStyle(AR::ModulationStyle::Segments); r.setSpaceLayout(AR::SpaceLayout::Geometric);
@@ -251,7 +251,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
     EXPECT_TRUE((roundTrip<Reverb<float>>([](auto& r) {
         r.setMix(0.55f); r.setPreDelay(25.0f);
         r.setDecayScale(0.7f); r.setStretch(1.3f);
-        r.setDucking(9.0f); r.setGate(-35.0f); r.setGateHold(300.0f); r.setGateRelease(80.0f);
+        r.setDryDip(9.0f); r.setGate(-35.0f); r.setGateHold(300.0f); r.setGateRelease(80.0f);
     })));
     EXPECT_TRUE((roundTrip<Equalizer<float>>([](auto& e) {
         Equalizer<float>::BandConfig b;
@@ -292,11 +292,11 @@ DSPARK_TEST(State_roundtrip_new_effects)
     })));
     using TM = TapeMachine<float>;
     EXPECT_TRUE((roundTrip<TM>([](auto& t) {
-        t.setTransport(TM::Transport::Speed); t.setHum(-70.0f, TM::Mains::Hz60); t.setCrosstalk(-55.0f);
-        t.setAsymmetry(0.3f); t.setTransformer(0.6f); t.setHeadModel(TM::HeadModel::Contour);
+        t.setTransport(TM::Transport::Speed); t.setHum(-70.0f, TM::Mains::Hz60); t.setChannelBleed(-55.0f);
+        t.setEvenHarmonics(0.3f); t.setOutputIron(0.6f); t.setHeadModel(TM::HeadModel::Contour);
         t.setElectronics(TM::Electronics::Circuit); t.setAlignment(1.5f, -2.0f);
         t.setFormulation(TM::Formulation::HighOutput); t.setTrackFormat(TM::TrackFormat::Full);
-        t.setCalibrationLevel(6.0f); t.setMonitor(TM::Monitor::Sync);
+        t.setCalibrationLevel(6.0f); t.setMonitor(TM::Monitor::RecordHead);
         t.setOversamplingMode(TM::OversamplingMode::MinimumPhase);
     })));
     EXPECT_TRUE((roundTrip<TubePreamp<float>>([](auto& t) {
@@ -325,13 +325,13 @@ DSPARK_TEST(State_roundtrip_new_effects)
         d.setSensitivityBand(0, b);
     })));
     EXPECT_TRUE((roundTrip<TonalBalance<float>>([](auto& t) {
-        t.setBalance(0.8f); t.setBoost(0.1f); t.setTame(0.9f); t.setTilt(-1.5f); t.setRange(9.0f);
+        t.setBalance(0.8f); t.setFillDips(0.1f); t.setTrimPeaks(0.9f); t.setTilt(-1.5f); t.setRange(9.0f);
         t.setKnee(2.0f); t.setFrequencyRange(40.0f, 16000.0f); t.setLevelCompensation(true); t.setReferenceLevel(90.0f);
     })));
     EXPECT_TRUE((roundTrip<ResonanceSuppressor<float>>([](auto& r) {
-        r.setThreshold(5.0f); r.setDepth(0.5f); r.setRange(18.0f); r.setWidth(0.5f); r.setAttack(2.0f);
-        r.setRelease(200.0f); r.setMode(ResonanceSuppressor<float>::Mode::Hard);
-        r.setLinkMode(ResonanceSuppressor<float>::Link::MidSide); r.setLink(0.3f); r.setMidSideBalance(1.5f);
+        r.setThreshold(5.0f); r.setStrength(0.5f); r.setRange(18.0f); r.setWidth(0.5f); r.setAttack(2.0f);
+        r.setRelease(200.0f); r.setMode(ResonanceSuppressor<float>::Mode::Deep);
+        r.setLinkMode(ResonanceSuppressor<float>::Link::MidSide); r.setLink(0.3f); r.setSideWeight(1.5f);
         r.setQuality(ResonanceSuppressor<float>::Quality::Offline);
         KeyEqualizer<float, 2>::Band b;
         b.shape = KeyEqualizer<float, 2>::Shape::HighShelf; b.frequency = 5000.0f; b.gainDb = 4.0f;

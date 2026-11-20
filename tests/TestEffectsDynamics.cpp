@@ -3518,7 +3518,7 @@ DSPARK_TEST(DynamicEQ_relative_threshold_follows_the_level_of_the_band)
 
 // New: a band acts on, and listens to, the left, the right, the middle or the
 // sides of the pair, in both engines.
-DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
+DSPARK_TEST(DynamicEQ_band_scope_acts_and_listens_where_it_is_set)
 {
     using DE = DynamicEQ<float>;
     const int n = 48000;
@@ -3539,7 +3539,7 @@ DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
         auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 100.0f, 12.0f);
 
         // The key is on the left only.
-        c.placement = DE::Placement::Left;
+        c.scope = DE::Scope::Left;
         {
             auto d = dynEqMake(mixed, 2, c);
             std::vector<Vec> x { probe, probe }, key { loud, silent };
@@ -3547,7 +3547,7 @@ DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
             EXPECT_NEAR(gainOf(x[0], 0.02), -12.0, 0.2);
             EXPECT_EQ(farFrom(x[1], probe), 0.0);
         }
-        c.placement = DE::Placement::Right;
+        c.scope = DE::Scope::Right;
         {
             auto d = dynEqMake(mixed, 2, c);
             std::vector<Vec> x { probe, probe }, key { loud, silent };
@@ -3563,7 +3563,7 @@ DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
             left[static_cast<size_t>(i)] = probe[static_cast<size_t>(i)] + other[static_cast<size_t>(i)];
             right[static_cast<size_t>(i)] = probe[static_cast<size_t>(i)] - other[static_cast<size_t>(i)];
         }
-        c.placement = DE::Placement::Mid;
+        c.scope = DE::Scope::Mid;
         {
             auto d = dynEqMake(mixed, 2, c);
             std::vector<Vec> x { left, right }, key { loud, loud };
@@ -3577,7 +3577,7 @@ DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
             EXPECT_NEAR(gainOf(middle, 0.02), -12.0, 0.2);
             EXPECT_NEAR(gainOf(sides, 0.01), 0.0, 0.01);
         }
-        c.placement = DE::Placement::Side;
+        c.scope = DE::Scope::Side;
         {
             auto d = dynEqMake(mixed, 2, c);
             std::vector<Vec> x { left, right }, key { loud, loud };         // no sides in the key: nothing to do
@@ -3598,13 +3598,13 @@ DSPARK_TEST(DynamicEQ_band_placement_acts_and_listens_where_it_is_placed)
         }
 
         // One channel: the left and the middle are it; it has no right and no sides.
-        for (auto place : { DE::Placement::Left, DE::Placement::Mid, DE::Placement::Right, DE::Placement::Side })
+        for (auto place : { DE::Scope::Left, DE::Scope::Mid, DE::Scope::Right, DE::Scope::Side })
         {
-            c.placement = place;
+            c.scope = place;
             auto d = dynEqMake(mixed, 1, c);
             std::vector<Vec> x { probe }, key { loud };
             dynEqRun(*d, x, key);
-            const bool acts = place == DE::Placement::Left || place == DE::Placement::Mid;
+            const bool acts = place == DE::Scope::Left || place == DE::Scope::Mid;
             EXPECT_NEAR(gainOf(x[0], 0.02), acts ? -12.0 : 0.0, acts ? 0.2 : 0.001);
         }
     }
@@ -3653,7 +3653,7 @@ DSPARK_TEST(DynamicEQ_new_band_fields_are_kept_and_guarded)
 {
     using DE = DynamicEQ<float>;
     auto c = dynEqCut(700.0f, 1.5f, -25.0f, 3.0f, 9.0f);
-    c.gain = 3.0f; c.knee = 6.0f; c.placement = DE::Placement::Side;
+    c.gain = 3.0f; c.knee = 6.0f; c.scope = DE::Scope::Side;
     c.timing = DE::Timing::Program; c.relativeThreshold = true;
 
     auto a = dynEqMake(true, 2, c);
@@ -3668,7 +3668,7 @@ DSPARK_TEST(DynamicEQ_new_band_fields_are_kept_and_guarded)
     auto wild = c;
     wild.gain = std::numeric_limits<float>::quiet_NaN();
     wild.knee = std::numeric_limits<float>::infinity();
-    wild.placement = static_cast<DE::Placement>(9);
+    wild.scope = static_cast<DE::Scope>(9);
     wild.timing = static_cast<DE::Timing>(-3);
     a->setBand(0, wild);
     EXPECT_TRUE(a->getState() == blob);
@@ -3724,7 +3724,7 @@ DSPARK_TEST(DynamicEQ_mixed_engine_is_block_independent_and_recovers)
         c.gain = 2.0f;
         auto d = dynEqMake(true, 2, c);
         auto second = dynEqCut(6000.0f, 1.0f, -45.0f, 3.0f, 9.0f);
-        second.placement = DE::Placement::Mid;
+        second.scope = DE::Scope::Mid;
         second.timing = DE::Timing::Program;
         second.aboveBoost = true;
         d->setBand(1, second);
@@ -3917,7 +3917,7 @@ DSPARK_TEST(DynamicEQ_linear_phase_keeps_time_with_its_detector)
 
 // The mode keeps the guarantees of the others (block independence, recovery
 // from a sample that is not a number), its placements, and its state.
-DSPARK_TEST(DynamicEQ_linear_phase_blocks_placements_and_state)
+DSPARK_TEST(DynamicEQ_linear_phase_blocks_scopes_and_state)
 {
     using DE = DynamicEQ<float>;
     const int n = 48000;
@@ -3936,7 +3936,7 @@ DSPARK_TEST(DynamicEQ_linear_phase_blocks_placements_and_state)
         c.gain = 2.0f;
         auto d = dynEqLinear(2, c);
         auto second = dynEqCut(6000.0f, 1.0f, -45.0f, 3.0f, 9.0f);
-        second.placement = DE::Placement::Mid;
+        second.scope = DE::Scope::Mid;
         second.timing = DE::Timing::Program;
         second.aboveBoost = true;
         d->setBand(1, second);
@@ -3980,7 +3980,7 @@ DSPARK_TEST(DynamicEQ_linear_phase_blocks_placements_and_state)
     // A band on the middle: the middle takes the cut, the sides are the sides, late.
     {
         auto c = dynEqCut(1000.0f, 2.0f, -40.0f, 100.0f, 12.0f);
-        c.placement = DE::Placement::Mid;
+        c.scope = DE::Scope::Mid;
         auto d = dynEqLinear(2, c);
         const Vec probe = makeSine(1000.0, 0.02, 48000.0, n), other = makeSine(1000.0, 0.01, 48000.0, n);
         const Vec loud = makeSine(1000.0, 0.5, 48000.0, n);
@@ -5608,7 +5608,7 @@ DSPARK_TEST(Compressor_smooth_character_levels_under_and_catches_over)
 {
     using C = Compressor<float>;
     const auto smooth = [](C& c) {
-        c.setCharacter(C::Character::Smooth);
+        c.setCharacter(C::Character::Layered);
         c.setDetector(C::DetectorType::Hilbert);
         c.setThreshold(-20.0f);
         c.setRatio(4.0f);
@@ -5670,7 +5670,7 @@ DSPARK_TEST(Compressor_smooth_character_levels_under_and_catches_over)
     // The paths: one sample at a time is the block; Topology and Precision change nothing.
     const Vec burst = compLowOverHigh(24000);
     const auto dense = [](C& c) {
-        c.setCharacter(C::Character::Smooth);
+        c.setCharacter(C::Character::Layered);
         c.setThreshold(-24.0f);
         c.setRatio(3.0f);
         c.setAttack(2.0f);
@@ -5702,7 +5702,7 @@ DSPARK_TEST(Compressor_smooth_character_levels_under_and_catches_over)
     }
     // Upward: one envelope on the knobs, as Clean.
     const auto upward = [](C& c) { c.setMode(C::Mode::Upward); c.setThreshold(-30.0f); c.setRatio(2.0f); };
-    EXPECT_EQ(compFarthest(compRender(burst, [&](C& c) { upward(c); c.setCharacter(C::Character::Smooth); }),
+    EXPECT_EQ(compFarthest(compRender(burst, [&](C& c) { upward(c); c.setCharacter(C::Character::Layered); }),
                            compRender(burst, upward)), 0.0);
 
     // Switching characters while it runs carries the gain across.
@@ -5714,7 +5714,7 @@ DSPARK_TEST(Compressor_smooth_character_levels_under_and_catches_over)
         int at = 0;
         double last = 0.0, jump = 0.0;
         processInBlocks(x, 16, [&](AudioBufferView<float> b) {
-            if (at == 48000) c->setCharacter(C::Character::Smooth);
+            if (at == 48000) c->setCharacter(C::Character::Layered);
             c->processBlock(b);
             at += b.getNumSamples();
             const double gr = static_cast<double>(c->getGainReductionDb());
@@ -5725,11 +5725,11 @@ DSPARK_TEST(Compressor_smooth_character_levels_under_and_catches_over)
     }
 
     C a;
-    a.setCharacter(C::Character::Smooth);
+    a.setCharacter(C::Character::Layered);
     const auto blob = a.getState();
     C b;
     EXPECT_TRUE(b.setState(blob.data(), blob.size()));
-    EXPECT_TRUE(b.getCharacter() == C::Character::Smooth);
+    EXPECT_TRUE(b.getCharacter() == C::Character::Layered);
 }
 
 // New: with the Varimu character the colour applies the gain through a
@@ -5805,7 +5805,7 @@ DSPARK_TEST(Compressor_varimu_colour_is_a_push_pull_element_that_bends_with_the_
     };
     EXPECT_EQ(others(C::Character::Clean), 0.0);
     EXPECT_EQ(others(C::Character::Opto), 0.0);
-    EXPECT_EQ(others(C::Character::Smooth), 0.0);
+    EXPECT_EQ(others(C::Character::Layered), 0.0);
 }
 
 // New: the gain can be smoothed after the ballistics. Two sections round its
@@ -7579,8 +7579,8 @@ DSPARK_TEST(Delta_listen_is_the_complement_of_the_output)
             c->setThreshold(-24.0f); c->setRatio(4.0f); c->setAttack(5.0f); c->setRelease(80.0f);
             c->prepare(spec(48000.0, 128, 2));
         }
-        b.setDelta(true);
-        EXPECT_TRUE(b.isDelta());
+        b.setRemovalListen(true);
+        EXPECT_TRUE(b.isRemovalListen());
         const auto plain = l13Through(a, in);
         const auto delta = l13Through(b, in);
         EXPECT_LT(check(plain, delta, a.getLatency()), 1e-5);
@@ -7591,7 +7591,7 @@ DSPARK_TEST(Delta_listen_is_the_complement_of_the_output)
     {
         DeEsser<float> a, b;
         for (auto* d : { &a, &b }) { d->setThreshold(-40.0f); d->prepare(spec(48000.0, 128, 2)); }
-        b.setDelta(true);
+        b.setRemovalListen(true);
         const auto plain = l13Through(a, in);
         const auto delta = l13Through(b, in);
         EXPECT_LT(check(plain, delta, 0), 1e-6);
@@ -7606,7 +7606,7 @@ DSPARK_TEST(Delta_listen_is_the_complement_of_the_output)
             d->setBand(0, band);
             d->prepare(spec(48000.0, 128, 2));
         }
-        b->setDelta(true);
+        b->setRemovalListen(true);
         const auto plain = l13Through(*a, in);
         const auto delta = l13Through(*b, in);
         EXPECT_LT(check(plain, delta, a->getLatency()), 1e-5);

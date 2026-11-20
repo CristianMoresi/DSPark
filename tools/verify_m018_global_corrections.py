@@ -26,7 +26,7 @@ from check_public_text import canonical_text_bytes
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED_DIRECTORIES = ("Core", "Effects", "Analysis", "IO", "Music")
 EXPECTED_INSTALLED_HEADERS = 176
-EXPECTED_ORDINARY_TESTS = 1767
+EXPECTED_ORDINARY_TESTS = 1770
 PACKAGE_SOURCE_COMMIT = "816766a14e04804ba3425d789e8bb384866067ea"
 PACKAGE_SOURCE_PARENT = "6885f80e21264298c7e73f44dd05a73f3ddb4210"
 PACKAGE_SOURCE_URL_PREFIX = (
@@ -1885,10 +1885,10 @@ LIVE_REVERB_MUTATION_ANCHOR = (
     "                                   irSampleRate_, spec_, fftBlockSize_, ds, st);\n"
 )
 LIVE_REVERB_BASELINE_HASH = (
-    "b7118c4c08647f972825cc0020a2fe8df616a3c886f16b1923dd1c036b571c7d"
+    "38d64922e1cc4ac7dfd44832812b490f0202b186e2fb07aa218ebf60606c11c6"
 )
 LIVE_REVERB_SUBJECT_HASH = (
-    "5b7192d8bca5d93a4a00e1d2a266a401d2d522a6e4e1cfbaa90dbbece4cb4e85"
+    "8e6aeb22653ad48985b69f2307d644763abda4c8bad301115a75bcc0dcb57ed0"
 )
 LIVE_REVERB_ANCHOR_HASH = (
     "6cf8d8b452439b4a8b12e6a4e3cf68c962f315bb4fcc4060af68f4aad031c616"
@@ -1904,7 +1904,7 @@ LIVE_REVERB_VARIANTS = (
     {
         "id": "early-mix",
         "insertion": "        mix_.store(mix, std::memory_order_relaxed);\n",
-        "source_sha256": "e8688a10cfc073f6cbfc5e64c058c364eb184c76355b2f7373b63d431b9f228a",
+        "source_sha256": "08c23160bcff406d7d60cbaef001f470383fdd0fef4d0a388b8dd561aed14f7d",
         "patch_sha256": "a046788e1d04e80da8c109841883222f443f54c279545353b37f49c544efc132",
         "oracle": "EXPECTED_RED",
     },
@@ -1914,14 +1914,14 @@ LIVE_REVERB_VARIANTS = (
             "        preDelayMs_.store(preDelay, std::memory_order_relaxed);\n"
             "        preDelaySamples_.store(preDelaySamples, std::memory_order_relaxed);\n"
         ),
-        "source_sha256": "fd5f90bc451381d849896bb31b16ad41f34cc5815f580d677d33b382af8b5cc8",
+        "source_sha256": "04bdc4fca8698b70345555daa9a6d44ef697ee97a8b9bde7f9ce7762032792d7",
         "patch_sha256": "de17090331265e62bac51c011a5deb73811bde9abf6f942cac5ee630dc8adb8c",
         "oracle": "EXPECTED_RED",
     },
     {
         "id": "partial-shaping-publication",
         "insertion": "        decayScale_.store(ds, std::memory_order_relaxed);\n",
-        "source_sha256": "b599b0be1a4f9adef84d270d99a3f31d2ba7be62ff487577b7e9bc9ab86ab0af",
+        "source_sha256": "e8347e85134846e003a6a63672126262a346a1eb24dfa77f0bf8211d7fec8d29",
         "patch_sha256": "99b78a38f70b428a398dcb3703b35a512ae74ca264a1eeb8de1d70ad4bca5e8b",
         "oracle": "EXPECTED_RED",
     },

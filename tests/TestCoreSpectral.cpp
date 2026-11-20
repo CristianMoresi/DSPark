@@ -2982,7 +2982,7 @@ std::vector<float> sfNoise(size_t n, uint32_t seed)
 // whatever the blocks; a flat gain scales it; a cut leaves nothing before
 // the event (minimum phase); the delta is the complement; a key replaces the
 // power the design reads.
-DSPARK_TEST(SpectralFilter_delay_scale_minimum_phase_delta_and_key)
+DSPARK_TEST(SpectralFilter_delay_scale_minimum_phase_removal_and_key)
 {
     const AudioSpec s = spec(48000.0, 512, 1);
     const std::vector<float> in = sfNoise(24000, 3u);
@@ -3027,9 +3027,9 @@ DSPARK_TEST(SpectralFilter_delay_scale_minimum_phase_delta_and_key)
     f.reset();
     const auto kept = sfRun(f, in, 512, lowPass);
     f.reset();
-    f.setDelta(true);
+    f.setRemovalListen(true);
     const auto taken = sfRun(f, in, 512, lowPass);
-    f.setDelta(false);
+    f.setRemovalListen(false);
     double complement = 0.0;
     for (size_t i = 3000; i < in.size(); ++i)
         complement = std::max(complement, std::abs(static_cast<double>(kept[i] + taken[i] - in[i - 1024])));
@@ -3040,4 +3040,40 @@ DSPARK_TEST(SpectralFilter_delay_scale_minimum_phase_delta_and_key)
     f.reset();
     (void)sfRun(f, in, 512, [&](int, const float* p, float*, int n) noexcept { for (int k = 0; k < n; ++k) seen = std::max(seen, static_cast<double>(p[k])); }, &silence);
     EXPECT_EQ(seen, 0.0);
+}
+
+// New: the readout of a per-bin curve. A notch one bin wide shows at the
+// point that covers it, its sign kept; the points span 20 Hz to 20 kHz; a
+// point narrower than a bin takes the nearest bin; a frame of the wrong
+// size or channel changes nothing.
+DSPARK_TEST(SpectralReadout_keeps_the_largest_magnitude_between_points)
+{
+    using R = SpectralReadout<float>;
+    const double binHz = 48000.0 / 4096.0;
+    const int bins = 2049;
+    auto r = std::make_unique<R>();
+    r->prepare(binHz, bins);
+    std::vector<double> curve(static_cast<size_t>(bins), 1.0);
+    curve[85] = -9.0;                       // 996 Hz
+    r->publish(0, curve.data(), bins);
+    const auto pointOf = [](double hz) {
+        return static_cast<int>(std::lround((R::kPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+    };
+    EXPECT_EQ(r->value(0, pointOf(1000.0)), -9.0f);
+    EXPECT_EQ(r->value(0, pointOf(300.0)), 1.0f);
+    EXPECT_EQ(r->value(0, 0), 1.0f);        // 20 Hz: narrower than a bin
+    EXPECT_EQ(r->value(1, pointOf(1000.0)), 0.0f);
+    EXPECT_EQ(r->extreme(), -9.0f);
+    EXPECT_NEAR(R::frequency(0), 20.0, 1e-9);
+    EXPECT_NEAR(R::frequency(R::kPoints - 1), 20000.0, 1e-6);
+
+    std::vector<double> other(static_cast<size_t>(bins), 4.0);
+    r->publish(0, other.data(), bins - 1);
+    r->publish(2, other.data(), bins);
+    r->publish(-1, other.data(), bins);
+    EXPECT_EQ(r->value(0, pointOf(1000.0)), -9.0f);
+    EXPECT_EQ(r->value(0, -1), 0.0f);
+    EXPECT_EQ(r->value(0, R::kPoints), 0.0f);
+    r->clear();
+    EXPECT_EQ(r->extreme(), 0.0f);
 }

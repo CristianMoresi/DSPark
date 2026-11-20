@@ -4141,7 +4141,7 @@ DSPARK_TEST(AlgoReverb_decay_band_moves_the_decay_in_its_band)
 
 // New: freeze holds the tail at its level and with its highs, and the input
 // played meanwhile does not enter it; released, it decays again.
-DSPARK_TEST(AlgoReverb_freeze_holds_the_tail)
+DSPARK_TEST(AlgoReverb_tail_hold_keeps_the_tail)
 {
     const size_t n = 48000 * 5;
     const auto burst = [&](bool playOn) {
@@ -4153,8 +4153,8 @@ DSPARK_TEST(AlgoReverb_freeze_holds_the_tail)
         l11Wet(*rev, ARevF::Type::Hall);
         rev->setDecay(1.0f);
         return l11Run(*rev, in, in, [&](size_t off) {
-            if (off == 24064) rev->setFreeze(true);
-            if (off == 48000 * 4) rev->setFreeze(false);
+            if (off == 24064) rev->setTailHold(true);
+            if (off == 48000 * 4) rev->setTailHold(false);
         }).first;
     };
     const auto quiet = burst(false);
@@ -4175,7 +4175,7 @@ DSPARK_TEST(AlgoReverb_freeze_holds_the_tail)
 // New: ducking lowers the wet signal while the dry one plays and lets it back
 // after; the gate cuts the tail once the dry signal has stopped. Off, the
 // shaper's gain is exactly 1.
-DSPARK_TEST(AlgoReverb_ducking_and_gate_follow_the_dry_signal)
+DSPARK_TEST(AlgoReverb_dry_dip_and_gate_follow_the_dry_signal)
 {
     const size_t n = 48000 * 3;
     std::vector<float> in = l11Noise(n, 0.3f, 9u);
@@ -4188,7 +4188,7 @@ DSPARK_TEST(AlgoReverb_ducking_and_gate_follow_the_dry_signal)
         return l11Run(*rev, in, in, [](size_t) {}).first;
     };
     const auto plain = wet([](ARevF&) {});
-    const auto ducked = wet([](ARevF& r) { r.setDucking(12.0f); });
+    const auto ducked = wet([](ARevF& r) { r.setDryDip(12.0f); });
     const auto gated = wet([](ARevF& r) { r.setGate(-30.0f); r.setGateHold(50.0f); r.setGateRelease(40.0f); });
     EXPECT_LT(l11RmsDb(ducked, 24000, 48000), l11RmsDb(plain, 24000, 48000) - 8.0);
     EXPECT_NEAR(l11RmsDb(ducked, 48000 + 72000, 48000 + 96000), l11RmsDb(plain, 48000 + 72000, 48000 + 96000), 2.0);
@@ -4200,9 +4200,9 @@ DSPARK_TEST(AlgoReverb_ducking_and_gate_follow_the_dry_signal)
     shaper.sync();
     EXPECT_TRUE(!shaper.isActive());
     for (int i = 0; i < 1000; ++i) EXPECT_EQ(shaper.next(i % 7 == 0 ? 0.9f : 0.01f), 1.0f);
-    shaper.setDucking(std::numeric_limits<float>::quiet_NaN());
+    shaper.setDryDip(std::numeric_limits<float>::quiet_NaN());
     shaper.setGate(-300.0f);
-    EXPECT_EQ(shaper.getDucking(), 0.0f);
+    EXPECT_EQ(shaper.getDryDip(), 0.0f);
     EXPECT_EQ(shaper.getGate(), -200.0f);
 }
 
@@ -4210,7 +4210,7 @@ DSPARK_TEST(AlgoReverb_ducking_and_gate_follow_the_dry_signal)
 // darkens the wet signal; thickness lifts a quiet input into the tank and
 // holds a loud one back; the input width centres the excitation; the power
 // width law keeps the tail's power when the side is narrowed.
-DSPARK_TEST(AlgoReverb_distance_thickness_and_width)
+DSPARK_TEST(AlgoReverb_source_depth_tank_leveling_and_width)
 {
     const size_t n = 48000 * 2;
     const auto noise = l11Noise(n, 0.3f, 3u);
@@ -4221,7 +4221,7 @@ DSPARK_TEST(AlgoReverb_distance_thickness_and_width)
         return l11Run(*rev, l, r, [](size_t) {});
     };
     const auto near0 = run(noise, noise, [](ARevF&) {}).first;
-    const auto far1 = run(noise, noise, [](ARevF& r) { r.setDistance(1.0f); }).first;
+    const auto far1 = run(noise, noise, [](ARevF& r) { r.setSourceDepth(1.0f); }).first;
     EXPECT_LT(l11Line(far1, 8000.0, 48000, 48000) - l11Line(far1, 500.0, 48000, 48000),
               l11Line(near0, 8000.0, 48000, 48000) - l11Line(near0, 500.0, 48000, 48000) - 6.0);
 
@@ -4229,7 +4229,7 @@ DSPARK_TEST(AlgoReverb_distance_thickness_and_width)
     {
         const auto in = l11Noise(n, amp * 1.7320508f, 4u);
         const double plain = l11RmsDb(run(in, in, [](ARevF&) {}).first, 48000, n);
-        const double thick = l11RmsDb(run(in, in, [](ARevF& r) { r.setThickness(1.0f); }).first, 48000, n);
+        const double thick = l11RmsDb(run(in, in, [](ARevF& r) { r.setTankLeveling(1.0f); }).first, 48000, n);
         if (amp < 0.1f) EXPECT_GT(thick, plain + 6.0);
         else EXPECT_LT(thick, plain);
     }
@@ -4341,8 +4341,8 @@ DSPARK_TEST(AlgoReverb_tank_controls_clamp_and_ignore_invalid_values)
 {
     ARevF r;
     const float nan = std::numeric_limits<float>::quiet_NaN();
-    r.setDistance(nan);
-    r.setThickness(2.0f);
+    r.setSourceDepth(nan);
+    r.setTankLeveling(2.0f);
     r.setTempo(1000.0f);
     r.setInputWidth(-1.0f);
     r.setShimmer(nan);
@@ -4352,8 +4352,8 @@ DSPARK_TEST(AlgoReverb_tank_controls_clamp_and_ignore_invalid_values)
     r.setWidthLaw(static_cast<ARevF::WidthLaw>(5));
     r.setModulationStyle(static_cast<ARevF::ModulationStyle>(-2));
     r.setSpaceLayout(static_cast<ARevF::SpaceLayout>(3));
-    EXPECT_EQ(r.getDistance(), 0.0f);
-    EXPECT_EQ(r.getThickness(), 1.0f);
+    EXPECT_EQ(r.getSourceDepth(), 0.0f);
+    EXPECT_EQ(r.getTankLeveling(), 1.0f);
     EXPECT_EQ(r.getTempo(), 400.0f);
     EXPECT_EQ(r.getInputWidth(), 0.0f);
     EXPECT_EQ(r.getShimmer(), 0.0f);
@@ -4370,7 +4370,7 @@ DSPARK_TEST(AlgoReverb_tank_controls_clamp_and_ignore_invalid_values)
 }
 
 // New: the convolution reverb's ducking and gate.
-DSPARK_TEST(ConvReverb_ducking_and_gate_follow_the_dry_signal)
+DSPARK_TEST(ConvReverb_dry_dip_and_gate_follow_the_dry_signal)
 {
     std::vector<float> ir(72000);
     uint32_t seed = 11u;
@@ -4392,7 +4392,7 @@ DSPARK_TEST(ConvReverb_ducking_and_gate_follow_the_dry_signal)
         return l11Run(*rev, in, in, [](size_t) {}).first;
     };
     const auto plain = wet([](Reverb<float>&) {});
-    const auto ducked = wet([](Reverb<float>& r) { r.setDucking(12.0f); });
+    const auto ducked = wet([](Reverb<float>& r) { r.setDryDip(12.0f); });
     const auto gated = wet([](Reverb<float>& r) { r.setGate(-30.0f); r.setGateHold(50.0f); r.setGateRelease(40.0f); });
     EXPECT_TRUE(loaded);
     EXPECT_LT(l11RmsDb(ducked, 24000, 48000), l11RmsDb(plain, 24000, 48000) - 8.0);
@@ -8218,7 +8218,7 @@ double l13RmsDb(const std::vector<float>& v, size_t from, size_t to)
 // New: the tonal balance lowers a band that stands out of the trend of the
 // programme, keeps the loudness, and with every amount at zero is the input
 // late by its latency.
-DSPARK_TEST(TonalBalance_tames_a_peak_and_keeps_the_loudness)
+DSPARK_TEST(TonalBalance_trims_a_peak_and_keeps_the_loudness)
 {
     const size_t n = 48000 * 4;
     const std::vector<float> base = l13Pinkish(n, 5u);
@@ -8235,7 +8235,7 @@ DSPARK_TEST(TonalBalance_tames_a_peak_and_keeps_the_loudness)
     EXPECT_NEAR(l13RmsDb(out.first, 96000, n), l13RmsDb(peaked, 96000, n), 1.5);
 
     auto still = std::make_unique<TonalBalance<float>>();
-    still->setBalance(0.0f); still->setBoost(0.0f); still->setTame(0.0f);
+    still->setBalance(0.0f); still->setFillDips(0.0f); still->setTrimPeaks(0.0f);
     still->prepare(spec(48000.0, 256, 2));
     const auto same = l13Run(*still, base, base);
     double worst = 0.0;
@@ -8275,7 +8275,7 @@ DSPARK_TEST(ResonanceSuppressor_takes_out_a_resonance)
     EXPECT_NEAR(l13Line(out.first, 600.0, from, len), l13Line(rung, 600.0, from - static_cast<size_t>(lat), len), 6.0);
 
     auto delta = std::make_unique<ResonanceSuppressor<float>>();
-    delta->setDelta(true);
+    delta->setRemovalListen(true);
     delta->prepare(spec(48000.0, 256, 2));
     const auto taken = l13Run(*delta, rung, rung);
     double worst = 0.0;
@@ -8284,10 +8284,45 @@ DSPARK_TEST(ResonanceSuppressor_takes_out_a_resonance)
     EXPECT_LT(worst, 1e-3);
 
     ResonanceSuppressor<float> c;
-    c.setDepth(5.0f);
-    EXPECT_EQ(c.getDepth(), 1.0f);
-    c.setMode(ResonanceSuppressor<float>::Mode::Hard);
-    EXPECT_TRUE(c.getMode() == ResonanceSuppressor<float>::Mode::Hard);
+    c.setStrength(5.0f);
+    EXPECT_EQ(c.getStrength(), 1.0f);
+    c.setMode(ResonanceSuppressor<float>::Mode::Deep);
+    EXPECT_TRUE(c.getMode() == ResonanceSuppressor<float>::Mode::Deep);
+}
+
+// New: the display curves of the suppressor. Around the line the last frame
+// shows the reduction it applies and the resonance it found; around the
+// noise far less; a linked pair shows one curve on both channels; the focus
+// listen shows the gain of its filter (half, a flat curve); reset clears it.
+DSPARK_TEST(ResonanceSuppressor_display_shows_what_it_finds_and_takes_out)
+{
+    using RS = ResonanceSuppressor<float>;
+    const auto pointOf = [](double hz) {
+        return static_cast<int>(std::lround((RS::kDisplayPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+    };
+    const size_t n = 48000 * 3;
+    const std::vector<float> rung = l13Add(l13Noise(n, 0.1f, 7u), 2000.0, 0.2);
+    auto rs = std::make_unique<RS>();
+    rs->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*rs, rung, rung);
+    const int line = pointOf(2000.0), noise = pointOf(600.0);
+    const double atLine = rs->getDisplayReduction(0, line);
+    EXPECT_LT(atLine, -6.0);
+    EXPECT_LT(atLine, rs->getDisplayReduction(0, noise) - 3.0);
+    EXPECT_GT(rs->getDisplayExcess(0, line), 6.0);
+    EXPECT_EQ(rs->getDisplayReduction(1, line), rs->getDisplayReduction(0, line));
+    EXPECT_TRUE(rs->getPeakReduction() <= static_cast<float>(atLine));
+    EXPECT_NEAR(RS::getDisplayFrequency(line), 2000.0, 60.0);
+    rs->reset();
+    EXPECT_EQ(rs->getPeakReduction(), 0.0f);
+
+    auto focus = std::make_unique<RS>();
+    focus->setFocusListen(true);
+    focus->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*focus, rung, rung);
+    for (int p = 0; p < RS::kDisplayPoints; p += 9)
+        EXPECT_NEAR(static_cast<double>(focus->getDisplayReduction(0, p)), -6.02, 0.05);
+    EXPECT_EQ(focus->getDisplayExcess(0, line), 0.0f);
 }
 
 // New: spectral dynamics. Inside one bell, the cell with the loud tone is
@@ -8315,10 +8350,37 @@ DSPARK_TEST(SpectralDynamicEQ_acts_cell_by_cell)
     EXPECT_EQ(eq->getBand(1).cells, S::kMaxCells);
 }
 
+// New: the display curve of the spectral dynamic equalizer: the last frame's
+// gain, deep at the loud tone, shallower at the quiet one of the same bell,
+// nothing far outside it; the peak keeps its sign.
+DSPARK_TEST(SpectralDynamicEQ_display_shows_the_gain_of_the_frame)
+{
+    using S = SpectralDynamicEQ<float>;
+    const auto pointOf = [](double hz) {
+        return static_cast<int>(std::lround((S::kDisplayPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+    };
+    const size_t n = 48000 * 3;
+    const std::vector<float> in = l13Add(l13Add(l13Noise(n, 0.01f, 11u), 2500.0, 0.3), 1500.0, 0.01);
+    auto eq = std::make_unique<S>();
+    S::Band b;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 0.7f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    eq->setBand(0, b);
+    eq->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*eq, in, in);
+    const double loud = eq->getDisplayGain(pointOf(2500.0));
+    EXPECT_LT(loud, -3.0);
+    EXPECT_LT(loud, eq->getDisplayGain(pointOf(1500.0)) - 1.0);
+    EXPECT_GT(eq->getDisplayGain(pointOf(100.0)), -0.3);
+    EXPECT_LT(eq->getPeakGain(), -3.0f);
+    EXPECT_TRUE(eq->getPeakGain() <= static_cast<float>(loud));
+    eq->reset();
+    EXPECT_EQ(eq->getPeakGain(), 0.0f);
+}
+
 // New: the options of the denoiser. The delta is the complement of the
 // output; smoothing and release still reduce the learned noise; the filter
 // mode reduces it about as the STFT does, with the same latency.
-DSPARK_TEST(SpectralDenoiser_options_delta_and_filter_mode)
+DSPARK_TEST(SpectralDenoiser_options_removal_listen_and_filter_mode)
 {
     const size_t n = 48000 * 3;
     const std::vector<float> noise = l13Noise(n, 0.05f, 13u);
@@ -8336,7 +8398,7 @@ DSPARK_TEST(SpectralDenoiser_options_delta_and_filter_mode)
     smooth->setGainRelease(100.0f);
     const auto b = learnThen(*smooth);
     auto deltaD = std::make_unique<SpectralDenoiser<float>>();
-    deltaD->setDelta(true);
+    deltaD->setRemovalListen(true);
     const auto c = learnThen(*deltaD);
     const int lat = plain->getLatency();
     double worst = 0.0;

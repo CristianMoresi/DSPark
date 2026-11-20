@@ -111,6 +111,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         d.setBandwidth(1.5f); d.setAttack(2.0f); d.setRelease(80.0f);
         d.setDetectionMode(DeEsser<float>::DetectionMode::Derivative);
         d.setAutoThreshold(true);
+        d.setStructure(DeEsser<float>::Structure::Ladder);
     })));
     EXPECT_TRUE((roundTrip<TransientDesigner<float>>([](auto& t) {
         t.setAttack(40.0f); t.setSustain(-30.0f);   // percent units
@@ -256,6 +257,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         e.setMatchedBells(true);
         e.setSoftMode(true);
         e.setFilterMode(Equalizer<float>::FilterMode::LinearPhase);
+        e.setStructure(Equalizer<float>::Structure::Ladder);
     })));
     EXPECT_TRUE((roundTrip<CrossoverFilter<float>>([](auto& x) {
         x.setNumBands(3);
@@ -272,6 +274,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         b.frequency = 240.0f; b.belowRatio = 1.8f;
         d.setBand(1, b);
         d.setLinkMode(DynamicEQ<float>::LinkMode::Dominant);
+        d.setStructure(DynamicEQ<float>::Structure::Ladder);
     })));
 }
 

@@ -6068,3 +6068,37 @@ DSPARK_TEST(FilterEngine_ladder_structure_matches_the_direct_form)
         rest = std::max(rest, std::abs(static_cast<double>(out[0][i]) - static_cast<double>(out[1][i])));
     EXPECT_LT(rest / peak, 1e-4);
 }
+
+DSPARK_TEST(Equalizer_ladder_structure_matches_the_direct_form)
+{
+    // The bands of the minimum-phase engine as ladders: the same response.
+    using E = Equalizer<float>;
+    std::vector<float> out[2];
+    std::vector<float> in(24000);
+    uint32_t seed = 4242u;
+    for (auto& v : in) { seed = seed * 1664525u + 1013904223u; v = 0.3f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
+    for (int ladder = 0; ladder < 2; ++ladder)
+    {
+        auto e = std::make_unique<E>();
+        e->setNumBands(3);
+        e->setBand(0, 120.0f, 5.0f, 0.8f);
+        e->setBand(1, 1800.0f, -7.0f, 2.0f);
+        e->setBand(2, 9000.0f, 3.0f, 0.7f);
+        if (ladder) e->setStructure(E::Structure::Ladder);
+        e->prepare(spec(48000.0, 256, 1));
+        EXPECT_TRUE(e->getStructure() == (ladder ? E::Structure::Ladder : E::Structure::DirectForm));
+        out[ladder] = in;
+        for (int off = 0; off < 24000; off += 256)
+        {
+            float* ch[1] = { out[ladder].data() + off };
+            e->processBlock(AudioBufferView<float>(ch, 1, std::min(256, 24000 - off)));
+        }
+    }
+    double worst = 0.0, peak = 0.0;
+    for (size_t i = 0; i < out[0].size(); ++i)
+    {
+        worst = std::max(worst, std::abs(static_cast<double>(out[0][i]) - static_cast<double>(out[1][i])));
+        peak = std::max(peak, std::abs(static_cast<double>(out[0][i])));
+    }
+    EXPECT_LT(worst / peak, 1e-4);
+}

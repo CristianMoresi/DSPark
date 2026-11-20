@@ -7481,3 +7481,91 @@ DSPARK_TEST(DynamicEQ_dominant_link_reads_a_source_wherever_it_is_panned)
     EXPECT_GT(spread[0], 1.5);
     EXPECT_LT(spread[1], 0.3);
 }
+
+DSPARK_TEST(DynamicEQ_and_DeEsser_ladder_structure_matches_the_direct_form)
+{
+    // The dynamic filter is designed again every 16 samples as the gain
+    // moves; as a ladder it has the same response, so the output stays with
+    // the direct form's (closely while the gain swings, the two memories
+    // taking the jumps differently).
+    std::vector<float> burst(48000);
+    for (size_t i = 0; i < burst.size(); ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        const double env = (i / 4800) % 2 == 0 ? 0.6 : 0.05;
+        burst[i] = static_cast<float>(env * (std::sin(2.0 * 3.14159265358979323846 * 2200.0 * t)
+                                             + 0.5 * std::sin(2.0 * 3.14159265358979323846 * 6500.0 * t)));
+    }
+    const auto run = [&](auto& p) {
+        std::vector<float> l = burst, r = burst;
+        for (size_t off = 0; off < burst.size(); off += 256)
+        {
+            const int n = static_cast<int>(std::min<size_t>(256, burst.size() - off));
+            float* ch[2] = { l.data() + off, r.data() + off };
+            p.processBlock(AudioBufferView<float>(ch, 2, n));
+        }
+        return l;
+    };
+    {
+        using D = DynamicEQ<float>;
+        std::vector<float> out[2];
+        for (int ladder = 0; ladder < 2; ++ladder)
+        {
+            auto d = std::make_unique<D>();
+            D::BandConfig band;
+            band.frequency = 2200.0f; band.threshold = -24.0f; band.aboveRatio = 4.0f; band.aboveRangeDb = 18.0f;
+            d->setBand(0, band);
+            if (ladder) d->setStructure(D::Structure::Ladder);
+            d->prepare(spec(48000.0, 256, 2));
+            EXPECT_TRUE(d->getStructure() == (ladder ? D::Structure::Ladder : D::Structure::DirectForm));
+            out[ladder] = run(*d);
+        }
+        // Where a burst starts the bell jumps in from the identity: the direct
+        // form starts it from an empty memory, the ladder from the history it
+        // kept, so the two part there for a few milliseconds. Compared over
+        // the settled part of each burst, and in energy over the whole.
+        double worst = 0.0, peak = 0.0, e0 = 0.0, e1 = 0.0;
+        for (size_t i = 0; i < out[0].size(); ++i)
+        {
+            e0 += static_cast<double>(out[0][i]) * out[0][i];
+            e1 += static_cast<double>(out[1][i]) * out[1][i];
+            peak = std::max(peak, std::abs(static_cast<double>(out[0][i])));
+            if (i % 4800 >= 2400)
+                worst = std::max(worst, std::abs(static_cast<double>(out[0][i]) - static_cast<double>(out[1][i])));
+        }
+        const double energyDb = 10.0 * std::log10(e1 / e0);
+        std::cout << "  dynamic EQ: settled difference " << worst / peak << " of the peak, energy "
+                  << energyDb << " dB\n";
+        EXPECT_LT(worst / peak, 2e-2);
+        EXPECT_LT(std::abs(energyDb), 0.2);
+    }
+    {
+        using S = DeEsser<float>;
+        std::vector<float> out[2];
+        for (int ladder = 0; ladder < 2; ++ladder)
+        {
+            auto s = std::make_unique<S>();
+            s->setThreshold(-30.0f);
+            if (ladder) s->setStructure(S::Structure::Ladder);
+            s->prepare(spec(48000.0, 256, 2));
+            EXPECT_TRUE(s->getStructure() == (ladder ? S::Structure::Ladder : S::Structure::DirectForm));
+            out[ladder] = run(*s);
+        }
+        // The bell jumps as the reduction attacks at each burst: compared
+        // over the settled part of each burst, and in energy over the whole.
+        double worst = 0.0, peak = 0.0, e0 = 0.0, e1 = 0.0;
+        for (size_t i = 0; i < out[0].size(); ++i)
+        {
+            e0 += static_cast<double>(out[0][i]) * out[0][i];
+            e1 += static_cast<double>(out[1][i]) * out[1][i];
+            peak = std::max(peak, std::abs(static_cast<double>(out[0][i])));
+            if (i % 4800 >= 2400)
+                worst = std::max(worst, std::abs(static_cast<double>(out[0][i]) - static_cast<double>(out[1][i])));
+        }
+        const double energyDb = 10.0 * std::log10(e1 / e0);
+        std::cout << "  de-esser: settled difference " << worst / peak << " of the peak, energy "
+                  << energyDb << " dB\n";
+        EXPECT_LT(worst / peak, 2e-2);
+        EXPECT_LT(std::abs(energyDb), 0.2);
+    }
+}

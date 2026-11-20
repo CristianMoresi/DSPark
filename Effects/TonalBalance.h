@@ -23,13 +23,25 @@
  * stereo image. The specific loudness of each band (the power law over the
  * threshold in quiet) is smoothed in time and read in decibels of power.
  *
- * From there: a broad trend across the bands, and two deviations per band,
- * the trend against a reference shape (a tilt in dB per octave; the global
- * balance) and the band against its trend (the local contrast). Two
+ * Each band counts by how audible it is: nothing while its power is under
+ * its threshold in quiet, in full from 10 dB over it. In the bands at the
+ * ends, where the threshold climbs, a programme's loudness is almost
+ * nothing, and read as a level it would be a hole of tens of decibels; an
+ * inaudible band neither shapes the trend nor takes a correction.
+ *
+ * From there: a broad trend across the bands (a smoothing in which each band
+ * weighs by its audibility), and two deviations per band, the trend against
+ * a reference shape (a tilt in dB per octave; the global balance) and the
+ * band against its two sides (the local contrast: a dip is a band under the
+ * audible bands both below and above it, a peak a band over both, so the
+ * fall of the content at an end of the band is neither). The reference is
+ * a formula, flat loudness per Bark tilted by setTilt() around 1 kHz, and
+ * the tilt acts through setBalance() (the share of the way the trend moves
+ * toward it). Two
  * soft-knee curves (hyperbolas, with a different slope on each side) turn a
  * deviation into a correction: setBalance() moves the trend toward the
- * reference, setFillDips() raises bands that sit under their trend and
- * setTrimPeaks() lowers those that stand over it. The corrections are limited
+ * reference, setFillDips() raises dips and setTrimPeaks() lowers peaks. The
+ * corrections are limited
  * (setRange()), faded at the edges of setFrequencyRange() over one Bark, and
  * then offset so the total loudness of the programme does not change (the
  * correction redistributes). setLevelCompensation(true) converts loudness
@@ -155,11 +167,11 @@ public:
 
     /** @brief How far the trend moves toward the reference shape, 0 to 1 (default 0.5). */
     void setBalance(T amount) noexcept { store(balance_, amount, T(0), T(1)); }
-    /** @brief How much bands under their trend are raised, 0 to 1 (default 0.3). */
+    /** @brief How much dips (bands under both of their sides) are raised, 0 to 1 (default 0.3). */
     void setFillDips(T amount) noexcept { store(fillDips_, amount, T(0), T(1)); }
-    /** @brief How much bands over their trend are lowered, 0 to 1 (default 0.5). */
+    /** @brief How much peaks (bands over both of their sides) are lowered, 0 to 1 (default 0.5). */
     void setTrimPeaks(T amount) noexcept { store(trimPeaks_, amount, T(0), T(1)); }
-    /** @brief Tilt of the reference shape in dB per octave around 1 kHz, -6 to +6 (default 0: flat loudness per Bark). */
+    /** @brief Tilt of the reference shape in dB per octave around 1 kHz, -6 to +6 (default 0: flat loudness per Bark); it acts through setBalance(). */
     void setTilt(T dbPerOctave) noexcept { store(tilt_, dbPerOctave, T(-6), T(6)); }
     /** @brief Largest correction of a band, 0 to 24 dB (default 6). */
     void setRange(T db) noexcept { store(range_, db, T(0), T(24)); }
@@ -363,17 +375,34 @@ private:
         const double lo = static_cast<double>(loHz_.load(std::memory_order_relaxed));
         const double hi = static_cast<double>(hiHz_.load(std::memory_order_relaxed));
         const double zLo = AuditoryScale::hzToBark(lo), zHi = AuditoryScale::hzToBark(hi);
-        std::array<double, kBands> level {}, trend {}, weight {}, exponent {};
+        // How audible each band is: its power over its threshold in quiet,
+        // nothing under it, all of it from kAudibleSpan dB over. A band
+        // under the threshold has a loudness of almost nothing, and its
+        // level would read as a hole of tens of decibels: it neither shapes
+        // the trend nor takes a correction (filling it would raise content
+        // nobody hears, the ends of the band first).
+        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, audible {}, weighed {};
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
             exponent[i] = comp ? bands_.getExponent(b) : kMidExponent;
             level[i] = 10.0 * std::log10(loud_[i] + 1e-12) / exponent[i];
-            trend[i] = level[i];
+            const double over = 10.0 * std::log10((tmpA_[i] + 1e-30) / bands_.getThreshold(b));
+            audible[i] = std::clamp(over / kAudibleSpan, 0.0, 1.0);
+            trend[i] = audible[i] * level[i];
+            weighed[i] = audible[i];
             const double z = bands_.getBark(b);
-            weight[i] = std::clamp(z - zLo + 0.5, 0.0, 1.0) * std::clamp(zHi - z + 0.5, 0.0, 1.0);
+            weight[i] = std::clamp(z - zLo + 0.5, 0.0, 1.0) * std::clamp(zHi - z + 0.5, 0.0, 1.0) * audible[i];
         }
+        // The trend across the bands, each weighed by how audible it is (a
+        // normalized smoothing: the audible neighbours of a band decide it).
         AuditoryBands<double>::smoothAcross(trend.data(), kBands, 0.9);
+        AuditoryBands<double>::smoothAcross(weighed.data(), kBands, 0.9);
+        for (int b = 0; b < kBands; ++b)
+        {
+            const auto i = static_cast<size_t>(b);
+            trend[i] = weighed[i] > 1e-9 ? trend[i] / weighed[i] : level[i];
+        }
         double meanDev = 0.0, wsum = 0.0;
         for (int b = 0; b < kBands; ++b)
         {
@@ -384,6 +413,31 @@ private:
             wsum += weight[i];
         }
         meanDev = wsum > 0.0 ? meanDev / wsum : 0.0;
+        // The two sides of each band: what the audible bands below it say,
+        // and what those above it say (one-pole averages that leave the band
+        // itself out). A dip is a band under both sides and a peak a band
+        // over both; where the content falls away at an end of the band,
+        // nothing louder lies beyond, so the fall is neither. A side with no
+        // audible band says nothing (it reads as the band itself).
+        std::array<double, kBands> below {}, above {};
+        {
+            double num = 0.0, den = 0.0;
+            for (int b = 0; b < kBands; ++b)
+            {
+                const auto i = static_cast<size_t>(b);
+                below[i] = den > 1e-9 ? num / den : level[i];
+                num = kSidePole * num + audible[i] * level[i];
+                den = kSidePole * den + audible[i];
+            }
+            num = 0.0; den = 0.0;
+            for (int b = kBands - 1; b >= 0; --b)
+            {
+                const auto i = static_cast<size_t>(b);
+                above[i] = den > 1e-9 ? num / den : level[i];
+                num = kSidePole * num + audible[i] * level[i];
+                den = kSidePole * den + audible[i];
+            }
+        }
         const double balance = static_cast<double>(balance_.load(std::memory_order_relaxed));
         const double fillDips = static_cast<double>(fillDips_.load(std::memory_order_relaxed));
         const double trimPeaks = static_cast<double>(trimPeaks_.load(std::memory_order_relaxed));
@@ -394,8 +448,9 @@ private:
         {
             const auto i = static_cast<size_t>(b);
             const double global = tmpC_[i] - meanDev;
-            const double local = level[i] - trend[i];
-            double c = -balance * soft(global) - (local > 0.0 ? trimPeaks : fillDips) * soft(local);
+            const double dip = std::min(0.0, level[i] - std::min(below[i], above[i]));
+            const double peak = std::max(0.0, level[i] - std::max(below[i], above[i]));
+            double c = -balance * soft(global) - trimPeaks * soft(peak) - fillDips * soft(dip);
             c = std::clamp(c, -range, range) * weight[i];
             corr_[i] = c;
         }
@@ -419,6 +474,9 @@ private:
         }
         bank_.setGains(gains.data(), hop_, (hops_++ & 7) == 0 ? 1 : 0);
     }
+
+    static constexpr double kAudibleSpan = 10.0;  ///< dB over the threshold in quiet from which a band counts in full.
+    static constexpr double kSidePole = 0.9;      ///< Pole of the one-sided averages a dip or a peak is read against.
 
     double fs_ = 48000.0, powerScale_ = 1.0, keyFade_ = 0.0;
     int channels_ = 0, fft_ = 2048, hop_ = 128, bins_ = 1025, analysisDelay_ = 0;

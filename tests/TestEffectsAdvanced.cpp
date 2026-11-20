@@ -36,6 +36,7 @@
 #include "../Effects/TapeMachine.h"
 #include "../Effects/RingModulator.h"
 #include "../Effects/FrequencyShifter.h"
+#include "../Core/AuditoryBands.h"
 #include "../Core/FFT.h"
 #include "../Core/ZeroLatencyConvolver.h"
 
@@ -8261,11 +8262,72 @@ double l13RmsDb(const std::vector<float>& v, size_t from, size_t to)
     return 10.0 * std::log10(std::max(s / static_cast<double>(to - from), 1e-30));
 }
 
+// The total loudness of the auditory model the tonal balance keeps (specific
+// loudness over Bark, from the mean power spectrum of 2048-sample Hann
+// frames), as a level: 10 log10(N) / 0.23.
+double l13ModelLoudnessDb(const std::vector<float>& v, size_t from)
+{
+    constexpr int size = 2048;
+    FFTReal<double> fft(static_cast<size_t>(size));
+    std::vector<double> win(size), frame(size), sp(size + 2), mean(size / 2 + 1, 0.0);
+    double sw = 0.0;
+    for (int i = 0; i < size; ++i)
+    {
+        win[static_cast<size_t>(i)] = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * i / size);
+        sw += win[static_cast<size_t>(i)];
+    }
+    int frames = 0;
+    for (size_t at = from; at + size <= v.size(); at += size / 2, ++frames)
+    {
+        for (int i = 0; i < size; ++i) frame[static_cast<size_t>(i)] = v[at + static_cast<size_t>(i)] * win[static_cast<size_t>(i)];
+        fft.forward(frame.data(), sp.data());
+        for (int k = 0; k <= size / 2; ++k)
+            mean[static_cast<size_t>(k)] += 4.0 / (sw * sw) * (sp[static_cast<size_t>(2 * k)] * sp[static_cast<size_t>(2 * k)]
+                                                              + sp[static_cast<size_t>(2 * k + 1)] * sp[static_cast<size_t>(2 * k + 1)]);
+    }
+    for (auto& m : mean) m /= frames;
+    AuditoryBands<double> bands;
+    bands.prepare(48000.0, size, 72, 20.0, 20000.0);
+    std::vector<double> power(72), specific(72);
+    bands.bandPowers(mean.data(), power.data());
+    bands.specificLoudness(power.data(), specific.data());
+    return 10.0 * std::log10(bands.totalLoudness(specific.data())) / 0.23;
+}
+
+// Pink-ish noise with little at the ends, like a mix: fourth-order
+// Butterworth high-pass at 50 Hz and low-pass at 12 kHz.
+std::vector<float> l13MixLike(size_t n, uint32_t seed)
+{
+    struct Section
+    {
+        double b0, b1, b2, a1, a2, z1 = 0.0, z2 = 0.0;
+        Section(bool high, double hz, double q)
+        {
+            const double w = 2.0 * 3.14159265358979323846 * hz / 48000.0, c = std::cos(w), al = std::sin(w) / (2.0 * q), a0 = 1.0 + al;
+            b0 = (high ? (1 + c) : (1 - c)) / 2 / a0; b1 = (high ? -(1 + c) : (1 - c)) / a0; b2 = b0;
+            a1 = -2 * c / a0; a2 = (1 - al) / a0;
+        }
+        double run(double x) { const double y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; return y; }
+    };
+    Section s[4] = { { true, 50.0, 0.5412 }, { true, 50.0, 1.3066 }, { false, 12000.0, 0.5412 }, { false, 12000.0, 1.3066 } };
+    std::vector<float> v = l13Pinkish(n, seed);
+    for (float& x : v)
+    {
+        double y = x;
+        for (auto& f : s) y = f.run(y);
+        x = static_cast<float>(y);
+    }
+    return v;
+}
+
 } // namespace
 
 // New: the tonal balance lowers a band that stands out of the trend of the
 // programme, keeps the loudness, and with every amount at zero is the input
-// late by its latency.
+// late by its latency. The loudness kept is that of its auditory model: on
+// this programme, where the tone carries most of the energy, cutting the tone
+// 5 dB lowers the RMS 1.9 dB (and the integrated loudness 2.3 LU) while the
+// model's total loudness moves 0.14 dB.
 DSPARK_TEST(TonalBalance_trims_a_peak_and_keeps_the_loudness)
 {
     const size_t n = 48000 * 4;
@@ -8280,7 +8342,8 @@ DSPARK_TEST(TonalBalance_trims_a_peak_and_keeps_the_loudness)
     EXPECT_LT(static_cast<double>(tb->getCorrection(at3k)), -1.0);
     const int lat = tb->getLatency();
     EXPECT_LT(l13Line(out.first, 3000.0, 96000, 96000) - l13Line(peaked, 3000.0, 96000 - static_cast<size_t>(lat), 96000), -1.0);
-    EXPECT_NEAR(l13RmsDb(out.first, 96000, n), l13RmsDb(peaked, 96000, n), 1.5);
+    EXPECT_NEAR(l13ModelLoudnessDb(out.first, 96000), l13ModelLoudnessDb(peaked, 96000), 0.5);
+    EXPECT_LT(static_cast<double>(tb->getCorrection(at3k)), -4.0);       // the excess over both sides, half of it
 
     auto still = std::make_unique<TonalBalance<float>>();
     still->setBalance(0.0f); still->setFillDips(0.0f); still->setTrimPeaks(0.0f);
@@ -8304,6 +8367,71 @@ DSPARK_TEST(TonalBalance_trims_a_peak_and_keeps_the_loudness)
     EXPECT_EQ(c.getRange(), 6.0f);
     c.setTilt(40.0f);
     EXPECT_EQ(c.getTilt(), 6.0f);
+}
+
+// Defect: in the bands at the ends (20-50 Hz, 12-20 kHz) the threshold in
+// quiet is high and the loudness of a programme there is almost nothing; it
+// read as a hole of tens of decibels and Fill Dips raised it to the range
+// (+6 dB over 12 kHz on a mix-like programme), and the fall of the content
+// at an end read as a dip. A band now counts by how far it sits over its
+// threshold, and a dip is a band under both of its sides.
+DSPARK_TEST(TonalBalance_leaves_the_ends_alone)
+{
+    const size_t n = 48000 * 5;
+    for (const bool quiet : { false, true })
+    {
+        std::vector<float> x = l13MixLike(n, 11u);
+        if (quiet) for (float& v : x) v *= 0.1f;                 // 20 dB lower
+        struct Amounts { float balance, fill, trim; };
+        for (const Amounts a : { Amounts { 0.5f, 0.3f, 0.5f }, Amounts { 0.0f, 1.0f, 0.0f }, Amounts { 0.0f, 0.0f, 1.0f } })
+        {
+            auto tb = std::make_unique<TonalBalance<float>>();
+            tb->setBalance(a.balance); tb->setFillDips(a.fill); tb->setTrimPeaks(a.trim);
+            tb->prepare(spec(48000.0, 256, 2));
+            (void)l13Run(*tb, x, x);
+            double lowEnd = 0.0, highEnd = 0.0;
+            for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+            {
+                const double hz = tb->getBandCentre(b), c = static_cast<double>(tb->getCorrection(b));
+                if (hz < 60.0) lowEnd = std::max(lowEnd, std::abs(c));
+                if (hz > 12000.0) highEnd = std::max(highEnd, std::abs(c));
+            }
+            std::printf("  [tonal] %s, balance %.1f fill %.1f trim %.1f: ends %.2f / %.2f dB\n", quiet ? "-20 dB" : "as made",
+                        static_cast<double>(a.balance), static_cast<double>(a.fill), static_cast<double>(a.trim), lowEnd, highEnd);
+            EXPECT_LT(lowEnd, 1.0);
+            EXPECT_LT(highEnd, 1.0);
+        }
+    }
+}
+
+// Defect: the tilt of the reference hardly moved the curve (+0.08 dB/oct of
+// correction for a tilt of +3 on a mix-like programme): the inaudible ends
+// set the mean the reference is measured against. Now the correction slopes
+// with the tilt, either way, and with Balance at zero the tilt does nothing
+// (it is what Balance moves the trend toward).
+DSPARK_TEST(TonalBalance_tilt_tilts_the_curve)
+{
+    const size_t n = 48000 * 5;
+    const std::vector<float> x = l13MixLike(n, 13u);
+    const auto slope = [&](float balance, float tilt) {
+        auto tb = std::make_unique<TonalBalance<float>>();
+        tb->setBalance(balance); tb->setFillDips(0.0f); tb->setTrimPeaks(0.0f); tb->setTilt(tilt);
+        tb->prepare(spec(48000.0, 256, 2));
+        (void)l13Run(*tb, x, x);
+        int lo = 0, hi = 0;
+        for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+        {
+            if (std::abs(std::log(tb->getBandCentre(b) / 200.0)) < std::abs(std::log(tb->getBandCentre(lo) / 200.0))) lo = b;
+            if (std::abs(std::log(tb->getBandCentre(b) / 5000.0)) < std::abs(std::log(tb->getBandCentre(hi) / 5000.0))) hi = b;
+        }
+        return (static_cast<double>(tb->getCorrection(hi)) - static_cast<double>(tb->getCorrection(lo))) / std::log2(25.0);
+    };
+    const double down = slope(0.5f, -3.0f), flat = slope(0.5f, 0.0f), up = slope(0.5f, 3.0f), off = slope(0.0f, 3.0f);
+    std::printf("  [tonal] correction 200 Hz-5 kHz: tilt -3 %.2f, 0 %.2f, +3 %.2f dB/oct; balance 0 %.2f\n", down, flat, up, off);
+    EXPECT_LT(down, -0.7);
+    EXPECT_GT(up, 0.7);
+    EXPECT_LT(std::abs(flat), 0.2);
+    EXPECT_LT(std::abs(off), 1e-6);
 }
 
 // New: the resonance suppressor takes a line out of noise and leaves the

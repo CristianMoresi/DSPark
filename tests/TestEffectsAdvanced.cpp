@@ -3662,7 +3662,9 @@ DSPARK_TEST(AlgoReverb_decay_changes_glide_without_clicks)
     // join the late field's), so a decay change retunes them; the new gains
     // glide over ~20 ms. Toggling the Hall decay 1 s <-> 3 s every 8 blocks
     // under a 220 Hz tone gave a max second difference of 0.022 before (the
-    // step of the previous engine's early field), 0.0059 now.
+    // step of the previous engine's early field), 0.0059 then; with the wet
+    // signal at the dry signal's level the step of the loop gains alone gave
+    // 0.024, and they now glide to the new decay as well.
     ARevF rev;
     rev.prepare(spec(48000.0, 256, 2));
     rev.setType(ARevF::Type::Hall);
@@ -3688,6 +3690,7 @@ DSPARK_TEST(AlgoReverb_decay_changes_glide_without_clicks)
             y1 = y;
         }
     }
+    std::cout << "  [reverb decay toggle] max second difference " << maxD2 << "\n";
     EXPECT_LT(maxD2, 0.01);
 }
 
@@ -4139,8 +4142,53 @@ DSPARK_TEST(AlgoReverb_decay_band_moves_the_decay_in_its_band)
     EXPECT_EQ(rev->getDecayBand(1).multiplier, 4.0f);
 }
 
-// New: freeze holds the tail at its level and with its highs, and the input
-// played meanwhile does not enter it; released, it decays again.
+// New: the wet signal keeps the dry signal's level. On pink noise (the
+// spectrum of programme material) at full mix every type sits within 3 dB of
+// the dry level (it was 7 to 16 dB under it), and a Hall keeps it as its
+// decay goes from 0.5 to 6 s. White noise would read the spring 4 dB low:
+// a spring tank passes no treble, where white noise has most of its energy.
+DSPARK_TEST(AlgoReverb_wet_signal_keeps_the_dry_level)
+{
+    const size_t n = 48000 * 4;
+    auto noise = l11Noise(n, 0.25f, 3u);
+    {
+        // Pink: the white noise through three poles (-3 dB per octave from
+        // about 10 Hz to 15 kHz), back to the white noise's peak level.
+        double b0 = 0.0, b1 = 0.0, b2 = 0.0;
+        float peak = 0.0f;
+        for (auto& x : noise)
+        {
+            const double w = static_cast<double>(x);
+            b0 = 0.99765 * b0 + w * 0.0990460;
+            b1 = 0.96300 * b1 + w * 0.2965164;
+            b2 = 0.57000 * b2 + w * 1.0526913;
+            x = static_cast<float>(b0 + b1 + b2 + w * 0.1848);
+            peak = std::max(peak, std::abs(x));
+        }
+        for (auto& x : noise) x *= 0.25f / peak;
+    }
+    const double dry = l11RmsDb(noise, n / 2, n);
+    const auto wetOf = [&](ARevF::Type type, float decay) {
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, type);
+        if (decay > 0.0f) rev->setDecay(decay);
+        const auto out = l11Run(*rev, noise, noise, [](size_t) {});
+        return l11RmsDb(out.first, n / 2, n) - dry;
+    };
+    for (auto type : { ARevF::Type::Room, ARevF::Type::Hall, ARevF::Type::Chamber, ARevF::Type::Plate,
+                       ARevF::Type::Spring, ARevF::Type::Cathedral })
+    {
+        const double level = wetOf(type, 0.0f);
+        std::cout << "  [reverb wet] type " << static_cast<int>(type) << " wet - dry " << level << " dB\n";
+        EXPECT_NEAR(level, 0.0, 3.0);
+    }
+    const double shortHall = wetOf(ARevF::Type::Hall, 0.5f), longHall = wetOf(ARevF::Type::Hall, 6.0f);
+    std::cout << "  [reverb wet] hall 0.5 s " << shortHall << " dB, 6 s " << longHall << " dB\n";
+    EXPECT_NEAR(shortHall, longHall, 3.0);
+}
+
+// New: the tail hold keeps the tail at its level and with its highs, and the
+// input played meanwhile does not enter it; released, it decays again.
 DSPARK_TEST(AlgoReverb_tail_hold_keeps_the_tail)
 {
     const size_t n = 48000 * 5;
@@ -8375,6 +8423,30 @@ DSPARK_TEST(SpectralDynamicEQ_display_shows_the_gain_of_the_frame)
     EXPECT_TRUE(eq->getPeakGain() <= static_cast<float>(loud));
     eq->reset();
     EXPECT_EQ(eq->getPeakGain(), 0.0f);
+}
+
+// New: the cells crowd where the band acts. A loud tone at 2.5 kHz in a bell
+// there comes down while a quiet one at 2.2 kHz, a sixth of an octave away,
+// is left where it was (cells spread evenly over the whole skirt took it
+// down 4 dB with 32 cells).
+DSPARK_TEST(SpectralDynamicEQ_cells_resolve_close_tones)
+{
+    using S = SpectralDynamicEQ<float>;
+    const size_t n = 48000 * 3;
+    const std::vector<float> in = l13Add(l13Add(l13Noise(n, 0.01f, 11u), 2500.0, 0.3), 2200.0, 0.01);
+    auto eq = std::make_unique<S>();
+    S::Band b;
+    b.shape = S::Shape::Bell; b.frequency = 2500.0f; b.q = 1.0f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    eq->setBand(0, b);
+    eq->prepare(spec(48000.0, 256, 2));
+    const auto out = l13Run(*eq, in, in);
+    const auto lat = static_cast<size_t>(eq->getLatency());
+    const size_t from = 72000, len = 48000;
+    const double loud = l13Line(out.first, 2500.0, from, len) - l13Line(in, 2500.0, from - lat, len);
+    const double quiet = l13Line(out.first, 2200.0, from, len) - l13Line(in, 2200.0, from - lat, len);
+    std::cout << "  [spectral dynamic eq] loud " << loud << " dB, quiet " << quiet << " dB\n";
+    EXPECT_LT(loud, -6.0);
+    EXPECT_GT(quiet, -1.0);
 }
 
 // New: the options of the denoiser. The delta is the complement of the

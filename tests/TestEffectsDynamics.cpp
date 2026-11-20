@@ -8000,3 +8000,26 @@ DSPARK_TEST(Compressor_character_stage_moves_without_a_click)
     EXPECT_LT(worst, natural * 1.2);
     EXPECT_TRUE(c->getCharacterStage() == C::StagePosition::Off);
 }
+
+// New: the threshold in use. Without the automatic threshold it is the one
+// set; with it, the key's recent peak plus the one set: a tone peaking at
+// -10 dBFS and a threshold of -20 dB put it at -30 dBFS, in feed-forward and
+// in feedback (where the reference follows the input).
+DSPARK_TEST(Compressor_threshold_in_use_follows_the_automatic_reference)
+{
+    using C = Compressor<float>;
+    for (int topology = 0; topology < 2; ++topology)
+        for (int autoThr = 0; autoThr < 2; ++autoThr)
+        {
+            auto c = std::make_unique<C>();
+            c->setThreshold(-20.0f);
+            c->setTopology(topology ? C::Topology::FeedBack : C::Topology::FeedForward);
+            c->setAutoThreshold(autoThr != 0);
+            c->prepare(AudioSpec{ 48000.0, 256, 2 });
+            const int n = 48000;
+            std::vector<Vec> x { makeSine(1000.0, 0.316227766, 48000.0, n), makeSine(1000.0, 0.316227766, 48000.0, n) };
+            processInBlocks(x, 256, [&](AudioBufferView<float> v) { c->processBlock(v); });
+            const double inUse = static_cast<double>(c->getThresholdInUseDb());
+            EXPECT_NEAR(inUse, autoThr ? -30.0 : -20.0, 0.25);
+        }
+}

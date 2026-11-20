@@ -17,8 +17,10 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -94,6 +96,7 @@ struct ParamDesc
     std::string unit;                       // "dB", "ms", "Hz", ":1", "%"
     std::vector<std::string> choices;       // Only for Choice type
     bool        logarithmic = false;        // Log-scale slider
+    std::string group;                      // Tab the control sits on (empty: the first tab)
 };
 
 // --- Effect slot (one per processor instance) --------------------------------
@@ -114,9 +117,9 @@ public:
     std::function<void()>                                resetFn;
     std::function<void(int, float)>                      setParamFn;
 
-    // Optional metering getter - returns gain reduction in dB (positive value
-    // means the processor is attenuating the signal by that amount).
-    // Leave empty if the processor does not expose gain reduction.
+    // Optional metering getter - returns the gain change in dB (negative: the
+    // processor is attenuating the signal by that amount); the interface shows
+    // its history under the display. Leave empty if the processor has none.
     std::function<float()> gainReductionDbFn;
 
     // --- Optional rich-GUI hooks (filled by factories that support them) -------
@@ -132,10 +135,29 @@ public:
     std::function<void(const float* freqsHz, float* magsDb, int n,
                        double sampleRate, const float* paramValues)> targetMagnitudeFn;
 
+    // A second live curve, drawn thinner in another colour (e.g. the second
+    // channel of a processor that treats the two apart). Same signature.
+    std::function<void(const float* freqsHz, float* magsDb, int n,
+                       double sampleRate, const float* paramValues)> secondaryMagnitudeFn;
+
+    // What the processor finds, drawn as a filled area from 0 dB (e.g. the
+    // resonances a suppressor detects over its threshold). Same signature.
+    std::function<void(const float* freqsHz, float* magsDb, int n,
+                       double sampleRate, const float* paramValues)> activityFn;
+
+    // Legend of the display: what each curve shows (empty: not listed).
+    std::string liveLabel = "Response", targetLabel, secondaryLabel, activityLabel;
+
+    // Vertical scale of the response display, +/- dB.
+    float displayRangeDb = 24.0f;
+
     // Draggable curve nodes (parameter indices; -1 = that axis is fixed).
     // X drag -> freqParam (log), Y drag -> gainParam, mouse wheel -> qParam.
     struct CurveNode { int freqParam = -1; int gainParam = -1; int qParam = -1; };
     std::vector<CurveNode> curveNodes;
+
+    // Tabs of the control panel, in order (see group()).
+    std::vector<std::string> groups;
 
     // Parameter read-back: refreshes values[] from the processor's getters, for
     // processors whose own logic moves parameters (a reverb Type loads a whole
@@ -172,6 +194,31 @@ public:
                            static_cast<float>(def), ParamDesc::Choice, "",
                            std::move(opts), false });
         values.push_back(static_cast<float>(def));
+    }
+
+    /// Puts the controls at these indices on a tab of the control panel.
+    /// Tabs appear in the order of the calls; controls on no tab go to the
+    /// first one ("Main" when no call names it first).
+    void group(const char* tab, std::initializer_list<int> indices)
+    {
+        if (std::find(groups.begin(), groups.end(), tab) == groups.end()) groups.emplace_back(tab);
+        for (int i : indices)
+            if (i >= 0 && i < static_cast<int>(params.size())) params[static_cast<size_t>(i)].group = tab;
+    }
+
+    /// The tab of a control: its own, or the first tab.
+    [[nodiscard]] std::string groupOf(int index) const
+    {
+        const auto& g = params[static_cast<size_t>(index)].group;
+        if (!g.empty()) return g;
+        return groups.empty() ? std::string("Main") : groups.front();
+    }
+
+    /// Every tab, in order ("Main" alone when no control is on a tab).
+    [[nodiscard]] std::vector<std::string> tabs() const
+    {
+        if (groups.empty()) return { std::string("Main") };
+        return groups;
     }
 
     // --- Runtime interface ---

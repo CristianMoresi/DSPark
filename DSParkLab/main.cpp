@@ -75,7 +75,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     HWND hwnd = CreateWindowW(
         wc.lpszClassName, L"DSParkLab",
         WS_OVERLAPPEDWINDOW,
-        100, 100, 1280, 800,
+        80, 60, 1480, 940,
         nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(hwnd))
@@ -93,8 +93,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr;   // the layout is fixed: nothing to remember
     ImGui::StyleColorsDark();
     dsplab::Gui::applyTheme();
+
+    // Segoe UI from the system when it is there (the built-in font is small
+    // for a full-window layout), and its bold face for the titles.
+    {
+        char winDir[MAX_PATH] = {};
+        const UINT len = GetWindowsDirectoryA(winDir, MAX_PATH);
+        if (len > 0 && len < MAX_PATH)
+        {
+            const std::string fonts = std::string(winDir) + "\\Fonts\\";
+            const std::string body = fonts + "segoeui.ttf", bold = fonts + "segoeuib.ttf";
+            if (GetFileAttributesA(body.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                io.Fonts->AddFontFromFileTTF(body.c_str(), 16.0f);
+                if (GetFileAttributesA(bold.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    dsplab::Gui::setTitleFont(io.Fonts->AddFontFromFileTTF(bold.c_str(), 21.0f));
+            }
+        }
+    }
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);

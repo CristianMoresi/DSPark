@@ -1,6 +1,13 @@
 // DSParkLab - GUI
-// ImGui interface: transport, effect list, parameter panel, and an interactive
-// plugin-style analyzer (log-frequency spectrum + draggable EQ curve + multiband).
+// ImGui interface built for auditioning processors: a transport bar with the
+// A/B switch, an effect browser with search, and, for the selected effect, a
+// large display (spectrum, its response or live gain curves, what it detects,
+// draggable nodes), an activity strip (gain-reduction history, scope, output
+// meters, test tone and THD), and the controls as knobs on tabs, so no long
+// list has to be scrolled.
+//
+// Keys (when no text field has focus): Space plays/pauses, B switches the A/B
+// bypass, E enables or disables the selected effect, R resets its controls.
 
 #pragma once
 
@@ -11,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -28,41 +36,49 @@ namespace dsplab {
 class Gui
 {
 public:
-    // Polished dark theme with an amber accent (call once after StyleColorsDark()).
+    /// A larger font for titles (set by main() when a system font is found).
+    static void setTitleFont(ImFont* f) noexcept { titleFont() = f; }
+
+    // Dark theme with an amber accent (call once after StyleColorsDark()).
     static void applyTheme()
     {
         ImGuiStyle& s = ImGui::GetStyle();
-        s.WindowRounding = 6.0f; s.ChildRounding = 6.0f; s.FrameRounding = 4.0f;
-        s.GrabRounding = 4.0f; s.PopupRounding = 4.0f; s.ScrollbarRounding = 4.0f;
+        s.WindowRounding = 6.0f; s.ChildRounding = 6.0f; s.FrameRounding = 5.0f;
+        s.GrabRounding = 5.0f; s.PopupRounding = 5.0f; s.ScrollbarRounding = 5.0f;
+        s.TabRounding = 5.0f;
         s.WindowBorderSize = 0.0f; s.FrameBorderSize = 0.0f; s.ChildBorderSize = 1.0f;
-        s.WindowPadding = ImVec2(10, 10); s.FramePadding = ImVec2(8, 4);
+        s.WindowPadding = ImVec2(10, 10); s.FramePadding = ImVec2(8, 5);
         s.ItemSpacing = ImVec2(8, 6); s.ScrollbarSize = 12.0f;
 
         ImVec4* c = s.Colors;
         const ImVec4 accent(1.00f, 0.62f, 0.20f, 1.00f);
-        c[ImGuiCol_WindowBg]         = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
-        c[ImGuiCol_ChildBg]          = ImVec4(0.11f, 0.12f, 0.15f, 1.00f);
-        c[ImGuiCol_PopupBg]          = ImVec4(0.12f, 0.13f, 0.16f, 0.98f);
-        c[ImGuiCol_Border]           = ImVec4(0.22f, 0.24f, 0.29f, 1.00f);
-        c[ImGuiCol_FrameBg]          = ImVec4(0.16f, 0.17f, 0.21f, 1.00f);
-        c[ImGuiCol_FrameBgHovered]   = ImVec4(0.22f, 0.24f, 0.29f, 1.00f);
-        c[ImGuiCol_FrameBgActive]    = ImVec4(0.26f, 0.28f, 0.34f, 1.00f);
-        c[ImGuiCol_TitleBg]          = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
-        c[ImGuiCol_TitleBgActive]    = ImVec4(0.12f, 0.13f, 0.16f, 1.00f);
-        c[ImGuiCol_Button]           = ImVec4(0.20f, 0.22f, 0.27f, 1.00f);
-        c[ImGuiCol_ButtonHovered]    = ImVec4(0.28f, 0.31f, 0.38f, 1.00f);
-        c[ImGuiCol_ButtonActive]     = accent;
-        c[ImGuiCol_SliderGrab]       = accent;
-        c[ImGuiCol_SliderGrabActive] = ImVec4(1.00f, 0.74f, 0.35f, 1.00f);
-        c[ImGuiCol_CheckMark]        = accent;
-        c[ImGuiCol_Header]           = ImVec4(0.20f, 0.22f, 0.27f, 1.00f);
-        c[ImGuiCol_HeaderHovered]    = ImVec4(0.28f, 0.31f, 0.38f, 1.00f);
-        c[ImGuiCol_HeaderActive]     = ImVec4(1.00f, 0.62f, 0.20f, 0.55f);
-        c[ImGuiCol_Separator]        = ImVec4(0.24f, 0.26f, 0.31f, 1.00f);
-        c[ImGuiCol_Text]             = ImVec4(0.88f, 0.90f, 0.93f, 1.00f);
-        c[ImGuiCol_TextDisabled]     = ImVec4(0.50f, 0.53f, 0.60f, 1.00f);
-        c[ImGuiCol_ScrollbarBg]      = ImVec4(0.09f, 0.10f, 0.12f, 0.00f);
-        c[ImGuiCol_ScrollbarGrab]    = ImVec4(0.26f, 0.28f, 0.34f, 1.00f);
+        c[ImGuiCol_WindowBg]           = ImVec4(0.08f, 0.09f, 0.11f, 1.00f);
+        c[ImGuiCol_ChildBg]            = ImVec4(0.10f, 0.11f, 0.14f, 1.00f);
+        c[ImGuiCol_PopupBg]            = ImVec4(0.12f, 0.13f, 0.16f, 0.98f);
+        c[ImGuiCol_Border]             = ImVec4(0.20f, 0.22f, 0.27f, 1.00f);
+        c[ImGuiCol_FrameBg]            = ImVec4(0.15f, 0.16f, 0.20f, 1.00f);
+        c[ImGuiCol_FrameBgHovered]     = ImVec4(0.21f, 0.23f, 0.28f, 1.00f);
+        c[ImGuiCol_FrameBgActive]      = ImVec4(0.25f, 0.27f, 0.33f, 1.00f);
+        c[ImGuiCol_TitleBg]            = ImVec4(0.08f, 0.09f, 0.11f, 1.00f);
+        c[ImGuiCol_TitleBgActive]      = ImVec4(0.11f, 0.12f, 0.15f, 1.00f);
+        c[ImGuiCol_Button]             = ImVec4(0.19f, 0.21f, 0.26f, 1.00f);
+        c[ImGuiCol_ButtonHovered]      = ImVec4(0.27f, 0.30f, 0.37f, 1.00f);
+        c[ImGuiCol_ButtonActive]       = accent;
+        c[ImGuiCol_SliderGrab]         = accent;
+        c[ImGuiCol_SliderGrabActive]   = ImVec4(1.00f, 0.74f, 0.35f, 1.00f);
+        c[ImGuiCol_CheckMark]          = accent;
+        c[ImGuiCol_Header]             = ImVec4(0.19f, 0.21f, 0.26f, 1.00f);
+        c[ImGuiCol_HeaderHovered]      = ImVec4(0.27f, 0.30f, 0.37f, 1.00f);
+        c[ImGuiCol_HeaderActive]       = ImVec4(1.00f, 0.62f, 0.20f, 0.55f);
+        c[ImGuiCol_Separator]          = ImVec4(0.22f, 0.24f, 0.29f, 1.00f);
+        c[ImGuiCol_Tab]                = ImVec4(0.14f, 0.15f, 0.19f, 1.00f);
+        c[ImGuiCol_TabHovered]         = ImVec4(0.30f, 0.26f, 0.20f, 1.00f);
+        c[ImGuiCol_TabSelected]        = ImVec4(0.36f, 0.26f, 0.12f, 1.00f);
+        c[ImGuiCol_TabSelectedOverline]= accent;
+        c[ImGuiCol_Text]               = ImVec4(0.89f, 0.91f, 0.94f, 1.00f);
+        c[ImGuiCol_TextDisabled]       = ImVec4(0.50f, 0.53f, 0.60f, 1.00f);
+        c[ImGuiCol_ScrollbarBg]        = ImVec4(0.08f, 0.09f, 0.11f, 0.00f);
+        c[ImGuiCol_ScrollbarGrab]      = ImVec4(0.25f, 0.27f, 0.33f, 1.00f);
     }
 
     void render(AudioEngine& engine, std::vector<EffectSlot>& effects)
@@ -73,67 +89,60 @@ public:
         ImGui::Begin("DSParkLab", nullptr,
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                     ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-        drawTransport(engine);
-        ImGui::Separator();
+                     ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar);
 
         EffectSlot* sel = nullptr;
         for (auto& e : effects)
             if (e.selected) { sel = &e; break; }
 
-        const float listW  = 230.0f;
-        const float paramW = 340.0f;
+        handleKeys(engine, sel);
+        drawTopBar(engine);
+        ImGui::Spacing();
 
-        // Column 1 - effect list
-        ImGui::BeginChild("EffectList", ImVec2(listW, 0), true);
-        drawEffectList(effects);
+        ImGui::BeginChild("Browser", ImVec2(220.0f, 0), ImGuiChildFlags_Borders);
+        drawBrowser(effects);
         ImGui::EndChild();
-
         ImGui::SameLine();
 
-        // Column 2 - analyzer (fills the vertical slack) + meters underneath
-        float centerW = ImGui::GetContentRegionAvail().x - paramW - 8.0f;
-        if (centerW < 220.0f) centerW = 220.0f;
-        ImGui::BeginChild("Center", ImVec2(centerW, 0), false);
-        {
-            const float meterH = 92.0f;
-            float analyzerH = ImGui::GetContentRegionAvail().y - meterH;
-            if (analyzerH < 200.0f) analyzerH = 200.0f;
-            drawAnalyzer(engine, sel, analyzerH);
-            drawMeters(engine);
-        }
-        ImGui::EndChild();
-
-        ImGui::SameLine();
-
-        // Column 3 - parameters for the selected effect. NoScrollWithMouse so the
-        // wheel adjusts the hovered control (combo/slider) instead of scrolling the
-        // list; use the scrollbar to scroll long parameter sets.
-        ImGui::BeginChild("ParamCol", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollWithMouse);
-        drawParamPanel(sel);
+        ImGui::BeginChild("Main", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+        drawMain(engine, sel);
         ImGui::EndChild();
 
         ImGui::End();
     }
 
 private:
-    int   dragNode_ = -1;       // index of the curve node being dragged (-1 = none)
-    void* dragOwner_ = nullptr; // which EffectSlot owns the active drag
-    float seekValue_ = 0.0f;    // seek-bar value while the user is dragging it
-    bool  seekActive_ = false;  // true while the seek bar is grabbed (defer the seek)
-    float thdTimer_ = 0.0f;     // live THD reading refresh accumulator
-    AudioEngine::ThdReading thdLast_ {};
+    // --- Sizes of the control grid ----------------------------------------------
 
-    // Reader-owned copy of the engine's waveform snapshot (see drawMeters).
+    static constexpr float kCellW = 94.0f;
+    static constexpr float kKnobR = 21.0f;
+    static constexpr float kFMin = 20.0f, kFMax = 20000.0f;
+    static constexpr int   kHistory = 360;   // frames of gain-reduction history
+
+    static ImFont*& titleFont() noexcept { static ImFont* f = nullptr; return f; }
+
+    // --- Interface state ----------------------------------------------------------
+
+    int   dragNode_ = -1;        // curve node being dragged (-1 = none)
+    void* dragOwner_ = nullptr;  // slot that owns the drag
+    float seekValue_ = 0.0f;     // seek bar value while it is held
+    bool  seekActive_ = false;
+    float thdTimer_ = 0.0f;
+    AudioEngine::ThdReading thdLast_ {};
+    char  search_[64] = {};
+    float range_ = 24.0f;        // vertical scale of the display (+/- dB), per slot
+    std::array<float, kHistory> grHistory_ {};
+    int   grHead_ = 0;
+    const EffectSlot* grOwner_ = nullptr;
     std::array<float, AudioEngine::kBlockSize> waveL_ {};
     std::array<float, AudioEngine::kBlockSize> waveR_ {};
 
-    // --- Frequency / dB mapping helpers ---------------------------------------
+    // --- Mapping helpers -----------------------------------------------------------
 
-    static constexpr float kFMin = 20.0f, kFMax = 20000.0f;
-    static constexpr float kEqRange = 24.0f;  // EQ curve vertical scale (+/- dB)
-
+    static float cellH() noexcept
+    {
+        return 2.0f * ImGui::GetTextLineHeight() + 2.0f * kKnobR + 14.0f;
+    }
     static float freqToX(float f, float x0, float w)
     {
         const float lo = std::log10(kFMin), hi = std::log10(kFMax);
@@ -146,30 +155,61 @@ private:
         const float t = std::clamp((x - x0) / w, 0.0f, 1.0f);
         return std::pow(10.0f, lo + t * (hi - lo));
     }
-    static float dbToYspec(float db, float y0, float h)         // -100..0 dB -> bottom..top
+    static float dbToYspec(float db, float y0, float h)
     {
         const float t = std::clamp((db + 100.0f) / 100.0f, 0.0f, 1.0f);
         return y0 + h - t * h;
     }
-    static float dbToYeq(float db, float y0, float h)           // +range..-range -> top..bottom
+    float dbToYeq(float db, float y0, float h) const
     {
-        const float t = std::clamp((db + kEqRange) / (2.0f * kEqRange), 0.0f, 1.0f);
+        const float t = std::clamp((db + range_) / (2.0f * range_), 0.0f, 1.0f);
         return y0 + h - t * h;
     }
-    static float yToDbEq(float y, float y0, float h)
+    float yToDbEq(float y, float y0, float h) const
     {
         const float t = std::clamp((y0 + h - y) / h, 0.0f, 1.0f);
-        return -kEqRange + t * 2.0f * kEqRange;
+        return -range_ + t * 2.0f * range_;
     }
 
-    // --- Transport bar ---------------------------------------------------------
+    static std::string lower(std::string s)
+    {
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
 
-    void drawTransport(AudioEngine& engine)
+    /// The text cut to a width, with an ellipsis when it does not fit.
+    static std::string fitText(const std::string& s, float maxW)
+    {
+        if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+        std::string t = s;
+        while (!t.empty() && ImGui::CalcTextSize((t + "...").c_str()).x > maxW) t.pop_back();
+        return t + "...";
+    }
+
+    // --- Keys -------------------------------------------------------------------------
+
+    void handleKeys(AudioEngine& engine, EffectSlot* sel)
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.WantTextInput || ImGui::IsAnyItemActive()) return;
+        if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) engine.togglePlay();
+        if (ImGui::IsKeyPressed(ImGuiKey_B, false)) engine.setBypass(!engine.isBypassed());
+        if (sel && ImGui::IsKeyPressed(ImGuiKey_E, false)) sel->enabled = !sel->enabled.get();
+        if (sel && ImGui::IsKeyPressed(ImGuiKey_R, false)) sel->applyAllDefaults();
+    }
+
+    // --- Top bar: file, transport, seek, A/B --------------------------------------------
+
+    void drawTopBar(AudioEngine& engine)
     {
         const bool loading = engine.isLoading();
+        if (titleFont()) ImGui::PushFont(titleFont());
+        ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.28f, 1.0f), "DSParkLab");
+        if (titleFont()) ImGui::PopFont();
+        ImGui::SameLine(0, 18);
 
         ImGui::BeginDisabled(loading);
-        if (ImGui::Button("Open File"))
+        if (ImGui::Button("Open..."))
         {
             char path[MAX_PATH] = {};
             OPENFILENAMEA ofn = {};
@@ -181,29 +221,36 @@ private:
             if (GetOpenFileNameA(&ofn))
                 engine.loadFile(path);
         }
-        ImGui::EndDisabled();
-
         ImGui::SameLine();
-        ImGui::BeginDisabled(loading);
-        bool playing = engine.isPlaying();
-        if (ImGui::Button(playing ? "Pause" : "Play"))
+        const bool playing = engine.isPlaying();
+        if (ImGui::Button(playing ? "Pause" : "Play", ImVec2(64, 0)))
             engine.togglePlay();
+        ImGui::SetItemTooltip("Space");
         ImGui::SameLine();
         if (ImGui::Button("Stop"))
             engine.stop();
         ImGui::EndDisabled();
-
         ImGui::SameLine();
         bool loop = engine.isLooping();
         if (ImGui::Checkbox("Loop", &loop))
             engine.setLooping(loop);
 
-        // Seek bar - only jumps the transport when the mouse is RELEASED, not
-        // continuously while dragging (which made the position thrash/loop).
-        ImGui::SameLine();
-        float playPos = engine.getPosition();
+        // A/B switch: wide and coloured, the most used control while listening.
+        ImGui::SameLine(0, 16);
+        const bool bypass = engine.isBypassed();
+        ImGui::PushStyleColor(ImGuiCol_Button, bypass ? ImVec4(0.55f, 0.18f, 0.16f, 1.0f) : ImVec4(0.16f, 0.36f, 0.22f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bypass ? ImVec4(0.66f, 0.24f, 0.20f, 1.0f) : ImVec4(0.20f, 0.45f, 0.28f, 1.0f));
+        if (ImGui::Button(bypass ? "B: Bypassed" : "A: Processed", ImVec2(120, 0)))
+            engine.setBypass(!bypass);
+        ImGui::PopStyleColor(2);
+        ImGui::SetItemTooltip("Switch between the processed and the dry signal (B)");
+
+        // Seek bar: the transport jumps when the bar is released.
+        ImGui::SameLine(0, 16);
+        const float playPos = engine.getPosition();
         float shown = seekActive_ ? seekValue_ : playPos;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 120.0f);
+        const float infoW = 250.0f;
+        ImGui::SetNextItemWidth(std::max(80.0f, ImGui::GetContentRegionAvail().x - infoW));
         ImGui::SliderFloat("##seek", &shown, 0.0f, 1.0f, "");
         if (ImGui::IsItemActivated()) seekActive_ = true;
         if (seekActive_) seekValue_ = shown;
@@ -211,334 +258,139 @@ private:
         else if (seekActive_ && !ImGui::IsItemActive()) seekActive_ = false;
 
         ImGui::SameLine();
-        float dur = engine.getDurationSeconds();
-        float cur = shown * dur;
-        char timeBuf[32];
-        std::snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d / %02d:%02d",
-                      static_cast<int>(cur) / 60, static_cast<int>(cur) % 60,
-                      static_cast<int>(dur) / 60, static_cast<int>(dur) % 60);
-        ImGui::Text("%s", timeBuf);
-
+        const float dur = engine.getDurationSeconds();
+        const float cur = shown * dur;
+        ImGui::Text("%02d:%02d / %02d:%02d",
+                    static_cast<int>(cur) / 60, static_cast<int>(cur) % 60,
+                    static_cast<int>(dur) / 60, static_cast<int>(dur) % 60);
+        ImGui::SameLine();
         if (loading)
         {
             const int dots = static_cast<int>(ImGui::GetTime() * 2.0) % 4;
             const char* dotStrs[4] = { "", ".", "..", "..." };
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Loading%s", dotStrs[dots]);
-            ImGui::SameLine();
         }
         else if (engine.hasFile())
-        {
-            ImGui::TextDisabled("%.0f Hz  |  %dch", engine.getSampleRate(), engine.getChannels());
-            ImGui::SameLine();
-        }
-
-        bool bypass = engine.isBypassed();
-        if (ImGui::Checkbox("Bypass (A/B)", &bypass))
-            engine.setBypass(bypass);
+            ImGui::TextDisabled("%.0f Hz | %d ch", engine.getSampleRate(), engine.getChannels());
+        else
+            ImGui::TextDisabled("No file");
     }
 
-    // --- Effect list (left panel) ----------------------------------------------
+    // --- Browser -----------------------------------------------------------------------
 
-    void drawEffectList(std::vector<EffectSlot>& effects)
+    void drawBrowser(std::vector<EffectSlot>& effects)
     {
-        ImGui::Text("Effects");
+        ImGui::TextDisabled("EFFECTS");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##search", "Search...", search_, sizeof(search_));
+        const std::string needle = lower(search_);
+
+        int enabledCount = 0;
+        for (const auto& e : effects) enabledCount += e.enabled.get() ? 1 : 0;
+        if (enabledCount > 0)
+        {
+            ImGui::TextDisabled("%d on", enabledCount);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("All off"))
+                for (auto& e : effects) e.enabled = false;
+        }
         ImGui::Separator();
 
+        ImGui::BeginChild("##list", ImVec2(0, 0));
         std::string currentCat;
         bool catOpen = true;
-
         for (int i = 0; i < static_cast<int>(effects.size()); ++i)
         {
-            auto& e = effects[i];
+            auto& e = effects[static_cast<size_t>(i)];
+            if (!needle.empty() && lower(e.name).find(needle) == std::string::npos
+                && lower(e.category).find(needle) == std::string::npos)
+                continue;
             if (e.category != currentCat)
             {
                 currentCat = e.category;
+                if (!needle.empty()) ImGui::SetNextItemOpen(true);
                 catOpen = ImGui::CollapsingHeader(currentCat.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
             }
             if (!catOpen) continue;
 
             ImGui::PushID(i);
-            // The audio thread reads this flag, so the widget edits a local
-            // copy and the result is published back rather than letting the
-            // checkbox store straight into the shared word.
+            // The audio thread reads this flag: edit a copy, publish the result.
             bool slotEnabled = e.enabled.get();
             if (ImGui::Checkbox("##en", &slotEnabled))
                 e.enabled = slotEnabled;
+            ImGui::SetItemTooltip(slotEnabled ? "In the chain (click to take it out)" : "Out of the chain (click to put it in)");
             ImGui::SameLine();
+            if (slotEnabled) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.40f, 1.0f));
             if (ImGui::Selectable(e.name.c_str(), e.selected))
             {
                 for (auto& eff : effects) eff.selected = false;
                 e.selected = true;
             }
+            if (slotEnabled) ImGui::PopStyleColor();
             ImGui::PopID();
         }
+        ImGui::EndChild();
     }
 
-    // --- Interactive analyzer (spectrum + EQ curve + nodes + multiband) --------
+    // --- Main area ---------------------------------------------------------------------
 
-    void drawAnalyzer(AudioEngine& engine, EffectSlot* sel, float budgetH)
-    {
-        const bool hasOverlay = sel && (sel->magnitudeFn || sel->multibandFn);
-        ImGui::Text("%s", sel ? sel->name.c_str() : "Analyzer");
-        if (hasOverlay) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("- drag nodes: X freq, Y gain | wheel = Q");
-        }
-
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const float w = ImGui::GetContentRegionAvail().x;
-        float h = budgetH - 26.0f;             // leave room for the title row
-        if (h < 160.0f) h = 160.0f;
-        const ImVec2 p1 = ImVec2(p0.x + w, p0.y + h);
-
-        ImGui::InvisibleButton("##analyzer", ImVec2(w, h));
-        const bool canvasHovered = ImGui::IsItemHovered();
-
-        dl->AddRectFilled(p0, p1, IM_COL32(18, 20, 26, 255), 4.0f);
-        dl->PushClipRect(p0, p1, true);
-
-        // Frequency grid + labels
-        const float gridF[]   = { 30, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000 };
-        const char* gridL[]   = { "30","50","100","200","500","1k","2k","5k","10k","20k" };
-        for (int i = 0; i < 10; ++i)
-        {
-            float x = freqToX(gridF[i], p0.x, w);
-            dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(42, 46, 56, 255));
-            dl->AddText(ImVec2(x + 2, p1.y - 14), IM_COL32(110, 116, 130, 255), gridL[i]);
-        }
-        // dB grid (EQ scale): +12, 0, -12
-        for (int d = -12; d <= 12; d += 12)
-        {
-            float y = dbToYeq(static_cast<float>(d), p0.y, h);
-            dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y),
-                        d == 0 ? IM_COL32(70, 76, 90, 255) : IM_COL32(38, 42, 50, 255));
-            char b[8]; std::snprintf(b, sizeof(b), "%+d", d);
-            dl->AddText(ImVec2(p0.x + 3, y - 13), IM_COL32(110, 116, 130, 255), b);
-        }
-
-        // Spectrum (faint filled curve)
-        const int bins = engine.getSpectrumBins();
-        const float* spec = engine.getSpectrumDb();
-        if (bins > 1 && spec)
-        {
-            float prevX = 0, prevY = 0; bool have = false;
-            for (int k = 1; k < bins; ++k)
-            {
-                const float f = engine.binToFrequency(k);
-                if (f < kFMin || f > kFMax) continue;
-                const float x = freqToX(f, p0.x, w);
-                const float y = dbToYspec(spec[k], p0.y, h);
-                if (have)
-                {
-                    dl->AddQuadFilled(ImVec2(prevX, prevY), ImVec2(x, y),
-                                      ImVec2(x, p1.y), ImVec2(prevX, p1.y),
-                                      IM_COL32(60, 130, 200, 60));
-                    dl->AddLine(ImVec2(prevX, prevY), ImVec2(x, y), IM_COL32(90, 170, 240, 160), 1.5f);
-                }
-                prevX = x; prevY = y; have = true;
-            }
-        }
-
-        // EQ / filter response curve + draggable nodes
-        if (sel && sel->magnitudeFn)
-            drawCurveAndNodes(dl, sel, engine, p0, w, h, canvasHovered);
-
-        // Multiband bands + per-band gain reduction
-        if (sel && sel->multibandFn)
-            drawMultiband(dl, sel, p0, w, h);
-
-        dl->PopClipRect();
-        dl->AddRect(p0, p1, IM_COL32(70, 76, 90, 255), 4.0f);
-    }
-
-    void drawCurveAndNodes(ImDrawList* dl, EffectSlot* sel, AudioEngine& engine,
-                           ImVec2 p0, float w, float h, bool canvasHovered)
-    {
-        const double sr = engine.getSampleRate() > 0 ? engine.getSampleRate() : 48000.0;
-        // One sample per screen pixel so sharp features (notch nulls, high-Q peaks)
-        // render smoothly and don't flicker/alias as the frequency is moved.
-        constexpr int kMaxN = 1200;
-        // Bounded BEFORE the conversion, not after: the content region can be
-        // zero or negative at some window sizes, and a clamp on the result of
-        // an out-of-range conversion runs too late. The test is written so a
-        // NaN takes the low branch instead of failing both comparisons.
-        const int N = !(w > 64.0f) ? 64
-                    : (w > static_cast<float>(kMaxN) ? kMaxN : static_cast<int>(w));
-        static float freqs[kMaxN], mags[kMaxN];
-        static ImVec2 pts[kMaxN];
-        for (int i = 0; i < N; ++i)
-            freqs[i] = xToFreq(p0.x + (static_cast<float>(i) / (N - 1)) * w, p0.x, w);
-
-        // Faint "target" curve behind (e.g. a dynamic-EQ band's max boost/cut, where
-        // the draggable node sits); the live curve below animates toward it.
-        if (sel->targetMagnitudeFn)
-        {
-            static float tmags[kMaxN]; static ImVec2 tpts[kMaxN];
-            sel->targetMagnitudeFn(freqs, tmags, N, sr, sel->values.data());
-            for (int i = 0; i < N; ++i)
-            {
-                float dbc = std::clamp(tmags[i], -kEqRange, kEqRange);
-                tpts[i] = ImVec2(p0.x + (static_cast<float>(i) / (N - 1)) * w, dbToYeq(dbc, p0.y, h));
-            }
-            dl->AddPolyline(tpts, N, IM_COL32(255, 190, 70, 90), 0, 1.5f);
-        }
-
-        sel->magnitudeFn(freqs, mags, N, sr, sel->values.data());
-
-        // Response polyline (clamp dB to the visible range so deep notches read as a
-        // clean dip to the floor instead of a 1-pixel spike).
-        for (int i = 0; i < N; ++i)
-        {
-            float dbc = std::clamp(mags[i], -kEqRange, kEqRange);
-            pts[i] = ImVec2(p0.x + (static_cast<float>(i) / (N - 1)) * w, dbToYeq(dbc, p0.y, h));
-        }
-        dl->AddPolyline(pts, N, IM_COL32(255, 190, 70, 255), 0, 2.4f);
-
-        auto curveDbAt = [&](float fHz) -> float {
-            const float t = (freqToX(fHz, p0.x, w) - p0.x) / w;
-            // Same rule as the sample count above: a zero-width region makes t
-            // a NaN, so the range is settled before the conversion.
-            const float scaled = t * static_cast<float>(N - 1) + 0.5f;
-            const int idx = !(scaled > 0.0f) ? 0
-                          : (scaled >= static_cast<float>(N - 1) ? N - 1
-                                                                : static_cast<int>(scaled));
-            return mags[idx];
-        };
-
-        const ImVec2 mouse = ImGui::GetIO().MousePos;
-        const float wheel = ImGui::GetIO().MouseWheel;
-
-        // On press, grab the NEAREST node so edge/hidden nodes are reachable by
-        // clicking anywhere on the graph; X is weighted more (bands run along X).
-        if (ImGui::IsItemActivated() && dragNode_ < 0)
-        {
-            int best = -1; float bestD = 1e30f;
-            for (int ni = 0; ni < static_cast<int>(sel->curveNodes.size()); ++ni)
-            {
-                const auto& nd = sel->curveNodes[ni];
-                if (nd.freqParam < 0) continue;
-                const float fHz  = sel->values[nd.freqParam];
-                const float gain = (nd.gainParam >= 0) ? sel->values[nd.gainParam] : curveDbAt(fHz);
-                const ImVec2 cc(freqToX(fHz, p0.x, w), dbToYeq(gain, p0.y, h));
-                const float d = std::fabs(mouse.x - cc.x) + 0.35f * std::fabs(mouse.y - cc.y);
-                if (d < bestD) { bestD = d; best = ni; }
-            }
-            if (best >= 0) { dragNode_ = best; dragOwner_ = sel; }
-        }
-
-        for (int ni = 0; ni < static_cast<int>(sel->curveNodes.size()); ++ni)
-        {
-            const auto& node = sel->curveNodes[ni];
-            if (node.freqParam < 0) continue;
-            const float fHz  = sel->values[node.freqParam];
-            const float gain = (node.gainParam >= 0) ? sel->values[node.gainParam] : curveDbAt(fHz);
-            const ImVec2 c(freqToX(fHz, p0.x, w), dbToYeq(gain, p0.y, h));
-
-            const bool nearNode = std::fabs(mouse.x - c.x) < 12.0f && std::fabs(mouse.y - c.y) < 12.0f;
-            const bool active = (dragNode_ == ni && dragOwner_ == sel);
-
-            // Move only while actually dragging (a plain click grabs but doesn't jump)
-            if (active && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
-            {
-                const auto& fp = sel->params[node.freqParam];
-                sel->applyParam(node.freqParam, std::clamp(xToFreq(mouse.x, p0.x, w), fp.min, fp.max));
-                if (node.gainParam >= 0)
-                {
-                    const auto& gp = sel->params[node.gainParam];
-                    sel->applyParam(node.gainParam, std::clamp(yToDbEq(mouse.y, p0.y, h), gp.min, gp.max));
-                }
-            }
-            // Mouse wheel over node -> Q
-            if (canvasHovered && nearNode && node.qParam >= 0 && wheel != 0.0f)
-            {
-                const auto& qp = sel->params[node.qParam];
-                float nq = std::clamp(sel->values[node.qParam] * (wheel > 0 ? 1.15f : 0.87f), qp.min, qp.max);
-                sel->applyParam(node.qParam, nq);
-            }
-
-            const ImU32 col = (active || nearNode) ? IM_COL32(255, 230, 140, 255) : IM_COL32(255, 190, 70, 255);
-            dl->AddCircleFilled(c, 6.0f, col);
-            dl->AddCircle(c, 6.0f, IM_COL32(30, 30, 30, 255), 0, 1.5f);
-            char lbl[8]; std::snprintf(lbl, sizeof(lbl), "%d", ni + 1);
-            dl->AddText(ImVec2(c.x - 3, c.y - 7), IM_COL32(20, 20, 20, 255), lbl);
-
-            // Value readout while hovering/dragging a node
-            if (active || nearNode)
-            {
-                char vb[64];
-                const bool hasG = node.gainParam >= 0;
-                const bool hasQ = node.qParam >= 0;
-                const float gv = hasG ? sel->values[node.gainParam] : 0.0f;
-                const float qv = hasQ ? sel->values[node.qParam] : 0.0f;
-                if (hasG && hasQ)      std::snprintf(vb, sizeof(vb), "%.0f Hz  %+.1f dB  Q %.2f", fHz, gv, qv);
-                else if (hasG)         std::snprintf(vb, sizeof(vb), "%.0f Hz  %+.1f dB", fHz, gv);
-                else if (hasQ)         std::snprintf(vb, sizeof(vb), "%.0f Hz  Q %.2f", fHz, qv);
-                else                   std::snprintf(vb, sizeof(vb), "%.0f Hz", fHz);
-                const ImVec2 tsz = ImGui::CalcTextSize(vb);
-                ImVec2 tp(c.x + 10, c.y - 9);
-                if (tp.x + tsz.x > p0.x + w) tp.x = c.x - 10 - tsz.x;
-                dl->AddRectFilled(ImVec2(tp.x - 3, tp.y - 2), ImVec2(tp.x + tsz.x + 3, tp.y + tsz.y + 2),
-                                  IM_COL32(20, 22, 28, 220), 3.0f);
-                dl->AddText(tp, IM_COL32(255, 235, 180, 255), vb);
-            }
-        }
-
-        // End drag
-        if (dragNode_ >= 0 && !ImGui::IsItemActive())
-        {
-            dragNode_ = -1; dragOwner_ = nullptr;
-        }
-    }
-
-    void drawMultiband(ImDrawList* dl, EffectSlot* sel, ImVec2 p0, float w, float h)
-    {
-        float xo[8] = {}; float gr[8] = {};
-        const int nb = sel->multibandFn(xo, gr, 8);
-        if (nb <= 0) return;
-
-        const ImU32 bandCols[3] = { IM_COL32(80, 160, 90, 40), IM_COL32(90, 130, 200, 40), IM_COL32(200, 130, 80, 40) };
-        float left = p0.x;
-        for (int b = 0; b < nb; ++b)
-        {
-            const float right = (b < nb - 1) ? freqToX(xo[b], p0.x, w) : (p0.x + w);
-            dl->AddRectFilled(ImVec2(left, p0.y), ImVec2(right, p0.y + h), bandCols[b % 3]);
-            if (b < nb - 1)
-                dl->AddLine(ImVec2(right, p0.y), ImVec2(right, p0.y + h), IM_COL32(150, 150, 160, 200), 1.5f);
-
-            // Gain-reduction bar from the top of the band region
-            const float grDb = std::clamp(gr[b], 0.0f, 24.0f);
-            const float barH = (grDb / 24.0f) * (h * 0.5f);
-            dl->AddRectFilled(ImVec2(left + 2, p0.y), ImVec2(right - 2, p0.y + barH),
-                              IM_COL32(230, 90, 70, 150));
-            char lbl[24]; std::snprintf(lbl, sizeof(lbl), "-%.1f dB", grDb);
-            dl->AddText(ImVec2(left + 6, p0.y + 4), IM_COL32(235, 235, 240, 255), lbl);
-            left = right;
-        }
-    }
-
-    // --- Parameter panel -------------------------------------------------------
-
-    void drawParamPanel(EffectSlot* sel)
+    void drawMain(AudioEngine& engine, EffectSlot* sel)
     {
         if (!sel)
         {
-            ImGui::TextDisabled("Select an effect");
-            ImGui::Spacing();
-            ImGui::TextWrapped("Pick an effect from the list to edit it. Filters/EQs show an "
-                               "interactive response curve; drag the nodes on the analyzer.");
+            drawWelcome(engine);
             return;
         }
+        if (sel != grOwner_) { grHistory_.fill(0.0f); grHead_ = 0; grOwner_ = sel; }
+        range_ = sel->displayRangeDb > 1.0f ? sel->displayRangeDb : 24.0f;
 
+        drawHeader(sel);
+
+        const float total = ImGui::GetContentRegionAvail().y;
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float activityH = 84.0f;
+        float controlsH = controlsHeight(*sel, width);
+        controlsH = std::clamp(controlsH, cellH() + 24.0f, std::max(cellH() + 24.0f, total * 0.48f));
+        float displayH = total - controlsH - activityH - 2.0f * ImGui::GetStyle().ItemSpacing.y;
+        if (displayH < 180.0f) displayH = 180.0f;
+
+        drawDisplay(engine, sel, displayH);
+        drawActivity(engine, sel, activityH);
+        ImGui::BeginChild("Controls", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        drawControls(sel);
+        ImGui::EndChild();
+    }
+
+    void drawWelcome(AudioEngine& engine)
+    {
+        drawDisplay(engine, nullptr, std::max(180.0f, ImGui::GetContentRegionAvail().y - 84.0f - 8.0f));
+        drawActivity(engine, nullptr, 84.0f);
+    }
+
+    void drawHeader(EffectSlot* sel)
+    {
+        if (titleFont()) ImGui::PushFont(titleFont());
         ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "%s", sel->name.c_str());
+        if (titleFont()) ImGui::PopFont();
+        ImGui::SameLine();
         ImGui::TextDisabled("%s", sel->category.c_str());
-        if (ImGui::Button("Reset Defaults", ImVec2(-1, 0)))
-            sel->applyAllDefaults();
 
-        // Convolution-reverb IR loader
+        ImGui::SameLine(0, 18);
+        const bool on = sel->enabled.get();
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? ImVec4(0.75f, 0.45f, 0.12f, 1.0f) : ImVec4(0.19f, 0.21f, 0.26f, 1.0f));
+        if (ImGui::Button(on ? "On" : "Off", ImVec2(52, 0)))
+            sel->enabled = !on;
+        ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Put the effect in or out of the chain (E)");
+        ImGui::SameLine();
+        if (ImGui::Button("Reset"))
+            sel->applyAllDefaults();
+        ImGui::SetItemTooltip("Every control to its default (R)");
+
         if (sel->loadIRFn)
         {
-            if (ImGui::Button("Load IR (WAV)...", ImVec2(-1, 0)))
+            ImGui::SameLine();
+            if (ImGui::Button("Load IR..."))
             {
                 char path[MAX_PATH] = {};
                 OPENFILENAMEA ofn = {};
@@ -550,193 +402,728 @@ private:
                 if (GetOpenFileNameA(&ofn))
                     sel->loadIRFn(path);
             }
-            ImGui::TextDisabled("(or use Decay for a synthetic IR)");
+            ImGui::SetItemTooltip("A WAV file (summed to mono); without one, Decay builds a synthetic IR");
         }
-        ImGui::Separator();
 
-        // Live gain-reduction meter at the top (most-watched value).
-        if (sel->gainReductionDbFn)
+        ImGui::SameLine();
+        if (!sel->curveNodes.empty())
+            ImGui::TextDisabled("  Drag a node: frequency and gain | wheel on it: width | double-click a knob: default");
+        else
+            ImGui::TextDisabled("  Drag a knob up or down (Shift: fine) | wheel: step | double-click: default");
+    }
+
+    // --- Display: spectrum, curves, what the effect detects, nodes ----------------------
+
+    void drawDisplay(AudioEngine& engine, EffectSlot* sel, float h)
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x;
+        const ImVec2 p1 = ImVec2(p0.x + w, p0.y + h);
+
+        ImGui::InvisibleButton("##display", ImVec2(std::max(w, 1.0f), std::max(h, 1.0f)));
+        const bool hovered = ImGui::IsItemHovered();
+
+        dl->AddRectFilled(p0, p1, IM_COL32(15, 17, 22, 255), 6.0f);
+        dl->PushClipRect(p0, p1, true);
+
+        const float gridF[] = { 30, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000 };
+        const char* gridL[] = { "30","50","100","200","500","1k","2k","5k","10k","20k" };
+        for (int i = 0; i < 10; ++i)
         {
-            float grv = std::clamp(-sel->gainReductionDbFn(), 0.0f, 24.0f);
-            float norm = grv / 24.0f;
-            char lbl[32]; std::snprintf(lbl, sizeof(lbl), "GR  -%.1f dB", grv);
-            ImVec4 col = norm < 0.25f ? ImVec4(0.2f, 0.8f, 0.2f, 1)
-                       : norm < 0.6f  ? ImVec4(0.9f, 0.8f, 0.2f, 1)
-                                      : ImVec4(1.0f, 0.3f, 0.2f, 1);
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
-            ImGui::ProgressBar(norm, ImVec2(-1, 16), lbl);
-            ImGui::PopStyleColor();
-            ImGui::Separator();
+            const float x = freqToX(gridF[i], p0.x, w);
+            dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(38, 42, 52, 255));
+            dl->AddText(ImVec2(x + 3, p1.y - 17), IM_COL32(105, 112, 128, 255), gridL[i]);
+        }
+        const bool curves = sel && (sel->magnitudeFn || sel->activityFn);
+        if (curves)
+        {
+            const float step = range_ >= 24.0f ? 12.0f : 6.0f;
+            for (float d = -range_ + step; d < range_; d += step)
+            {
+                const float y = dbToYeq(d, p0.y, h);
+                dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y),
+                            std::fabs(d) < 0.01f ? IM_COL32(72, 78, 94, 255) : IM_COL32(34, 38, 47, 255));
+                char b[8]; std::snprintf(b, sizeof(b), "%+.0f", d);
+                dl->AddText(ImVec2(p0.x + 4, y - 15), IM_COL32(105, 112, 128, 255), b);
+            }
         }
 
-        // Mirror parameters the processor moved itself (e.g. a preset load),
-        // unless the user is holding a widget right now.
+        drawSpectrum(dl, engine, p0, w, h);
+
+        float* mags = nullptr;
+        int n = 0;
+        if (sel && curves)
+            drawCurves(dl, sel, engine, p0, w, h, mags, n);
+        if (sel && sel->magnitudeFn)
+            drawNodes(dl, sel, p0, w, h, hovered, mags, n);
+        if (sel && sel->multibandFn)
+            drawMultiband(dl, sel, p0, w, h);
+        if (sel) drawLegend(dl, sel, p0, w);
+
+        // Readout under the cursor: the frequency and the curve there.
+        if (hovered && dragNode_ < 0)
+        {
+            const ImVec2 m = ImGui::GetIO().MousePos;
+            dl->AddLine(ImVec2(m.x, p0.y), ImVec2(m.x, p1.y), IM_COL32(120, 128, 145, 90));
+            const float f = xToFreq(m.x, p0.x, w);
+            char b[64];
+            if (mags && n > 1)
+            {
+                const int idx = std::clamp(static_cast<int>((m.x - p0.x) / w * static_cast<float>(n - 1) + 0.5f), 0, n - 1);
+                std::snprintf(b, sizeof(b), f >= 1000.0f ? "%.2f kHz  %+.1f dB" : "%.0f Hz  %+.1f dB",
+                              f >= 1000.0f ? f / 1000.0f : f, mags[idx]);
+            }
+            else
+                std::snprintf(b, sizeof(b), f >= 1000.0f ? "%.2f kHz" : "%.0f Hz", f >= 1000.0f ? f / 1000.0f : f);
+            const ImVec2 ts = ImGui::CalcTextSize(b);
+            float tx = m.x + 8;
+            if (tx + ts.x > p1.x - 4) tx = m.x - 8 - ts.x;
+            dl->AddRectFilled(ImVec2(tx - 4, p0.y + 6), ImVec2(tx + ts.x + 4, p0.y + 8 + ts.y), IM_COL32(20, 22, 28, 230), 3.0f);
+            dl->AddText(ImVec2(tx, p0.y + 7), IM_COL32(235, 238, 245, 255), b);
+        }
+
+        if (!sel)
+        {
+            const char* hint = engine.hasFile() ? "Pick an effect on the left to see and change what it does"
+                                                : "Open an audio file (or turn on the test tone) and pick an effect on the left";
+            const ImVec2 ts = ImGui::CalcTextSize(hint);
+            dl->AddText(ImVec2(p0.x + (w - ts.x) * 0.5f, p0.y + h * 0.45f), IM_COL32(150, 156, 170, 255), hint);
+        }
+
+        dl->PopClipRect();
+        dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 6.0f);
+    }
+
+    static void drawSpectrum(ImDrawList* dl, AudioEngine& engine, ImVec2 p0, float w, float h)
+    {
+        const int bins = engine.getSpectrumBins();
+        const float* spec = engine.getSpectrumDb();
+        if (bins <= 1 || !spec) return;
+        const float bottom = p0.y + h;
+        float prevX = 0, prevY = 0;
+        bool have = false;
+        for (int k = 1; k < bins; ++k)
+        {
+            const float f = engine.binToFrequency(k);
+            if (f < kFMin || f > kFMax) continue;
+            const float x = freqToX(f, p0.x, w);
+            const float y = dbToYspec(spec[k], p0.y, h);
+            if (have && x - prevX >= 0.5f)
+            {
+                dl->AddQuadFilled(ImVec2(prevX, prevY), ImVec2(x, y), ImVec2(x, bottom), ImVec2(prevX, bottom),
+                                  IM_COL32(55, 120, 190, 50));
+                dl->AddLine(ImVec2(prevX, prevY), ImVec2(x, y), IM_COL32(85, 160, 230, 140), 1.3f);
+                prevX = x; prevY = y;
+            }
+            else if (!have) { prevX = x; prevY = y; have = true; }
+        }
+    }
+
+    void drawCurves(ImDrawList* dl, EffectSlot* sel, AudioEngine& engine, ImVec2 p0, float w, float h,
+                    float*& outMags, int& outN)
+    {
+        const double sr = engine.getSampleRate() > 0 ? engine.getSampleRate() : 48000.0;
+        constexpr int kMaxN = 1200;
+        // Bounded before the conversion: the region can be zero or negative.
+        const int N = !(w > 64.0f) ? 64 : (w > static_cast<float>(kMaxN) ? kMaxN : static_cast<int>(w));
+        static float freqs[kMaxN], mags[kMaxN], extra[kMaxN];
+        static ImVec2 pts[kMaxN];
+        for (int i = 0; i < N; ++i)
+            freqs[i] = xToFreq(p0.x + (static_cast<float>(i) / (N - 1)) * w, p0.x, w);
+        const auto xAt = [&](int i) { return p0.x + (static_cast<float>(i) / (N - 1)) * w; };
+        const float zeroY = dbToYeq(0.0f, p0.y, h);
+
+        // What the effect detects: a filled area from 0 dB.
+        if (sel->activityFn)
+        {
+            sel->activityFn(freqs, extra, N, sr, sel->values.data());
+            for (int i = 1; i < N; ++i)
+            {
+                const float y0 = dbToYeq(std::clamp(extra[i - 1], -range_, range_), p0.y, h);
+                const float y1 = dbToYeq(std::clamp(extra[i], -range_, range_), p0.y, h);
+                dl->AddQuadFilled(ImVec2(xAt(i - 1), y0), ImVec2(xAt(i), y1), ImVec2(xAt(i), zeroY), ImVec2(xAt(i - 1), zeroY),
+                                  IM_COL32(230, 80, 70, 80));
+            }
+        }
+        // The target behind the live curve.
+        if (sel->targetMagnitudeFn)
+        {
+            sel->targetMagnitudeFn(freqs, extra, N, sr, sel->values.data());
+            for (int i = 0; i < N; ++i)
+                pts[i] = ImVec2(xAt(i), dbToYeq(std::clamp(extra[i], -range_, range_), p0.y, h));
+            dl->AddPolyline(pts, N, IM_COL32(255, 200, 90, 95), 0, 1.6f);
+        }
+        if (sel->secondaryMagnitudeFn)
+        {
+            sel->secondaryMagnitudeFn(freqs, extra, N, sr, sel->values.data());
+            for (int i = 0; i < N; ++i)
+                pts[i] = ImVec2(xAt(i), dbToYeq(std::clamp(extra[i], -range_, range_), p0.y, h));
+            dl->AddPolyline(pts, N, IM_COL32(110, 210, 230, 220), 0, 1.6f);
+        }
+        if (sel->magnitudeFn)
+        {
+            sel->magnitudeFn(freqs, mags, N, sr, sel->values.data());
+            for (int i = 0; i < N; ++i)
+                pts[i] = ImVec2(xAt(i), dbToYeq(std::clamp(mags[i], -range_, range_), p0.y, h));
+            // A light fill between the curve and 0 dB shows where the effect acts.
+            for (int i = 1; i < N; ++i)
+                dl->AddQuadFilled(pts[i - 1], pts[i], ImVec2(pts[i].x, zeroY), ImVec2(pts[i - 1].x, zeroY),
+                                  IM_COL32(255, 170, 60, 28));
+            dl->AddPolyline(pts, N, IM_COL32(255, 186, 70, 255), 0, 2.4f);
+            outMags = mags;
+            outN = N;
+        }
+    }
+
+    void drawNodes(ImDrawList* dl, EffectSlot* sel, ImVec2 p0, float w, float h, bool hovered,
+                   const float* mags, int n)
+    {
+        const auto curveDbAt = [&](float fHz) -> float {
+            if (!mags || n < 2) return 0.0f;
+            const float t = (freqToX(fHz, p0.x, w) - p0.x) / w;
+            const float scaled = t * static_cast<float>(n - 1) + 0.5f;
+            const int idx = !(scaled > 0.0f) ? 0 : (scaled >= static_cast<float>(n - 1) ? n - 1 : static_cast<int>(scaled));
+            return mags[idx];
+        };
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const float wheel = ImGui::GetIO().MouseWheel;
+
+        // On press, grab the nearest node, so nodes at the edges are easy to reach.
+        if (ImGui::IsItemActivated() && dragNode_ < 0)
+        {
+            int best = -1; float bestD = 1e30f;
+            for (int ni = 0; ni < static_cast<int>(sel->curveNodes.size()); ++ni)
+            {
+                const auto& nd = sel->curveNodes[static_cast<size_t>(ni)];
+                if (nd.freqParam < 0) continue;
+                const float fHz = sel->values[static_cast<size_t>(nd.freqParam)];
+                const float gain = nd.gainParam >= 0 ? sel->values[static_cast<size_t>(nd.gainParam)] : curveDbAt(fHz);
+                const ImVec2 cc(freqToX(fHz, p0.x, w), dbToYeq(gain, p0.y, h));
+                const float d = std::fabs(mouse.x - cc.x) + 0.35f * std::fabs(mouse.y - cc.y);
+                if (d < bestD) { bestD = d; best = ni; }
+            }
+            if (best >= 0) { dragNode_ = best; dragOwner_ = sel; }
+        }
+
+        for (int ni = 0; ni < static_cast<int>(sel->curveNodes.size()); ++ni)
+        {
+            const auto& node = sel->curveNodes[static_cast<size_t>(ni)];
+            if (node.freqParam < 0) continue;
+            const float fHz = sel->values[static_cast<size_t>(node.freqParam)];
+            const float gain = node.gainParam >= 0 ? sel->values[static_cast<size_t>(node.gainParam)] : curveDbAt(fHz);
+            const ImVec2 c(freqToX(fHz, p0.x, w), dbToYeq(gain, p0.y, h));
+            const bool nearNode = std::fabs(mouse.x - c.x) < 12.0f && std::fabs(mouse.y - c.y) < 12.0f;
+            const bool active = dragNode_ == ni && dragOwner_ == sel;
+
+            if (active && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+            {
+                const auto& fp = sel->params[static_cast<size_t>(node.freqParam)];
+                sel->applyParam(node.freqParam, std::clamp(xToFreq(mouse.x, p0.x, w), fp.min, fp.max));
+                if (node.gainParam >= 0)
+                {
+                    const auto& gp = sel->params[static_cast<size_t>(node.gainParam)];
+                    sel->applyParam(node.gainParam, std::clamp(yToDbEq(mouse.y, p0.y, h), gp.min, gp.max));
+                }
+            }
+            if (hovered && nearNode && node.qParam >= 0 && wheel != 0.0f)
+            {
+                const auto& qp = sel->params[static_cast<size_t>(node.qParam)];
+                const float nq = std::clamp(sel->values[static_cast<size_t>(node.qParam)] * (wheel > 0 ? 1.15f : 0.87f), qp.min, qp.max);
+                sel->applyParam(node.qParam, nq);
+            }
+
+            const ImU32 col = (active || nearNode) ? IM_COL32(255, 232, 150, 255) : IM_COL32(255, 186, 70, 255);
+            dl->AddCircleFilled(c, 7.0f, col);
+            dl->AddCircle(c, 7.0f, IM_COL32(25, 25, 25, 255), 0, 1.5f);
+            char lbl[8]; std::snprintf(lbl, sizeof(lbl), "%d", ni + 1);
+            const ImVec2 ls = ImGui::CalcTextSize(lbl);
+            dl->AddText(ImVec2(c.x - ls.x * 0.5f, c.y - ls.y * 0.5f), IM_COL32(20, 20, 20, 255), lbl);
+
+            if (active || nearNode)
+            {
+                char vb[64];
+                const bool hasG = node.gainParam >= 0, hasQ = node.qParam >= 0;
+                const float gv = hasG ? sel->values[static_cast<size_t>(node.gainParam)] : 0.0f;
+                const float qv = hasQ ? sel->values[static_cast<size_t>(node.qParam)] : 0.0f;
+                if (hasG && hasQ)  std::snprintf(vb, sizeof(vb), "%.0f Hz  %+.1f dB  Q %.2f", fHz, gv, qv);
+                else if (hasG)     std::snprintf(vb, sizeof(vb), "%.0f Hz  %+.1f dB", fHz, gv);
+                else if (hasQ)     std::snprintf(vb, sizeof(vb), "%.0f Hz  Q %.2f", fHz, qv);
+                else               std::snprintf(vb, sizeof(vb), "%.0f Hz", fHz);
+                const ImVec2 tsz = ImGui::CalcTextSize(vb);
+                ImVec2 tp(c.x + 12, c.y - 9);
+                if (tp.x + tsz.x > p0.x + w) tp.x = c.x - 12 - tsz.x;
+                dl->AddRectFilled(ImVec2(tp.x - 3, tp.y - 2), ImVec2(tp.x + tsz.x + 3, tp.y + tsz.y + 2), IM_COL32(20, 22, 28, 225), 3.0f);
+                dl->AddText(tp, IM_COL32(255, 236, 185, 255), vb);
+            }
+        }
+        if (dragNode_ >= 0 && !ImGui::IsItemActive()) { dragNode_ = -1; dragOwner_ = nullptr; }
+    }
+
+    static void drawMultiband(ImDrawList* dl, EffectSlot* sel, ImVec2 p0, float w, float h)
+    {
+        float xo[8] = {}; float gr[8] = {};
+        const int nb = sel->multibandFn(xo, gr, 8);
+        if (nb <= 0) return;
+        const ImU32 bandCols[3] = { IM_COL32(80, 160, 90, 36), IM_COL32(90, 130, 200, 36), IM_COL32(200, 130, 80, 36) };
+        float left = p0.x;
+        for (int b = 0; b < nb; ++b)
+        {
+            const float right = b < nb - 1 ? freqToX(xo[b], p0.x, w) : p0.x + w;
+            dl->AddRectFilled(ImVec2(left, p0.y), ImVec2(right, p0.y + h), bandCols[b % 3]);
+            if (b < nb - 1)
+                dl->AddLine(ImVec2(right, p0.y), ImVec2(right, p0.y + h), IM_COL32(150, 150, 160, 200), 1.5f);
+            const float grDb = std::clamp(gr[b], 0.0f, 24.0f);
+            const float barH = grDb / 24.0f * (h * 0.5f);
+            dl->AddRectFilled(ImVec2(left + 2, p0.y), ImVec2(right - 2, p0.y + barH), IM_COL32(230, 90, 70, 150));
+            char lbl[24]; std::snprintf(lbl, sizeof(lbl), "-%.1f dB", grDb);
+            dl->AddText(ImVec2(left + 6, p0.y + 26), IM_COL32(235, 235, 240, 255), lbl);
+            left = right;
+        }
+    }
+
+    static void drawLegend(ImDrawList* dl, const EffectSlot* sel, ImVec2 p0, float w)
+    {
+        struct Item { const std::string* text; ImU32 col; bool filled; };
+        Item items[4];
+        int n = 0;
+        if (sel->magnitudeFn && !sel->liveLabel.empty()) items[n++] = { &sel->liveLabel, IM_COL32(255, 186, 70, 255), false };
+        if (sel->secondaryMagnitudeFn && !sel->secondaryLabel.empty()) items[n++] = { &sel->secondaryLabel, IM_COL32(110, 210, 230, 255), false };
+        if (sel->targetMagnitudeFn && !sel->targetLabel.empty()) items[n++] = { &sel->targetLabel, IM_COL32(255, 200, 90, 140), false };
+        if (sel->activityFn && !sel->activityLabel.empty()) items[n++] = { &sel->activityLabel, IM_COL32(230, 80, 70, 170), true };
+        float x = p0.x + w - 10.0f;
+        const float y = p0.y + 8.0f;
+        for (int i = n - 1; i >= 0; --i)
+        {
+            const ImVec2 ts = ImGui::CalcTextSize(items[i].text->c_str());
+            x -= ts.x;
+            dl->AddText(ImVec2(x, y), IM_COL32(200, 205, 215, 255), items[i].text->c_str());
+            x -= 22.0f;
+            const float my = y + ts.y * 0.5f;
+            if (items[i].filled) dl->AddRectFilled(ImVec2(x, my - 5), ImVec2(x + 16, my + 5), items[i].col, 2.0f);
+            else dl->AddLine(ImVec2(x, my), ImVec2(x + 16, my), items[i].col, 2.5f);
+            x -= 14.0f;
+        }
+    }
+
+    // --- Activity strip: gain reduction over time, scope, meters, test tone -------------
+
+    void drawActivity(AudioEngine& engine, EffectSlot* sel, float h)
+    {
+        ImGui::BeginChild("Activity", ImVec2(0, h), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float innerH = ImGui::GetContentRegionAvail().y;
+        const float toneW = 300.0f, meterW = 120.0f;
+        const bool hasGr = sel && sel->gainReductionDbFn;
+        const float graphW = std::max(120.0f, avail - toneW - meterW - 3.0f * ImGui::GetStyle().ItemSpacing.x);
+
+        if (hasGr)
+        {
+            const float gr = std::clamp(-sel->gainReductionDbFn(), 0.0f, 48.0f);
+            grHistory_[static_cast<size_t>(grHead_)] = gr;
+            grHead_ = (grHead_ + 1) % kHistory;
+            drawGrHistory(gr, graphW, innerH);
+        }
+        else
+            drawScope(engine, graphW, innerH);
+
+        ImGui::SameLine();
+        drawMeters(engine, meterW, innerH);
+        ImGui::SameLine();
+        ImGui::BeginChild("Tone", ImVec2(0, innerH));
+        drawTone(engine);
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
+    void drawGrHistory(float now, float w, float h)
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(w, h));
+        const ImVec2 p1(p0.x + w, p0.y + h);
+        dl->AddRectFilled(p0, p1, IM_COL32(15, 17, 22, 255), 4.0f);
+        float peak = 6.0f;
+        for (float v : grHistory_) peak = std::max(peak, v);
+        const float scale = std::ceil(peak / 6.0f) * 6.0f;
+        for (float d = 6.0f; d < scale; d += 6.0f)
+        {
+            const float y = p0.y + d / scale * h;
+            dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y), IM_COL32(34, 38, 47, 255));
+        }
+        const float dx = w / static_cast<float>(kHistory - 1);
+        for (int i = 1; i < kHistory; ++i)
+        {
+            const float a = grHistory_[static_cast<size_t>((grHead_ + i - 1) % kHistory)];
+            const float b = grHistory_[static_cast<size_t>((grHead_ + i) % kHistory)];
+            const float x0 = p0.x + (i - 1) * dx, x1 = p0.x + i * dx;
+            const float ya = p0.y + a / scale * h, yb = p0.y + b / scale * h;
+            dl->AddQuadFilled(ImVec2(x0, p0.y), ImVec2(x1, p0.y), ImVec2(x1, yb), ImVec2(x0, ya), IM_COL32(230, 95, 70, 110));
+            dl->AddLine(ImVec2(x0, ya), ImVec2(x1, yb), IM_COL32(250, 130, 95, 230), 1.5f);
+        }
+        char b[48];
+        std::snprintf(b, sizeof(b), "Gain reduction  %.1f dB", now);
+        dl->AddText(ImVec2(p0.x + 6, p1.y - 18), IM_COL32(215, 220, 230, 255), b);
+        std::snprintf(b, sizeof(b), "%.0f dB", scale);
+        dl->AddText(ImVec2(p1.x - ImGui::CalcTextSize(b).x - 6, p1.y - 18), IM_COL32(120, 126, 140, 255), b);
+        dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
+    }
+
+    void drawScope(AudioEngine& engine, float w, float h)
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(w, h));
+        const ImVec2 p1(p0.x + w, p0.y + h);
+        dl->AddRectFilled(p0, p1, IM_COL32(15, 17, 22, 255), 4.0f);
+        const float mid = p0.y + h * 0.5f;
+        dl->AddLine(ImVec2(p0.x, mid), ImVec2(p1.x, mid), IM_COL32(40, 44, 54, 255));
+        // The engine overwrites its snapshot on the audio thread: draw a copy.
+        const int n = engine.getWaveform(waveL_.data(), waveR_.data(), static_cast<int>(waveL_.size()));
+        if (n > 1)
+        {
+            static ImVec2 pts[AudioEngine::kBlockSize];
+            for (int i = 0; i < n; ++i)
+                pts[i] = ImVec2(p0.x + w * static_cast<float>(i) / static_cast<float>(n - 1),
+                                mid - std::clamp(waveL_[static_cast<size_t>(i)], -1.0f, 1.0f) * h * 0.46f);
+            dl->AddPolyline(pts, n, IM_COL32(110, 200, 150, 230), 0, 1.3f);
+        }
+        dl->AddText(ImVec2(p0.x + 6, p1.y - 18), IM_COL32(150, 156, 170, 255), "Output");
+        dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
+    }
+
+    static void drawMeters(AudioEngine& engine, float w, float h)
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(w, h));
+        const float peaks[2] = { engine.getPeakL(), engine.getPeakR() };
+        const char* names[2] = { "L", "R" };
+        const float barW = (w - 30.0f) * 0.5f;
+        for (int c = 0; c < 2; ++c)
+        {
+            const float db = peaks[c] > 0.0f ? 20.0f * std::log10(peaks[c]) : -100.0f;
+            const float t = std::clamp((db + 60.0f) / 60.0f, 0.0f, 1.0f);
+            const float x0 = p0.x + 4.0f + static_cast<float>(c) * (barW + 6.0f);
+            const float top = p0.y + 2.0f, bottom = p0.y + h - 18.0f;
+            dl->AddRectFilled(ImVec2(x0, top), ImVec2(x0 + barW, bottom), IM_COL32(24, 27, 34, 255), 2.0f);
+            const float y = bottom - t * (bottom - top);
+            const ImU32 col = db > -1.0f ? IM_COL32(235, 70, 60, 255) : db > -9.0f ? IM_COL32(235, 200, 70, 255) : IM_COL32(80, 200, 110, 255);
+            dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + barW, bottom), col, 2.0f);
+            dl->AddText(ImVec2(x0 + barW * 0.5f - 4.0f, bottom + 1.0f), IM_COL32(150, 156, 170, 255), names[c]);
+        }
+        char b[24];
+        const float worst = std::max(peaks[0], peaks[1]);
+        std::snprintf(b, sizeof(b), "%.1f", worst > 0.0f ? 20.0f * std::log10(worst) : -100.0f);
+        dl->AddText(ImVec2(p0.x + w - 28.0f, p0.y + 2.0f), IM_COL32(200, 205, 215, 255), b);
+        dl->AddText(ImVec2(p0.x + w - 28.0f, p0.y + 18.0f), IM_COL32(110, 116, 130, 255), "dBFS");
+    }
+
+    void drawTone(AudioEngine& engine)
+    {
+        bool tone = engine.getTestTone();
+        if (ImGui::Checkbox("Test tone", &tone))
+            engine.setTestTone(tone);
+        ImGui::SetItemTooltip("A sine through the chain instead of the file, with THD+N read at its frequency");
+        if (!engine.isDeviceReady())
+        {
+            ImGui::TextDisabled("Load a file once to start the audio");
+            return;
+        }
+        if (!tone) { ImGui::TextDisabled("THD+N reads with the tone on"); return; }
+
+        float freq = engine.getTestToneFreq();
+        float db = engine.getTestToneDb();
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        if (ImGui::SliderFloat("##f", &freq, 20.0f, 20000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic))
+            engine.setTestToneFreq(freq);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        if (ImGui::SliderFloat("##l", &db, -60.0f, 0.0f, "%.0f dB"))
+            engine.setTestToneDb(db);
+
+        // A few readings per second: enough for a live meter, cheap on the GUI thread.
+        thdTimer_ += ImGui::GetIO().DeltaTime;
+        if (thdTimer_ > 0.25f) { thdTimer_ = 0.0f; thdLast_ = engine.computeThd(); }
+        if (thdLast_.valid)
+        {
+            if (thdLast_.thdnPercent < 0.001f) ImGui::Text("THD+N < 0.001 %%");
+            else ImGui::Text("THD+N %.3f %%", thdLast_.thdnPercent);
+            ImGui::TextDisabled("Fundamental %.1f dBFS  RMS %.1f dBFS", thdLast_.fundDb, thdLast_.rmsDb);
+        }
+        else
+            ImGui::TextDisabled("THD+N: settling...");
+    }
+
+    // --- Controls: knobs, switches and choices on tabs ----------------------------------
+
+    static int spanOf(const ParamDesc& pd)
+    {
+        if (pd.type != ParamDesc::Choice) return 1;
+        float widest = ImGui::CalcTextSize(pd.name.c_str()).x;
+        for (const auto& c : pd.choices) widest = std::max(widest, ImGui::CalcTextSize(c.c_str()).x + 34.0f);
+        return widest > kCellW - 10.0f ? 2 : 1;
+    }
+
+    /// The rows of one tab laid out in a width, as the height they need.
+    static float tabHeight(const EffectSlot& s, const std::string& tab, float width)
+    {
+        const int cols = std::max(1, static_cast<int>(width / kCellW));
+        int col = 0, rows = 0;
+        for (int i = 0; i < static_cast<int>(s.params.size()); ++i)
+        {
+            if (s.groupOf(i) != tab) continue;
+            const int sp = std::min(cols, spanOf(s.params[static_cast<size_t>(i)]));
+            if (rows == 0) rows = 1;
+            if (col + sp > cols) { ++rows; col = 0; }
+            col += sp;
+        }
+        return static_cast<float>(rows) * cellH();
+    }
+
+    static float controlsHeight(const EffectSlot& s, float width)
+    {
+        const auto tabs = s.tabs();
+        float tallest = 0.0f;
+        for (const auto& t : tabs) tallest = std::max(tallest, tabHeight(s, t, width - 24.0f));
+        const float tabBar = tabs.size() > 1 ? ImGui::GetFrameHeight() + 8.0f : 0.0f;
+        return tallest + tabBar + 2.0f * ImGui::GetStyle().WindowPadding.y + 4.0f;
+    }
+
+    void drawControls(EffectSlot* sel)
+    {
+        // Mirror what the processor moved itself (a preset), unless a widget is held.
         if (sel->readbackFn && !ImGui::IsAnyItemActive())
             sel->readbackFn(sel->values);
 
+        const auto tabs = sel->tabs();
+        ImGui::PushID(sel->name.c_str());
+        if (tabs.size() > 1)
+        {
+            if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_FittingPolicyScroll))
+            {
+                for (const auto& t : tabs)
+                    if (ImGui::BeginTabItem(t.c_str()))
+                    {
+                        drawGrid(sel, t);
+                        ImGui::EndTabItem();
+                    }
+                ImGui::EndTabBar();
+            }
+        }
+        else
+            drawGrid(sel, tabs.front());
+        ImGui::PopID();
+    }
+
+    void drawGrid(EffectSlot* sel, const std::string& tab)
+    {
+        const float width = ImGui::GetContentRegionAvail().x;
+        const int cols = std::max(1, static_cast<int>(width / kCellW));
+        const ImVec2 origin = ImGui::GetCursorPos();
+        int col = 0, row = 0;
         for (int i = 0; i < static_cast<int>(sel->params.size()); ++i)
         {
-            auto& pd = sel->params[i];
-            float& val = sel->values[i];
+            if (sel->groupOf(i) != tab) continue;
+            const auto& pd = sel->params[static_cast<size_t>(i)];
+            const int sp = std::min(cols, spanOf(pd));
+            if (col + sp > cols) { ++row; col = 0; }
+            ImGui::SetCursorPos(ImVec2(origin.x + static_cast<float>(col) * kCellW, origin.y + static_cast<float>(row) * cellH()));
             ImGui::PushID(i);
-
+            const float cellWidth = static_cast<float>(sp) * kCellW;
             switch (pd.type)
             {
-            case ParamDesc::Slider:
-            {
-                float old = val;
-                ImGui::TextUnformatted(pd.name.c_str());     // label above (no truncation in a column)
-                ImGui::SetNextItemWidth(-1.0f);              // full-width slider
-                ImGui::SliderFloat("##s", &val, pd.min, pd.max, formatStr(val, pd.unit),
-                                   pd.logarithmic ? ImGuiSliderFlags_Logarithmic : 0);
-                // Hover + mouse wheel nudges the value (audio-style).
-                if (ImGui::IsItemHovered())
-                {
-                    const float wh = ImGui::GetIO().MouseWheel;
-                    if (wh != 0.0f)
-                        val = std::clamp(pd.logarithmic ? val * std::pow(1.06f, wh)
-                                                        : val + (pd.max - pd.min) * 0.03f * wh,
-                                         pd.min, pd.max);
-                }
-                if (val != old) sel->applyParam(i, val);
-                break;
+                case ParamDesc::Slider: knob(sel, i, cellWidth); break;
+                case ParamDesc::Toggle: toggle(sel, i, cellWidth); break;
+                case ParamDesc::Choice: choice(sel, i, cellWidth); break;
             }
-            case ParamDesc::Toggle:
-            {
-                bool on = val > 0.5f;
-                if (ImGui::Checkbox(pd.name.c_str(), &on)) { val = on ? 1.0f : 0.0f; sel->applyParam(i, val); }
-                // Wheel toggles too
-                if (ImGui::IsItemHovered() && ImGui::GetIO().MouseWheel != 0.0f)
-                {
-                    float nv = ImGui::GetIO().MouseWheel > 0.0f ? 1.0f : 0.0f;
-                    if (nv != val) { val = nv; sel->applyParam(i, val); }
-                }
-                break;
-            }
-            case ParamDesc::Choice:
-            {
-                int cur = static_cast<int>(val);
-                ImGui::TextUnformatted(pd.name.c_str());
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::BeginCombo("##c",
-                    cur < static_cast<int>(pd.choices.size()) ? pd.choices[cur].c_str() : ""))
-                {
-                    for (int c = 0; c < static_cast<int>(pd.choices.size()); ++c)
-                    {
-                        bool isSel = (c == cur);
-                        if (ImGui::Selectable(pd.choices[c].c_str(), isSel)) { val = static_cast<float>(c); sel->applyParam(i, val); }
-                        if (isSel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
-                // Hover + mouse wheel cycles options without opening the list.
-                if (ImGui::IsItemHovered())
-                {
-                    const float wh = ImGui::GetIO().MouseWheel;
-                    if (wh != 0.0f)
-                    {
-                        // Wheel up = previous option, wheel down = next (matches list feel).
-                        int nc = std::clamp(cur + (wh > 0.0f ? -1 : 1), 0,
-                                            static_cast<int>(pd.choices.size()) - 1);
-                        if (nc != cur) { val = static_cast<float>(nc); sel->applyParam(i, val); }
-                    }
-                }
-                break;
-            }
-            }
-            ImGui::Spacing();
             ImGui::PopID();
+            col += sp;
         }
+        ImGui::SetCursorPos(ImVec2(origin.x, origin.y + static_cast<float>(row + 1) * cellH()));
+        ImGui::Dummy(ImVec2(1, 1));
     }
 
-    // --- Compact meters + waveform (bottom) ------------------------------------
-
-    void drawMeters(AudioEngine& engine)
+    static bool integral(const ParamDesc& pd)
     {
-        // The engine overwrites its snapshot every block on the audio thread,
-        // so the plot is drawn from a copy taken here rather than from a
-        // pointer into it.
-        const int waveN = engine.getWaveform(waveL_.data(), waveR_.data(),
-                                             static_cast<int>(waveL_.size()));
-        if (waveN > 0)
-            ImGui::PlotLines("##wave", waveL_.data(), waveN, 0, "Waveform", -1.0f, 1.0f, ImVec2(-1, 50));
-
-        float peakL = engine.getPeakL(), peakR = engine.getPeakR();
-        float dbL = peakL > 0.0f ? 20.0f * std::log10(peakL) : -100.0f;
-        float dbR = peakR > 0.0f ? 20.0f * std::log10(peakR) : -100.0f;
-        float normL = std::clamp((dbL + 60.0f) / 60.0f, 0.0f, 1.0f);
-        float normR = std::clamp((dbR + 60.0f) / 60.0f, 0.0f, 1.0f);
-        char lblL[32], lblR[32];
-        std::snprintf(lblL, sizeof(lblL), "L  %.1f dB", dbL);
-        std::snprintf(lblR, sizeof(lblR), "R  %.1f dB", dbR);
-        ImVec4 colL = normL > 0.9f ? ImVec4(1, 0.2f, 0.2f, 1) : ImVec4(0.2f, 0.8f, 0.2f, 1);
-        ImVec4 colR = normR > 0.9f ? ImVec4(1, 0.2f, 0.2f, 1) : ImVec4(0.2f, 0.8f, 0.2f, 1);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, colL);
-        ImGui::ProgressBar(normL, ImVec2(-1, 16), lblL);
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, colR);
-        ImGui::ProgressBar(normR, ImVec2(-1, 16), lblR);
-        ImGui::PopStyleColor();
-
-        drawThdPanel(engine);
+        const auto whole = [](float v) { return std::fabs(v - std::round(v)) < 1e-4f; };
+        return whole(pd.min) && whole(pd.max) && whole(pd.defaultVal) && pd.max - pd.min >= 3.0f
+            && (pd.unit.empty() || pd.unit == "st" || pd.unit == "BPM");
     }
 
-    // --- Test tone + live THD metering panel ------------------------------------
-
-    void drawThdPanel(AudioEngine& engine)
+    static std::string valueText(const ParamDesc& pd, float v)
     {
-        ImGui::Separator();
-        bool tone = engine.getTestTone();
-        if (ImGui::Checkbox("Test Tone", &tone))
-            engine.setTestTone(tone);
-        if (!engine.isDeviceReady())
+        char b[48];
+        if (pd.unit == "Hz" && std::fabs(v) >= 1000.0f) std::snprintf(b, sizeof(b), "%.2f kHz", v / 1000.0f);
+        else if (pd.unit == "Hz") std::snprintf(b, sizeof(b), std::fabs(v) < 100.0f ? "%.1f Hz" : "%.0f Hz", v);
+        else if (pd.unit == ":1") std::snprintf(b, sizeof(b), "%.1f:1", v);
+        else if (integral(pd)) std::snprintf(b, sizeof(b), pd.unit.empty() ? "%.0f" : "%.0f %s", v, pd.unit.c_str());
+        else if (pd.unit.empty()) std::snprintf(b, sizeof(b), "%.2f", v);
+        else if (pd.unit == "ms" && std::fabs(v) >= 100.0f) std::snprintf(b, sizeof(b), "%.0f ms", v);
+        else std::snprintf(b, sizeof(b), "%.1f %s", v, pd.unit.c_str());
+        return b;
+    }
+
+    static float toNorm(const ParamDesc& pd, float v)
+    {
+        if (pd.max <= pd.min) return 0.0f;
+        if (pd.logarithmic && pd.min > 0.0f) return std::clamp(std::log(v / pd.min) / std::log(pd.max / pd.min), 0.0f, 1.0f);
+        return std::clamp((v - pd.min) / (pd.max - pd.min), 0.0f, 1.0f);
+    }
+    static float fromNorm(const ParamDesc& pd, float t)
+    {
+        t = std::clamp(t, 0.0f, 1.0f);
+        if (pd.logarithmic && pd.min > 0.0f) return pd.min * std::pow(pd.max / pd.min, t);
+        return pd.min + t * (pd.max - pd.min);
+    }
+
+    static void label(const std::string& text, float x, float w)
+    {
+        const std::string shown = fitText(text, w - 6.0f);
+        const float tw = ImGui::CalcTextSize(shown.c_str()).x;
+        ImGui::SetCursorPosX(x + (w - tw) * 0.5f);
+        ImGui::TextUnformatted(shown.c_str());
+    }
+
+    void knob(EffectSlot* sel, int i, float w)
+    {
+        const auto& pd = sel->params[static_cast<size_t>(i)];
+        float val = sel->values[static_cast<size_t>(i)];
+        const float x = ImGui::GetCursorPosX(), y = ImGui::GetCursorPosY();
+        label(pd.name, x, w);
+        const ImVec2 screen = ImGui::GetCursorScreenPos();
+        const ImVec2 centre(screen.x + w * 0.5f - (ImGui::GetCursorPosX() - x), screen.y + kKnobR + 2.0f);
+        ImGui::SetCursorPos(ImVec2(x, ImGui::GetCursorPosY()));
+        ImGui::InvisibleButton("##k", ImVec2(w, 2.0f * kKnobR + 6.0f));
+        const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
+        const ImGuiIO& io = ImGui::GetIO();
+        float t = toNorm(pd, val);
+        bool changed = false;
+        if (active && io.MouseDelta.y != 0.0f)
         {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(load a file once to initialise audio)");
-            return;
+            t -= io.MouseDelta.y * (io.KeyShift ? 0.0012f : 0.0060f);
+            changed = true;
         }
-
-        if (tone)
+        if (hovered && io.MouseWheel != 0.0f)
         {
-            float freq = engine.getTestToneFreq();
-            float db   = engine.getTestToneDb();
-            ImGui::SetNextItemWidth(140);
-            if (ImGui::SliderFloat("Freq", &freq, 20.0f, 20000.0f, "%.0f Hz",
-                                   ImGuiSliderFlags_Logarithmic))
-                engine.setTestToneFreq(freq);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(110);
-            if (ImGui::SliderFloat("Level", &db, -60.0f, 0.0f, "%.1f dB"))
-                engine.setTestToneDb(db);
-
-            // Refresh the reading a few times per second: enough for a live
-            // meter, cheap enough to never matter on the GUI thread.
-            thdTimer_ += ImGui::GetIO().DeltaTime;
-            if (thdTimer_ > 0.25f)
-            {
-                thdTimer_ = 0.0f;
-                thdLast_ = engine.computeThd();
-            }
-            if (thdLast_.valid)
-            {
-                ImGui::Text("THD+N: %s   Fund: %.1f dBFS   RMS: %.1f dBFS",
-                            thdLast_.thdnPercent < 0.001f ? "<0.001 %"
-                                : formatStr(thdLast_.thdnPercent, "%"),
-                            thdLast_.fundDb, thdLast_.rmsDb);
-            }
-            else
-                ImGui::TextDisabled("THD+N: settling...");
+            t += io.MouseWheel * (io.KeyShift ? 0.005f : 0.025f);
+            changed = true;
         }
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        {
+            val = pd.defaultVal;
+            sel->applyParam(i, val);
+            changed = false;
+        }
+        else if (changed)
+        {
+            val = fromNorm(pd, t);
+            if (val != sel->values[static_cast<size_t>(i)]) sel->applyParam(i, val);
+        }
+        if (hovered || active)
+            ImGui::SetTooltip("%s\n%s   (%s to %s)\nDrag: change, Shift: fine, double-click: %s",
+                              pd.name.c_str(), valueText(pd, val).c_str(), valueText(pd, pd.min).c_str(),
+                              valueText(pd, pd.max).c_str(), valueText(pd, pd.defaultVal).c_str());
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float a0 = 0.75f * 3.14159265f, a1 = 2.25f * 3.14159265f;
+        const float tv = toNorm(pd, val);
+        const bool bipolar = !pd.logarithmic && pd.min < 0.0f && pd.max > 0.0f;
+        const float tz = bipolar ? toNorm(pd, 0.0f) : 0.0f;
+        dl->PathArcTo(centre, kKnobR, a0, a1, 40);
+        dl->PathStroke(IM_COL32(48, 53, 65, 255), ImDrawFlags_None, 4.0f);
+        const float from = a0 + (a1 - a0) * std::min(tz, tv), to = a0 + (a1 - a0) * std::max(tz, tv);
+        if (to - from > 0.01f)
+        {
+            dl->PathArcTo(centre, kKnobR, from, to, 32);
+            dl->PathStroke(active ? IM_COL32(255, 214, 130, 255) : IM_COL32(255, 168, 60, 255), ImDrawFlags_None, 4.0f);
+        }
+        dl->AddCircleFilled(centre, kKnobR - 6.0f, hovered || active ? IM_COL32(52, 57, 70, 255) : IM_COL32(40, 44, 55, 255));
+        const float av = a0 + (a1 - a0) * tv;
+        dl->AddLine(ImVec2(centre.x + std::cos(av) * (kKnobR - 14.0f), centre.y + std::sin(av) * (kKnobR - 14.0f)),
+                    ImVec2(centre.x + std::cos(av) * (kKnobR - 6.0f), centre.y + std::sin(av) * (kKnobR - 6.0f)),
+                    IM_COL32(240, 242, 246, 255), 2.5f);
+
+        const std::string vt = fitText(valueText(pd, val), w - 4.0f);
+        const float tw = ImGui::CalcTextSize(vt.c_str()).x;
+        ImGui::SetCursorPos(ImVec2(x + (w - tw) * 0.5f, y + ImGui::GetTextLineHeightWithSpacing() + 2.0f * kKnobR + 6.0f));
+        ImGui::TextColored(active ? ImVec4(1.0f, 0.85f, 0.55f, 1.0f) : ImVec4(0.72f, 0.75f, 0.82f, 1.0f), "%s", vt.c_str());
     }
 
-    // --- Helpers ---------------------------------------------------------------
-
-    static const char* formatStr(float val, const std::string& unit)
+    void toggle(EffectSlot* sel, int i, float w)
     {
-        static char buf[64];
-        if (unit.empty()) std::snprintf(buf, sizeof(buf), "%.2f", val);
-        else              std::snprintf(buf, sizeof(buf), "%.1f %s", val, unit.c_str());
-        return buf;
+        const auto& pd = sel->params[static_cast<size_t>(i)];
+        const float val = sel->values[static_cast<size_t>(i)];
+        const bool on = val > 0.5f;
+        const float x = ImGui::GetCursorPosX(), y = ImGui::GetCursorPosY();
+        const float bw = w - 10.0f, bh = 2.0f * kKnobR + 4.0f;
+        ImGui::SetCursorPos(ImVec2(x + 5.0f, y + ImGui::GetTextLineHeightWithSpacing() * 0.5f + 2.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? ImVec4(0.72f, 0.43f, 0.12f, 1.0f) : ImVec4(0.17f, 0.19f, 0.24f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? ImVec4(0.85f, 0.52f, 0.16f, 1.0f) : ImVec4(0.24f, 0.27f, 0.33f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
+        const std::string shown = fitText(pd.name, bw - 8.0f);
+        if (ImGui::Button((shown + "##t").c_str(), ImVec2(bw, bh)))
+            sel->applyParam(i, on ? 0.0f : 1.0f);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+        ImGui::SetItemTooltip("%s: %s (click to switch)", pd.name.c_str(), on ? "on" : "off");
+        ImGui::SetCursorPos(ImVec2(x, y + ImGui::GetTextLineHeightWithSpacing() * 0.5f + bh + 6.0f));
+        label(on ? "On" : "Off", x, w);
+    }
+
+    void choice(EffectSlot* sel, int i, float w)
+    {
+        const auto& pd = sel->params[static_cast<size_t>(i)];
+        const int cur = std::clamp(static_cast<int>(sel->values[static_cast<size_t>(i)] + 0.5f), 0,
+                                   std::max(0, static_cast<int>(pd.choices.size()) - 1));
+        const float x = ImGui::GetCursorPosX();
+        label(pd.name, x, w);
+        const int nOpts = static_cast<int>(pd.choices.size());
+        // Few short options: segmented buttons; otherwise a list.
+        float segW = 0.0f;
+        for (const auto& c : pd.choices) segW += ImGui::CalcTextSize(c.c_str()).x + 12.0f;
+        ImGui::SetCursorPosX(x + 5.0f);
+        if (nOpts <= 3 && segW <= w - 10.0f)
+        {
+            const float bw = (w - 10.0f) / static_cast<float>(nOpts);
+            const float bh = 2.0f * kKnobR - 6.0f;
+            for (int c = 0; c < nOpts; ++c)
+            {
+                if (c > 0) ImGui::SameLine(0, 0);
+                const bool isSel = c == cur;
+                ImGui::PushStyleColor(ImGuiCol_Button, isSel ? ImVec4(0.72f, 0.43f, 0.12f, 1.0f) : ImVec4(0.17f, 0.19f, 0.24f, 1.0f));
+                if (ImGui::Button((pd.choices[static_cast<size_t>(c)] + "##o" + std::to_string(c)).c_str(), ImVec2(bw, bh)) && !isSel)
+                    sel->applyParam(i, static_cast<float>(c));
+                ImGui::PopStyleColor();
+            }
+        }
+        else
+        {
+            ImGui::SetNextItemWidth(w - 10.0f);
+            if (ImGui::BeginCombo("##c", nOpts > 0 ? pd.choices[static_cast<size_t>(cur)].c_str() : ""))
+            {
+                for (int c = 0; c < nOpts; ++c)
+                {
+                    const bool isSel = c == cur;
+                    if (ImGui::Selectable(pd.choices[static_cast<size_t>(c)].c_str(), isSel))
+                        sel->applyParam(i, static_cast<float>(c));
+                    if (isSel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+            {
+                const float wh = ImGui::GetIO().MouseWheel;
+                if (wh != 0.0f)
+                {
+                    const int nc = std::clamp(cur + (wh > 0.0f ? -1 : 1), 0, nOpts - 1);
+                    if (nc != cur) sel->applyParam(i, static_cast<float>(nc));
+                }
+                ImGui::SetTooltip("%s: %s (wheel: next or previous)", pd.name.c_str(),
+                                  nOpts > 0 ? pd.choices[static_cast<size_t>(cur)].c_str() : "");
+            }
+        }
     }
 };
 

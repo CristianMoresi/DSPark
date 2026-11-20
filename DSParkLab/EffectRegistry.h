@@ -12,6 +12,22 @@
 
 namespace dsplab {
 
+// The display curves of the spectral processors sit at points evenly in log
+// frequency from 20 Hz to 20 kHz (dspark::SpectralReadout); this reads them
+// at the frequencies of the screen, between two points linearly.
+template <typename ValueAt>
+inline void readDisplayCurve(int points, ValueAt valueAt, const float* f, float* out, int n)
+{
+    const double span = std::log(1000.0), last = static_cast<double>(points - 1);
+    for (int i = 0; i < n; ++i)
+    {
+        const double u = std::clamp(last * std::log(std::max(1.0, static_cast<double>(f[i])) / 20.0) / span, 0.0, last);
+        const int a = static_cast<int>(u), b = std::min(points - 1, a + 1);
+        const double t = u - static_cast<double>(a);
+        out[i] = static_cast<float>((1.0 - t) * static_cast<double>(valueAt(a)) + t * static_cast<double>(valueAt(b)));
+    }
+}
+
 // =============================================================================
 // FILTERS
 // =============================================================================
@@ -124,7 +140,7 @@ inline EffectSlot makeEqualizer()
         s.addSlider(nm, 0.1f, 10, 1, "");
         std::snprintf(nm, sizeof(nm), "Band %d Type", b + 1);
         s.addChoice(nm, {"Peak","Low Shelf","High Shelf","Low Pass","High Pass",
-                         "Notch","Band Pass","Tilt","All Pass","Flat Tilt",
+                         "Notch","Band Pass","Tilt","All Pass","Constant Tilt",
                          "Low Pass Wall","High Pass Wall"}, 0);
         std::snprintf(nm, sizeof(nm), "Band %d Slope", b + 1);
         // Cuts only. Whole steps of 6 from 6 to 48 with the cookbook engine;
@@ -134,11 +150,11 @@ inline EffectSlot makeEqualizer()
     // Global controls (indices 20/21, appended so band indices stay stable):
     // Phase Mode switches the IIR cascade for the FFT overlap-save engine
     // (adds maxBlockSize of latency, audible as a small delay here) or for the
-    // natural-phase mode (the bands from their analog prototypes plus a short
+    // prototype-phase mode (the bands from their analog prototypes plus a short
     // correction of their phase, 32 samples late), and
     // Matched Bells selects the analog-matched de-cramped design for Peak bands
     // (audible on high-frequency bells; the curve follows).
-    s.addChoice("Phase Mode", {"Minimum","Linear","Natural"}, 0);
+    s.addChoice("Phase Mode", {"Minimum","Linear","Prototype"}, 0);
     s.addToggle("Matched Bells", true);
     // Analog Response (index 22): every band designed from its analog prototype
     // (no shrinking towards Nyquist, in both phase modes), with glided changes.
@@ -151,10 +167,10 @@ inline EffectSlot makeEqualizer()
         std::snprintf(nm, sizeof(nm), "Band %d Order", b + 1);
         s.addSlider(nm, 1, 16, 1, "");
     }
-    // Band N Place (27..30): the channels the band acts on.
+    // Band N Channels (27..30): the channels the band acts on.
     for (int b = 0; b < 4; ++b) {
         char nm[32];
-        std::snprintf(nm, sizeof(nm), "Band %d Place", b + 1);
+        std::snprintf(nm, sizeof(nm), "Band %d Channels", b + 1);
         s.addChoice(nm, {"Stereo","Left","Right","Mid","Side"}, 0);
     }
     // Structure (index 31): the minimum-phase bands as normalized ladders.
@@ -177,7 +193,7 @@ inline EffectSlot makeEqualizer()
         if (i >= 27 && i <= 30)
         {
             auto cfg = p->getBandConfig(i - 27);
-            cfg.placement = static_cast<EQ::Placement>(std::clamp(static_cast<int>(v), 0, 4));
+            cfg.scope = static_cast<EQ::Scope>(std::clamp(static_cast<int>(v), 0, 4));
             p->setBand(i - 27, cfg);
             return;
         }
@@ -192,7 +208,7 @@ inline EffectSlot makeEqualizer()
         {
             const int mode = static_cast<int>(v);
             p->setFilterMode(mode == 1 ? EQ::FilterMode::LinearPhase
-                           : mode == 2 ? EQ::FilterMode::NaturalPhase
+                           : mode == 2 ? EQ::FilterMode::PrototypePhase
                                        : EQ::FilterMode::MinimumPhase);
             return;
         }
@@ -233,6 +249,12 @@ inline EffectSlot makeEqualizer()
         }
     };
     s.curveNodes = { {0,1,2}, {5,6,7}, {10,11,12}, {15,16,17} };
+    s.liveLabel = "Response";
+    s.group("Band 1", { 0, 1, 2, 3, 4, 23, 27 });
+    s.group("Band 2", { 5, 6, 7, 8, 9, 24, 28 });
+    s.group("Band 3", { 10, 11, 12, 13, 14, 25, 29 });
+    s.group("Band 4", { 15, 16, 17, 18, 19, 26, 30 });
+    s.group("Engine", { 20, 21, 22, 31 });
     return s;
 }
 
@@ -335,8 +357,8 @@ inline EffectSlot makeCompressor()
     // Enum: Peak=0, Rms=1, TruePeak=2, SplitPolarity=3, Hilbert=4, Hybrid=5
     s.addChoice("Detector", {"Peak","RMS","TruePeak","SplitPolarity","Hilbert","Hybrid"}, 0);
     // Character order MUST match dspark::Compressor::Character enum.
-    // Enum: Clean=0, Opto=1, FET=2, Varimu=3, Smooth=4
-    s.addChoice("Character", {"Clean","Opto","FET","Varimu","Smooth"}, 0);
+    // Enum: Clean=0, Opto=1, FET=2, Varimu=3, Layered=4
+    s.addChoice("Character", {"Clean","Opto","FET","Varimu","Layered"}, 0);
     // Harmonic signature of the character (FET: 2nd order of the element;
     // Varimu: the gain through a push-pull pair).
     s.addSlider("Color", 0, 1, 0, "");
@@ -377,7 +399,7 @@ inline EffectSlot makeCompressor()
     s.addSlider("Key Tilt", -6, 6, 0, "dB/oct");
     // The gain smoothed after the ballistics (index 32).
     s.addSlider("Gain Smoothing", 0, 50, 0, "ms");
-    s.addToggle("Delta Listen", false);   // 33: what the compression takes out
+    s.addToggle("Hear Removed", false);   // 33: what the compression takes out
     s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // 34: the pair read as its dominant component
     s.addChoice("Opto Cell", {"Two stages","Three stages"}, 0); // 35: the Opto character with a medium memory
     s.addChoice("Colour Stage", {"Off","Before","After"}, 0);   // 36: the analog colour stage
@@ -442,7 +464,7 @@ inline EffectSlot makeCompressor()
                 break;
             }
             case 32: p->setGainSmoothing(v); break;
-            case 33: p->setDelta(v > 0.5f); break;
+            case 33: p->setRemovalListen(v > 0.5f); break;
             case 34: p->setLinkMode(static_cast<dspark::Compressor<float>::LinkMode>(static_cast<int>(v))); break;
             case 35: p->setOptoCell(static_cast<dspark::Compressor<float>::OptoCell>(static_cast<int>(v))); break;
             case 36: p->setCharacterStage(static_cast<dspark::Compressor<float>::StagePosition>(static_cast<int>(v))); break;
@@ -461,6 +483,11 @@ inline EffectSlot makeCompressor()
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18 });
+    s.group("Character", { 8, 9, 10, 11, 12, 19, 34, 35 });
+    s.group("Timing", { 13, 14, 15, 20, 21, 22, 23, 32 });
+    s.group("Key", { 24, 25, 26, 27, 28, 29, 30, 31, 33 });
+    s.group("Colour Stage", { 36, 37, 38, 39, 40, 41, 42 });
     return s;
 }
 
@@ -649,7 +676,7 @@ inline EffectSlot makeDeEsser()
     s.addChoice("Detection", {"Bandpass","Derivative"}, 0);
     // Threshold counted from the level of the whole input.
     s.addToggle("Auto Threshold", false);
-    s.addToggle("Delta Listen", false);   // 6: what the de-esser takes out
+    s.addToggle("Hear Removed", false);   // 6: what the de-esser takes out
     s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // 7: the cut bell as a normalized ladder
     s.addToggle("Mixed Bell", false);                        // 8: one fixed filter mixed by the reduction
     s.addSlider("Attack", 0.1f, 20, 0.5f, "ms");             // 9
@@ -665,7 +692,7 @@ inline EffectSlot makeDeEsser()
             case 3: p->setReduction(v); break;
             case 4: p->setDetectionMode(static_cast<dspark::DeEsser<float>::DetectionMode>(static_cast<int>(v))); break;
             case 5: p->setAutoThreshold(v > 0.5f); break;
-            case 6: p->setDelta(v > 0.5f); break;
+            case 6: p->setRemovalListen(v > 0.5f); break;
             case 7: p->setStructure(static_cast<dspark::DeEsser<float>::Structure>(static_cast<int>(v))); break;
             case 8: p->setMixedBell(v > 0.5f); break;
             case 9: p->setAttack(v); break;
@@ -714,10 +741,10 @@ inline EffectSlot makeSaturation()
     s.addSlider("Curve Asymmetry", -1, 1, 0, "");
     s.addSlider("Asymmetry", -1, 1, 0, "");
     s.addSlider("Program Noise", -120, -20, -120, "dB");
-    s.addSlider("Dynamics", -1, 1, 0, "");
-    s.addSlider("Dynamics Focus", 0, 2000, 0, "Hz");
-    s.addSlider("Feedback", -0.95f, 0.95f, 0, "");
-    s.addSlider("Feedback Freq", 20, 2000, 200, "Hz");
+    s.addSlider("Level Tracking", -1, 1, 0, "");
+    s.addSlider("Tracking Corner", 0, 2000, 0, "Hz");
+    s.addSlider("Comb Loop", -0.95f, 0.95f, 0, "");
+    s.addSlider("Comb Loop Freq", 20, 2000, 200, "Hz");
     s.addToggle("Drive Compensation", false);
     s.addChoice("Oversampling Mode", {"Linear phase","Minimum phase"}, 0);
     auto shape = std::make_shared<std::array<std::atomic<float>, 4>>();
@@ -752,10 +779,10 @@ inline EffectSlot makeSaturation()
                 break;
             case 11: p->setAsymmetry(v); break;
             case 12: p->setProgramNoise(v); break;
-            case 13: p->setDynamics(v); break;
-            case 14: p->setDynamicsFocus(v); break;
-            case 15: p->setFeedback(v, k[3].load()); break;
-            case 16: k[3] = v; p->setFeedback(p->getFeedback(), v); break;
+            case 13: p->setLevelTracking(v); break;
+            case 14: p->setTrackingCorner(v); break;
+            case 15: p->setCombLoop(v, k[3].load()); break;
+            case 16: k[3] = v; p->setCombLoop(p->getCombLoop(), v); break;
             case 17: p->setDriveCompensation(v > 0.5f); break;
             case 18: modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); break;
             case 0: p->setAlgorithm(static_cast<typename dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); break;
@@ -769,6 +796,10 @@ inline EffectSlot makeSaturation()
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 17 });
+    s.group("Curve", { 8, 9, 10, 11, 12 });
+    s.group("Tracking & Loop", { 13, 14, 15, 16 });
+    s.group("Oversampling", { 6, 7, 18 });
     return s;
 }
 
@@ -838,6 +869,11 @@ inline EffectSlot makeMultibandSaturation()
             case 4: p->setBandSolo(band, v > 0.5f); break;
         }
     };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 26 });
+    s.group("Band 1", { 6, 7, 8, 9, 10 });
+    s.group("Band 2", { 11, 12, 13, 14, 15 });
+    s.group("Band 3", { 16, 17, 18, 19, 20 });
+    s.group("Band 4", { 21, 22, 23, 24, 25 });
     return s;
 }
 
@@ -1188,14 +1224,14 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("High Cut (max = off)", 2000, 20000, 20000, "Hz", true); // 19
     // Around the tank (indices 20 to 43). Every choice's order MUST match its
     // enum in dspark::AlgorithmicReverb (or KeyEqualizer for the wet EQ).
-    s.addToggle("Freeze", false);                                      // 20
-    s.addSlider("Ducking", 0, 24, 0, "dB");                            // 21
+    s.addToggle("Hold Tail", false);                                   // 20
+    s.addSlider("Dip Under Dry", 0, 24, 0, "dB");                      // 21
     s.addSlider("Gate (min = off)", -80, 0, -80, "dB");                // 22
     s.addSlider("Gate Hold", 0, 1000, 100, "ms");                      // 23
     s.addSlider("Gate Release", 5, 1000, 150, "ms", true);             // 24
-    s.addSlider("Distance", 0, 1, 0, "");                              // 25
-    s.addSlider("Thickness", 0, 1, 0, "");                             // 26
-    s.addToggle("Thickness Saturation", false);                        // 27
+    s.addSlider("Source Depth", 0, 1, 0, "");                          // 25
+    s.addSlider("Tank Leveling", 0, 1, 0, "");                         // 26
+    s.addToggle("Tank Saturation", false);                             // 27
     s.addSlider("Tempo", 40, 240, 120, "BPM");                         // 28
     s.addChoice("Pre-Delay Note", {"Off","1/1","1/2","1/4","1/8","1/16","1/32"}, 0); // 29
     s.addChoice("Note Feel", {"Straight","Dotted","Triplet"}, 0);      // 30
@@ -1221,14 +1257,14 @@ inline EffectSlot makeAlgorithmicReverb()
     s.setParamFn = [p, decayBand, wetBand, noteFeel](int i, float v) {
         using KE = dspark::KeyEqualizer<float, 2>;
         switch(i) {
-            case 20: p->setFreeze(v > 0.5f); return;
-            case 21: p->setDucking(v); return;
+            case 20: p->setTailHold(v > 0.5f); return;
+            case 21: p->setDryDip(v); return;
             case 22: p->setGate(v <= -79.5f ? -200.0f : v); return;
             case 23: p->setGateHold(v); return;
             case 24: p->setGateRelease(v); return;
-            case 25: p->setDistance(v); return;
-            case 26: p->setThickness(v); return;
-            case 27: p->setThicknessSaturation(v > 0.5f); return;
+            case 25: p->setSourceDepth(v); return;
+            case 26: p->setTankLeveling(v); return;
+            case 27: p->setTankSaturation(v > 0.5f); return;
             case 28: p->setTempo(v); return;
             case 29: (*noteFeel)[0] = static_cast<int>(v);
                      p->setPreDelayNote(static_cast<ARV::NoteValue>((*noteFeel)[0]), static_cast<ARV::NoteFeel>((*noteFeel)[1])); return;
@@ -1294,6 +1330,12 @@ inline EffectSlot makeAlgorithmicReverb()
         v[16] = std::max(p->getLateLevel(), -60.0f);
         v[17] = p->getWidth();
     };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 17 });
+    s.group("Decay & Tone", { 6, 7, 8, 9, 10, 18, 19 });
+    s.group("Space", { 11, 12, 13, 14, 15, 16, 31, 32, 33, 34 });
+    s.group("Tail", { 20, 21, 22, 23, 24, 25, 26, 27, 35 });
+    s.group("Tempo", { 28, 29, 30 });
+    s.group("Bands", { 36, 37, 38, 39, 40, 41, 42, 43 });
     return s;
 }
 
@@ -1397,7 +1439,7 @@ inline EffectSlot makeDynamicEQ()
     auto p = std::make_shared<DEQ>();
 
     // UI mirror: per band [Freq, Q, Threshold, Amount, Ratio, Attack, Release,
-    // Below, Type, Rest Gain, Knee, Place, Timing, Relative]. Amount is signed:
+    // Below, Type, Rest Gain, Knee, Channels, Timing, Relative]. Amount is signed:
     // +dB boosts the band when triggered, -dB cuts it. It is the node's Y axis,
     // so you drag a band UP to boost or DOWN to cut. Type selects the dynamic
     // filter shape (Bell / Low Shelf / High Shelf), matching DynamicEQ::BandShape
@@ -1429,7 +1471,7 @@ inline EffectSlot makeDynamicEQ()
         else       { c.aboveRatio = ratio; c.aboveBoost = boost; }
         c.gain      = v[9];
         c.knee      = v[10];                  // below 0: the automatic knee
-        c.placement = static_cast<DEQ::Placement>(std::clamp(static_cast<int>(v[11]), 0, 4));
+        c.scope = static_cast<DEQ::Scope>(std::clamp(static_cast<int>(v[11]), 0, 4));
         c.timing    = static_cast<DEQ::Timing>(std::clamp(static_cast<int>(v[12]), 0, 1));
         c.relativeThreshold = v[13] > 0.5f;
         return c;
@@ -1459,7 +1501,7 @@ inline EffectSlot makeDynamicEQ()
         auto nm = [pfx](const char* n){ static char buf[24]; std::snprintf(buf, sizeof(buf), "%s%s", pfx, n); return buf; };
         s.addSlider(nm("Rest Gain"),  -24, 24, 0.0f, "dB");
         s.addSlider(nm("Knee"),        -1, 24, 0.0f, "dB");     // -1: automatic
-        s.addChoice(nm("Place"), {"Stereo","Left","Right","Mid","Side"}, 0);
+        s.addChoice(nm("Channels"), {"Stereo","Left","Right","Mid","Side"}, 0);
         s.addChoice(nm("Timing"), {"Manual","Program"}, 0);
         s.addToggle(nm("Relative Thr"), false);
     }
@@ -1469,7 +1511,7 @@ inline EffectSlot makeDynamicEQ()
     auto linearApplied = std::make_shared<std::atomic<bool>>(false);
     auto lastSpec = std::make_shared<dspark::AudioSpec>();
     s.addToggle("Linear Phase", false);
-    s.addToggle("Delta Listen", false);   // what the bands take out
+    s.addToggle("Hear Removed", false);   // what the bands take out
     s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // stereo bands read the dominant component
     s.addChoice("Structure", {"Direct Form","Ladder"}, 0);   // the band filter as a normalized ladder
     s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
@@ -1496,7 +1538,7 @@ inline EffectSlot makeDynamicEQ()
         const int oldCount = 2 * 9;
         if (i == oldCount) { p->setMixedBands(v > 0.5f); return; }
         if (i == oldCount + 1 + 2 * 5) { linearWanted->store(v > 0.5f, std::memory_order_relaxed); return; }
-        if (i == oldCount + 2 + 2 * 5) { p->setDelta(v > 0.5f); return; }
+        if (i == oldCount + 2 + 2 * 5) { p->setRemovalListen(v > 0.5f); return; }
         if (i == oldCount + 3 + 2 * 5) { p->setLinkMode(static_cast<dspark::DynamicEQ<float>::LinkMode>(static_cast<int>(v))); return; }
         if (i == oldCount + 4 + 2 * 5) { p->setStructure(static_cast<dspark::DynamicEQ<float>::Structure>(static_cast<int>(v))); return; }
         int band = 0, prm = 0;
@@ -1530,6 +1572,11 @@ inline EffectSlot makeDynamicEQ()
         curve(f, mdb, n, v[3], v[12]);
     };
     s.curveNodes = { {0,3,1}, {9,12,10} };  // X=freq, Y=Amount (drag to boost/cut), wheel=Q
+    s.liveLabel = "Gain now";
+    s.targetLabel = "Amount";
+    s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 19, 20, 21, 22, 23 });
+    s.group("Band 2", { 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 27, 28 });
+    s.group("Engine", { 18, 29, 30, 31, 32 });
     return s;
 }
 
@@ -1581,7 +1628,7 @@ inline EffectSlot makeMultibandCompressor()
     s.gainReductionDbFn = [p]() {
         float gr = 0.0f;
         for (int b = 0; b < 3; ++b) gr = std::max(gr, static_cast<float>(p->getBandGainReductionDb(b)));
-        return gr;
+        return -gr;   // the meter reads a gain change: negative is a reduction
     };
     // Band visualiser: 2 crossover frequencies + live per-band gain reduction.
     s.multibandFn = [p, xover](float* xHz, float* grDb, int maxBands) -> int {
@@ -1632,7 +1679,7 @@ inline EffectSlot makeConvolutionReverb()
     s.addSlider("Mix", 0, 1, 0, "");               // 2 - default dry
     s.addSlider("Decay Scale", 0.25f, 2.0f, 1.0f, "x"); // 3 (reshapes loaded/synthetic IR)
     s.addSlider("Stretch", 0.5f, 2.0f, 1.0f, "x");      // 4 (tape-speed style)
-    s.addSlider("Ducking", 0, 24, 0, "dB");             // 5
+    s.addSlider("Dip Under Dry", 0, 24, 0, "dB");       // 5
     s.addSlider("Gate (min = off)", -80, 0, -80, "dB"); // 6
     s.addSlider("Gate Hold", 0, 1000, 100, "ms");       // 7
     s.addSlider("Gate Release", 5, 1000, 150, "ms", true); // 8
@@ -1649,7 +1696,7 @@ inline EffectSlot makeConvolutionReverb()
             case 2: p->setMix(v); break;
             case 3: p->setDecayScale(v); break;      // IR rebuild, atomic publish (safe live)
             case 4: p->setStretch(v); break;         // IR rebuild, atomic publish (safe live)
-            case 5: p->setDucking(v); break;
+            case 5: p->setDryDip(v); break;
             case 6: p->setGate(v <= -79.5f ? -200.0f : v); break;
             case 7: p->setGateHold(v); break;
             case 8: p->setGateRelease(v); break;
@@ -1700,9 +1747,9 @@ inline EffectSlot makeTapeMachine()
     s.addSlider("Hiss", -120, -40, -120, "dBFS");                          // 9
     s.addSlider("Hum", -120, -40, -120, "dBFS");                           // 10
     s.addChoice("Mains", {"50 Hz","60 Hz"}, 0);                            // 11
-    s.addSlider("Crosstalk", -120, -30, -120, "dB");                       // 12
-    s.addSlider("Asymmetry", 0, 1, 0, "");                                 // 13
-    s.addSlider("Transformer", 0, 1, 0, "");                               // 14
+    s.addSlider("Channel Bleed", -120, -30, -120, "dB");                   // 12
+    s.addSlider("Even Harmonics", 0, 1, 0, "");                            // 13
+    s.addSlider("Output Iron", 0, 1, 0, "");                               // 14
     s.addChoice("Head", {"Bump","Contour"}, 0);                            // 15
     s.addChoice("Electronics", {"Ideal","Circuit"}, 0);                    // 16
     s.addSlider("Align HF", -6, 6, 0, "dB");                               // 17
@@ -1710,7 +1757,7 @@ inline EffectSlot makeTapeMachine()
     s.addChoice("Formulation", {"Classic","High Output","Vintage"}, 0);    // 19
     s.addChoice("Track", {"Half","Full","Quarter"}, 0);                    // 20
     s.addSlider("Calibration", 0, 9, 0, "dB");                             // 21
-    s.addChoice("Monitor", {"Repro","Sync","Input"}, 0);                   // 22
+    s.addChoice("Monitor", {"Play Head","Record Head","Source"}, 0);                   // 22
     s.addToggle("Auto Oversampling", false);                               // 23
     s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0); // 24
     // setAutomaticOversampling() is a setup call (it re-prepares): the UI
@@ -1761,9 +1808,9 @@ inline EffectSlot makeTapeMachine()
             case 9: p->setNoise(v); break;
             case 10: hum->store(v); p->setHum(v, static_cast<TM::Mains>(mains->load())); break;
             case 11: mains->store(static_cast<int>(v)); p->setHum(hum->load(), static_cast<TM::Mains>(static_cast<int>(v))); break;
-            case 12: p->setCrosstalk(v); break;
-            case 13: p->setAsymmetry(v); break;
-            case 14: p->setTransformer(v); break;
+            case 12: p->setChannelBleed(v); break;
+            case 13: p->setEvenHarmonics(v); break;
+            case 14: p->setOutputIron(v); break;
             case 15: p->setHeadModel(static_cast<TM::HeadModel>(static_cast<int>(v))); break;
             case 16: p->setElectronics(static_cast<TM::Electronics>(static_cast<int>(v))); break;
             case 17: (*align)[0].store(v); p->setAlignment(v, (*align)[1].load()); break;
@@ -1776,6 +1823,10 @@ inline EffectSlot makeTapeMachine()
             case 24: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7 });
+    s.group("Machine", { 8, 15, 16, 19, 20, 21, 22 });
+    s.group("Noise & Colour", { 9, 10, 11, 12, 13, 14 });
+    s.group("Alignment", { 17, 18, 23, 24 });
     return s;
 }
 
@@ -1850,6 +1901,8 @@ inline EffectSlot makeTubePreamp()
             case 13: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 13 });
+    s.group("Cabinet", { 9, 10, 11, 12 });
     return s;
 }
 
@@ -2005,7 +2058,7 @@ inline EffectSlot makeSpectralDenoiser()
     // The options (indices 3 to 10).
     s.addSlider("Spectral Smoothing", 0, 0.95f, 0, "");                 // 3
     s.addSlider("Gain Release", 0, 500, 0, "ms");                       // 4
-    s.addToggle("Delta Listen", false);                                 // 5
+    s.addToggle("Hear Removed", false);                                 // 5
     s.addToggle("Filter Mode (minimum phase)", false);                  // 6
     s.addSlider("Link (filter mode)", 0, 1, 0, "");                     // 7
     // Order MUST match dspark::KeyEqualizer::Shape.
@@ -2024,7 +2077,7 @@ inline EffectSlot makeSpectralDenoiser()
             case 2: p->setThreshold(v); break;
             case 3: p->setSpectralSmoothing(v); break;
             case 4: p->setGainRelease(v); break;
-            case 5: p->setDelta(v > 0.5f); break;
+            case 5: p->setRemovalListen(v > 0.5f); break;
             case 6: p->setFilterMode(v > 0.5f); break;
             case 7: p->setLink(v); break;
             case 8: sens->shape = static_cast<KE::Shape>(static_cast<int>(v)); p->setSensitivityBand(0, *sens); break;
@@ -2045,8 +2098,8 @@ inline EffectSlot makeTonalBalance()
     EffectSlot s;
     s.name = "Tonal Balance"; s.category = "Spectral";
     s.addSlider("Balance", 0, 1, 0, "");                       // 0 - default 0 = no global move
-    s.addSlider("Boost", 0, 1, 0, "");                         // 1
-    s.addSlider("Tame", 0, 1, 0, "");                          // 2
+    s.addSlider("Fill Dips", 0, 1, 0, "");                         // 1
+    s.addSlider("Trim Peaks", 0, 1, 0, "");                          // 2
     s.addSlider("Tilt", -6, 6, 0, "dB/oct");                   // 3
     s.addSlider("Range", 0, 24, 6, "dB");                      // 4
     s.addSlider("Knee", 0.1f, 12, 3, "dB");                    // 5
@@ -2055,14 +2108,45 @@ inline EffectSlot makeTonalBalance()
     s.addToggle("Level Compensation", false);                  // 8
     s.addSlider("Reference Level", 60, 130, 100, "dB SPL");    // 9
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
+    // The band centres exist once the processor is prepared; the display
+    // reads them from this copy (taken where prepare() runs).
+    using TB = dspark::TonalBalance<float>;
+    auto centres = std::make_shared<std::array<double, TB::kBands>>();
+    auto ready = std::make_shared<std::atomic<bool>>(false);
+    s.prepareFn = [p, centres, ready](auto& sp) {
+        p->prepare(sp);
+        for (int b = 0; b < TB::kBands; ++b) (*centres)[static_cast<std::size_t>(b)] = std::log(std::max(1.0, p->getBandCentre(b)));
+        ready->store(true, std::memory_order_release);
+    };
+    // Live: the correction of each band now (any thread), drawn between the
+    // band centres. Behind it: the reference shape the trend is pulled to.
+    s.magnitudeFn = [p, centres, ready](const float* f, float* mdb, int n, double, const float*) {
+        if (!ready->load(std::memory_order_acquire)) { std::fill(mdb, mdb + n, 0.0f); return; }
+        const auto& c = *centres;
+        int j = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double lf = std::log(std::max(1.0f, f[i]));
+            while (j < TB::kBands - 2 && lf > c[static_cast<std::size_t>(j + 1)]) ++j;
+            const double span = c[static_cast<std::size_t>(j + 1)] - c[static_cast<std::size_t>(j)];
+            const double t = span > 0.0 ? std::clamp((lf - c[static_cast<std::size_t>(j)]) / span, 0.0, 1.0) : 0.0;
+            const double a = p->getCorrection(j), b = p->getCorrection(j + 1);
+            mdb[i] = static_cast<float>(a + t * (b - a));
+        }
+    };
+    s.targetMagnitudeFn = [](const float* f, float* mdb, int n, double, const float* v) {
+        for (int i = 0; i < n; ++i) mdb[i] = v[3] * std::log2(std::max(1.0f, f[i]) / 1000.0f);
+    };
+    s.liveLabel = "Correction now";
+    s.targetLabel = "Reference tilt";
+    s.displayRangeDb = 12.0f;
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, range](int i, float v) {
         switch (i) {
             case 0: p->setBalance(v); break;
-            case 1: p->setBoost(v); break;
-            case 2: p->setTame(v); break;
+            case 1: p->setFillDips(v); break;
+            case 2: p->setTrimPeaks(v); break;
             case 3: p->setTilt(v); break;
             case 4: p->setRange(v); break;
             case 5: p->setKnee(v); break;
@@ -2082,17 +2166,17 @@ inline EffectSlot makeResonanceSuppressor()
     EffectSlot s;
     s.name = "Resonance Suppressor"; s.category = "Spectral";
     s.addSlider("Threshold", 0, 30, 3, "dB");                   // 0
-    s.addSlider("Depth", 0, 1, 0, "");                          // 1 - default 0 = no reduction
+    s.addSlider("Strength", 0, 1, 0, "");                       // 1 - default 0 = no reduction
     s.addSlider("Range", 0, 48, 12, "dB");                      // 2
     s.addSlider("Width", 0.05f, 4, 0.333f, "oct", true);        // 3
     s.addSlider("Attack", 0.5f, 500, 5, "ms", true);            // 4
     s.addSlider("Release", 5, 2000, 80, "ms", true);            // 5
-    s.addChoice("Mode", {"Soft","Hard"}, 0);                    // 6 - order MUST match RS::Mode
+    s.addChoice("Mode", {"Smooth","Deep"}, 0);                   // 6 - order MUST match RS::Mode
     s.addChoice("Stereo", {"Per Bin","Mid/Side"}, 0);           // 7 - order MUST match RS::Link
     s.addSlider("Link", 0, 1, 1, "");                           // 8
-    s.addSlider("Mid/Side Balance", 0, 2, 1, "");               // 9
-    s.addToggle("Delta Listen", false);                         // 10
-    s.addToggle("Band Solo", false);                            // 11
+    s.addSlider("Side Weight", 0, 2, 1, "");                    // 9
+    s.addToggle("Hear Removed", false);                         // 10
+    s.addToggle("Hear Focus", false);                           // 11
     s.addChoice("Quality (on reload)", {"Realtime","Offline"}, 0); // 12
     s.addChoice("Sensitivity Band", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 13
     s.addSlider("Sensitivity Freq", 20, 20000, 3000, "Hz", true); // 14
@@ -2105,7 +2189,7 @@ inline EffectSlot makeResonanceSuppressor()
         using KE = dspark::KeyEqualizer<float, 2>;
         switch (i) {
             case 0: p->setThreshold(v); break;
-            case 1: p->setDepth(v); break;
+            case 1: p->setStrength(v); break;
             case 2: p->setRange(v); break;
             case 3: p->setWidth(v); break;
             case 4: p->setAttack(v); break;
@@ -2113,15 +2197,48 @@ inline EffectSlot makeResonanceSuppressor()
             case 6: p->setMode(static_cast<RS::Mode>(static_cast<int>(v))); break;
             case 7: p->setLinkMode(static_cast<RS::Link>(static_cast<int>(v))); break;
             case 8: p->setLink(v); break;
-            case 9: p->setMidSideBalance(v); break;
-            case 10: p->setDelta(v > 0.5f); break;
-            case 11: p->setBandSolo(v > 0.5f); break;
+            case 9: p->setSideWeight(v); break;
+            case 10: p->setRemovalListen(v > 0.5f); break;
+            case 11: p->setFocusListen(v > 0.5f); break;
             case 12: p->setQuality(static_cast<RS::Quality>(static_cast<int>(v))); break;
             case 13: sens->shape = static_cast<KE::Shape>(static_cast<int>(v)); p->setSensitivityBand(0, *sens); break;
             case 14: sens->frequency = v; p->setSensitivityBand(0, *sens); break;
             case 15: sens->gainDb = v; p->setSensitivityBand(0, *sens); break;
         }
     };
+    // Live: the reduction of the last frame on each channel (the mid and the
+    // side with Mid/Side); filled: the resonances found over the threshold;
+    // behind: the sensitivity curve, whose band is the node.
+    s.magnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
+        readDisplayCurve(RS::kDisplayPoints, [&](int k) { return p->getDisplayReduction(0, k); }, f, mdb, n);
+    };
+    s.secondaryMagnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
+        readDisplayCurve(RS::kDisplayPoints, [&](int k) { return p->getDisplayReduction(1, k); }, f, mdb, n);
+    };
+    s.activityFn = [p](const float* f, float* mdb, int n, double, const float*) {
+        readDisplayCurve(RS::kDisplayPoints, [&](int k) { return p->getDisplayExcess(0, k); }, f, mdb, n);
+    };
+    auto view = std::make_shared<dspark::KeyEqualizer<float, 2>>();
+    s.targetMagnitudeFn = [view](const float* f, float* mdb, int n, double sr, const float* v) {
+        using KE = dspark::KeyEqualizer<float, 2>;
+        view->prepare(sr);
+        KE::Band b;
+        b.shape = static_cast<KE::Shape>(std::clamp(static_cast<int>(v[13]), 0, 6));
+        b.frequency = v[14];
+        b.gainDb = v[15];
+        view->setBand(0, b);
+        const auto response = view->getResponse();
+        for (int i = 0; i < n; ++i) mdb[i] = static_cast<float>(response.magnitudeDb(static_cast<double>(f[i])));
+    };
+    s.curveNodes = { {14, 15, -1} };
+    s.gainReductionDbFn = [p]() { return static_cast<float>(p->getPeakReduction()); };
+    s.liveLabel = "Reduction";
+    s.secondaryLabel = "Reduction, 2nd channel";
+    s.activityLabel = "Resonance found";
+    s.targetLabel = "Sensitivity";
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 6 });
+    s.group("Stereo & Listen", { 7, 8, 9, 10, 11, 12 });
+    s.group("Sensitivity", { 13, 14, 15 });
     return s;
 }
 
@@ -2168,6 +2285,38 @@ inline EffectSlot makeSpectralDynamicEQ()
         }
         p->setBand(i / 9, b);
     };
+    // Live: the gain of the last frame, cell by cell; behind: each band's
+    // shape at its full range, where the nodes sit.
+    s.magnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
+        readDisplayCurve(SD::kDisplayPoints, [&](int k) { return p->getDisplayGain(k); }, f, mdb, n);
+    };
+    s.targetMagnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
+        using BC = dspark::BiquadCoeffs;
+        BC c[2]; bool on[2] = { false, false };
+        for (int b = 0; b < 2; ++b)
+        {
+            const float* x = v + 9 * b;
+            const int shape = static_cast<int>(x[0]);
+            const double fr = std::clamp(static_cast<double>(x[1]), 20.0, 0.45 * sr), q = std::max(0.1, static_cast<double>(x[2]));
+            const double range = static_cast<double>(x[5]);
+            on[b] = shape != 0;
+            if (shape == 1) c[b] = BC::makePeak(sr, fr, q, range);
+            else if (shape == 2) c[b] = BC::makeLowShelf(sr, fr, range);
+            else if (shape == 3) c[b] = BC::makeHighShelf(sr, fr, range);
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            double mag = 1.0;
+            for (int b = 0; b < 2; ++b) if (on[b]) mag *= c[b].getMagnitude(static_cast<double>(f[i]), sr);
+            mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
+        }
+    };
+    s.curveNodes = { {1, 5, 2}, {10, 14, 11} };
+    s.gainReductionDbFn = [p]() { return std::min(0.0f, static_cast<float>(p->getPeakGain())); };
+    s.liveLabel = "Gain now";
+    s.targetLabel = "Full range";
+    s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8 });
+    s.group("Band 2", { 9, 10, 11, 12, 13, 14, 15, 16, 17 });
     return s;
 }
 

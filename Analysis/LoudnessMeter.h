@@ -18,6 +18,12 @@
  * the conformance suite on every target, and the official EBU files when
  * DSPARK_EBU_TEST_SET points at them.
  *
+ * The two K-weighting stages run side by side: stage 1 of a frame in one
+ * register (both channels) next to stage 2 of the frame before it, so the two
+ * recursions overlap instead of waiting on each other. Every call closes the
+ * pipeline on its last frame, so a call accounts for all of its samples, and
+ * the stages compute the same operations as one after the other.
+ *
  * Threading:
  * - prepare() / reset(): setup thread / stream owner (not concurrent with
  *   the process calls or the readers).
@@ -27,13 +33,15 @@
  *   getLoudnessRange, getTruePeakDb, isMeasurementValid): any thread,
  *   lock-free; values are approximate while a block is in flight (metering).
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h, TruePeakDetector.h.
+ * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h, SimdOps.h,
+ * TruePeakDetector.h.
  */
 
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
 #include "../Core/Biquad.h"
+#include "../Core/SimdOps.h"
 #include "../Core/TruePeakDetector.h"
 
 #include <algorithm>
@@ -166,16 +174,37 @@ public:
         truePeakMax_.store(measureTruePeak(data, 0, numSamples,
                                            truePeakMax_.load(std::memory_order_relaxed)),
                            std::memory_order_relaxed);
-        for (int i = 0; i < numSamples; ++i)
+        // One register holds stage 1 of frame i (lane 0) and stage 2 of frame
+        // i - 1 (lane 1); the first frame's stage 1 and the last frame's
+        // stage 2 run on their own.
+        using L = KLane;
+        double pre = applyBiquad(static_cast<double>(data[0]), pre_, preState_[0]);
+        if (numSamples > 1)
         {
-            double filtered = applyKWeighting(static_cast<double>(data[i]), 0);
-            currentBlockPower_ += filtered * filtered;
-            if (!std::isfinite(currentBlockPower_))
-                invalidateMeasurement();
-
-            if (++currentBlockSamples_ >= blockSamples_)
-                commitBlock();
+            const auto b0 = L::set(pre_.b0, rlb_.b0), b1 = L::set(pre_.b1, rlb_.b1);
+            const auto b2 = L::set(pre_.b2, rlb_.b2), a1 = L::set(pre_.a1, rlb_.a1);
+            const auto a2 = L::set(pre_.a2, rlb_.a2);
+            auto z1 = L::set(preState_[0].z1, rlbState_[0].z1);
+            auto z2 = L::set(preState_[0].z2, rlbState_[0].z2);
+            for (int i = 1; i < numSamples; ++i)
+            {
+                const auto y = L::step(b0, b1, b2, a1, a2, L::set(static_cast<double>(data[i]), pre), z1, z2);
+                pre = L::first(y);
+                const double filtered = L::second(y);
+                if (accumulate(filtered * filtered))
+                {
+                    // A non-finite block cleared the states: frame i restarts
+                    // from them, as it would one stage after the other.
+                    pre = applyBiquad(static_cast<double>(data[i]), pre_, preState_[0]);
+                    z1 = L::set(preState_[0].z1, 0.0);
+                    z2 = L::set(preState_[0].z2, 0.0);
+                }
+            }
+            preState_[0] = { L::first(z1), L::first(z2) };
+            rlbState_[0] = { L::second(z1), L::second(z2) };
         }
+        const double filtered = applyBiquad(pre, rlb_, rlbState_[0]);
+        (void)accumulate(filtered * filtered);
     }
 
     /**
@@ -193,18 +222,54 @@ public:
         const T peakLeft = measureTruePeak(left, 0, numSamples,
                                            truePeakMax_.load(std::memory_order_relaxed));
         truePeakMax_.store(measureTruePeak(right, 1, numSamples, peakLeft), std::memory_order_relaxed);
-        for (int i = 0; i < numSamples; ++i)
+        // Two registers, both channels in each: stage 1 of frame i next to
+        // stage 2 of frame i - 1, which has no wait on it. The first frame's
+        // stage 1 and the last frame's stage 2 run on their own.
+        using L = KLane;
+        double preL = applyBiquad(static_cast<double>(left[0]), pre_, preState_[0]);
+        double preR = applyBiquad(static_cast<double>(right[0]), pre_, preState_[1]);
+        if (numSamples > 1)
         {
-            double filtL = applyKWeighting(static_cast<double>(left[i]), 0);
-            double filtR = applyKWeighting(static_cast<double>(right[i]), 1);
-
-            currentBlockPower_ += (filtL * filtL + filtR * filtR);
-            if (!std::isfinite(currentBlockPower_))
-                invalidateMeasurement();
-
-            if (++currentBlockSamples_ >= blockSamples_)
-                commitBlock();
+            const auto pb0 = L::set(pre_.b0, pre_.b0), pb1 = L::set(pre_.b1, pre_.b1);
+            const auto pb2 = L::set(pre_.b2, pre_.b2), pa1 = L::set(pre_.a1, pre_.a1);
+            const auto pa2 = L::set(pre_.a2, pre_.a2);
+            const auto rb0 = L::set(rlb_.b0, rlb_.b0), rb1 = L::set(rlb_.b1, rlb_.b1);
+            const auto rb2 = L::set(rlb_.b2, rlb_.b2), ra1 = L::set(rlb_.a1, rlb_.a1);
+            const auto ra2 = L::set(rlb_.a2, rlb_.a2);
+            auto pz1 = L::set(preState_[0].z1, preState_[1].z1);
+            auto pz2 = L::set(preState_[0].z2, preState_[1].z2);
+            auto rz1 = L::set(rlbState_[0].z1, rlbState_[1].z1);
+            auto rz2 = L::set(rlbState_[0].z2, rlbState_[1].z2);
+            auto pending = L::set(preL, preR);
+            for (int i = 1; i < numSamples; ++i)
+            {
+                const auto x = L::set(static_cast<double>(left[i]), static_cast<double>(right[i]));
+                const auto k = L::step(rb0, rb1, rb2, ra1, ra2, pending, rz1, rz2);
+                pending = L::step(pb0, pb1, pb2, pa1, pa2, x, pz1, pz2);
+                const double filtL = L::first(k);
+                const double filtR = L::second(k);
+                if (accumulate(filtL * filtL + filtR * filtR))
+                {
+                    // A non-finite block cleared the states: frame i restarts
+                    // from them, as it would one stage after the other.
+                    pending = L::set(applyBiquad(static_cast<double>(left[i]), pre_, preState_[0]),
+                                     applyBiquad(static_cast<double>(right[i]), pre_, preState_[1]));
+                    pz1 = L::set(preState_[0].z1, preState_[1].z1);
+                    pz2 = L::set(preState_[0].z2, preState_[1].z2);
+                    rz1 = L::set(0.0, 0.0);
+                    rz2 = L::set(0.0, 0.0);
+                }
+            }
+            preState_[0] = { L::first(pz1), L::first(pz2) };
+            preState_[1] = { L::second(pz1), L::second(pz2) };
+            rlbState_[0] = { L::first(rz1), L::first(rz2) };
+            rlbState_[1] = { L::second(rz1), L::second(rz2) };
+            preL = L::first(pending);
+            preR = L::second(pending);
         }
+        const double filtL = applyBiquad(preL, rlb_, rlbState_[0]);
+        const double filtR = applyBiquad(preR, rlb_, rlbState_[1]);
+        (void)accumulate(filtL * filtL + filtR * filtR);
     }
 
     /**
@@ -532,13 +597,55 @@ private:
         return output;
     }
 
-    double applyKWeighting(double input, int channel) noexcept
+    /// Two lanes of the K-weighting recursion: one register of two doubles
+    /// where the target has one, two scalars otherwise. Each lane computes
+    /// applyBiquad()'s operations in the same order.
+    template <int W, typename D = double> struct KPair
     {
-        double x = applyBiquad(input, pre_, preState_[channel]);
-        return applyBiquad(x, rlb_, rlbState_[channel]);
+        struct V { D a, b; };
+        static V set(D a, D b) noexcept { return { a, b }; }
+        static D first(V v) noexcept { return v.a; }
+        static D second(V v) noexcept { return v.b; }
+        static V step(V b0, V b1, V b2, V a1, V a2, V x, V& z1, V& z2) noexcept
+        {
+            const V y { b0.a * x.a + z1.a, b0.b * x.b + z1.b };
+            z1 = { b1.a * x.a - a1.a * y.a + z2.a, b1.b * x.b - a1.b * y.b + z2.b };
+            z2 = { b2.a * x.a - a2.a * y.a + D(1e-18), b2.b * x.b - a2.b * y.b + D(1e-18) };
+            return y;
+        }
+    };
+    template <typename D> struct KPair<2, D>
+    {
+        using O = simd::Vec<D, 2>;
+        using V = typename O::V;
+        static V set(D a, D b) noexcept { return O::set2(a, b); }
+        static D first(V v) noexcept { return O::lane0(v); }
+        static D second(V v) noexcept { return O::lane1(v); }
+        static V step(V b0, V b1, V b2, V a1, V a2, V x, V& z1, V& z2) noexcept
+        {
+            const V y = O::add(O::mul(b0, x), z1);
+            z1 = O::add(O::sub(O::mul(b1, x), O::mul(a1, y)), z2);
+            z2 = O::add(O::sub(O::mul(b2, x), O::mul(a2, y)), O::set1(D(1e-18)));
+            return y;
+        }
+    };
+    using KLane = KPair<simd::kVecDoubleNarrow>;
+
+    /// Adds one K-weighted frame's power to the block; true when that closed
+    /// a non-finite block and cleared the filter states.
+    [[nodiscard]] bool accumulate(double power) noexcept
+    {
+        currentBlockPower_ += power;
+        if (!std::isfinite(currentBlockPower_))
+            invalidateMeasurement();
+        if (++currentBlockSamples_ >= blockSamples_)
+            return commitBlock();
+        return false;
     }
 
-    void commitBlock() noexcept
+    /// Commits the running sub-block; true when it was non-finite and the
+    /// filter states were cleared.
+    bool commitBlock() noexcept
     {
         const double meanPower = currentBlockPower_ / currentBlockSamples_;
         currentBlockPower_ = 0.0;
@@ -557,7 +664,7 @@ private:
                 preState_[ch] = {};
                 rlbState_[ch] = {};
             }
-            return;
+            return true;
         }
 
         // Update sliding window ring buffer
@@ -639,6 +746,7 @@ private:
                 }
             }
         }
+        return false;
     }
 
     /// Mean K-weighted power of the last numBlocks committed sub-blocks.

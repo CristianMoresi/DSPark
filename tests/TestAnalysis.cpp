@@ -1429,6 +1429,111 @@ DSPARK_TEST(LoudnessMeter_louder_signal_higher_LUFS)
     EXPECT_GT(lufs2, lufs1); // Louder signal = higher LUFS
 }
 
+// The two K-weighting stages run overlapped (stage 1 of a frame next to stage 2
+// of the frame before it). Fed in chunks of every length, with a non-finite
+// sample that clears the states in the middle, the meter must read what the
+// two stages one after the other read, after every call.
+namespace
+{
+struct SerialKMeter
+{
+    struct State { double z1 = 0.0, z2 = 0.0; };
+    BiquadCoeffs pre = BiquadCoeffs::makeKWeightingShelf(48000.0);
+    BiquadCoeffs rlb = BiquadCoeffs::makeKWeightingHighPass(48000.0);
+    State preState[2], rlbState[2];
+    std::vector<double> blocks;
+    double power = 0.0;
+    int count = 0;
+
+    static double step(double x, const BiquadCoeffs& c, State& s)
+    {
+        const double y = c.b0 * x + s.z1;
+        s.z1 = c.b1 * x - c.a1 * y + s.z2;
+        s.z2 = c.b2 * x - c.a2 * y + 1e-18;
+        return y;
+    }
+
+    void push(const double* x, int channels)
+    {
+        double sum = 0.0;
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            const double k = step(step(x[ch], pre, preState[ch]), rlb, rlbState[ch]);
+            sum += k * k;
+        }
+        power += sum;
+        if (++count < 4800) return;
+        const double mean = power / count;
+        power = 0.0;
+        count = 0;
+        if (!std::isfinite(mean))
+        {
+            for (int ch = 0; ch < 2; ++ch) { preState[ch] = {}; rlbState[ch] = {}; }
+            return;
+        }
+        blocks.push_back(mean);
+    }
+
+    double momentary() const
+    {
+        double sum = 0.0;
+        for (int i = 0; i < 4; ++i)
+            if (static_cast<int>(blocks.size()) - 1 - i >= 0)
+                sum += blocks[blocks.size() - 1 - static_cast<size_t>(i)];
+        const double mean = sum / 4.0;
+        if (mean <= 1e-10) return -100.0;
+        return std::max(-100.0, -0.691 + 10.0 * std::log10(mean));
+    }
+};
+} // namespace
+
+DSPARK_TEST(LoudnessMeter_overlapped_k_stages_read_as_one_after_the_other)
+{
+    const int lengths[] = { 1, 2, 7, 333, 4800, 1, 4799, 2, 9600, 3, 1201, 17 };
+    for (int channels = 1; channels <= 2; ++channels)
+    {
+        LoudnessMeter<double> meter;
+        meter.prepare(48000.0, channels);
+        SerialKMeter reference;
+        uint32_t seed = 12345u + static_cast<uint32_t>(channels);
+        auto noise = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<double>(seed >> 8) / 8388608.0 - 1.0;
+        };
+
+        std::vector<double> left, right;
+        int position = 0;
+        double worst = 0.0;
+        int checks = 0;
+        for (int round = 0; round < 6; ++round)
+        {
+            for (int length : lengths)
+            {
+                left.resize(static_cast<size_t>(length));
+                right.resize(static_cast<size_t>(length));
+                for (int i = 0; i < length; ++i, ++position)
+                {
+                    const double level = 0.05 + 0.4 * (0.5 + 0.5 * std::sin(position * 3.0e-4));
+                    left[static_cast<size_t>(i)] = level * noise();
+                    right[static_cast<size_t>(i)] = level * noise();
+                    if (position == 70000) left[static_cast<size_t>(i)] = std::numeric_limits<double>::quiet_NaN();
+                    const double frame[2] = { left[static_cast<size_t>(i)], right[static_cast<size_t>(i)] };
+                    reference.push(frame, channels);
+                }
+                if (channels == 2)
+                    meter.process(left.data(), right.data(), length);
+                else
+                    meter.process(left.data(), length);
+                worst = std::max(worst, std::abs(static_cast<double>(meter.getMomentaryLUFS()) - reference.momentary()));
+                ++checks;
+            }
+        }
+        EXPECT_GT(static_cast<int>(reference.blocks.size()), 20);
+        EXPECT_GT(checks, 60);
+        EXPECT_LT(worst, 1e-9);
+    }
+}
+
 // Pin: the true-peak max-hold must NOT be permanently poisoned by a single
 // non-finite (Inf/NaN) input sample. The K-filter / histogram path
 // already drops a poisoned block and self-recovers; before the fix std::max()

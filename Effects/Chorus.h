@@ -25,7 +25,9 @@
  *   phase by a bounded frequency offset (no phase jump), and voices fade in and
  *   out over 50 ms with the level normalisation following the fade.
  * - Delay reads use 4-point Hermite interpolation by default, or optionally the
- *   framework's 32-tap Kaiser sinc reader (setInterpolation()).
+ *   framework's 32-tap Kaiser sinc reader, or 2-point linear reads whose
+ *   loss of highs belongs to the sound of many chorus units
+ *   (setInterpolation()).
  * - setModel(Model::Analog) (off by default) runs a bucket-brigade chorus:
  *   the channels summed to mono, high-passed at 5 Hz, into two bucket-brigade
  *   lines of 512 stages (Core/BucketBrigade.h) whose clocks a triangle wave
@@ -90,8 +92,11 @@ public:
     enum class Interpolation
     {
         Hermite,  ///< 4-point cubic (default).
-        Sinc      ///< 32-tap Kaiser sinc: transparent to 15 kHz at 44.1/48 kHz,
+        Sinc,     ///< 32-tap Kaiser sinc: transparent to 15 kHz at 44.1/48 kHz,
                   ///< about 5x the read cost; the shortest delay is 16 samples.
+        Linear    ///< 2-point linear: its loss of highs (a gentle low-pass that
+                  ///< moves with the fraction, -6 dB at Nyquist half way between
+                  ///< samples) is part of the sound of many chorus units.
     };
 
     /** @brief The engine (setModel()). */
@@ -228,10 +233,10 @@ public:
         updateLfoPhases();
     }
 
-    /** @brief Selects the fractional read kernel. Thread-safe. */
+    /** @brief Selects the fractional read kernel. Thread-safe; an out-of-range value reads as Hermite. */
     void setInterpolation(Interpolation mode) noexcept
     {
-        interpolation_.store(mode == Interpolation::Sinc ? Interpolation::Sinc : Interpolation::Hermite,
+        interpolation_.store(mode == Interpolation::Sinc || mode == Interpolation::Linear ? mode : Interpolation::Hermite,
                              std::memory_order_relaxed);
     }
 
@@ -424,7 +429,7 @@ public:
         setAutoDepth(r.read("autoDepth", false));
         setModWaveform(static_cast<typename Oscillator<T>::Waveform>(
             r.read("waveform", 0)));
-        setInterpolation(r.read("interp", 0) == 1 ? Interpolation::Sinc : Interpolation::Hermite);
+        setInterpolation(static_cast<Interpolation>(r.read("interp", 0)));
         setModel(r.read("model", 0) == 1 ? Model::Analog : Model::Digital);
         // The preset index only (rate, depth and centre were read above).
         analogMode_.store(std::clamp(static_cast<int>(r.read("analogMode", 0)), 0, 2), std::memory_order_relaxed);
@@ -478,6 +483,14 @@ protected:
                                dFrac > 0.0 ? 1.0 - dFrac : 0.0);
     }
 
+    /** @brief One modulated read with the selected kernel. */
+    [[nodiscard]] T readTap(const RingBuffer<T>& ring, T delay, Interpolation interp) const noexcept
+    {
+        if (interp == Interpolation::Sinc) return readSinc(ring, delay);
+        if (interp == Interpolation::Linear) return ring.template readInterpolated<InterpMethod::Linear>(delay);
+        return ring.readInterpolated(delay);
+    }
+
     /** @brief One block of at most the prepared size. */
     void processChunk(AudioBufferView<T> buffer) noexcept
     {
@@ -494,7 +507,8 @@ protected:
         T mixVal       = mix_.load(std::memory_order_relaxed);
         int nVoices    = numVoices_.load(std::memory_order_relaxed);
         bool autoD     = autoDepth_.load(std::memory_order_relaxed);
-        const bool sinc = interpolation_.load(std::memory_order_relaxed) == Interpolation::Sinc && sinc_;
+        Interpolation interp = interpolation_.load(std::memory_order_relaxed);
+        if (interp == Interpolation::Sinc && !sinc_) interp = Interpolation::Hermite;
 
         mixer_.pushDry(buffer);
         if (model_.load(std::memory_order_relaxed) == Model::Analog)
@@ -577,7 +591,7 @@ protected:
         // the historical 0.005 at 48 kHz; the old fixed value made parameter
         // glides twice as fast at 96 kHz as at 48 kHz).
         T smoothCoeff = std::min(T(1), T(240) / static_cast<T>(spec_.sampleRate));
-        const T minDelay = sinc ? T(SincInterpolator<T>::kAfter) : T(1);
+        const T minDelay = interp == Interpolation::Sinc ? T(SincInterpolator<T>::kAfter) : T(1);
 
         // 2. Channel outer, sample inner (cache-friendly per-channel state)
         for (int ch = 0; ch < nCh; ++ch)
@@ -615,7 +629,7 @@ protected:
 
                         // Safety clamp against ring buffer limits
                         T delay = std::clamp(rawDelay, minDelay, static_cast<T>(maxDelaySamples_ - 2));
-                        wetRaw += sinc ? readSinc(ring, delay) : ring.readInterpolated(delay);
+                        wetRaw += readTap(ring, delay, interp);
                     }
                     fbState_[ch] = wetRaw / static_cast<T>(nVoices);
                     channelData[i] = wetRaw * voiceNorm;
@@ -637,7 +651,7 @@ protected:
                     // Safety clamp against ring buffer limits
                     T delay = std::clamp(rawDelay, minDelay, static_cast<T>(maxDelaySamples_ - 2));
 
-                    const T tap = sinc ? readSinc(ring, delay) : ring.readInterpolated(delay);
+                    const T tap = readTap(ring, delay, interp);
                     wetRaw += g == T(1) ? tap : g * tap;
                     gainSum += g;
                     powerSum += g * g;

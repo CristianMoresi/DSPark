@@ -13,7 +13,9 @@
  * frequency in it is loud. Here a band (a bell or a shelf, with its
  * frequency, Q and range) covers the frequencies where its static response
  * at full range is over one percent of that range, cut into up to 128
- * cells spaced evenly in log frequency (setBand(): `cells`). Every hop the
+ * cells (setBand(): `cells`) placed by the band's weight: equal steps of
+ * its shape integrated over log frequency, so they crowd where the band
+ * acts and the skirts take a few wide ones. Every hop the
  * level of a cell is the largest power of the key's spectrum in it,
  * weighted by the band's shape there; the threshold is relative to the
  * band's own recent peak (it rises at once and falls by 2 dB per second),
@@ -272,12 +274,28 @@ private:
             if (share > 0.01) { if (lo < 0) lo = k; hi = k; }
         }
         if (lo < 0) { s.active = false; return; }
-        // Cells evenly in log over the span.
+        // Cells by the band's weight: equal steps of the shape integrated over
+        // log frequency (each bin weighs its share over its index), so the
+        // cells crowd where the band acts and the skirts, where it barely
+        // moves, take a few wide ones. Every cell keeps at least one bin.
         s.cells = std::min(b.cells, hi - lo + 1);
-        const double lf = std::log(std::max(1.0, lo * binHz)), hf = std::log(std::max(2.0, (hi + 1) * binHz));
-        for (int j = 0; j <= s.cells; ++j)
-            s.edge[static_cast<size_t>(j)] = std::clamp(static_cast<int>(std::lround(std::exp(lf + (hf - lf) * j / s.cells) / binHz)), lo, hi + 1);
+        double total = 0.0;
+        for (int k = lo; k <= hi; ++k) total += s.shape[static_cast<size_t>(k)] / static_cast<double>(k);
         s.edge[0] = lo;
+        int cell = 1;
+        double acc = 0.0;
+        for (int k = lo; k <= hi && cell < s.cells; ++k)
+        {
+            acc += s.shape[static_cast<size_t>(k)] / static_cast<double>(k);
+            while (cell < s.cells && acc >= total * static_cast<double>(cell) / static_cast<double>(s.cells))
+            {
+                const int room = hi + 1 - (s.cells - cell);   // what the cells after this one still need
+                s.edge[static_cast<size_t>(cell)] = std::min(room, std::max(s.edge[static_cast<size_t>(cell - 1)] + 1, k + 1));
+                ++cell;
+            }
+        }
+        for (; cell < s.cells; ++cell)
+            s.edge[static_cast<size_t>(cell)] = std::min(hi + 1 - (s.cells - cell), s.edge[static_cast<size_t>(cell - 1)] + 1);
         s.edge[static_cast<size_t>(s.cells)] = hi + 1;
         const double hopSeconds = static_cast<double>(filter_.getHopSize()) / fs;
         for (int j = 0; j < s.cells; ++j)

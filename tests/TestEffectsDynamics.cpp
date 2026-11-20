@@ -4333,11 +4333,14 @@ struct CompLines
     double gainDb = 0.0, worstDb = 0.0;
 };
 
-template <class Setup>
-CompLines compLines(int bin, double amplitude, Setup&& setup)
+// The gain of a bin-locked tone through a processor and the largest line of
+// its output that is no harmonic of it (dB re the tone), over the last of six
+// 32768-sample spans.
+template <class Processor, class Setup>
+CompLines toneLines(int bin, double amplitude, Setup&& setup)
 {
     constexpr int n = 32768;
-    auto c = std::make_unique<Compressor<double>>();
+    auto c = std::make_unique<Processor>();
     setup(*c);
     c->prepare(AudioSpec{ 48000.0, 512, 1 });
     std::vector<double> x(static_cast<size_t>(n) * 6);
@@ -4363,6 +4366,12 @@ CompLines compLines(int bin, double amplitude, Setup&& setup)
     r.gainDb = 10.0 * std::log10(power(bin)) - 20.0 * std::log10(amplitude * n / 2.0);
     r.worstDb = 10.0 * std::log10(std::max(worst / power(bin), 1e-30));
     return r;
+}
+
+template <class Setup>
+CompLines compLines(int bin, double amplitude, Setup&& setup)
+{
+    return toneLines<Compressor<double>>(bin, amplitude, std::forward<Setup>(setup));
 }
 
 } // namespace
@@ -8022,4 +8031,197 @@ DSPARK_TEST(Compressor_threshold_in_use_follows_the_automatic_reference)
             const double inUse = static_cast<double>(c->getThresholdInUseDb());
             EXPECT_NEAR(inUse, autoThr ? -30.0 : -20.0, 0.25);
         }
+}
+
+// New: Precision::High reads the signal at eight points a sample and runs the
+// gain computer's window, hold, release and ramp at eight steps a sample. The
+// corners of the gain fall where the crests are, not on the sample grid, and
+// the lines that are no harmonics of a steady tone fall by tens of dB; the
+// level of the tone stays where it was.
+DSPARK_TEST(Limiter_high_precision_lowers_the_lines_that_are_no_harmonics)
+{
+    using Lim = Limiter<double>;
+    struct Row { double standard, high, gainStandard, gainHigh; };
+    std::vector<Row> rows;
+    for (int bin : { 68, 683, 3413 })                         // 100 Hz, 1 and 5 kHz
+        for (double release : { 20.0, 100.0 })
+            for (const bool hold : { true, false })           // the default 10 ms hold, and none
+            {
+                const auto at = [&](Lim::Precision precision) {
+                    return toneLines<Lim>(bin, 1.0, [&](Lim& l) {
+                        l.setCeiling(-6.0);
+                        l.setRelease(release);
+                        if (!hold) l.setHold(0.0);
+                        l.setPrecision(precision);
+                    });
+                };
+                const CompLines standard = at(Lim::Precision::Standard);
+                const CompLines high = at(Lim::Precision::High);
+                std::cout << "  limiter, " << 48000.0 * bin / 32768.0 << " Hz, release " << release << " ms, "
+                          << (hold ? "hold 10 ms" : "no hold") << ": " << standard.worstDb << " -> "
+                          << high.worstDb << " dBc, gain " << standard.gainDb << " -> " << high.gainDb << " dB\n";
+                rows.push_back({ standard.worstDb, high.worstDb, standard.gainDb, high.gainDb });
+            }
+    for (const Row& r : rows)
+    {
+        EXPECT_LT(r.high, r.standard - 20.0);
+        EXPECT_LT(r.high, -100.0);
+        EXPECT_NEAR(r.gainHigh, r.gainStandard, 0.1);
+    }
+}
+
+// The points concern the sample seven frames back: the latency is seven
+// samples longer, the input comes out that late below the ceiling, every
+// sample leaves at or below the ceiling, the per-sample path is the block
+// path to the bit for mono, a switch during playback stays under the
+// ceiling, and the state carries the choice. With true peak on the precision
+// does not apply.
+DSPARK_TEST(Limiter_high_precision_latency_ceiling_paths_and_state)
+{
+    using Lim = Limiter<double>;
+    {
+        Lim lim;
+        lim.prepare(48000.0, 2);
+        EXPECT_TRUE(lim.getPrecision() == Lim::Precision::Standard);
+        EXPECT_EQ(lim.getLatency(), 96);
+        lim.setPrecision(Lim::Precision::High);
+        EXPECT_EQ(lim.getLatency(), 96 + 7);
+        lim.setTruePeak(true);
+        EXPECT_EQ(lim.getLatency(), 96);
+        lim.setTruePeak(false);
+        lim.prepare(44100.0, 2);                         // survives a re-preparation
+        EXPECT_TRUE(lim.getPrecision() == Lim::Precision::High);
+        EXPECT_EQ(lim.getLatency(), 88 + 7);
+    }
+
+    // Below the ceiling: the input, getLatency() samples late.
+    {
+        Lim lim;
+        lim.setCeiling(-1.0);
+        lim.setPrecision(Lim::Precision::High);
+        lim.prepare(48000.0, 1);
+        const size_t latency = static_cast<size_t>(lim.getLatency());
+        std::vector<double> x(8000);
+        LimiterTestNoise noise { 0x51u };
+        for (double& v : x) v = 0.25 * noise.next();
+        std::vector<double> y = x;
+        for (size_t o = 0; o < y.size(); o += 300)
+        {
+            double* ch[1] = { y.data() + o };
+            lim.processBlock(AudioBufferView<double>(ch, 1, static_cast<int>(std::min<size_t>(300, y.size() - o))));
+        }
+        double worst = 0.0;
+        for (size_t i = 0; i < y.size(); ++i)
+            worst = std::max(worst, std::abs(y[i] - (i >= latency ? x[i - latency] : 0.0)));
+        EXPECT_LT(worst, 1e-15);
+    }
+
+    // The sample-domain contract at the shortest lookahead, with isolated
+    // crests over a tone.
+    {
+        std::vector<double> x(6000);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = 0.5 * std::sin(2.0 * 3.14159265358979 * 1000.0 * static_cast<double>(i) / 48000.0);
+        x[1000] = 2.0;
+        x[1090] = 1.6;
+        x[1400] = -1.9;
+        Lim lim;
+        lim.setCeiling(-1.0);
+        lim.setPrecision(Lim::Precision::High);
+        lim.prepare(48000.0, 1);
+        lim.setLookahead(0.5);
+        const double ceil = decibelsToGain(-1.0);
+        std::vector<double> y = x;
+        for (size_t i = 0; i < y.size(); ++i)
+        {
+            double* p[1] = { &y[i] };
+            lim.processBlock(AudioBufferView<double>(p, 1, 1));
+        }
+        int hits = 0;
+        for (const double v : y) hits += std::abs(v) > ceil * (1.0 + 1e-12) ? 1 : 0;
+        EXPECT_EQ(hits, 0);
+    }
+
+    // The per-sample path is the block path to the bit, with every option on.
+    for (const bool everyPeak : { false, true })
+    {
+        Limiter<float> lb, ls;
+        for (Limiter<float>* l : { &lb, &ls })
+        {
+            l->setCeiling(-6.0f);
+            if (everyPeak) l->setHoldMode(Limiter<float>::HoldMode::EveryPeak);
+            l->setPrecision(Limiter<float>::Precision::High);
+            l->prepare(48000.0, 1);
+            l->setAdaptiveRelease(true);
+            l->setSafetyClip(true);
+        }
+        const int n = 6000;
+        std::vector<float> in(static_cast<size_t>(n));
+        LimiterTestNoise noise { 0x77u };
+        for (int i = 0; i < n; ++i)
+            in[static_cast<size_t>(i)] = static_cast<float>(0.05 * std::sin(6.283185307179586 * 330.0 * i / 48000.0)
+                                                            + (i % 997 == 500 ? 1.0 : 0.0) + 0.4 * noise.next());
+        std::vector<float> blockOut = in;
+        const int sizes[] = { 512, 37, 300, 1, 129, 700 };
+        for (int off = 0, k = 0; off < n; ++k)
+        {
+            const int len = std::min(sizes[k % 6], n - off);
+            float* p[1] = { blockOut.data() + off };
+            lb.processBlock(AudioBufferView<float>(p, 1, len));
+            off += len;
+        }
+        float maxDiff = 0.0f;
+        for (int i = 0; i < n; ++i)
+            maxDiff = std::max(maxDiff, std::abs(ls.processSample(in[static_cast<size_t>(i)], 0) - blockOut[static_cast<size_t>(i)]));
+        EXPECT_TRUE(maxDiff == 0.0f);
+        const float ceiling = decibelsToGain(-6.0f);
+        for (int i = 0; i < n; ++i)
+            EXPECT_TRUE(std::abs(blockOut[static_cast<size_t>(i)]) <= ceiling + 1e-6f);
+    }
+
+    // Switched on and off during playback over noise twice the ceiling.
+    {
+        const double ceiling = std::pow(10.0, -1.0 / 20.0);
+        std::vector<double> x(96000);
+        LimiterTestNoise noise { 0x4321u };
+        for (double& v : x) v = 2.0 * ceiling * noise.next();
+        Lim lim;
+        lim.setCeiling(-1.0);
+        lim.prepare(48000.0, 2);
+        std::vector<double> left = x, right = x;
+        int block = 0;
+        double worst = 0.0;
+        bool finite = true;
+        for (size_t o = 0; o < x.size(); o += 512, ++block)
+        {
+            if (block == 40) lim.setPrecision(Lim::Precision::High);
+            if (block == 120) lim.setPrecision(Lim::Precision::Standard);
+            const int len = static_cast<int>(std::min<size_t>(512, x.size() - o));
+            double* ch[2] = { left.data() + o, right.data() + o };
+            lim.processBlock(AudioBufferView<double>(ch, 2, len));
+            for (int i = 0; i < len; ++i)
+            {
+                finite = finite && std::isfinite(left[o + static_cast<size_t>(i)]);
+                worst = std::max(worst, std::abs(left[o + static_cast<size_t>(i)]));
+            }
+        }
+        EXPECT_TRUE(finite);
+        EXPECT_TRUE(worst <= ceiling * (1.0 + 1e-12));
+    }
+
+    // The state carries the choice; a blob without it restores Standard.
+    {
+        Limiter<float> a;
+        a.setPrecision(Limiter<float>::Precision::High);
+        const auto blob = a.getState();
+        StateReader r(blob.data(), blob.size());
+        EXPECT_EQ(r.read("precision", int32_t(-1)), int32_t(1));
+        Limiter<float> b;
+        EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(b.getPrecision() == Limiter<float>::Precision::High);
+        Limiter<float> plain;
+        const auto old = plain.getState();
+        EXPECT_TRUE(b.setState(old.data(), old.size()));
+        EXPECT_TRUE(b.getPrecision() == Limiter<float>::Precision::Standard);
+    }
 }

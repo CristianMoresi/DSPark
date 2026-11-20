@@ -4308,7 +4308,8 @@ AnalogEq::BandConfig eqBand(AnalogEq::BandType type, double hz, double gain, dou
 double eqWorstAgainst(const AnalogCascade& proto, const AnalogEq::BandConfig& cfg, bool analog,
                       const std::vector<double>& freqs, double fs = 48000.0, bool linearPhase = false)
 {
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setAnalogResponse(analog);
     if (linearPhase) eq.setFilterMode(AnalogEq::FilterMode::LinearPhase);
     eq.setBand(0, cfg);
@@ -4388,7 +4389,8 @@ DSPARK_TEST(Equalizer_analog_cuts_take_any_slope)
         const AnalogEq::BandConfig cfg = eqBand(Type::LowPass, 2000.0, 0.0, 0.7071, slope);
         EXPECT_LT(eqWorstAgainst(FilterDesign::highCut(2000.0, slope), cfg, true, freqs), 0.3);
 
-        AnalogEq eq;
+        auto eqHeap = std::make_unique<AnalogEq>();
+        AnalogEq& eq = *eqHeap;
         eq.setAnalogResponse(true);
         eq.setBand(0, cfg);
         eq.prepare({ 48000.0, 256, 1 });
@@ -4480,7 +4482,8 @@ DSPARK_TEST(Equalizer_analog_bands_of_any_order_and_the_new_types)
 DSPARK_TEST(Equalizer_analog_analysis_curve_is_the_audio)
 {
     using Type = AnalogEq::BandType;
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setAnalogResponse(true);
     eq.setBand(0, eqBand(Type::HighPass, 80.0, 0.0, 1.2, 21.0));
     eq.setBand(1, eqBand(Type::Peak, 2500.0, -7.0, 3.0, 12.0, 5));
@@ -4505,7 +4508,8 @@ DSPARK_TEST(Equalizer_analog_parameter_changes_glide)
     const double fs = 48000.0;
     const auto tone = [&](int n) { return 0.5 * std::sin(2.0 * 3.14159265358979323846 * 100.0 * n / fs); };
     const auto run = [&](double toGain, int block, std::vector<double>& out) {
-        AnalogEq eq;
+        auto eqHeap = std::make_unique<AnalogEq>();
+        AnalogEq& eq = *eqHeap;
         eq.setAnalogResponse(true);
         eq.setBand(0, eqBand(Type::LowShelf, 400.0, 0.0, 0.7071));
         eq.prepare({ fs, 512, 1 });
@@ -4549,7 +4553,8 @@ DSPARK_TEST(Equalizer_analog_band_at_zero_gain_leaves_the_path)
 {
     using Type = AnalogEq::BandType;
     const double fs = 48000.0;
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setAnalogResponse(true);
     eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 2.0));
     eq.setBand(1, eqBand(Type::HighShelf, 6000.0, 0.01, 0.7071));
@@ -4707,7 +4712,8 @@ DSPARK_TEST(Equalizer_band_placement_acts_where_it_is_placed)
         const EqStereo in = eqStereoNoise(4096, 11u);
         // What one band does to one signal.
         const auto alone = [&](const AnalogEq::BandConfig& cfg, std::vector<double> x) {
-            AnalogEq eq;
+            auto eqHeap = std::make_unique<AnalogEq>();
+            AnalogEq& eq = *eqHeap;
             eq.setAnalogResponse(analog);
             eq.setBand(0, cfg);
             eq.prepare({ 48000.0, 256, 1 });
@@ -4715,7 +4721,8 @@ DSPARK_TEST(Equalizer_band_placement_acts_where_it_is_placed)
             return x;
         };
         const auto placed = [&](std::initializer_list<AnalogEq::BandConfig> bands) {
-            AnalogEq eq;
+            auto eqHeap = std::make_unique<AnalogEq>();
+            AnalogEq& eq = *eqHeap;
             eq.setAnalogResponse(analog);
             int index = 0;
             for (const AnalogEq::BandConfig& cfg : bands) eq.setBand(index++, cfg);
@@ -4839,7 +4846,8 @@ DSPARK_TEST(Equalizer_band_placement_in_linear_phase_is_one_matrix)
     // signals are all sides: the bell does not touch them.
     for (const double sign : { 1.0, -1.0 })
     {
-        AnalogEq eq;
+        auto eqHeap = std::make_unique<AnalogEq>();
+        AnalogEq& eq = *eqHeap;
         make({ eqPlaced(eqBand(Type::Peak, 1000.0, 12.0, 1.0), Place::Mid) }, eq);
         EqStereo y;
         y.l.assign(static_cast<size_t>(length), 0.0);
@@ -4856,7 +4864,8 @@ DSPARK_TEST(Equalizer_band_placement_state_and_curves)
 {
     using Type = AnalogEq::BandType;
     using Place = AnalogEq::Placement;
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setBand(0, eqPlaced(eqBand(Type::Peak, 1000.0, 6.0, 1.0), Place::Side));
     eq.setBand(1, eqPlaced(eqBand(Type::Peak, 1000.0, -4.0, 1.0), Place::Left));
     eq.setBand(2, eqBand(Type::Peak, 1000.0, 3.0, 1.0));
@@ -4924,7 +4933,8 @@ struct EqDistance { double level = 0.0, phase = 0.0; };
 EqDistance eqDistance(const AnalogCascade& proto, const AnalogEq::BandConfig& cfg, AnalogEq::FilterMode mode,
                       double fs = 48000.0)
 {
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setAnalogResponse(true);
     eq.setFilterMode(mode);
     eq.setBand(0, cfg);
@@ -4949,7 +4959,8 @@ EqDistance eqDistance(const AnalogCascade& proto, const AnalogEq::BandConfig& cf
 DSPARK_TEST(Equalizer_natural_phase_at_rest_is_the_signal_late_to_the_bit)
 {
     using Type = AnalogEq::BandType;
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
     eq.setBand(0, eqBand(Type::Peak, 1000.0, 0.0, 1.0));
     eq.setBand(1, eqBand(Type::HighShelf, 8000.0, 0.0, 0.7071));
@@ -5008,7 +5019,8 @@ DSPARK_TEST(Equalizer_natural_phase_does_not_depend_on_the_blocks_and_fades_a_ch
     eqRunStereo(first, reference, 512);
     for (int block : { 37, 64, 480 })
     {
-        AnalogEq eq;
+        auto eqHeap = std::make_unique<AnalogEq>();
+        AnalogEq& eq = *eqHeap;
         make(eq);
         EqStereo y = x;
         eqRunStereo(eq, y, block);
@@ -5016,7 +5028,8 @@ DSPARK_TEST(Equalizer_natural_phase_does_not_depend_on_the_blocks_and_fades_a_ch
         EXPECT_LT(eqWorstDiff(y.r, reference.r), 1e-12);
     }
 
-    AnalogEq eq;
+    auto eqHeap = std::make_unique<AnalogEq>();
+    AnalogEq& eq = *eqHeap;
     eq.setFilterMode(AnalogEq::FilterMode::NaturalPhase);
     eq.setBand(0, eqBand(Type::HighShelf, 10000.0, 9.0, 0.7071));
     eq.prepare({ 48000.0, 256, 1 });

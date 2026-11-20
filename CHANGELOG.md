@@ -532,6 +532,26 @@ All notable user-facing changes to DSPark are documented here.
   direct form against ladder: four bands of the equalizer 16 to 42 and 47 to
   77 ns, a dynamic band 63 to 143 and 65 to 148 ns, the de-esser 22 to 35
   and 26 to 42 ns.
+- `CrossoverFilter::setStructure(Structure::Ladder)` (opt-in; state key
+  `structure`), and `setCrossoverStructure()` in `MultibandCompressor` and
+  `MultibandSaturation` (state key `xoverStructure`): the sections of the
+  splits and of the phase correction as normalized ladders, allocated by
+  `prepare()` on the heap so that the switch never allocates; during a glide
+  their coefficients ramp across the 32-sample grid. The bands are the
+  direct form's to 4e-9; four bands in stereo cost 2.4 to 6.3 times as much.
+  The 5 ms glide of the splits already keeps the direct form's memory
+  consistent: with a split jumping between 100 Hz and 10 kHz every 64
+  samples, the band sum of 0.3 of noise peaks at 0.65 either way at LR24
+  (0.70 against 0.64 at LR48).
+- `Compressor::setOptoCell(OptoCell::ThreeStage)` (opt-in; state key
+  `optoCell`): the Opto character with a medium memory between the fast
+  stage and the deep one (charge over one release time, 30 ms to 1 s;
+  release over five), shares of the gain 0.6, 0.25 and 0.15, and the fast
+  stage at 0.725 release times so that a fully charged cell still recovers
+  half its reduction in one release time (0.497 measured). With a release of
+  100 ms and 4:1 at 0 dBFS, after a 150 ms phrase 1.82 dB are left at 0.3 s
+  (two stages 1.28) and 0.65 at 1 s (0.92); after 4 s of compression 0.61 dB
+  are left at 3 s (two stages 1.61). The analytic makeup models it too.
 - `Saturation::Algorithm::Curve`: a soft clipper shaped by three controls
   (`setCurveShape(hardness, curvature, asymmetry)`) that keep the slope at
   the origin and the ceiling: how far it stays a straight line before it
@@ -1390,6 +1410,18 @@ All notable user-facing changes to DSPark are documented here.
   in stereo costs 4.1 to 9.8 ns per frame (10.1 to 17.1 before) and a
   four-band equalizer 16 to 42 (38 to 86). The response is the same; the
   output moves at the level of rounding.
+- `LoudnessMeter`: the two K-weighting stages run side by side, stage 1 of a
+  frame (both channels in one register) next to stage 2 of the frame before
+  it, and every call closes the pipeline on its last frame. Readings are the
+  same to the bit (each stage computes the same operations); the meter costs
+  0.91 to 0.975 of what it did per frame (the true-peak reader is most of the
+  rest).
+- `DCBlocker`: pairs of channels run in the two lanes of one register (an
+  odd last channel alone, 32-bit x86 one at a time), each lane computing the
+  single-channel operations. In stereo it costs 0.26 to 0.80 of what it did
+  per frame at orders 2 to 10 and 0.53 to 0.84 at order 1 (the same on one
+  compiler); the output is the same to the bit where the compiler does not
+  fuse multiply-adds (3e-8 in float otherwise).
 - `PitchShifter::prepare(spec, 0)`: every engine takes the power of two
   nearest 43 ms, as Studio did (Standard and High kept 2048 at any rate):
   2048 at 44.1 and 48 kHz as before, 4096 at 88.2 and 96 kHz and 8192 at

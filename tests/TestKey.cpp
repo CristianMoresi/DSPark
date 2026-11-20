@@ -55,9 +55,9 @@ const std::array<Timbre, 3> kTimbres { {
 } };
 
 void addNote(std::vector<float>& out, double t0, double dur, int midi,
-             double amp, const Timbre& tb)
+             double amp, const Timbre& tb, double cents = 0.0)
 {
-    const double f0 = 440.0 * std::exp2((midi - 69) / 12.0);
+    const double f0 = 440.0 * std::exp2((midi - 69 + cents / 100.0) / 12.0);
     const auto i0 = static_cast<long long>(t0 * kFs);
     const auto n  = static_cast<long long>(dur * kFs);
     const double atk = 0.01 * kFs, rel = 0.05 * kFs;
@@ -83,7 +83,7 @@ void addNote(std::vector<float>& out, double t0, double dur, int midi,
 int foldRoot(int pc, int low) { return low + ((pc - (low % 12)) + 12) % 12; }
 
 std::vector<float> renderCadence(int tonicPc, bool minor, const Timbre& tb,
-                                 int low, int reps, double bar = 1.0)
+                                 int low, int reps, double bar = 1.0, double cents = 0.0)
 {
     std::vector<float> out(static_cast<std::size_t>(kFs * (bar * 4 * reps + 1.0)), 0.0f);
     const int degs[4] = { 0, 5, 7, 0 };
@@ -95,7 +95,7 @@ std::vector<float> renderCadence(int tonicPc, bool minor, const Timbre& tb,
         {
             const int root = foldRoot((tonicPc + degs[c]) % 12, low);
             for (int i = 0; i < 3; ++i)
-                addNote(out, t, bar * 0.95, root + (cm[c] ? min[i] : maj[i]), 0.16, tb);
+                addNote(out, t, bar * 0.95, root + (cm[c] ? min[i] : maj[i]), 0.16, tb, cents);
             t += bar;
         }
     return out;
@@ -216,21 +216,33 @@ KeyOrder<T> independentKeyOrder(
 {
     using KD = KeyDetector<T>;
     const bool temperley = profile == KD::Profile::Temperley;
-    const auto& major = temperley ? KD::kTemperleyMajor
+    const bool recorded = profile == KD::Profile::Recorded;
+    const auto& major = recorded ? KD::kRecordedMajor
+                      : temperley ? KD::kTemperleyMajor
                                   : KD::kKrumhanslKesslerMajor;
-    const auto& minor = temperley ? KD::kTemperleyMinor
+    const auto& minor = recorded ? KD::kRecordedMinor
+                      : temperley ? KD::kTemperleyMinor
                                   : KD::kKrumhanslKesslerMinor;
+
+    // Recorded: a cosine (no centring) against the cube root of the chroma;
+    // the published profiles: a Pearson correlation against the chroma.
+    std::array<double, 12> evidence {};
+    for (int pc = 0; pc < 12; ++pc)
+    {
+        const double value = static_cast<double>(chroma[static_cast<std::size_t>(pc)]);
+        evidence[static_cast<std::size_t>(pc)] = recorded ? std::cbrt(value) : value;
+    }
 
     KeyOrder<T> result;
     double chromaMean = 0.0;
-    for (const T value : chroma) chromaMean += static_cast<double>(value);
-    chromaMean /= 12.0;
+    for (const double value : evidence) chromaMean += value;
+    chromaMean = recorded ? 0.0 : chromaMean / 12.0;
     for (int mode = 0; mode < 2; ++mode)
     {
         const auto& weights = mode == 0 ? major : minor;
         double profileMean = 0.0;
         for (const double value : weights) profileMean += value;
-        profileMean /= 12.0;
+        profileMean = recorded ? 0.0 : profileMean / 12.0;
         for (int tonic = 0; tonic < 12; ++tonic)
         {
             double numerator = 0.0;
@@ -238,8 +250,7 @@ KeyOrder<T> independentKeyOrder(
             double profilePower = 0.0;
             for (int pc = 0; pc < 12; ++pc)
             {
-                const double x = static_cast<double>(
-                    chroma[static_cast<std::size_t>(pc)]) - chromaMean;
+                const double x = evidence[static_cast<std::size_t>(pc)] - chromaMean;
                 const double y = weights[static_cast<std::size_t>(
                     (pc - tonic + 12) % 12)] - profileMean;
                 numerator += x * y;
@@ -343,6 +354,27 @@ DSPARK_TEST(Key_published_profile_digits_are_pinned)
     EXPECT_GT(KD::kKrumhanslKesslerMinor[10], KD::kKrumhanslKesslerMinor[11]);
     EXPECT_GT(KD::kTemperleyMinor[8], KD::kTemperleyMinor[9]);
     EXPECT_GT(KD::kTemperleyMajor[9], KD::kTemperleyMajor[8]);
+
+    // The measured degree weights of Profile::Recorded, and the relations its
+    // mode decision rests on: each mode's own third over the other's, the
+    // leading tone over the flat seventh in major and the reverse in minor,
+    // the flat sixth over the natural one in minor, the tonic on top.
+    const double rMaj[12] = { 1.0, 0.04, 0.3, 0.04, 0.55, 0.3,
+                              0.04, 0.85, 0.04, 0.3, 0.04, 0.35 };
+    const double rMin[12] = { 1.0, 0.04, 0.3, 0.45, 0.04, 0.3,
+                              0.04, 0.85, 0.3, 0.05, 0.25, 0.2 };
+    for (int i = 0; i < 12; ++i)
+    {
+        EXPECT_EQ(KD::kRecordedMajor[static_cast<std::size_t>(i)], rMaj[i]);
+        EXPECT_EQ(KD::kRecordedMinor[static_cast<std::size_t>(i)], rMin[i]);
+        if (i > 0) EXPECT_GT(KD::kRecordedMajor[0], KD::kRecordedMajor[static_cast<std::size_t>(i)]);
+        if (i > 0) EXPECT_GT(KD::kRecordedMinor[0], KD::kRecordedMinor[static_cast<std::size_t>(i)]);
+    }
+    EXPECT_GT(KD::kRecordedMajor[4], KD::kRecordedMajor[3]);
+    EXPECT_GT(KD::kRecordedMinor[3], KD::kRecordedMinor[4]);
+    EXPECT_GT(KD::kRecordedMajor[11], KD::kRecordedMajor[10]);
+    EXPECT_GT(KD::kRecordedMinor[10], KD::kRecordedMinor[11]);
+    EXPECT_GT(KD::kRecordedMinor[8], KD::kRecordedMinor[9]);
 }
 
 // ============================================================================
@@ -353,12 +385,15 @@ DSPARK_TEST(Key_all_24_keys_cadence_and_aeolian)
 {
     using KD = KeyDetector<float>;
     const int registers[2] = { 54, 58 };   // tops out at 72 / 76.
+    const KD::Profile profiles[3] = { KD::Profile::KrumhanslKessler, KD::Profile::Temperley,
+                                      KD::Profile::Recorded };
+    const char* const profileNames[3] = { "KrumhanslKessler", "Temperley", "Recorded" };
 
-    for (int prof = 0; prof < 2; ++prof)
+    for (int prof = 0; prof < 3; ++prof)
     {
         KD kd;
         kd.prepare(keySpec(), 0);
-        kd.setProfile(prof == 0 ? KD::Profile::KrumhanslKessler : KD::Profile::Temperley);
+        kd.setProfile(profiles[prof]);
 
         int n = 0, tonicOk = 0, correct = 0;
         int rel = 0, par = 0, dom = 0, sub = 0, other = 0, none = 0;
@@ -409,7 +444,7 @@ DSPARK_TEST(Key_all_24_keys_cadence_and_aeolian)
         std::printf("  [key] %-16s n=%d tonic=%.2f%% tonic+mode=%.2f%% "
                     "RELATIVE=%d PARALLEL=%d DOMINANT=%d SUBDOMINANT=%d OTHER=%d NONE=%d "
                     "minConf=%.4f\n",
-                    prof == 0 ? "KrumhanslKessler" : "Temperley",
+                    profileNames[prof],
                     n, tonicPct, bothPct, rel, par, dom, sub, other, none,
                     static_cast<double>(minConf));
 
@@ -493,9 +528,11 @@ DSPARK_TEST(Key_modal_material_reads_as_its_centre)
                          { "Lydian", 3, false }, { "Mixolydian", 4, false },
                          { "Aeolian", 5, true } };
 
+    for (const KD::Profile profile : { KD::Profile::KrumhanslKessler, KD::Profile::Recorded })
+    {
     KD kd;
     kd.prepare(keySpec(), 0);
-    kd.setProfile(KD::Profile::KrumhanslKessler);
+    kd.setProfile(profile);
 
     for (const auto& m : modes)
     {
@@ -519,8 +556,9 @@ DSPARK_TEST(Key_modal_material_reads_as_its_centre)
                 minConf = std::min(minConf, k.confidence);
                 maxConf = std::max(maxConf, k.confidence);
             }
-        std::printf("  [key] modal %-11s centre-as-minor=%d centre-as-major=%d "
+        std::printf("  [key] %-16s modal %-11s centre-as-minor=%d centre-as-major=%d "
                     "other-diatonic-major=%d elsewhere=%d conf[%.4f..%.4f]\n",
+                    profile == KD::Profile::Recorded ? "Recorded" : "KrumhanslKessler",
                     m.name, centreMinor, centreMajor, parentMajor, elsewhere,
                     static_cast<double>(minConf), static_cast<double>(maxConf));
         // The centre is found even where the mode is not: the reading is the
@@ -530,6 +568,7 @@ DSPARK_TEST(Key_modal_material_reads_as_its_centre)
         EXPECT_EQ(m.expectMinor ? centreMinor : centreMajor, 3);
         EXPECT_EQ(elsewhere, 0);
     }
+    }
 }
 
 // ============================================================================
@@ -538,7 +577,10 @@ DSPARK_TEST(Key_modal_material_reads_as_its_centre)
 
 DSPARK_TEST(Key_auto_window_map_and_non_48k_anchor)
 {
-    KeyDetector<float> kd;
+    using KD = KeyDetector<float>;
+    // The note front end of the published profiles.
+    KD kd;
+    kd.setProfile(KD::Profile::KrumhanslKessler);
     const double rates[6]  = { 44100, 48000, 88200, 96000, 176400, 192000 };
     const int    expect[6] = { 4096,  4096,  8192,  8192,  16384,   16384 };
     for (int i = 0; i < 6; ++i)
@@ -551,6 +593,21 @@ DSPARK_TEST(Key_auto_window_map_and_non_48k_anchor)
     EXPECT_EQ(kd.getWindowSize(), 1024);
     kd.prepare(keySpec(), 1 << 20);
     EXPECT_EQ(kd.getWindowSize(), 16384);
+
+    // The peak front end of Profile::Recorded keeps ~186 ms at every rate,
+    // whatever the request for the note front end.
+    KD rec;
+    EXPECT_TRUE(rec.getProfile() == KD::Profile::Recorded);
+    const int peakExpect[6] = { 8192, 8192, 16384, 16384, 32768, 32768 };
+    for (int i = 0; i < 6; ++i)
+    {
+        rec.prepare(keySpec(rates[i]), 0);
+        EXPECT_EQ(rec.getWindowSize(), peakExpect[i]);
+    }
+    rec.prepare(keySpec(), 64);
+    EXPECT_EQ(rec.getWindowSize(), 8192);
+    rec.prepare(keySpec(), 1 << 20);
+    EXPECT_EQ(rec.getWindowSize(), 8192);
 
     // The non-48k anchor is an accuracy anchor, not only a window one: a
     // cadence at 44.1 kHz must still name its key.
@@ -815,6 +872,8 @@ DSPARK_TEST(Key_profile_switch_rereads_the_same_evidence)
     using KD = KeyDetector<float>;
     KD kd;
     kd.prepare(keySpec(), 0);
+    EXPECT_TRUE(kd.getProfile() == KD::Profile::Recorded);
+    kd.setProfile(KD::Profile::KrumhanslKessler);
     EXPECT_TRUE(kd.getProfile() == KD::Profile::KrumhanslKessler);
     const auto a = renderCadence(4, true, kTimbres[1], 56, 2);
     const auto k1 = run(kd, a);
@@ -879,6 +938,7 @@ DSPARK_TEST(Key_votes_are_magnitudes_not_energies)
                                   + 0.1 * std::sin(twoPi<double> * 391.9954 * t));
     }
     KeyDetector<float> kd;
+    kd.setProfile(KeyDetector<float>::Profile::KrumhanslKessler);   // the note front end's vote
     kd.prepare(AudioSpec{ fs, 512, 1 });
     kd.pushSamples(std::span<const float>(x.data(), x.size()));
     EXPECT_NEAR(static_cast<double>(kd.chroma()[0]) / static_cast<double>(kd.chroma()[7]), 3.0, 0.3);
@@ -903,4 +963,96 @@ DSPARK_TEST(Key_minor_tonics_use_their_standard_spelling)
     EXPECT_TRUE(name(10, true) == "Bbm");
     EXPECT_TRUE(name(1, false) == "Db");
     EXPECT_TRUE(name(8, false) == "Ab");
+}
+
+// ============================================================================
+// Profile::Recorded: its own front end, read through the public contract.
+// ============================================================================
+
+// The estimate is the ranking an independent cosine against the cube root of
+// the published chroma gives, field for field.
+DSPARK_TEST(Key_recorded_order_matches_an_independent_cosine)
+{
+    using KD = KeyDetector<float>;
+    KD kd;
+    kd.prepare(keySpec(), 0);
+    EXPECT_TRUE(kd.getProfile() == KD::Profile::Recorded);
+    const int tonics[3] = { 0, 7, 10 };
+    for (int i = 0; i < 3; ++i)
+    {
+        const bool minor = (i == 1);
+        const auto audio = renderCadence(tonics[i], minor, kTimbres[static_cast<std::size_t>(i)], 56, 2);
+        const auto key = run(kd, audio);
+        const auto order = independentKeyOrder(kd.chroma(), KD::Profile::Recorded);
+        expectKeyMatchesOrder<float>(key, order);
+        EXPECT_EQ(key.tonicPitchClass, tonics[i]);
+        EXPECT_EQ(key.isMinor, minor);
+    }
+}
+
+// A programme tuned away from A = 440 Hz folds onto its notes: the peak front
+// end reads the third of a semitone the peaks fall in from the programme
+// itself. 40 cents is past a third of a semitone either way.
+DSPARK_TEST(Key_recorded_reads_detuned_programmes)
+{
+    using KD = KeyDetector<float>;
+    const double detunes[3] = { 0.0, -40.0, 40.0 };
+    std::array<std::array<float, 12>, 24> inTune {};
+    for (int d = 0; d < 3; ++d)
+    {
+        int correct = 0, publishedCorrect = 0;
+        double worstChromaMove = 0.0;
+        for (int tonic = 0; tonic < 12; ++tonic)
+            for (int m = 0; m < 2; ++m)
+            {
+                const auto audio = renderCadence(tonic, m == 1, kTimbres[1], 56, 2, 1.0, detunes[d]);
+                KD kd;
+                kd.prepare(keySpec(), 0);
+                const auto key = run(kd, audio);
+                correct += static_cast<int>(key.tonicPitchClass == tonic && key.isMinor == (m == 1));
+                const auto slot = static_cast<std::size_t>(tonic * 2 + m);
+                if (d == 0) inTune[slot] = kd.chroma();
+                for (int pc = 0; pc < 12; ++pc)
+                    worstChromaMove = std::max(worstChromaMove, std::abs(
+                        static_cast<double>(kd.chroma()[static_cast<std::size_t>(pc)])
+                        - static_cast<double>(inTune[slot][static_cast<std::size_t>(pc)])));
+
+                KD published;
+                published.setProfile(KD::Profile::KrumhanslKessler);
+                published.prepare(keySpec(), 0);
+                const auto other = run(published, audio);
+                publishedCorrect += static_cast<int>(other.tonicPitchClass == tonic
+                                                     && other.isMinor == (m == 1));
+            }
+        std::printf("  [key] detune %+.0f cents: Recorded %d/24, KrumhanslKessler %d/24, "
+                    "largest chroma move from in tune %.4f\n",
+                    detunes[d], correct, publishedCorrect, worstChromaMove);
+        EXPECT_EQ(correct, 24);
+        EXPECT_LT(worstChromaMove, 0.02);
+    }
+}
+
+// One frame once a window is full, then one every quarter window, and the
+// window of the rate in getWindowSize().
+DSPARK_TEST(Key_recorded_frames_follow_the_window)
+{
+    using KD = KeyDetector<float>;
+    KD kd;
+    kd.prepare(keySpec(), 0);
+    const int size = kd.getWindowSize();
+    const int hop = size / 4;
+    const auto audio = renderCadence(2, false, kTimbres[2], 56, 2);
+    const auto want = static_cast<std::size_t>(size + 3 * hop);
+    EXPECT_TRUE(audio.size() > want + static_cast<std::size_t>(hop));
+    kd.pushSamples(std::span<const float>(audio.data(), want - 1));
+    EXPECT_EQ(kd.getFrameCount(), 3u);
+    kd.pushSamples(std::span<const float>(audio.data() + want - 1, 1));
+    EXPECT_EQ(kd.getFrameCount(), 4u);
+    kd.pushSamples(std::span<const float>(audio.data() + want, static_cast<std::size_t>(hop) - 1));
+    EXPECT_EQ(kd.getFrameCount(), 4u);
+    kd.pushSamples(std::span<const float>(audio.data() + want + hop - 1, 1));
+    EXPECT_EQ(kd.getFrameCount(), 5u);
+    // The published profiles' front end counted its own frames all along.
+    kd.setProfile(KD::Profile::KrumhanslKessler);
+    EXPECT_GT(kd.getFrameCount(), 5u);
 }

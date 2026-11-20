@@ -387,7 +387,7 @@
  * | `SpectralDynamicEQ<T>`   | Effects/SpectralDynamicEQ.h | Dynamic bands with a level per cell inside each band, minimum phase |
  * | `PitchCorrector<T>`      | Effects/PitchCorrector.h | Monophonic scale-aware retune: detect, quantize, shift, with formant preservation |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Multirate note chroma + template chord recognition with confidence |
- * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: accumulated chroma against published key profiles |
+ * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: tuned spectral-peak chroma against measured key profiles, or the published ones |
  * | `DeEsser<T>`             | Effects/DeEsser.h     | Split-band de-esser with dynamic sibilance detection                |
  * | `AutoGain<T>`            | Effects/AutoGain.h    | Automatic gain compensation for honest A/B comparison               |
  * | `Clipper<T>`             | Effects/Clipper.h     | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio, oversampling)     |

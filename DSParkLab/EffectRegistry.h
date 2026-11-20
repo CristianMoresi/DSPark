@@ -2197,9 +2197,9 @@ inline EffectSlot makeTonalBalance()
     auto p = std::make_shared<dspark::TonalBalance<float>>();
     EffectSlot s;
     s.name = "Tonal Balance"; s.category = "Spectral";
-    s.addSlider("Balance", 0, 1, 0, "");                       // 0 - default 0 = no global move
-    s.addSlider("Fill Dips", 0, 1, 0, "");                         // 1
-    s.addSlider("Trim Peaks", 0, 1, 0, "");                          // 2
+    s.addSlider("Balance", 0, 1, 0.5f, "");                    // 0 - the effect's defaults: Tilt acts through Balance
+    s.addSlider("Fill Dips", 0, 1, 0.3f, "");                         // 1
+    s.addSlider("Trim Peaks", 0, 1, 0.5f, "");                          // 2
     s.addSlider("Tilt", -6, 6, 0, "dB/oct");                   // 3
     s.addSlider("Range", 0, 24, 6, "dB");                      // 4
     s.addSlider("Knee", 0.1f, 12, 3, "dB");                    // 5

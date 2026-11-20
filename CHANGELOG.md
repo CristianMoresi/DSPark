@@ -6,6 +6,18 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `BucketBrigade`: `prepare(rate, stages, corner, 2)` runs a line at twice
+  the host's rate (the input interpolated half way between samples, the
+  output read every other step after its low-pass), so the images of a clock
+  near or below the host's rate are filtered as in the device instead of
+  folding into the band; `processPair()` runs two lines on the same input
+  and corner through one input low-pass, each giving to the bit what it
+  gives alone; `setPrecision(Precision::High)` reads the input at the clock's
+  ticks by a quintic through six steps and the held output through a
+  quadratic B-spline over three steps (three steps more delay), which takes
+  out the two artifacts of the model itself: the images of the input read
+  by a straight line between steps, and those of the clock's harmonics that
+  the step's average let fold back. Defaults are as before, to the bit.
 - `Limiter::setPrecision(Precision::High)`: the sample-peak signal read at
   eight points per sample (a 16-tap Kaiser-windowed sinc gives the seven
   between the samples) and the gain computer's sliding minimum, hold,
@@ -2709,6 +2721,27 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Chorus` analog model: the right tap was the asymmetric triangle half a
+  cycle on, not the left one inverted, so the two delays did not add up to
+  a constant (in the Slow mode the sum swung by 15 to 17 samples at 44.1
+  and 48 kHz, and twice a cycle both taps rose together); one phase now
+  carries the asymmetry in its speed and both taps read a symmetric triangle
+  of it half a turn apart (the sum holds within half a sample). The centre
+  and the depth were read once a block and the mode's offset switched at
+  once: automating the centre stepped the clock at the block rate (lines at
+  the tone +- fs / 512, -39 dBc when swept over a second in blocks of 512;
+  now -70) and a change of mode jumped (19 times the steady sweep's largest
+  second difference; now 2.3): they now ramp across the block and glide
+  (50 ms), and the filters' corner moves at most an octave in a quarter of a
+  second. At 176.4 and 192 kHz the half-rate engine's output alternated
+  between two delays a sample apart (the image of a 5 kHz tone at 91 kHz was
+  -16 dBc; now -43, the linear interpolation's). And the lines' clock,
+  slower than the host's rate in every mode, folded its images into the
+  band: the lines now run at twice the rate below 88.2 kHz, with their high
+  precision, so at the longest delay of the Slow mode and no depth a 1, 3 or
+  5 kHz tone leaves no other line within 91 dB of it at 44.1, 48 and 96 kHz
+  (before: 35 to 81 dB). The two lines share their input low-pass. Cost: 91
+  ns per stereo frame at 48 kHz (46 before) and 57 at 96 kHz (40).
 - `Compressor`: an envelope within 1e-4 dB of zero was put back on zero
   whatever its target, to end the tail of a release. Leaving zero in steps
   shorter than that, each step was undone and the gain never moved: a slow

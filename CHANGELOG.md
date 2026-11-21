@@ -6,6 +6,19 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TonalBalance::setListeningCompensation()`, -30 to +30 dB: compensates a
+  listening level that much lower than the one the programme is balanced
+  at. The ear loses the two ends first as the level falls, so each band is
+  raised by the level times one minus the ratio of the mid loudness exponent
+  to its own, and the total loudness stays: with 20 dB, +2.1 dB at 60 Hz
+  and +1.9 dB at 12 kHz against -0.1 dB at 1 kHz, the loudness unmoved.
+  State key `listening`.
+- `TonalBalance::setResponse(Response::Common)` and `setResponseTime()`: a
+  short integration per band (four periods of its centre, 8 to 100 ms) and
+  then one response time for every band, so the curve moves together. On a
+  programme that turns from dark to bright the correction covers 63 % of
+  its way in 0.16 s at 150 Hz and 0.06 s at 8 kHz with 60 ms, against 1.29 s
+  and 0.23 s by band (the default). State keys `response` and `responseMs`.
 - `TonalBalance::setReference(Reference::EvenPower)`: the programme is
   compared against the loudness, band by band, of a programme with the same
   power in every band of the ear's scale at its own level, read through the

@@ -9898,3 +9898,205 @@ DSPARK_TEST(TonalBalance_render_quality_lands_closer)
     EXPECT_TRUE(b.getQualityFollowsRender());
     EXPECT_TRUE(b.getQuality() == Tb9::Quality::Realtime);
 }
+
+// New: setTimeFocus(). Each band is read through a stretch of the window of
+// its own: on a steady programme the corrections are those of the whole
+// window, and when the programme turns from dark to bright the top band
+// follows sooner (with a short common response).
+DSPARK_TEST(TonalBalance_time_focus_reads_the_top_sooner)
+{
+    const std::vector<float> steady = l13MixLike(48000 * 3, 101u);
+    const auto plain = m9Balance([](Tb9& t) { t.setBalance(1.0f); }, steady);
+    const auto focused = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setTimeFocus(true); }, steady);
+    double apart = 0.0;
+    for (int b = 4; b < Tb9::kBands - 4; ++b)
+        apart = std::max(apart, std::abs(static_cast<double>(plain->getCorrection(b)) - static_cast<double>(focused->getCorrection(b))));
+
+    const size_t n = 48000 * 4, turn = 48000 * 2;
+    std::vector<float> x = m9Dark(n, 71u, 1500.0);
+    {
+        const std::vector<float> bright = l13Noise(n, 0.1f, 73u);
+        for (size_t i = turn; i < n; ++i) x[i] = bright[i];
+    }
+    // Milliseconds after the turn at which the band at 8 kHz has covered 63 % of its way.
+    const auto followed = [&](bool focus) {
+        auto tb = std::make_unique<Tb9>();
+        tb->setBalance(1.0f);
+        tb->setResponse(Tb9::Response::Common);
+        tb->setResponseTime(10.0f);
+        tb->setTimeFocus(focus);
+        tb->prepare(spec(48000.0, 64, 2));
+        int band = 0;
+        for (int b = 1; b < Tb9::kBands; ++b)
+            if (std::abs(tb->getBandCentre(b) - 8000.0) < std::abs(tb->getBandCentre(band) - 8000.0)) band = b;
+        std::vector<float> l = x, r = x;
+        std::vector<double> track;
+        for (size_t off = 0; off + 64 <= n; off += 64)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            tb->processBlock(AudioBufferView<float>(ch, 2, 64));
+            track.push_back(static_cast<double>(tb->getCorrection(band)));
+        }
+        const size_t at = turn / 64;
+        const double before = track[at - 1], after = track.back();
+        for (size_t i = at; i < track.size(); ++i)
+            if ((track[i] - before) * (after - before) > 0.0 && std::abs(track[i] - before) >= 0.63 * std::abs(after - before))
+                return static_cast<double>(i - at) * 64000.0 / 48000.0;
+        return 9999.0;
+    };
+    const double whole = followed(false), sooner = followed(true);
+    std::printf("  [balance] steady, the corrections with the focus stand within %.2f dB of the plain ones; dark to bright at 8 kHz: %.1f ms plain, %.1f ms with the focus\n",
+                apart, whole, sooner);
+    EXPECT_LT(apart, 0.5);
+    EXPECT_LT(sooner, whole - 3.0);
+    Tb9 a;
+    a.setTimeFocus(true);
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getTimeFocus());
+}
+
+namespace {
+
+// A quiet noise with a short burst of a tone three quarters of the way in
+// (primed: the same burst a quarter of the way in as well).
+std::vector<float> m9Burst(size_t n, double hz, double ms, bool primed = false)
+{
+    std::vector<float> x = l13Noise(n, 0.02f, 211u);
+    const size_t len = static_cast<size_t>(0.001 * ms * 48000.0), fade = 48;
+    for (const size_t at : { n * 3 / 4, n / 4 })
+    for (size_t i = 0; i < len; ++i)
+    {
+        if (at == n / 4 && !primed) break;
+        double g = 1.0;
+        if (i < fade) g = 0.5 - 0.5 * std::cos(3.14159265358979323846 * static_cast<double>(i) / fade);
+        if (i + fade > len) g = 0.5 - 0.5 * std::cos(3.14159265358979323846 * static_cast<double>(len - i) / fade);
+        x[at + i] += static_cast<float>(0.3 * g * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0));
+    }
+    return x;
+}
+
+// What a readout does over the second half of a signal with a burst three
+// quarters of the way in: the milliseconds it stays past a mark, the furthest
+// it goes, and how long before the burst comes out it first passes the mark.
+struct M9Action { double span = 0.0, most = 0.0, ahead = 0.0; };
+
+template <class P, class Read>
+M9Action m9Action(P& p, const std::vector<float>& x, Read&& read, double mark)
+{
+    std::vector<float> l = x, r = x;
+    int blocks = 0;
+    double most = 0.0, first = -1.0;
+    for (size_t off = 0; off + 64 <= x.size(); off += 64)
+    {
+        float* ch[2] = { l.data() + off, r.data() + off };
+        p.processBlock(AudioBufferView<float>(ch, 2, 64));
+        if (off < x.size() / 2) continue;
+        const double v = std::abs(static_cast<double>(read()));
+        most = std::max(most, v);
+        if (v > mark)
+        {
+            ++blocks;
+            if (first < 0.0) first = static_cast<double>(off + 64);
+        }
+    }
+    // The burst comes out the latency after it goes in.
+    const double out = static_cast<double>(x.size() * 3 / 4) + static_cast<double>(p.getLatency());
+    return { blocks * 64000.0 / 48000.0, most, first < 0.0 ? 0.0 : (out - first) * 1000.0 / 48000.0 };
+}
+
+} // namespace
+
+// New: ResonanceSuppressor::setTimeFocus(). The spectrum is read through a
+// window that shortens as frequency rises.
+DSPARK_TEST(ResonanceSuppressor_time_focus_reads_the_top_through_a_shorter_window)
+{
+    const std::vector<float> white = l13Noise(48000 * 3, 0.1f, 7u);
+    const auto level = [&](bool focus) {
+        auto rs = std::make_unique<Rs8>();
+        rs->setTimeFocus(focus);
+        rs->prepare(spec(48000.0, 256, 2));
+        const size_t late = static_cast<size_t>(rs->getLatency());
+        const auto out = l13Run(*rs, white, white);
+        return l13RmsDb(out.first, white.size() / 2, white.size()) - l13RmsDb(white, white.size() / 2 - late, white.size() - late);
+    };
+    const double noisePlain = level(false), noiseFocus = level(true);
+    double line[3][2] = {};
+    const double at[3] = { 200.0, 2000.0, 8000.0 };
+    for (int i = 0; i < 3; ++i)
+    {
+        const std::vector<float> rung = l13Add(white, at[i], 0.2);
+        line[i][0] = m8LineChange([](Rs8&) {}, rung, at[i]);
+        line[i][1] = m8LineChange([](Rs8& rs) { rs.setTimeFocus(true); }, rung, at[i]);
+    }
+    const std::vector<float> burst = m9Burst(48000 * 2, 8000.0, 10.0);
+    M9Action act[2];
+    for (const int kind : { 0, 1 })
+    {
+        auto rs = std::make_unique<Rs8>();
+        rs->setTimeFocus(kind == 1);
+        rs->prepare(spec(48000.0, 64, 2));
+        act[kind] = m9Action(*rs, burst, [&] { return rs->getPeakReduction(); }, 3.0);
+    }
+    std::printf("  [suppressor] focus: a white noise %.2f dB, %.2f with it; a line at 200 Hz %.2f / %.2f, at 2 kHz %.2f / %.2f, at 8 kHz %.2f / %.2f dB; a burst of 10 ms at 8 kHz: past 3 dB for %.1f ms from %.1f ms before it comes out (most %.1f dB), %.1f ms from %.1f before (most %.1f) with it\n",
+                noisePlain, noiseFocus, line[0][0], line[0][1], line[1][0], line[1][1], line[2][0], line[2][1],
+                act[0].span, act[0].ahead, act[0].most, act[1].span, act[1].ahead, act[1].most);
+    // The grain of a noise is left alone, a held line is still reduced, and
+    // what a burst sets off lasts less and starts later.
+    EXPECT_GT(noiseFocus, noisePlain + 0.1);
+    EXPECT_LT(line[1][1], -3.0);
+    EXPECT_LT(line[2][1], -3.0);
+    EXPECT_LT(act[1].span, 0.75 * act[0].span);
+    EXPECT_LT(act[1].ahead, act[0].ahead - 20.0);
+    Rs8 a;
+    a.setTimeFocus(true);
+    const auto blob = a.getState();
+    Rs8 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getTimeFocus());
+}
+
+// New: SpectralDynamicEQ::setTimeFocus(). The levels are read through a
+// window that shortens as frequency rises.
+DSPARK_TEST(SpectralDynamicEQ_time_focus_reads_the_top_through_a_shorter_window)
+{
+    using S = SpectralDynamicEQ<float>;
+    const auto make = [](bool focus, int block) {
+        auto eq = std::make_unique<S>();
+        S::Band b;
+        b.shape = S::Shape::Bell; b.frequency = 8000.0f; b.q = 1.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f;
+        b.attack = 1.0f; b.release = 20.0f; b.cells = 8;
+        eq->setBand(0, b);
+        eq->setTimeFocus(focus);
+        eq->prepare(spec(48000.0, block, 2));
+        return eq;
+    };
+    const std::vector<float> steady = l13Add(l13Noise(48000 * 3, 0.02f, 9u), 8000.0, 0.25);
+    double held[2] = {};
+    M9Action act[2];
+    // The band's threshold hangs from its recent peak: an earlier burst sets it,
+    // so the noise between the two is left alone.
+    const std::vector<float> burst = m9Burst(48000 * 2, 8000.0, 10.0, true);
+    for (const int kind : { 0, 1 })
+    {
+        auto eq = make(kind == 1, 256);
+        const size_t late = static_cast<size_t>(eq->getLatency());
+        const auto out = l13Run(*eq, steady, steady);
+        held[kind] = l13Line(out.first, 8000.0, steady.size() / 2, steady.size() / 2) - l13Line(steady, 8000.0, steady.size() / 2 - late, steady.size() / 2);
+        auto quick = make(kind == 1, 64);
+        act[kind] = m9Action(*quick, burst, [&] { return quick->getPeakGain(); }, 1.0);
+    }
+    std::printf("  [spectral dynamic eq] focus: a held tone at 8 kHz %.2f dB, %.2f with it; a burst of 10 ms: past 1 dB for %.1f ms from %.1f ms before it comes out (most %.1f dB), %.1f ms from %.1f before (most %.1f) with it\n",
+                held[0], held[1], act[0].span, act[0].ahead, act[0].most, act[1].span, act[1].ahead, act[1].most);
+    // A held tone is cut the same, and the cut a burst sets off starts later and lasts less.
+    EXPECT_NEAR(held[1], held[0], 0.5);
+    EXPECT_LT(act[1].ahead, act[0].ahead - 4.0);
+    EXPECT_LT(act[1].span, 0.75 * act[0].span);
+    S a;
+    a.setTimeFocus(true);
+    const auto blob = a.getState();
+    S b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getTimeFocus());
+}

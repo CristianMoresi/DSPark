@@ -3256,3 +3256,62 @@ DSPARK_TEST(SpectralFocus_shortens_the_window_as_frequency_rises)
     EXPECT_LT(focusTop, focusMid);
     EXPECT_LT(focusMid, focusLow + 1.0);
 }
+
+// New: SpectralFilter::setTimeFocus(). The design is given each bin's power
+// through a stretch of the window of its own: a noise reads the same by
+// octaves (the padded transform included), and a tone that starts at 8 kHz
+// goes from nothing to all of its power in fewer frames.
+DSPARK_TEST(SpectralFilter_time_focus_gives_the_design_a_shorter_window_at_the_top)
+{
+    const AudioSpec s = spec(48000.0, 512, 1);
+    const double binHz = 48000.0 / 4096.0;
+    const auto octave = [&](const std::vector<double>& mean, double lowHz) {
+        double sum = 0.0;
+        int count = 0;
+        for (int k = static_cast<int>(lowHz / binHz); k < static_cast<int>(2.0 * lowHz / binHz); ++k) { sum += mean[static_cast<size_t>(k)]; ++count; }
+        return 10.0 * std::log10(std::max(sum / std::max(count, 1), 1e-30));
+    };
+    std::vector<float> noise(48000 * 4);
+    {
+        uint32_t state = 12345u;
+        for (auto& x : noise) { state = state * 1664525u + 1013904223u; x = 0.1f * (static_cast<float>(state >> 8) / 8388608.0f - 1.0f); }
+    }
+    std::vector<float> start(48000, 0.0f);
+    for (size_t i = 24000; i < start.size(); ++i) start[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * 8000.0 * static_cast<double>(i) / 48000.0));
+    double apart = 0.0;
+    int between[2] = { 0, 0 };
+    std::vector<double> means[2];
+    for (const int kind : { 0, 1 })
+    {
+        SpectralFilter<float> f;
+        f.prepare(s, 2048, 2, 4);
+        f.setTimeFocus(kind == 1);
+        EXPECT_TRUE(f.isTimeFocus() == (kind == 1));
+        std::vector<double> mean;
+        int frames = 0;
+        (void)sfRun(f, noise, 512, [&](int, const float* power, float*, int bins) noexcept {
+            if (mean.empty()) mean.assign(static_cast<size_t>(bins), 0.0);
+            for (int k = 0; k < bins; ++k) mean[static_cast<size_t>(k)] += static_cast<double>(power[k]);
+            ++frames;
+        });
+        for (auto& m : mean) m /= std::max(frames, 1);
+        means[kind] = mean;
+        f.reset();
+        std::vector<double> lobe;
+        (void)sfRun(f, start, 512, [&](int, const float* power, float*, int bins) noexcept {
+            const int centre = static_cast<int>(std::lround(8000.0 / binHz));
+            double sum = 0.0;
+            for (int k = centre - 200; k <= centre + 200; ++k)
+                if (k >= 0 && k < bins) sum += static_cast<double>(power[k]);
+            lobe.push_back(sum);
+        });
+        for (const double v : lobe)
+            if (v > 0.1 * lobe.back() && v < 0.9 * lobe.back()) ++between[kind];
+    }
+    for (const double low : { 250.0, 1000.0, 4000.0, 8000.0 })
+        apart = std::max(apart, std::abs(octave(means[1], low) - octave(means[0], low)));
+    std::printf("  [filter] with the focus a noise reads within %.2f dB by octaves; a tone that starts at 8 kHz: %d frames part of the way, %d with the focus\n",
+                apart, between[0], between[1]);
+    EXPECT_LT(apart, 0.4);
+    EXPECT_LT(between[1], between[0]);
+}

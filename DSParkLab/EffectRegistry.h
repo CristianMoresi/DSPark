@@ -2231,6 +2231,9 @@ inline EffectSlot makeTonalBalance()
     s.addSlider("High Freq", 1000, 20000, 16000, "Hz", true);  // 7
     s.addToggle("Level Compensation", false);                  // 8
     s.addSlider("Reference Level", 60, 130, 100, "dB SPL");    // 9
+    s.addSlider("Range Knee", 0, 6, 0, "dB");                  // 10
+    s.addSlider("Floor", 10, 120, 30, "dB");                   // 11
+    s.addChoice("Reference", {"Flat Loudness","Even Power"}, 0); // 12 - order MUST match TonalBalance::Reference
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
     // The band centres exist once the processor is prepared; the display
     // reads them from this copy (taken where prepare() runs).
@@ -2278,6 +2281,9 @@ inline EffectSlot makeTonalBalance()
             case 7: (*range)[1] = v; p->setFrequencyRange((*range)[0], (*range)[1]); break;
             case 8: p->setLevelCompensation(v > 0.5f); break;
             case 9: p->setReferenceLevel(v); break;
+            case 10: p->setRangeKnee(v); break;
+            case 11: p->setFloor(v); break;
+            case 12: p->setReference(static_cast<dspark::TonalBalance<float>::Reference>(static_cast<int>(v))); break;
         }
     };
     return s;

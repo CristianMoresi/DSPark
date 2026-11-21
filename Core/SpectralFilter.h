@@ -42,7 +42,7 @@
  * reset() and the setters on the audio thread (owner-managed).
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, DenormalGuard.h, DspMath.h,
- * FFT.h, WindowFunctions.h.
+ * FFT.h, SpectralEnvelope.h, WindowFunctions.h.
  */
 
 #include "AudioBuffer.h"
@@ -50,6 +50,7 @@
 #include "DenormalGuard.h"
 #include "DspMath.h"
 #include "FFT.h"
+#include "SpectralEnvelope.h"
 #include "WindowFunctions.h"
 
 #include <algorithm>
@@ -123,6 +124,9 @@ public:
         frame_.assign(static_cast<size_t>(m_ + 2), 0.0);
         kernel_.assign(static_cast<size_t>(m_ + 2), 0.0);
         power_.assign(static_cast<size_t>(bins_), T(0));
+        focusPower_.assign(static_cast<size_t>(bins_), T(0));
+        // No narrower than a bin of the window itself (the padding only reads between them).
+        focus_.prepare(window_.data(), n_, m_, focusWidth_, static_cast<double>(pad_));
         powers_.assign(static_cast<size_t>(ch), std::vector<T>(static_cast<size_t>(bins_), T(0)));
         gain_.assign(static_cast<size_t>(bins_), T(1));
         channels_ = ch;
@@ -145,6 +149,28 @@ public:
      */
     void setShortKernel(bool on) noexcept { shortKernel_ = on; }
     [[nodiscard]] bool isShortKernel() const noexcept { return shortKernel_; }
+
+    /**
+     * @brief Gives the design each bin's power through a stretch of the
+     *        window of its own, shorter as frequency rises (SpectralFocus;
+     *        off by default: the whole window at every frequency). The
+     *        filter itself is applied as before. A noise reads the same
+     *        (within 0.1 dB by octaves, padding included); a tone that
+     *        starts at the top shows whole from one frame to the next, where
+     *        the whole window shows part of it for a frame; a held tone
+     *        stands less above what surrounds it.
+     */
+    void setTimeFocus(bool on) noexcept { timeFocus_ = on; }
+    [[nodiscard]] bool isTimeFocus() const noexcept { return timeFocus_; }
+    /**
+     * @brief The width the focus smooths the spectrum by, 1/24 to 1 octave
+     *        (1/6 by default). Read at prepare().
+     */
+    void setTimeFocusWidth(double octaves) noexcept
+    {
+        if (std::isfinite(octaves)) focusWidth_ = std::clamp(octaves, 1.0 / 24.0, 1.0);
+    }
+    [[nodiscard]] double getTimeFocusWidth() const noexcept { return focusWidth_; }
 
     [[nodiscard]] int getLatency() const noexcept { return n_; }
     [[nodiscard]] int getWindowSize() const noexcept { return n_; }
@@ -278,6 +304,12 @@ private:
         const auto powerOf = [&](int ch) {
             const double* s = detectorSpectrum(ch);
             T* p = powers_[static_cast<size_t>(ch)].data();
+            if (timeFocus_)
+            {
+                focus_.power(s, p);
+                for (int k = 0; k < bins_; ++k) p[k] *= static_cast<T>(scale);
+                return;
+            }
             for (int k = 0; k < bins_; ++k)
                 p[k] = static_cast<T>(scale * (s[2 * k] * s[2 * k] + s[2 * k + 1] * s[2 * k + 1]));
         };
@@ -287,6 +319,13 @@ private:
             for (int ch = 0; ch < nCh; ++ch)
             {
                 const double* s = detectorSpectrum(ch);
+                if (timeFocus_)
+                {
+                    focus_.power(s, focusPower_.data());
+                    const T share = static_cast<T>(scale / nCh);
+                    for (int k = 0; k < bins_; ++k) power_[static_cast<size_t>(k)] += share * focusPower_[static_cast<size_t>(k)];
+                    continue;
+                }
                 for (int k = 0; k < bins_; ++k)
                     power_[static_cast<size_t>(k)] += static_cast<T>(scale * (s[2 * k] * s[2 * k] + s[2 * k + 1] * s[2 * k + 1]) / nCh);
             }
@@ -382,14 +421,15 @@ private:
         for (int k = 0; k < m_; ++k) a[static_cast<size_t>((readPos_ + k) & accMask)] += norm_ * y[k];
     }
 
-    double fs_ = 48000.0, norm_ = 0.5;
+    double fs_ = 48000.0, norm_ = 0.5, focusWidth_ = 1.0 / 6.0;
     int n_ = 2048, pad_ = 2, m_ = 4096, hop_ = 512, bins_ = 2049, kernelLength_ = 2049, shortLength_ = 2048, channels_ = 0;
     int writePos_ = 0, readPos_ = 0, hopCounter_ = 0;
-    bool prepared_ = false, linked_ = false, removalListen_ = false, keyActive_ = false, shortKernel_ = false;
+    bool prepared_ = false, linked_ = false, removalListen_ = false, keyActive_ = false, shortKernel_ = false, timeFocus_ = false;
+    SpectralFocus<T> focus_;
     std::unique_ptr<FFTReal<double>> fft_;
     std::vector<double> window_, taper_, shortTaper_, frame_, kernel_, keySpectrum_;
     std::vector<std::vector<double>> ring_, keyRing_, accum_, spectra_;
-    std::vector<T> power_, gain_;
+    std::vector<T> power_, gain_, focusPower_;
     std::vector<std::vector<T>> powers_;
 };
 

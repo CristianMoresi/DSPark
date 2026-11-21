@@ -574,7 +574,10 @@ private:
         // Stream-owner direct writes (setCoeffsNow): prepare() and the audio
         // thread are the only callers, and the coefficients are for their own
         // use (docs/threading.md, the origin rule).
-        auto c = BiquadCoeffs::makeBandPass(sampleRate_, fEff, static_cast<double>(bw));
+        // Matched to the analog band-pass, like the bell it drives: a
+        // bilinear one narrows toward Nyquist and would hear less than the
+        // bell cuts, right where the sibilance is.
+        auto c = BiquadCoeffs::makeBandPassMatched(sampleRate_, fEff, static_cast<double>(bw));
         for (int ch = 0; ch < kMaxChannels; ++ch)
             detector_[ch].setCoeffsNow(c);
 

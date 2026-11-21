@@ -979,6 +979,10 @@ private:
         bool rests = false;                 ///< The band has a filter at rest (its gain is not 0 dB).
         bool cuts = false, lifts = false;   ///< It has an end below its rest, and one above.
         double cutScale = 0.0, liftScale = 0.0;   ///< 1 / (1 - end) and 1 / (end - 1), the ends as amplitude ratios to the rest.
+        // The reach of each end (1 - end and end - 1) on its way to a new range, with the filters.
+        double cutReach = 0.0, liftReach = 0.0, cutReachGoal = 0.0, liftReachGoal = 0.0;
+        double cutReachStep = 0.0, liftReachStep = 0.0;
+        int reachRamp = 0;                  ///< Samples of that way left.
         bool designed = false;              ///< Its filters carry a design: the next one glides.
     };
 
@@ -1499,7 +1503,7 @@ private:
      */
     void mixBand(int b, AudioBufferView<T> where, int n) noexcept
     {
-        const BandState& st = states_[b];
+        BandState& st = states_[b];
         MixedEngine& engine = *mixedEngine_;
         MixedBand& filters = engine.bands[static_cast<size_t>(b)];
         const T* gains = dynDb_[static_cast<size_t>(b)].data();
@@ -1508,6 +1512,7 @@ private:
         bool down = false, up = false;
         for (int j = 0; j < n; ++j)
         {
+            if (st.reachRamp > 0) stepReach(st);
             const double d = static_cast<double>(gains[j]);
             const double cut = cutWeight(st, d), lift = liftWeight(st, d);
             engine.cutWeight[static_cast<size_t>(j)] = cut;
@@ -1969,15 +1974,56 @@ private:
         return s;
     }
 
-    /** @brief Stores the sides of a band and the scales that turn its gain into the weight of each end. */
-    static void adoptSides(BandState& st, const Sides& s) noexcept
+    /**
+     * @brief Stores the sides of a band and the scales that turn its gain
+     *        into the weight of each end.
+     *
+     * The end of a side reaches 1 - end (a cut) or end - 1 (a lift) at the
+     * band's centre, and the weight is the gain asked over that reach. When
+     * the filter of a side glides to a new range (its coefficients move in a
+     * straight line, and so does its reach at the centre), the reach used for
+     * the weight moves with it over the same @p ramp samples: weight and
+     * filter then stay one curve on the way (the weight used to jump to the
+     * new range while the filter took its 20 ms: a step of level of several
+     * decibels on a band at work).
+     */
+    static void adoptSides(BandState& st, const Sides& s, int ramp = 0) noexcept
     {
+        const double cutGoal = s.cuts ? 1.0 - std::pow(10.0, -s.cutRange / 20.0) : 0.0;
+        const double liftGoal = s.lifts ? std::pow(10.0, s.liftRange / 20.0) - 1.0 : 0.0;
+        // A side that was not playing, or a band without a design, starts at its reach.
+        const bool glide = ramp > 0 && st.designed;
+        const bool cutGlides = glide && st.cuts && s.cuts, liftGlides = glide && st.lifts && s.lifts;
+        st.cutReachGoal = cutGoal;
+        st.liftReachGoal = liftGoal;
+        if (!cutGlides) st.cutReach = cutGoal;
+        if (!liftGlides) st.liftReach = liftGoal;
+        st.reachRamp = (cutGlides || liftGlides) ? ramp : 0;
+        st.cutReachStep = st.reachRamp > 0 ? (cutGoal - st.cutReach) / st.reachRamp : 0.0;
+        st.liftReachStep = st.reachRamp > 0 ? (liftGoal - st.liftReach) / st.reachRamp : 0.0;
         st.rests = s.rests;
         st.cuts = s.cuts;
         st.lifts = s.lifts;
-        st.cutScale = s.cuts ? 1.0 / (1.0 - std::pow(10.0, -s.cutRange / 20.0)) : 0.0;
-        st.liftScale = s.lifts ? 1.0 / (std::pow(10.0, s.liftRange / 20.0) - 1.0) : 0.0;
+        st.cutScale = st.cutReach > 0.0 ? 1.0 / st.cutReach : 0.0;
+        st.liftScale = st.liftReach > 0.0 ? 1.0 / st.liftReach : 0.0;
         st.designed = true;
+    }
+
+    /** @brief One sample of the way of a band's reaches to a new range (see adoptSides()). */
+    static void stepReach(BandState& st) noexcept
+    {
+        if (--st.reachRamp == 0)
+        {
+            st.cutReach = st.cutReachGoal;
+            st.liftReach = st.liftReachGoal;
+        }
+        else
+        {
+            st.cutReach += st.cutReachStep;
+            st.liftReach += st.liftReachStep;
+        }
+        st.cutScale = st.cutReach > 0.0 ? 1.0 / st.cutReach : 0.0;
+        st.liftScale = st.liftReach > 0.0 ? 1.0 / st.liftReach : 0.0;
     }
 
     /** @brief The weight of the end of the cuts for a gain of d dB from the rest (0 for a lift). */
@@ -2042,7 +2088,7 @@ private:
         if (cuts) place(filters.cut, designEnd(cfg, -cutRange), st.cuts, cuts);
         if (lifts) place(filters.lift, designEnd(cfg, liftRange), st.lifts, lifts);
 
-        adoptSides(st, sides);
+        adoptSides(st, sides, ramp);
     }
 
     void updateBandInternalState(int b, double fs) noexcept
@@ -2099,7 +2145,10 @@ private:
         // Detector listens where the gain filter acts: bandpass for bells,
         // the corresponding half of the spectrum for shelves. With program
         // timing the band-pass is narrower than the band, so what sets the
-        // gain is the middle of it.
+        // gain is the middle of it. The designs match the analog prototype
+        // (a bilinear band-pass narrows toward Nyquist: at 44.1 kHz it hears
+        // a band 30 % narrower in octaves than the one asked for at 10 kHz,
+        // so the detector heard less than the band it moves).
         // Direct writes (setCoeffsNow): this runs on the audio thread, which
         // owns these Biquads (one-master rule, see the threading block), so
         // even this cold reconfiguration must not self-publish through the
@@ -2109,13 +2158,13 @@ private:
         switch (cfg.shape)
         {
         case BandShape::Bell:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeBandPass(fs, cfg.frequency, detectorQ));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeBandPassMatched(fs, cfg.frequency, detectorQ));
             break;
         case BandShape::LowShelf:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeLowPass(fs, cfg.frequency, T(0.707)));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeLowPassMatched(fs, cfg.frequency, T(0.707)));
             break;
         case BandShape::HighShelf:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeHighPass(fs, cfg.frequency, T(0.707)));
+            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeHighPassMatched(fs, cfg.frequency, T(0.707)));
             break;
         }
 

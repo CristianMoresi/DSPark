@@ -6,6 +6,21 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `setTimeFocus()` in `TonalBalance`, `ResonanceSuppressor` and
+  `SpectralDynamicEQ` (off by default), and `SpectralFilter::setTimeFocus()`
+  under the last two: the analysis reads each frequency through a stretch of
+  the window of its own, shorter as frequency rises (`SpectralFocus`), so
+  what an event at the top sets off stays next to it. The tonal balance, at a
+  common response of 10 ms, follows a turn from dark to bright at 8 kHz in
+  20 ms in place of 28, with the same corrections on a steady programme
+  (within 0.03 dB). The suppressor's reduction of a 10 ms burst at 8 kHz
+  starts 17 ms before the burst comes out in place of 71 and lasts 128 ms in
+  place of 245, and it leaves the grain of a white noise alone (0.02 dB
+  taken in place of 0.31); a held line stands less above the envelope and is
+  reduced less at the same settings (6.7 dB where the whole window gives
+  11.2). The spectral dynamic equaliser cuts a held tone the same, and the
+  cut of the same burst lasts 21 ms in place of 43 and starts 17 ms ahead of
+  it in place of 28.
 - `SpectralFocus` (in `Core/SpectralEnvelope.h`): a frame's spectrum read
   through a window that shortens as frequency rises, from the one transform
   of the whole window. The complex spectrum is smoothed across frequency

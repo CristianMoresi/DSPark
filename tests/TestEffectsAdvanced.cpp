@@ -9824,3 +9824,43 @@ DSPARK_TEST(TonalBalance_common_response_moves_the_bands_together)
     EXPECT_LT(lowCommon, 5.0);
     EXPECT_LT(highCommon, 5.0);
 }
+
+// New: setLocalSlope(). Near the threshold in quiet a band's loudness grows
+// faster with its power than its exponent says, and the fixed exponent reads
+// what it lacks as more decibels than it is: on a quiet programme the ends
+// are asked for less with the local slope, and the middle for the same.
+DSPARK_TEST(TonalBalance_local_slope_asks_less_of_a_quiet_end)
+{
+    std::vector<float> quiet = l13MixLike(48000 * 3, 81u);
+    for (auto& s : quiet) s *= 0.01f;
+    const auto at = [](const Tb9& t, double hz) {
+        int band = 0;
+        for (int b = 1; b < Tb9::kBands; ++b)
+            if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
+        return static_cast<double>(t.getCorrection(band));
+    };
+    const auto with = [&](bool local) {
+        return m9Balance([=](Tb9& t) { t.setBalance(1.0f); t.setRange(24.0f); t.setFloor(120.0f); t.setFrequencyRange(20.0f, 20000.0f); t.setLocalSlope(local); }, quiet);
+    };
+    const auto fixed = with(false), local = with(true);
+    double fixedEnds = 0.0, localEnds = 0.0, fixedMid = 0.0, localMid = 0.0;
+    for (const double hz : { 40.0, 60.0, 90.0, 12000.0, 15000.0 })
+    {
+        fixedEnds += std::abs(at(*fixed, hz));
+        localEnds += std::abs(at(*local, hz));
+    }
+    for (const double hz : { 500.0, 1000.0, 2000.0 })
+    {
+        fixedMid += std::abs(at(*fixed, hz));
+        localMid += std::abs(at(*local, hz));
+    }
+    std::printf("  [balance] a programme 40 dB down: the ends are asked for %.2f dB in all with the fixed exponent and %.2f with the local slope;"
+                " the middle for %.2f and %.2f\n", fixedEnds, localEnds, fixedMid, localMid);
+    EXPECT_LT(localEnds, fixedEnds);
+    Tb9 a;
+    a.setLocalSlope(true);
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getLocalSlope());
+}

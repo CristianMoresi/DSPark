@@ -508,13 +508,14 @@ private:
         if (listenBand_ < 0 || listenChannels_ <= 0 || m > listenBlock_) return false;
         listenGoal_ = wanted == listenBand_ ? 1.0 : 0.0;
 
-        // The band as published (a bounded read: a collision keeps the design in use).
-        BandConfig cfg;
-        if (!staged_[static_cast<size_t>(listenBand_)].tryRead(cfg))
-        {
-            if (listenDesigned_) cfg = listenCfg_;
-            else cfg = states_[listenBand_].cfg;
-        }
+        // The band as the audio thread has adopted it. A change still waiting
+        // is adopted here, as the bands would a moment later, so the key is
+        // heard through the settings in force from its first sample (a band
+        // past the count in use keeps the settings it last ran with).
+        if (listenBand_ < numBands_.load(std::memory_order_relaxed)
+            && paramsDirty_[listenBand_].exchange(false, std::memory_order_acquire))
+            updateBandInternalState(listenBand_, sampleRate_ * runFactor());
+        const BandConfig cfg = states_[listenBand_].cfg;
         const bool moved = !listenDesigned_ || cfg.frequency != listenCfg_.frequency || cfg.q != listenCfg_.q
                            || cfg.shape != listenCfg_.shape || cfg.timing != listenCfg_.timing
                            || cfg.listenLow != listenCfg_.listenLow || cfg.listenHigh != listenCfg_.listenHigh;

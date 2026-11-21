@@ -556,7 +556,7 @@ public:
         // what is heard (and metered).
         const T loopGainLinear = decibelsToGain(smoothedGR_Db);
         if (amount < T(1)) smoothedGR_Db *= amount;
-        const bool gainSmooth = gainSmoothRate_ > 0.0;
+        const bool gainSmooth = shapesGain();
         if (advanceShared) syncGainSmoothing(gainSmooth);
         if (gainSmooth) smoothedGR_Db = smoothedGain(smoothedGR_Db, channel);
         const bool heardApart = amount < T(1) || gainSmooth;
@@ -650,6 +650,8 @@ public:
             layerPeakDb_[ch] = 0.0;
             gainSmoothA_[ch] = 0.0;
             gainSmoothB_[ch] = 0.0;
+            landingDb_[ch] = 0.0;
+            networkLow_[ch] = 0.0;
             balanceBands_[ch] = {};
             hybridMeanSq_[ch] = 0.0;
             lookaheadBuffers_[ch].reset();
@@ -985,10 +987,49 @@ public:
      * range. Off (the default) the target is cut at the range. The
      * semi-implicit FeedBack loop (Peak detector) keeps the corner.
      */
-    void setSoftRange(bool on) noexcept { softRange_.store(on, std::memory_order_relaxed); }
+    void setSoftRange(bool on) noexcept
+    {
+        rangeShape_.store(static_cast<int>(on ? RangeShape::Asymptotic : RangeShape::Corner), std::memory_order_relaxed);
+    }
 
-    /** @brief Whether the gain change approaches the range without a corner (setSoftRange()). */
-    [[nodiscard]] bool isSoftRange() const noexcept { return softRange_.load(std::memory_order_relaxed); }
+    /** @brief Whether the gain change meets the range without a corner (setSoftRange(), setRangeShape()). */
+    [[nodiscard]] bool isSoftRange() const noexcept
+    {
+        return rangeShape_.load(std::memory_order_relaxed) != static_cast<int>(RangeShape::Corner);
+    }
+
+    /** @brief How the gain change meets the range (see setRangeShape()). */
+    enum class RangeShape
+    {
+        Corner,      ///< Cut at the range (default).
+        Asymptotic,  ///< It bends from afar and never quite arrives: the curve of setSoftRange().
+        Local        ///< A bend in a stretch around the range; exact under it and over it.
+    };
+
+    /**
+     * @brief Selects how the gain change meets the range.
+     *
+     * Local bends the target over a stretch centred on the range, 6 dB wide
+     * (or as wide as the range, when the range is less than that): under the
+     * stretch the target is left as it is, over it it is the range exactly,
+     * and the slope is continuous at both ends. A target on the range comes
+     * out an eighth of the stretch short of it. Asymptotic, the curve of
+     * setSoftRange(), bends from much farther away: 16 % short at the range
+     * and never on it (a target of 12 dB under a range of 6 gives 5.9).
+     * The semi-implicit FeedBack loop (Peak detector) keeps the corner.
+     *
+     * State key "rangeShape" (absent: Asymptotic or Corner, as "softRange" says).
+     */
+    void setRangeShape(RangeShape shape) noexcept
+    {
+        rangeShape_.store(static_cast<int>(clampEnum(shape, RangeShape::Local)), std::memory_order_relaxed);
+    }
+
+    /** @brief How the gain change meets the range (setRangeShape()). */
+    [[nodiscard]] RangeShape getRangeShape() const noexcept
+    {
+        return static_cast<RangeShape>(rangeShape_.load(std::memory_order_relaxed));
+    }
 
     /**
      * @brief Selects how finely the control signal is computed (default: Standard).
@@ -1358,6 +1399,67 @@ public:
     [[nodiscard]] T getGainSmoothing() const noexcept { return gainSmoothMs_.load(std::memory_order_relaxed); }
 
     /**
+     * @brief Makes the last decibels of a release come back slowly
+     *        (milliseconds; 0, the default, is off).
+     *
+     * After the ballistics, the gain that is heard follows them at once
+     * while the gain change deepens, and on the way back with a time that
+     * grows as it gets near: `ms` once it is within tenths of a decibel of
+     * the gain it follows, e times shorter for each half decibel it is
+     * behind, so that several decibels behind it is the ballistics
+     * themselves. A release starts as it did and lands softly instead of
+     * arriving with the slope of its exponential, which is where a fast
+     * release is heard to pump. A feedback loop reads the gain before it.
+     * Values are held to [0, 2000] ms; a value that is not finite is ignored.
+     *
+     * State key "releaseLanding" (absent = 0).
+     */
+    void setReleaseLanding(T ms) noexcept
+    {
+        if (!std::isfinite(ms)) return;
+        landingMs_.store(std::clamp(ms, T(0), T(2000)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief The landing of the release, in milliseconds (setReleaseLanding()). */
+    [[nodiscard]] T getReleaseLanding() const noexcept { return landingMs_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief A lead-lag network in the control path: only a part of each
+     *        fast move of the gain is applied at once.
+     *
+     * The gain change in decibels, after the ballistics, passes through a
+     * first-order shelf that takes `depthDb` off what moves faster than
+     * `cornerHz` and leaves what is slower as it is. Its gain at 0 Hz is 1
+     * by construction, so the static curve does not move. Of a sudden move
+     * of the gain, 10^(-depthDb / 20) arrives at once and the rest with the
+     * time constant of the corner: an attack bites less, a release goes in
+     * two stretches, and the ripple a fast release leaves on a low tone
+     * falls by the depth, with none of the delay a low-pass adds
+     * (setGainSmoothing()). A feedback loop reads the gain before the
+     * network. A depth of 0 (the default) is off.
+     *
+     * State keys "networkDepth" and "networkCorner" (absent = 0 and 10).
+     *
+     * @param depthDb  0 to 12 dB. Non-finite values are ignored.
+     * @param cornerHz 1 to 100 Hz. Non-finite values keep the corner in use.
+     */
+    void setControlNetwork(T depthDb, T cornerHz = T(10)) noexcept
+    {
+        if (!std::isfinite(depthDb)) return;
+        networkDepthDb_.store(std::clamp(depthDb, T(0), T(12)), std::memory_order_relaxed);
+        if (std::isfinite(cornerHz))
+            networkCornerHz_.store(std::clamp(cornerHz, T(1), T(100)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Depth of the network in the control path, in dB (setControlNetwork()). */
+    [[nodiscard]] T getControlNetworkDepth() const noexcept { return networkDepthDb_.load(std::memory_order_relaxed); }
+
+    /** @brief Corner of the network in the control path, in Hz (setControlNetwork()). */
+    [[nodiscard]] T getControlNetworkCorner() const noexcept { return networkCornerHz_.load(std::memory_order_relaxed); }
+
+    /**
      * @brief Selects the Clean character's feed-forward ballistics.
      *
      * Branching (default) is a single branching one-pole on the gain target.
@@ -1588,7 +1690,8 @@ public:
         w.write("lookaheadShape", static_cast<int32_t>(getLookaheadShape()));
         w.write("feedbackKeyed", isFeedbackKeyed());
         w.write("amount", static_cast<float>(amount_.load(std::memory_order_relaxed)));
-        w.write("softRange", softRange_.load(std::memory_order_relaxed));
+        w.write("softRange", isSoftRange());   // what an older build understands
+        w.write("rangeShape", static_cast<int32_t>(getRangeShape()));
         w.write("precision", static_cast<int32_t>(precision_.load(std::memory_order_relaxed)));
         {
             const StageSettings st = getCharacterStageSettings();
@@ -1606,6 +1709,9 @@ public:
         w.write("attackEmphasis", static_cast<float>(attackEmphasis_.load(std::memory_order_relaxed)));
         keyEq_.writeState(w, "key");
         w.write("gainSmoothing", static_cast<float>(gainSmoothMs_.load(std::memory_order_relaxed)));
+        w.write("releaseLanding", static_cast<float>(landingMs_.load(std::memory_order_relaxed)));
+        w.write("networkDepth", static_cast<float>(networkDepthDb_.load(std::memory_order_relaxed)));
+        w.write("networkCorner", static_cast<float>(networkCornerHz_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -1645,7 +1751,7 @@ public:
         setLookaheadShape(static_cast<LookaheadShape>(r.read("lookaheadShape", 0)));
         setFeedbackKeyed(r.read("feedbackKeyed", false));
         setAmount(static_cast<T>(r.read("amount", 1.0f)));
-        setSoftRange(r.read("softRange", false));
+        setRangeShape(static_cast<RangeShape>(r.read("rangeShape", r.read("softRange", false) ? 1 : 0)));
         setPrecision(static_cast<Precision>(r.read("precision", 0)));
         {
             const StageSettings defaults {};
@@ -1665,6 +1771,8 @@ public:
         setAttackEmphasis(static_cast<T>(r.read("attackEmphasis", 0.0f)));
         keyEq_.readState(r, "key");
         setGainSmoothing(static_cast<T>(r.read("gainSmoothing", 0.0f)));
+        setReleaseLanding(static_cast<T>(r.read("releaseLanding", 0.0f)));
+        setControlNetwork(static_cast<T>(r.read("networkDepth", 0.0f)), static_cast<T>(r.read("networkCorner", 10.0f)));
         return true;
     }
 
@@ -1763,7 +1871,7 @@ protected:
         const bool decoupled = useDecoupled(charType, topoEff);
         syncDecoupledState(decoupled);
         const bool precise = !layered && usePrecision(topoEff, fbImplicit, splitAdaptive);
-        const bool gainSmooth = gainSmoothRate_ > 0.0;
+        const bool gainSmooth = shapesGain();
         syncGainSmoothing(gainSmooth);
         syncPrecisionState(precise);
         program_ = programTiming(charType, topoEff, decoupled, splitAdaptive);
@@ -2420,6 +2528,8 @@ protected:
             layerPeakDb_[ch] = layerPeakDb_[0];
             gainSmoothA_[ch] = gainSmoothA_[0];
             gainSmoothB_[ch] = gainSmoothB_[0];
+            landingDb_[ch] = landingDb_[0];
+            networkLow_[ch] = networkLow_[0];
         }
         if (holdEveryPeak_ && holdWindows_ && holdSamples_ > 0)
             for (int ch = 1; ch < nCh; ++ch) holdWindows_[static_cast<size_t>(ch)] = holdWindows_[0];
@@ -2458,7 +2568,7 @@ protected:
         T held = heldGrDb_[ch];
         int counter = holdCounters_[ch];
         const T range = rangeDb_.load(std::memory_order_relaxed);
-        const bool soft = softRange_.load(std::memory_order_relaxed);
+        const int soft = rangeShape_.load(std::memory_order_relaxed);
         const int holdN = holdSamples_;
         SlidingDeepest* const window = holdWindow(ch);
         const bool upward = ff.modeType == Mode::Upward;
@@ -2602,7 +2712,7 @@ protected:
         {
             const double shown = layeredStep(inputDb, thresh, ratio, knee, profileOf(cfg.charType),
                                              rangeDb_.load(std::memory_order_relaxed), holdSamples_,
-                                             softRange_.load(std::memory_order_relaxed),
+                                             rangeShape_.load(std::memory_order_relaxed),
                                              heldGrDb_[ch], holdCounters_[ch],
                                              layerLevelDb_[ch], layerPeakDb_[ch], holdWindow(ch));
             envFastDb_[ch] = shown;
@@ -2754,6 +2864,17 @@ protected:
             gainSmoothRate_ = (ms > 0.0) ? 1.0 - std::exp(-2000.0 / (static_cast<double>(fs) * ms)) : 0.0;
         }
 
+        // The landing of the release and the network of the control path.
+        {
+            const double rate = static_cast<double>(fs);
+            const double landing = static_cast<double>(landingMs_.load(std::memory_order_relaxed));
+            landingRate_ = (landing > 0.0) ? 1.0 - std::exp(-1000.0 / (rate * landing)) : 0.0;
+            const double depth = static_cast<double>(networkDepthDb_.load(std::memory_order_relaxed));
+            const double corner = static_cast<double>(networkCornerHz_.load(std::memory_order_relaxed));
+            networkShare_ = (depth > 0.0) ? std::pow(10.0, -depth / 20.0) : 1.0;
+            networkRate_ = 1.0 - std::exp(-2.0 * std::numbers::pi * corner / rate);
+        }
+
         // The attack as it is observed (a feedback loop, below, changes the
         // coefficient and not the result), and the coefficients of an eighth
         // of a sample: the eight steps per sample of Precision::High.
@@ -2887,7 +3008,7 @@ protected:
     [[nodiscard]] T applyHoldAndRange(T targetGR_Db, int ch) noexcept
     {
         return holdAndRange(targetGR_Db, rangeDb_.load(std::memory_order_relaxed), holdSamples_,
-                            heldGrDb_[ch], holdCounters_[ch], softRange_.load(std::memory_order_relaxed),
+                            heldGrDb_[ch], holdCounters_[ch], rangeShape_.load(std::memory_order_relaxed),
                             holdWindow(ch));
     }
 
@@ -3075,19 +3196,29 @@ protected:
      * @param holdSamples Hold length in samples (0 = off).
      * @param held        Held gain change (state).
      * @param counter     Remaining hold samples (state).
-     * @param soft        True to approach the range without a corner (setSoftRange()).
+     * @param soft        How the target meets the range: a RangeShape, as its number.
      * @param window      The sliding window that holds instead (HoldMode::EveryPeak), or nullptr.
      * @param perSample   Targets given per sample (the window counts samples).
      */
     [[nodiscard]] static T holdAndRange(T targetGR_Db, T range, int holdSamples,
-                                        T& held, int& counter, bool soft = false,
+                                        T& held, int& counter, int soft = 0,
                                         SlidingDeepest* window = nullptr, int perSample = 1) noexcept
     {
-        if (soft && range > T(0))
+        if (soft == static_cast<int>(RangeShape::Asymptotic) && range > T(0))
         {
             // g / (1 + (g / R)^4)^(1/4): g while it is small, R at most.
             const T x = targetGR_Db / range, x2 = x * x;
             targetGR_Db /= std::sqrt(std::sqrt(T(1) + x2 * x2));
+        }
+        else if (soft == static_cast<int>(RangeShape::Local) && range > T(0))
+        {
+            // A quadratic bend over a stretch centred on the range: the target
+            // under it, the range over it, and the slope continuous at both ends.
+            const T size = std::abs(targetGR_Db);
+            const T stretch = std::min(static_cast<T>(kLocalRangeStretchDb), range);
+            const T past = size - (range - stretch / T(2));
+            if (past >= stretch) targetGR_Db = std::copysign(range, targetGR_Db);
+            else if (past > T(0)) targetGR_Db = std::copysign(size - past * past / (T(2) * stretch), targetGR_Db);
         }
         else
         {
@@ -3579,7 +3710,7 @@ protected:
      * is shared out without a division.
      */
     [[nodiscard]] double layeredStep(T inputDb, T thresh, T ratio, T knee, const CharacterProfile& profile,
-                                     T range, int holdN, bool soft, T& held, int& counter,
+                                     T range, int holdN, int soft, T& held, int& counter,
                                      double& level, double& peak, SlidingDeepest* window = nullptr) const noexcept
     {
         const Layers want = layeredCurve(inputDb, thresh, ratio, knee, profile);
@@ -3651,35 +3782,81 @@ protected:
         return static_cast<T>(pair * (g / slope) / drive);
     }
 
-    /** @brief One frame of the two smoothing sections on a channel's gain (dB). */
-    [[nodiscard]] T smoothedGain(T grDb, int ch) noexcept
+    /** @brief Whether anything stands between the ballistics and the gain: the landing, the network or the smoothing. */
+    [[nodiscard]] bool shapesGain() const noexcept
     {
-        double& first = gainSmoothA_[static_cast<size_t>(ch)];
-        double& second = gainSmoothB_[static_cast<size_t>(ch)];
-        first += gainSmoothRate_ * (static_cast<double>(grDb) - first);
-        second += gainSmoothRate_ * (first - second);
-        // (End the asymptotic tail: 0 dB is exact again once it is reached.)
-        if (grDb == T(0) && std::abs(first) < 1e-6 && std::abs(second) < 1e-6)
-        {
-            first = 0.0;
-            second = 0.0;
-        }
-        return static_cast<T>(second);
+        return gainSmoothRate_ > 0.0 || landingRate_ > 0.0 || networkShare_ < 1.0;
     }
 
     /**
-     * @brief Seats the smoothing sections on the gain as it stands when the
-     *        smoothing engages. Audio thread only.
+     * @brief One frame of what stands between the ballistics and the gain on
+     *        a channel (dB): the landing of the release, the network of the
+     *        control path and the two smoothing sections, those that are on.
      */
-    void syncGainSmoothing(bool on) noexcept
+    [[nodiscard]] T smoothedGain(T grDb, int ch) noexcept
     {
-        if (on && !gainSmoothActive_)
+        const size_t c = static_cast<size_t>(ch);
+        double gain = static_cast<double>(grDb);
+        if (landingRate_ > 0.0)
+        {
+            // At once while the gain change deepens or changes side; on the
+            // way back, a follower that is slow near the gain it follows.
+            double& heard = landingDb_[c];
+            const double behind = std::abs(heard) - std::abs(gain);
+            if (behind <= 0.0 || (heard > 0.0) != (gain > 0.0))
+                heard = gain;
+            else
+                heard += std::min(1.0, landingRate_ * std::exp(std::min(behind * (1.0 / kLandingPaceDb), 40.0)))
+                         * (gain - heard);
+            if (gain == 0.0 && std::abs(heard) < 1e-6) heard = 0.0;
+            gain = heard;
+        }
+        if (networkShare_ < 1.0)
+        {
+            // A shelf: what is slow, whole; of what is fast, a share.
+            double& low = networkLow_[c];
+            low += networkRate_ * (gain - low);
+            if (gain == 0.0 && std::abs(low) < 1e-6) low = 0.0;
+            gain = low + networkShare_ * (gain - low);
+        }
+        if (gainSmoothRate_ > 0.0)
+        {
+            double& first = gainSmoothA_[c];
+            double& second = gainSmoothB_[c];
+            first += gainSmoothRate_ * (gain - first);
+            second += gainSmoothRate_ * (first - second);
+            // (End the asymptotic tail: 0 dB is exact again once it is reached.)
+            if (gain == 0.0 && std::abs(first) < 1e-6 && std::abs(second) < 1e-6)
+            {
+                first = 0.0;
+                second = 0.0;
+            }
+            gain = second;
+        }
+        return static_cast<T>(gain);
+    }
+
+    /**
+     * @brief Seats each of those stages on the gain as it stands when it
+     *        engages. Audio thread only.
+     */
+    void syncGainSmoothing(bool) noexcept
+    {
+        const bool smooth = gainSmoothRate_ > 0.0, landing = landingRate_ > 0.0, network = networkShare_ < 1.0;
+        if ((smooth && !gainSmoothActive_) || (landing && !landingActive_) || (network && !networkActive_))
         {
             const double shown = static_cast<double>(gainReductionDb_.load(std::memory_order_relaxed));
-            gainSmoothA_.fill(shown);
-            gainSmoothB_.fill(shown);
+            if (smooth && !gainSmoothActive_)
+            {
+                gainSmoothA_.fill(shown);
+                gainSmoothB_.fill(shown);
+            }
+            if (landing && !landingActive_) landingDb_.fill(shown);
+            if (network && !networkActive_) networkLow_.fill(shown);
         }
-        gainSmoothActive_ = on;
+        gainSmoothActive_ = smooth;
+        landingActive_ = landing;
+        networkActive_ = network;
     }
 
     /**
@@ -4479,7 +4656,7 @@ protected:
         }
 
         const T range = rangeDb_.load(std::memory_order_relaxed);
-        const bool soft = softRange_.load(std::memory_order_relaxed);
+        const int soft = rangeShape_.load(std::memory_order_relaxed);
         const int holdLength = holdSamples_ * count; // the hold counts levels here
         double last = precTarget_[c];
         double& hold = envHoldDb_[c];
@@ -4694,7 +4871,7 @@ protected:
         bool decoupled = false;     ///< Decoupled ballistics.
         bool loop = false;          ///< The detector reads the output (feedback).
         bool autoThreshold = false; ///< The threshold counts from the key's peak.
-        bool soft = false;          ///< Range with no corner.
+        int soft = 0;               ///< How the target meets the range (a RangeShape).
         bool valid = false;         ///< False until the first solve.
 
         bool operator==(const MakeupModelKey&) const = default;
@@ -4729,7 +4906,7 @@ protected:
         key.decoupled = decoupled;
         key.loop = loop;
         key.autoThreshold = autoThreshold_.load(std::memory_order_relaxed);
-        key.soft = softRange_.load(std::memory_order_relaxed);
+        key.soft = rangeShape_.load(std::memory_order_relaxed);
         key.valid = true;
         if (!(key == makeupKey_))
         {
@@ -5078,6 +5255,17 @@ protected:
     std::array<double, kMaxChannels> gainSmoothA_ {};
     std::array<double, kMaxChannels> gainSmoothB_ {};
     bool gainSmoothActive_ = false;                 ///< The smoothing ran last (audio thread).
+    static constexpr double kLandingPaceDb = 0.5;   ///< Decibels behind that make the landing e times faster.
+    std::atomic<T> landingMs_ { T(0) };             ///< Landing of the release (0: off).
+    double landingRate_ = 0.0;                      ///< Its coefficient when it is on the gain it follows (0: off).
+    std::array<double, kMaxChannels> landingDb_ {};
+    bool landingActive_ = false;
+    std::atomic<T> networkDepthDb_ { T(0) };        ///< Depth of the network of the control path (0: off).
+    std::atomic<T> networkCornerHz_ { T(10) };      ///< Its corner.
+    double networkShare_ = 1.0;                     ///< Share of a fast move applied at once (1: off).
+    double networkRate_ = 0.0;                      ///< Coefficient of its low-pass.
+    std::array<double, kMaxChannels> networkLow_ {};
+    bool networkActive_ = false;
     bool adaptiveMakeupActive_ = false; ///< Adaptive makeup ran last (audio thread).
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).
@@ -5155,7 +5343,8 @@ protected:
     bool rampActive_ = false;                        ///< The ramp ran in the last block.
     std::atomic<T> amount_ { T(1) };                ///< Share of the gain change that is applied, in dB.
     SmoothedValue<T> amountSmooth_;                 ///< De-zippered amount.
-    std::atomic<bool> softRange_ { false };         ///< The gain change approaches the range without a corner.
+    std::atomic<int> rangeShape_ { 0 };             ///< How the gain change meets the range (a RangeShape).
+    static constexpr double kLocalRangeStretchDb = 6.0; ///< Width of the bend of RangeShape::Local, at most.
 
     // Precision of the control signal (setPrecision): the detector's points
     // between samples, the history of the steps and their coefficients.

@@ -270,6 +270,16 @@ public:
     {
         if (useLanes_) lanes_.processBlock(buffer);
         else serial_.processBlock(buffer);
+        // A sample that is not a number would stay in the sections for good:
+        // it leaves as silence and the sections start again from rest.
+        bool broken = false;
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+        {
+            T* d = buffer.getChannel(ch);
+            for (int i = 0; i < buffer.getNumSamples(); ++i)
+                if (!std::isfinite(d[i])) { d[i] = T(0); broken = true; }
+        }
+        if (broken) reset();
     }
 
 private:

@@ -1174,7 +1174,9 @@ private:
             bucketHissCoeff_[c] = 1.0 - std::exp(-2.0 * 3.141592653589793 * b.getCorner() / fs);
             bucketCornerFor_[c] = d;
         }
-        return b.processSample(in, d / fs);
+        // The device's own delay (its filters, its hold) comes off the
+        // chain's, so the echo lands on the time asked for.
+        return b.processSample(in, b.delayFor(d / fs));
     }
 
     /**

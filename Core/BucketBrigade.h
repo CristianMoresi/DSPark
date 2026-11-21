@@ -160,6 +160,33 @@ public:
     }
 
     /**
+     * @brief The delay to ask of processSample() for the whole device to be
+     *        late by `wantedSeconds`.
+     *
+     * The chain is not all of the device's delay: its two low-passes add
+     * their group delay (that of two fourth-order Butterworth filters at the
+     * corner, taken at low frequencies), the held output half a clock period
+     * (the chain's delay over its number of stages) and the average over the
+     * step half a step (three and a half in high precision, which reads its
+     * input two steps back and weighs its output over three). This takes
+     * them off, so an echo lands on its time.
+     *
+     * @param wantedSeconds The delay from the input to the output.
+     * @return The delay of the chain alone (never under 10 microseconds).
+     */
+    [[nodiscard]] double delayFor(double wantedSeconds) const noexcept
+    {
+        // Group delay at low frequencies of a fourth-order Butterworth
+        // low-pass, in units of one over its corner in radians per second:
+        // the sum of one over the Q of its two sections.
+        static constexpr double kFourthOrderDelay = 1.0 / 0.5411961001461970 + 1.0 / 1.3065629648763764;
+        const double filters = 2.0 * kFourthOrderDelay / (2.0 * 3.141592653589793 * corner_);
+        const double steps = (precision_ == Precision::High ? 3.5 : 0.5) / rate_;
+        const double chainOnly = (wantedSeconds - filters - steps) / (1.0 + 1.0 / static_cast<double>(stages_));
+        return std::max(chainOnly, 1e-5);
+    }
+
+    /**
      * @brief One host sample through the device.
      * @param input        The sample.
      * @param delaySeconds The delay the clock is set for at this sample

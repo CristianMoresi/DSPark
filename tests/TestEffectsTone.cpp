@@ -7103,3 +7103,75 @@ DSPARK_TEST(TapeMachine_bias_shape_keeps_the_factor_and_is_saved)
         }
     }
 }
+
+// The effects that choose their oversampling offer the band of its first
+// stage: with Audible the latency follows the host rate, the lines of a driven
+// tone under 20 kHz are the ones the preset's band gives, a partial mix still
+// adds in phase, and every band of the multiband follows.
+DSPARK_TEST(Saturation_and_clipper_offer_the_audible_oversampling_band)
+{
+    struct Case { double rate; int latency; };
+    for (const Case c : { Case { 44100.0, 56 }, Case { 48000.0, 32 }, Case { 96000.0, 10 } })
+    {
+        auto sat = std::make_unique<Sat8>();
+        sat->setOversampling(2);
+        sat->prepare(AudioSpec{ c.rate, 512, 2 });
+        EXPECT_EQ(sat->getLatency(), 64);
+        EXPECT_TRUE(sat->getOversamplingBand() == Sat8::OversamplingBand::Preset);
+        sat->setOversamplingBand(Sat8::OversamplingBand::Audible);
+        EXPECT_TRUE(sat->getOversamplingBand() == Sat8::OversamplingBand::Audible);
+        EXPECT_EQ(sat->getLatency(), c.latency);
+        sat->prepare(AudioSpec{ c.rate, 256, 2 });
+        EXPECT_EQ(sat->getLatency(), c.latency);
+        sat->setOversamplingBand(Sat8::OversamplingBand::Preset);
+        EXPECT_EQ(sat->getLatency(), 64);
+
+        Clipper<float> clip;
+        clip.setOversampling(2);
+        clip.setOversamplingBand(Clipper<float>::OversamplingBand::Audible);
+        EXPECT_TRUE(clip.getOversamplingBand() == Clipper<float>::OversamplingBand::Audible);
+        clip.prepare(AudioSpec{ c.rate, 512, 2 });
+        EXPECT_EQ(clip.getLatency(), c.latency);
+    }
+
+    const auto setup = [](Sat8::OversamplingBand band, float mix, float drive) {
+        return [=](Sat8& s) {
+            s.setAlgorithm(Sat8::Algorithm::SoftClip);
+            s.setOversampling(2);
+            s.setOversamplingBand(band);
+            s.setDrive(drive);
+            s.setMix(mix);
+            s.setPreFilterHpFrequency(10.0f);
+        };
+    };
+
+    // A driven tone: its own line and its strong harmonics.
+    const Sat8Vec tone = sat8Sine(1000.0, 0.5, 24000);
+    const Sat8Vec preset = sat8Run(tone, setup(Sat8::OversamplingBand::Preset, 1.0f, 12.0f));
+    const Sat8Vec audible = sat8Run(tone, setup(Sat8::OversamplingBand::Audible, 1.0f, 12.0f));
+    for (double hz : { 1000.0, 3000.0, 5000.0, 7000.0, 9000.0 })
+    {
+        std::printf("BANDFX %5.0f Hz preset %.3f audible %.3f dB\n", hz, sat8Line(preset, hz), sat8Line(audible, hz));
+        EXPECT_NEAR(sat8Line(audible, hz), sat8Line(preset, hz), 0.05);
+    }
+
+    // A partial mix of a path that does nothing adds in phase with the dry one.
+    for (double hz : { 500.0, 2000.0, 8000.0, 15000.0 })
+    {
+        const Sat8Vec in = sat8Sine(hz, 0.01, 24000);
+        const double wet = sat8Line(sat8Run(in, setup(Sat8::OversamplingBand::Audible, 1.0f, 0.0f)), hz);
+        const double half = sat8Line(sat8Run(in, setup(Sat8::OversamplingBand::Audible, 0.5f, 0.0f)), hz);
+        std::printf("BANDFX mix at %5.0f Hz wet %.3f half %.3f dB\n", hz, wet, half);
+        EXPECT_NEAR(half, wet, 0.05);
+    }
+
+    // Every band of the multiband.
+    auto multi = std::make_unique<MultibandSaturation<float>>();
+    multi->prepare(AudioSpec{ 48000.0, 512, 2 });
+    multi->setOversampling(2);
+    const int before = multi->getLatency();
+    multi->setOversamplingBand(Sat8::OversamplingBand::Audible);
+    EXPECT_EQ(multi->getLatency(), before - 32);
+    EXPECT_TRUE(multi->getBandSaturation(0).getOversamplingBand() == Sat8::OversamplingBand::Audible);
+    EXPECT_TRUE(multi->getBandSaturation(2).getOversamplingBand() == Sat8::OversamplingBand::Audible);
+}

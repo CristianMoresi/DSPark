@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -2530,4 +2532,297 @@ DSPARK_TEST(DryPhase_leads_without_touching_the_level)
     const double bad = lead.processSample(0, std::numeric_limits<double>::infinity(), lead.advance());
     EXPECT_FALSE(std::isnan(bad));
     EXPECT_TRUE(std::isfinite(lead.processSample(0, 0.1, lead.advance())));
+}
+
+// ----------------------------------------------------------------------------
+// The first stage fitted to the host rate (Oversampling::Band::Audible)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+constexpr double kOsPi = 3.14159265358979323846;
+
+// Amplitude of a tone over a stretch of a signal (projection on its quadrature pair).
+double osToneAmplitude(const std::vector<double>& x, size_t from, size_t count, double hz, double rate)
+{
+    double sn = 0.0, cs = 0.0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const double phase = 2.0 * kOsPi * hz * static_cast<double>(from + i) / rate;
+        sn += x[from + i] * std::sin(phase);
+        cs += x[from + i] * std::cos(phase);
+    }
+    return 2.0 * std::hypot(sn, cs) / static_cast<double>(count);
+}
+
+// What a tone put in at the high rate leaves at a frequency of the base rate, in dB re the tone.
+double osAliasDb(Oversampling<double, 1>& os, double baseRate, double toneHz, double readHz)
+{
+    constexpr int kBlock = 256, kTotal = 16384;
+    const int factor = os.getFactor();
+    std::vector<double> out;
+    double base[kBlock];
+    for (int pos = 0; pos < kTotal; pos += kBlock)
+    {
+        auto hi = os.getHighRateBlock(kBlock);
+        for (int i = 0; i < hi.getNumSamples(); ++i)
+            hi.getChannel(0)[i] = 0.5 * std::sin(2.0 * kOsPi * toneHz
+                * static_cast<double>(static_cast<int64_t>(pos) * factor + i) / (baseRate * factor));
+        double* ch[1] = { base };
+        os.downsample(AudioBufferView<double>(ch, 1, kBlock));
+        out.insert(out.end(), base, base + kBlock);
+    }
+    return 20.0 * std::log10(osToneAmplitude(out, kTotal / 2, kTotal / 2, readHz, baseRate) / 0.5 + 1e-15);
+}
+
+// Gain of a tone of the base rate through the round trip.
+double osRoundTripGain(Oversampling<double, 1>& os, double baseRate, double hz)
+{
+    constexpr int kBlock = 256, kTotal = 16384;
+    hz = std::round(hz * 8192.0 / baseRate) * baseRate / 8192.0;   // a whole number of cycles in the window read
+    std::vector<double> out;
+    double base[kBlock];
+    for (int pos = 0; pos < kTotal; pos += kBlock)
+    {
+        for (int i = 0; i < kBlock; ++i)
+            base[i] = std::sin(2.0 * kOsPi * hz * static_cast<double>(pos + i) / baseRate);
+        double* ch[1] = { base };
+        AudioBufferView<double> view(ch, 1, kBlock);
+        (void)os.upsample(view);
+        os.downsample(view);
+        out.insert(out.end(), base, base + kBlock);
+    }
+    return osToneAmplitude(out, kTotal / 2, kTotal / 2, hz, baseRate);
+}
+
+// Level of the image of a base-rate tone in the 2x signal, in dB re the tone there.
+double osImageDb(Oversampling<double, 1>& os, double baseRate, double hz)
+{
+    constexpr int kBlock = 256, kTotal = 16384;
+    hz = std::round(hz * 8192.0 / baseRate) * baseRate / 8192.0;   // a whole number of cycles in the window read
+    std::vector<double> high;
+    double base[kBlock];
+    for (int pos = 0; pos < kTotal; pos += kBlock)
+    {
+        for (int i = 0; i < kBlock; ++i)
+            base[i] = std::sin(2.0 * kOsPi * hz * static_cast<double>(pos + i) / baseRate);
+        double* ch[1] = { base };
+        AudioBufferView<double> view(ch, 1, kBlock);
+        const auto up = os.upsample(view);
+        high.insert(high.end(), up.getChannel(0), up.getChannel(0) + up.getNumSamples());
+        os.downsample(view);
+    }
+    const size_t half = high.size() / 2;
+    const double tone = osToneAmplitude(high, half, half, hz, 2.0 * baseRate);
+    const double image = osToneAmplitude(high, half, half, baseRate - hz, 2.0 * baseRate);
+    return 20.0 * std::log10(image / tone + 1e-15);
+}
+
+} // namespace
+
+// With Band::Audible the first stage keeps 20 kHz and stops the image of
+// 20 kHz, so its transition widens with the host rate and its kernel gets
+// shorter; the delay stays a whole number of samples and an impulse lands on
+// it. The preset's band is the same at every rate.
+DSPARK_TEST(Oversampling_audible_band_shortens_the_first_stage_with_the_rate)
+{
+    using OS = Oversampling<double, 1>;
+    struct Rate { double rate; int taps; };
+    const Rate rates[] = { { 44100.0, 111 }, { 48000.0, 63 }, { 88200.0, 23 },
+                           { 96000.0, 19 }, { 176400.0, 15 }, { 192000.0, 15 } };
+    for (const auto& r : rates)
+    {
+        const double rate = r.rate;
+        OS os(2, OS::Quality::High, OS::Mode::LinearPhaseFir, OS::Depth::Preset, OS::Band::Audible);
+        EXPECT_EQ(os.getStageLength(0), 127);     // before prepare(): the preset's
+        EXPECT_EQ(os.getLatency(), 64);
+        os.prepare(spec(rate, 512, 1));
+        const int taps = os.getStageLength(0);
+        std::printf("BAND rate %.0f taps %d latency %d transition %.4f\n",
+                    rate, taps, os.getLatency(), os.getFirstStageTransition());
+        EXPECT_EQ(taps, r.taps);
+        EXPECT_EQ(os.getLatency(), (taps + 1) / 2);
+        EXPECT_NEAR(os.getFirstStageTransition(), 0.5 - 20000.0 / rate, 1e-12);
+
+        // An impulse comes back on the reported delay.
+        std::vector<double> block(512, 0.0);
+        block[40] = 1.0;
+        double* ch[1] = { block.data() };
+        AudioBufferView<double> view(ch, 1, 512);
+        (void)os.upsample(view);
+        os.downsample(view);
+        int argmax = 0;
+        for (int i = 1; i < 512; ++i)
+            if (std::abs(block[static_cast<size_t>(i)]) > std::abs(block[static_cast<size_t>(argmax)])) argmax = i;
+        EXPECT_EQ(argmax, 40 + os.getLatency());
+
+        // The single-precision engine runs the same design.
+        Oversampling<float, 1> single(2, Oversampling<float, 1>::Quality::High,
+                                      Oversampling<float, 1>::Mode::LinearPhaseFir,
+                                      Oversampling<float, 1>::Depth::Preset,
+                                      Oversampling<float, 1>::Band::Audible);
+        single.prepare(spec(rate, 512, 1));
+        EXPECT_EQ(single.getStageLength(0), taps);
+
+        // The preset's band does not look at the rate.
+        OS preset(2, OS::Quality::High);
+        preset.prepare(spec(rate, 512, 1));
+        EXPECT_EQ(preset.getStageLength(0), 127);
+        EXPECT_EQ(preset.getLatency(), 64);
+    }
+
+    // Every preset at 44.1 and at 96 kHz, and the depth of Depth::Deep. Low
+    // and Medium at 44.1 kHz: their own band is the wider one, and it stays.
+    struct Preset { OS::Quality q; int own, at44, at96; };
+    const Preset presets[] = { { OS::Quality::Low, 31, 31, 7 }, { OS::Quality::Medium, 63, 63, 15 },
+                               { OS::Quality::High, 127, 111, 19 }, { OS::Quality::Maximum, 255, 143, 27 } };
+    for (const auto& p : presets)
+    {
+        OS os(2, p.q, OS::Mode::LinearPhaseFir, OS::Depth::Preset, OS::Band::Audible);
+        EXPECT_EQ(os.getStageLength(0), p.own);
+        os.prepare(spec(44100.0, 64, 1));
+        EXPECT_EQ(os.getStageLength(0), p.at44);
+        os.prepare(spec(96000.0, 64, 1));
+        EXPECT_EQ(os.getStageLength(0), p.at96);
+    }
+    {
+        OS deep(2, OS::Quality::High, OS::Mode::LinearPhaseFir, OS::Depth::Deep, OS::Band::Audible);
+        EXPECT_EQ(deep.getStageLength(0), 163);
+        deep.prepare(spec(96000.0, 64, 1));
+        EXPECT_EQ(deep.getStageLength(0), 27);
+    }
+
+    // A second prepare() at another rate follows it, and a rate that is no
+    // rate keeps the preset.
+    {
+        OS os(4, OS::Quality::High, OS::Mode::LinearPhaseFir, OS::Depth::Preset, OS::Band::Audible);
+        os.prepare(spec(96000.0, 64, 1));
+        const int at96 = os.getStageLength(0);
+        EXPECT_EQ(os.getStageLength(1), 23);                       // later stages keep their designs
+        EXPECT_EQ(os.getLatency(), (at96 + 1) / 2 + 6);
+        EXPECT_EQ(os.getStageLength(2), 0);                        // a stage it does not have
+        os.prepare(spec(48000.0, 64, 1));
+        EXPECT_GT(os.getStageLength(0), at96);
+        os.prepare(spec(0.0, 64, 1));
+        EXPECT_EQ(os.getStageLength(0), 127);
+        EXPECT_EQ(os.getLatency(), 70);
+    }
+}
+
+// What the fitted stage has to keep: nothing folds under 20 kHz above the
+// preset's depth, on the way down or as an image on the way up, and the band
+// under 20 kHz passes whole. What it gives up is over 20 kHz.
+DSPARK_TEST(Oversampling_audible_band_keeps_the_presets_depth_under_20_kHz)
+{
+    using OS = Oversampling<double, 1>;
+    struct Case { OS::Quality q; double depth; };
+    const Case cases[] = { { OS::Quality::Low, 38.9 }, { OS::Quality::Medium, 59.5 },
+                           { OS::Quality::High, 79.2 }, { OS::Quality::Maximum, 100.1 } };
+    for (const auto& c : cases)
+    {
+        OS os(2, c.q, OS::Mode::LinearPhaseFir, OS::Depth::Preset, OS::Band::Audible);
+        os.prepare(spec(96000.0, 256, 1));
+        const double alias18 = osAliasDb(os, 96000.0, 78000.0, 18000.0);
+        const double alias20 = osAliasDb(os, 96000.0, 76000.0, 20000.0);
+        const double alias5 = osAliasDb(os, 96000.0, 91000.0, 5000.0);
+        const double image = osImageDb(os, 96000.0, 18000.0);
+        const double g1 = osRoundTripGain(os, 96000.0, 1000.0);
+        const double g19 = osRoundTripGain(os, 96000.0, 19900.0);
+        const double g30 = osRoundTripGain(os, 96000.0, 30000.0);
+        const double g40 = osRoundTripGain(os, 96000.0, 40000.0);
+        std::printf("DEPTH quality %d taps %d alias 18k %.2f 20k %.2f 5k %.2f image %.2f gain 1k %.6f 19.9k %.6f 30k %.4f 40k %.4f\n",
+                    static_cast<int>(c.q), os.getStageLength(0), alias18, alias20, alias5, image, g1, g19, g30, g40);
+        EXPECT_LT(alias18, -(c.depth - 0.3));
+        EXPECT_LT(alias20, -(c.depth - 0.3));
+        EXPECT_LT(alias5, -(c.depth - 0.3));
+        EXPECT_LT(image, -(c.depth - 0.3));
+        const double ripple = 3.0 * std::pow(10.0, -c.depth / 20.0);
+        EXPECT_NEAR(g1, 1.0, ripple);
+        EXPECT_NEAR(g19, 1.0, ripple);
+    }
+
+    // High at every rate: the edge of the stopband is the image of 20 kHz.
+    for (const double rate : { 44100.0, 48000.0, 88200.0, 176400.0, 192000.0 })
+    {
+        OS os(2, OS::Quality::High, OS::Mode::LinearPhaseFir, OS::Depth::Preset, OS::Band::Audible);
+        os.prepare(spec(rate, 256, 1));
+        const double alias = osAliasDb(os, rate, rate - 19000.0, 19000.0);
+        const double edge = osAliasDb(os, rate, rate - 20000.0, 20000.0);
+        const double gain = osRoundTripGain(os, rate, 19900.0);
+        std::printf("DEPTH rate %.0f taps %d alias 19k %.2f 20k %.2f gain 19.9k %.6f\n",
+                    rate, os.getStageLength(0), alias, edge, gain);
+        EXPECT_LT(alias, -78.9);
+        EXPECT_LT(edge, -78.9);
+        EXPECT_NEAR(gain, 1.0, 4e-4);
+    }
+
+    // The preset's band at 96 kHz, for what the fitted one gives up.
+    {
+        OS preset(2, OS::Quality::High);
+        preset.prepare(spec(96000.0, 256, 1));
+        const double g30 = osRoundTripGain(preset, 96000.0, 30000.0);
+        const double g40 = osRoundTripGain(preset, 96000.0, 40000.0);
+        std::printf("DEPTH preset at 96k gain 30k %.6f 40k %.6f\n", g30, g40);
+        EXPECT_NEAR(g30, 1.0, 4e-4);
+        EXPECT_NEAR(g40, 1.0, 4e-4);
+    }
+}
+
+// The polyphase mode gets the same band: fewer coefficients, less delay, the
+// same depth under 20 kHz; and the dry path through a twin still nulls.
+DSPARK_TEST(Oversampling_audible_band_in_the_polyphase_mode)
+{
+    using OS = Oversampling<double, 1>;
+    const AudioSpec s = spec(96000.0, 256, 1);
+    OS preset(2, OS::Quality::High, OS::Mode::PolyphaseIir);
+    OS audible(2, OS::Quality::High, OS::Mode::PolyphaseIir, OS::Depth::Preset, OS::Band::Audible);
+    preset.prepare(s);
+    audible.prepare(s);
+    EXPECT_EQ(audible.getStageLength(0), 0);
+    EXPECT_NEAR(audible.getFirstStageTransition(), 0.5 - 20000.0 / 96000.0, 1e-12);
+
+    const double presetDelay = preset.getRoundTripDelay(1000.0), audibleDelay = audible.getRoundTripDelay(1000.0);
+    const double presetEdge = preset.getRoundTripDelay(19000.0), audibleEdge = audible.getRoundTripDelay(19000.0);
+    const double alias18 = osAliasDb(audible, 96000.0, 78000.0, 18000.0);
+    const double alias20 = osAliasDb(audible, 96000.0, 76000.0, 20000.0);
+    const double g1 = osRoundTripGain(audible, 96000.0, 1000.0);
+    const double g19 = osRoundTripGain(audible, 96000.0, 19900.0);
+    std::printf("IIR delay at 1k %.3f (preset %.3f) at 19k %.3f (preset %.3f) latency %d (preset %d) alias 18k %.2f 20k %.2f gain 1k %.6f 19.9k %.6f\n",
+                audibleDelay, presetDelay, audibleEdge, presetEdge, audible.getLatency(), preset.getLatency(),
+                alias18, alias20, g1, g19);
+    EXPECT_LT(audibleDelay, presetDelay);
+    EXPECT_LT(audibleEdge - audibleDelay, presetEdge - presetDelay);   // and flatter over the band
+    EXPECT_LT(alias18, -78.9);
+    EXPECT_LT(alias20, -78.9);
+    EXPECT_NEAR(g1, 1.0, 4e-4);
+    EXPECT_NEAR(g19, 1.0, 4e-4);
+
+    // The dry path builds its twin with the band and the rate of the engine.
+    OversamplingDryPath<double, 1> dry;
+    dry.prepare(s, audible);
+    EXPECT_EQ(dry.getLatency(), audible.getLatency());
+    audible.reset();
+    double worst = 0.0;
+    for (int b = 0; b < 32; ++b)
+    {
+        double wet[256], aligned[256];
+        for (int i = 0; i < 256; ++i)
+            wet[i] = aligned[i] = std::sin(2.0 * kOsPi * 17987.0 * static_cast<double>(b * 256 + i) / 96000.0);
+        double* wetCh[1] = { wet };
+        double* dryCh[1] = { aligned };
+        AudioBufferView<double> wetView(wetCh, 1, 256), dryView(dryCh, 1, 256);
+        (void)audible.upsample(wetView);
+        audible.downsample(wetView);
+        dry.process(dryView);
+        for (int i = 0; i < 256; ++i) worst = std::max(worst, std::abs(wet[i] - aligned[i]));
+    }
+    EXPECT_TRUE(worst == 0.0);
+
+    // Linear phase: the dry path is the delay the prepared engine reports.
+    OS fir(2, OS::Quality::High, OS::Mode::LinearPhaseFir, OS::Depth::Preset, OS::Band::Audible);
+    fir.prepare(s);
+    OversamplingDryPath<double, 1> line;
+    line.prepare(s, fir);
+    EXPECT_EQ(line.getLatency(), fir.getLatency());
+    EXPECT_LT(line.getLatency(), 64);
 }

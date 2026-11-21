@@ -142,6 +142,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         s.setProgramNoise(-60.0f); s.setLevelTracking(0.5f); s.setTrackingCorner(150.0f);
         s.setCombLoop(-0.3f, 330.0f); s.setDriveCompensation(true);
         s.setOversamplingMode(Saturation<float>::OversamplingMode::MinimumPhase);
+        s.setOversamplingBand(Saturation<float>::OversamplingBand::Audible);
     })));
     {
         auto a = std::make_unique<MultibandSaturation<float>>();
@@ -166,6 +167,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         c.setInputGain(3.0f); c.setStages(3); c.setMix(0.65f);
         c.setSlewLimit(0.4f); c.setOversampling(4);
         c.setOversamplingMode(Clipper<float>::OversamplingMode::MinimumPhase);
+        c.setOversamplingBand(Clipper<float>::OversamplingBand::Audible);
     })));
     EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
         c.setRate(1.8f); c.setDepthMs(5.0f); c.setVoices(3);

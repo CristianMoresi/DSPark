@@ -72,8 +72,8 @@
  * after the change (0.17 s at 48 kHz) whatever the number of bands. The
  * first LinearPhase block after prepare(), reset() or a switch into the mode
  * completes a pending design at once (a one-off CPU cost of a few ms).
- * Memory: about 2 MB per stereo instance at 48 kHz, proportional to the
- * kernel length.
+ * Memory: about 4 MB per stereo instance at 48 kHz, proportional to the
+ * kernel length (half of it the curves kept for the bands, with 16 of them).
  *
  * Threading (per method; the model is docs/threading.md):
  * - Setup thread only, never concurrent with processing: prepare(), setState(),
@@ -194,7 +194,7 @@ public:
         T q             = T(0.707);         ///< Q factor (0.1 = wide, 10 = narrow).
         BandType type   = BandType::Peak;   ///< Filter type for this band.
         T slope         = T(12);            ///< Slope in dB/oct (LP/HP only): 6 to 48 in steps of 6, or any value from 0 to 96 with the analog response.
-        int order       = 1;                ///< Order of a bell, shelf, notch, band-pass or all-pass (1 to 16; 6 dB/oct each). Above 1 the band runs with the analog response.
+        int order       = 1;                ///< Order of a bell, shelf, notch, band-pass or all-pass (1 to 16; 6 dB/oct each), or 2 for a Tilt of twelve decibels per octave. Above 1 the band runs with the analog response.
         bool enabled    = true;             ///< False to bypass this band.
         Scope scope = Scope::Stereo;   ///< The channels the band acts on.
     };
@@ -708,6 +708,29 @@ public:
         configDirty_.store(true, std::memory_order_release);
     }
 
+    /**
+     * @brief Lets the Q of a shelf go above 0.7071 (off by default, where a
+     *        Q above it is read as 0.7071).
+     *
+     * With it on, a shelf whose Q is above 0.7071 rises over its plateau
+     * before the corner and dips under 0 dB after it, more the higher the Q
+     * (the plateau, the half gain at the corner and the inverse cut stay as
+     * they are); in a shelf of a higher order the Q acts on its sharpest
+     * pair. Such a band runs with the analog response. The Q of a Tilt of
+     * order 2 follows the same rule.
+     */
+    void setResonantShelves(bool enabled) noexcept
+    {
+        resonantShelves_.store(enabled, std::memory_order_relaxed);
+        configDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Returns whether the Q of a shelf can go above 0.7071 (setResonantShelves()). */
+    [[nodiscard]] bool isResonantShelves() const noexcept
+    {
+        return resonantShelves_.load(std::memory_order_relaxed);
+    }
+
     /** @brief Returns whether bands are designed from their analog prototypes (setAnalogResponse()). */
     [[nodiscard]] bool isAnalogResponse() const noexcept
     {
@@ -965,6 +988,7 @@ public:
         w.write("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)));
         w.write("softMode", softMode_.load(std::memory_order_relaxed));
         w.write("analog", analogResponse_.load(std::memory_order_relaxed));
+        w.write("resonantShelves", resonantShelves_.load(std::memory_order_relaxed));
         char key[24];
         for (int i = 0; i < n; ++i)
         {
@@ -1005,6 +1029,7 @@ public:
             r.read("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)))));
         setSoftMode(r.read("softMode", softMode_.load(std::memory_order_relaxed)));
         setAnalogResponse(r.read("analog", analogResponse_.load(std::memory_order_relaxed)));
+        setResonantShelves(r.read("resonantShelves", false));
         char key[24];
         for (int i = 0; i < n; ++i)
         {
@@ -1281,6 +1306,7 @@ protected:
         BiquadCascade<T, kMaxBandSections, kEngineChannels> cascade;
         BandConfig config {};       ///< What the cascade is on, or gliding to.
         bool soft = false;          ///< Soft mode when it was designed (it changes the Q).
+        bool resonant = false;      ///< setResonantShelves() when it was designed (it changes a shelf).
         int wanted = 0;             ///< Sections of that design (a glide can still carry more).
         bool configured = false;
         bool resting = false;       ///< The design is transparent (a gain band at 0 dB).
@@ -1305,7 +1331,10 @@ protected:
         return analogResponse_.load(std::memory_order_relaxed)
             || filterMode_.load(std::memory_order_relaxed) == FilterMode::PrototypePhase
             || static_cast<int>(cfg.type) > static_cast<int>(BandType::Tilt)
-            || cfg.order > 1;
+            || cfg.order > 1
+            || (resonantShelves_.load(std::memory_order_relaxed)
+                && (cfg.type == BandType::LowShelf || cfg.type == BandType::HighShelf)
+                && static_cast<double>(effectiveQ(cfg)) > FilterDesign::kButterworthQ + 1e-4);
     }
 
     /** @brief The analog prototype of a band. */
@@ -1316,6 +1345,10 @@ protected:
         const double q = std::max(static_cast<double>(effectiveQ(cfg)), 0.025);
         const int order = std::clamp(cfg.order, 1, kMaxBandSections);
         const double slope = static_cast<double>(cfg.slope);
+        // The Q of a shelf: above 0.7071 only with setResonantShelves().
+        const bool resonant = resonantShelves_.load(std::memory_order_relaxed);
+        const bool above = resonant && q > FilterDesign::kButterworthQ + 1e-4;
+        const double shelfQ = resonant ? std::clamp(q, 0.1, 20.0) : FilterDesign::kButterworthQ;
         AnalogCascade one;
         switch (cfg.type)
         {
@@ -1324,12 +1357,12 @@ protected:
                 one.add(AnalogSection::peak(f, q, g));
                 break;
             case BandType::LowShelf:
-                if (order > 1) return FilterDesign::lowShelf(f, g, order);
-                one.add(AnalogSection::lowShelf(f, g, shelfSlopeFromQ(q, g)));
+                if (order > 1) return FilterDesign::lowShelf(f, g, order, shelfQ);
+                one.add(above ? AnalogSection::lowShelfQ(f, g, shelfQ) : AnalogSection::lowShelf(f, g, shelfSlopeFromQ(q, g)));
                 break;
             case BandType::HighShelf:
-                if (order > 1) return FilterDesign::highShelf(f, g, order);
-                one.add(AnalogSection::highShelf(f, g, shelfSlopeFromQ(q, g)));
+                if (order > 1) return FilterDesign::highShelf(f, g, order, shelfQ);
+                one.add(above ? AnalogSection::highShelfQ(f, g, shelfQ) : AnalogSection::highShelf(f, g, shelfSlopeFromQ(q, g)));
                 break;
             case BandType::LowPass:      return FilterDesign::highCut(f, slope, q);
             case BandType::HighPass:     return FilterDesign::lowCut(f, slope, q);
@@ -1341,7 +1374,11 @@ protected:
                 if (order > 1) return FilterDesign::bandPass(f, q, order);
                 one.add(AnalogSection::bandPass(f, q));
                 break;
-            case BandType::Tilt:         one.add(AnalogSection::tilt(f, g)); break;
+            case BandType::Tilt:
+                // Order 1: six decibels per octave at most. From 2: twelve, with a Q.
+                one.add(order > 1 ? AnalogSection::tiltSecondOrder(f, g, resonant ? shelfQ : std::min(std::max(q, 0.1), FilterDesign::kButterworthQ))
+                                  : AnalogSection::tilt(f, g));
+                break;
             case BandType::AllPass:      return FilterDesign::allPass(f, q, order);
             case BandType::ConstantTilt:     return FilterDesign::tilt(f, FilterDesign::tiltSlopeWithin(f, g, kTiltCeilingDb));
             case BandType::LowPassWall:  return FilterDesign::ellipticHighCut(f);
@@ -1422,8 +1459,10 @@ protected:
     {
         AnalogBand& band = (*analog_)[static_cast<size_t>(index)];
         const bool soft = softMode_.load(std::memory_order_relaxed);
-        if (!snap && band.configured && band.soft == soft && sameDesign(band.config, cfg)) return;
+        const bool resonant = resonantShelves_.load(std::memory_order_relaxed);
+        if (!snap && band.configured && band.soft == soft && band.resonant == resonant && sameDesign(band.config, cfg)) return;
         band.soft = soft;
+        band.resonant = resonant;
         BiquadCoeffs target[kMaxBandSections];
         const int n = designSections(cfg, target, kMaxBandSections);
         const bool rest = restsAtUnity(cfg);
@@ -2725,6 +2764,7 @@ protected:
     std::atomic<bool> matchedBells_ { true };  ///< Matched (de-cramped) bells by default.
     std::atomic<bool> matchedFilters_ { false }; ///< Matched LP/HP/BP/shelves: opt-in.
     std::atomic<bool> analogResponse_ { false }; ///< Every band from its analog prototype: opt-in.
+    std::atomic<bool> resonantShelves_ { false }; ///< The Q of a shelf can go above 0.7071: opt-in.
 
     // The engine of the analog response (allocated by prepare(), run by the audio thread).
     std::unique_ptr<std::array<AnalogBand, MaxBands>> analog_;

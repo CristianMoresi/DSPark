@@ -9736,3 +9736,91 @@ DSPARK_TEST(TonalBalance_does_not_raise_what_is_masked)
     EXPECT_TRUE(b.setState(blob.data(), blob.size()));
     EXPECT_NEAR(static_cast<double>(b.getFloor()), 120.0, 1e-6);
 }
+
+// New: setListeningCompensation(). For a listening level 20 dB lower the two
+// ends, which the ear loses first, are raised more than the middle, and the
+// total loudness stays (the volume does not change).
+DSPARK_TEST(TonalBalance_listening_compensation_raises_the_ends)
+{
+    const std::vector<float> x = l13MixLike(48000 * 3, 61u);
+    const auto with = [&](float db) {
+        return m9Balance([=](Tb9& t) { t.setBalance(0.0f); t.setFillDips(0.0f); t.setTrimPeaks(0.0f); t.setRange(12.0f); t.setListeningCompensation(db); }, x);
+    };
+    const auto at = [](const Tb9& t, double hz) {
+        int band = 0;
+        for (int b = 1; b < Tb9::kBands; ++b)
+            if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
+        return static_cast<double>(t.getCorrection(band));
+    };
+    const auto quieter = with(20.0f);
+    const double low = at(*quieter, 60.0), mid = at(*quieter, 1000.0), high = at(*quieter, 12000.0);
+    std::printf("  [balance] a listening level 20 dB lower: %.2f dB at 60 Hz, %.2f at 1 kHz, %.2f at 12 kHz; the loudness moves %.3f dB\n",
+                low, mid, high, static_cast<double>(quieter->getLoudnessChange()));
+    EXPECT_GT(low, mid + 1.5);
+    EXPECT_GT(high, mid + 1.0);
+    EXPECT_NEAR(static_cast<double>(quieter->getLoudnessChange()), 0.0, 0.1);
+    const auto louder = with(-20.0f);
+    EXPECT_LT(at(*louder, 60.0), at(*louder, 1000.0) - 1.5);
+    const auto none = with(0.0f);
+    EXPECT_EQ(at(*none, 60.0), 0.0);
+    Tb9 a;
+    a.setListeningCompensation(90.0f);
+    a.setResponse(Tb9::Response::Common);
+    a.setResponseTime(1.0f);
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(b.getListeningCompensation()), 30.0, 1e-6);
+    EXPECT_TRUE(b.getResponse() == Tb9::Response::Common);
+    EXPECT_NEAR(static_cast<double>(b.getResponseTime()), 10.0, 1e-6);
+    b.setResponse(static_cast<Tb9::Response>(5));
+    EXPECT_TRUE(b.getResponse() == Tb9::Response::ByBand);
+}
+
+// New: Response::Common. A programme that turns from dark to bright: by band
+// the low end follows later than the top (its time is longer); with the
+// common response every band follows in about the same time, the one asked.
+DSPARK_TEST(TonalBalance_common_response_moves_the_bands_together)
+{
+    const size_t n = 48000 * 6, turn = 48000 * 3;
+    std::vector<float> x = m9Dark(n, 71u, 1500.0);
+    {
+        const std::vector<float> bright = l13Noise(n, 0.1f, 73u);
+        for (size_t i = turn; i < n; ++i) x[i] = bright[i];
+    }
+    const auto bandAt = [](const Tb9& t, double hz) {
+        int band = 0;
+        for (int b = 1; b < Tb9::kBands; ++b)
+            if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
+        return band;
+    };
+    // Seconds after the turn at which a band's correction has covered 63 % of its way.
+    const auto followed = [&](bool common, double hz) {
+        auto tb = std::make_unique<Tb9>();
+        tb->setBalance(1.0f);
+        if (common) { tb->setResponse(Tb9::Response::Common); tb->setResponseTime(60.0f); }
+        tb->prepare(spec(48000.0, 256, 2));
+        const int band = bandAt(*tb, hz);
+        std::vector<float> l = x, r = x;
+        std::vector<double> track;
+        for (size_t off = 0; off + 256 <= n; off += 256)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            tb->processBlock(AudioBufferView<float>(ch, 2, 256));
+            track.push_back(static_cast<double>(tb->getCorrection(band)));
+        }
+        const size_t at = turn / 256;
+        const double before = track[at - 1], after = track.back();
+        for (size_t i = at; i < track.size(); ++i)
+            if ((track[i] - before) * (after - before) > 0.0 && std::abs(track[i] - before) >= 0.63 * std::abs(after - before))
+                return static_cast<double>(i - at) * 256.0 / 48000.0;
+        return 99.0;
+    };
+    const double lowByBand = followed(false, 150.0), highByBand = followed(false, 8000.0);
+    const double lowCommon = followed(true, 150.0), highCommon = followed(true, 8000.0);
+    std::printf("  [balance] dark to bright, 63 %% of the way: by band %.3f s at 150 Hz and %.3f s at 8 kHz; common (60 ms) %.3f and %.3f s\n",
+                lowByBand, highByBand, lowCommon, highCommon);
+    EXPECT_LT(lowCommon, lowByBand);
+    EXPECT_LT(lowCommon, 5.0);
+    EXPECT_LT(highCommon, 5.0);
+}

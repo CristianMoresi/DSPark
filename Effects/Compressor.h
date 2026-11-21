@@ -197,10 +197,21 @@ public:
     enum class Mode
     {
         Downward,  ///< Standard: Reduces dynamic range by attenuating signals above the threshold.
-        Upward     ///< Upward: Reduces dynamic range by boosting signals below the threshold.
+        Upward,    ///< Upward: Reduces dynamic range by boosting signals below the threshold.
                    ///< The boost fades out when the SUSTAINED level (peak-held, falling
                    ///< 60 dB/s) drops 40 to 60 dB below the threshold, so pauses and the
                    ///< noise floor are not amplified; setRange() bounds the boost.
+        Both,      ///< Downward over the threshold and upward under a second, lower one, from
+                   ///< the same detector: what is loud comes down and what is quiet comes
+                   ///< up (see setLift()). The rise fades in silence as in Upward. A
+                   ///< feed-forward curve: in FeedBack (and so with the FET character) the
+                   ///< mode is Downward. A layered character runs one envelope, as in
+                   ///< Upward, and the automatic makeups other than Analytic are off.
+        Leveler    ///< No ratio and no knee: the gain is 1 / (1 + level / threshold). It
+                   ///< takes 6 dB at the threshold and hardens by itself, until the output
+                   ///< stays at the threshold however loud the input gets; setRange()
+                   ///< bounds it. A feed-forward curve, like Both; the automatic makeups
+                   ///< count it as Downward does its own curve.
     };
 
     /** @brief Ballistics of the Clean character in feed-forward (see setCleanBallistics). */
@@ -493,6 +504,7 @@ public:
         const CharacterProfile& profile = profileOf(charType);
         const Topology topoEff = topologyFor(profile, topo);
         const DetectorType detTypeEff = detectorFor(profile, detType);
+        modeType = modeIn(modeType, topoEff);
         const bool fbImplicit = topoEff == Topology::FeedBack
                              && modeType == Mode::Downward
                              && detTypeEff == DetectorType::Peak;
@@ -567,7 +579,7 @@ public:
         const bool heardApart = amount < T(1) || gainSmooth;
         T smoothedGainLinear = heardApart ? decibelsToGain(smoothedGR_Db) : loopGainLinear;
 
-        const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
+        const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && reducesOnly(modeType);
         if (advanceShared)
         {
             syncAdaptiveMakeup(adaptiveMakeup);
@@ -576,13 +588,13 @@ public:
         }
 
         T makeup = makeupDb;
-        if (modeType == Mode::Downward)
+        if (reducesOnly(modeType))
         {
             if (autoMkup == AutoMakeupMode::Adaptive)
                 makeup += -autoMakeupEnv_;
             else if (autoMkup == AutoMakeupMode::Static)
                 makeup += computeGain(T(0), thresh, ratio, knee, charType,
-                                      Mode::Downward, T(0)) * T(-0.5);
+                                      modeType, T(0)) * T(-0.5);
         }
         // The analytic makeup has a smoother of its own, advanced with the
         // shared ones.
@@ -803,13 +815,47 @@ public:
         setAutoMakeup(on ? AutoMakeupMode::Adaptive : AutoMakeupMode::Off);
     }
 
-    /** @brief Sets processing mode (Downward or Upward compression). */
+    /** @brief Sets the curve of the gain computer (Downward, Upward, Both or Leveler). */
     void setMode(Mode mode) noexcept
     {
-        mode_.store(clampEnum(mode, Mode::Upward), std::memory_order_relaxed);
+        mode_.store(clampEnum(mode, Mode::Leveler), std::memory_order_relaxed);
         // Feedback attack compensation only applies to Downward loops.
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief Sets the upward half of Mode::Both: what lies under a second,
+     *        lower threshold is raised.
+     *
+     * The lower threshold sits `belowDb` under the main one and moves with
+     * it; under it the level is raised with `ratio` (2: half the distance)
+     * up to `rangeDb`, with the knee of the main curve. Between the two
+     * thresholds the gain is 0 dB. A range of 0 leaves Mode::Both the same
+     * as Downward, bit for bit.
+     *
+     * State keys "liftBelow", "liftRatio" and "liftRange" (absent = 30, 2 and 6).
+     *
+     * @param belowDb Distance of the lower threshold under the main one, 0 to 80 dB.
+     * @param ratio   Ratio of the rise, 1 (none) to 20.
+     * @param rangeDb The most it raises, 0 to 40 dB.
+     *                Non-finite values keep the one in use.
+     */
+    void setLift(T belowDb, T ratio, T rangeDb) noexcept
+    {
+        if (std::isfinite(belowDb)) liftBelow_.store(std::clamp(belowDb, T(0), T(80)), std::memory_order_relaxed);
+        if (std::isfinite(ratio)) liftRatio_.store(std::clamp(ratio, T(1), T(20)), std::memory_order_relaxed);
+        if (std::isfinite(rangeDb)) liftRange_.store(std::clamp(rangeDb, T(0), T(40)), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @brief Distance of the lower threshold of Mode::Both under the main one, in dB (setLift()). */
+    [[nodiscard]] T getLiftBelow() const noexcept { return liftBelow_.load(std::memory_order_relaxed); }
+
+    /** @brief Ratio of the rise of Mode::Both (setLift()). */
+    [[nodiscard]] T getLiftRatio() const noexcept { return liftRatio_.load(std::memory_order_relaxed); }
+
+    /** @brief The most Mode::Both raises, in dB (setLift()). */
+    [[nodiscard]] T getLiftRange() const noexcept { return liftRange_.load(std::memory_order_relaxed); }
 
     /** @brief Sets stereo linking amount (0.0 = unlinked dual mono, 1.0 = fully linked). */
     void setStereoLink(T amount) noexcept
@@ -1740,9 +1786,10 @@ public:
         const bool feedback = topologyFor(profile, topology_.load(std::memory_order_relaxed)) == Topology::FeedBack;
         const DetectorType detType = detectorFor(profile, detectorType_.load(std::memory_order_relaxed));
         // The same routing as processBlock(): see usePrecision().
-        const bool solved = feedback && detType == DetectorType::Peak
-                         && mode_.load(std::memory_order_relaxed) == Mode::Downward;
-        const bool layered = isLayered(profile, mode_.load(std::memory_order_relaxed));
+        const Mode mode = modeIn(mode_.load(std::memory_order_relaxed),
+                                 feedback ? Topology::FeedBack : Topology::FeedForward);
+        const bool solved = feedback && detType == DetectorType::Peak && mode == Mode::Downward;
+        const bool layered = isLayered(profile, mode);
         const int reading = (precision_.load(std::memory_order_relaxed) == Precision::High && !layered
                              && readsBetweenSamples(detType) && (!feedback || solved)) ? kDetectorDelay : 0;
         const int coloured = (stagePosition_.load(std::memory_order_relaxed) != StagePosition::Off)
@@ -1822,6 +1869,9 @@ public:
         w.write("toneHigh", static_cast<float>(toneHighDb_.load(std::memory_order_relaxed)));
         w.write("controlLeak", static_cast<float>(controlLeak_.load(std::memory_order_relaxed)));
         w.write("detectorAsymmetry", static_cast<float>(detectorAsymmetry_.load(std::memory_order_relaxed)));
+        w.write("liftBelow", static_cast<float>(liftBelow_.load(std::memory_order_relaxed)));
+        w.write("liftRatio", static_cast<float>(liftRatio_.load(std::memory_order_relaxed)));
+        w.write("liftRange", static_cast<float>(liftRange_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -1886,6 +1936,8 @@ public:
         setReductionTone(static_cast<T>(r.read("toneLow", 0.0f)), static_cast<T>(r.read("toneHigh", 0.0f)));
         setControlLeak(static_cast<T>(r.read("controlLeak", 0.0f)));
         setDetectorAsymmetry(static_cast<T>(r.read("detectorAsymmetry", 0.0f)));
+        setLift(static_cast<T>(r.read("liftBelow", 30.0f)), static_cast<T>(r.read("liftRatio", 2.0f)),
+                static_cast<T>(r.read("liftRange", 6.0f)));
         return true;
     }
 
@@ -1971,6 +2023,7 @@ protected:
         const CharacterProfile& profile = profileOf(charType);
         const Topology topoEff = topologyFor(profile, topo);
         const DetectorType detTypeEff = detectorFor(profile, detType);
+        modeType = modeIn(modeType, topoEff);
 
         // Downward feedback with the peak detector resolves the loop
         // semi-implicitly (the level the loop will read is a known function
@@ -2041,11 +2094,11 @@ protected:
         T mixVal   = mixSmooth_.getCurrentValue();
         T colorAmt = colorSmooth_.getCurrentValue();
         T amount   = amountSmooth_.getCurrentValue();
-        const bool staticMakeup = autoMkup == AutoMakeupMode::Static && modeType == Mode::Downward;
-        const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && modeType == Mode::Downward;
+        const bool staticMakeup = autoMkup == AutoMakeupMode::Static && reducesOnly(modeType);
+        const bool adaptiveMakeup = autoMkup == AutoMakeupMode::Adaptive && reducesOnly(modeType);
         syncAdaptiveMakeup(adaptiveMakeup);
         T staticMakeupDb = staticMakeup
-            ? computeGain(T(0), thresh, ratio, knee, charType, Mode::Downward, T(0)) * T(-0.5)
+            ? computeGain(T(0), thresh, ratio, knee, charType, modeType, T(0)) * T(-0.5)
             : T(0);
         T analyticDb = analyticSmooth_.getCurrentValue();
 
@@ -2100,7 +2153,7 @@ protected:
                 // it stays click-free through threshold/ratio/knee automation.
                 if (staticMakeup)
                     staticMakeupDb = computeGain(T(0), thresh, ratio, knee, charType,
-                                                 Mode::Downward, T(0)) * T(-0.5);
+                                                 modeType, T(0)) * T(-0.5);
                 analyticDb = analyticSmooth_.getNextValue();
             }
 
@@ -2378,7 +2431,7 @@ protected:
                     (void)colorSmooth_.getNextValue();
                     amt[k]  = amountSmooth_.getNextValue();
                     stMk[k] = (ff.staticMakeup
-                        ? computeGain(T(0), thr[k], rat[k], kn[k], ff.charType, Mode::Downward, T(0)) * T(-0.5)
+                        ? computeGain(T(0), thr[k], rat[k], kn[k], ff.charType, ff.modeType, T(0)) * T(-0.5)
                         : T(0)) + analyticSmooth_.getNextValue();
                 }
             }
@@ -2702,6 +2755,19 @@ protected:
                 tgtA[k] = computeGainUpward(inDb[k], thr[k], rat[k], kn[k], guard);
             }
         }
+        else if (ff.modeType == Mode::Both)
+        {
+            for (int k = 0; k < m; ++k)
+            {
+                guard = std::max(inDb[k], guard - upwardGuardDecay_);
+                tgtA[k] = downwardCurve(inDb[k], thr[k], rat[k], kn[k], ff.charType)
+                        + lift(inDb[k], thr[k], kn[k], guard);
+            }
+        }
+        else if (ff.modeType == Mode::Leveler)
+        {
+            for (int k = 0; k < m; ++k) tgtA[k] = levelerCurve(inDb[k], thr[k]);
+        }
         else
         {
             for (int k = 0; k < m; ++k)
@@ -2803,7 +2869,7 @@ protected:
         // Sustained-level guard envelope for Upward mode: instant rise,
         // constant 60 dB/s fall (peak hold with linear decay).
         T guardDb = inputDb;
-        if (cfg.modeType == Mode::Upward)
+        if (cfg.modeType == Mode::Upward || cfg.modeType == Mode::Both)
         {
             T& g = upwardGuardDb_[ch];
             g = std::max(inputDb, g - upwardGuardDecay_);
@@ -2994,6 +3060,9 @@ protected:
             networkShare_ = (depth > 0.0) ? std::pow(10.0, -depth / 20.0) : 1.0;
             networkRate_ = 1.0 - std::exp(-2.0 * std::numbers::pi * corner / rate);
             leakCoeff_ = static_cast<T>(1.0 - std::exp(-2.0 * std::numbers::pi * kLeakCornerHz / rate));
+            liftBelowDb_ = liftBelow_.load(std::memory_order_relaxed);
+            liftRatioIn_ = std::max(liftRatio_.load(std::memory_order_relaxed), T(1));
+            liftRangeDb_ = liftRange_.load(std::memory_order_relaxed);
             asymDecay_ = static_cast<T>(std::exp(-1.0 / (rate * kAsymCrestSeconds)));
         }
 
@@ -3733,7 +3802,41 @@ protected:
     {
         if (modeType == Mode::Upward)
             return computeGainUpward(inputDb, thresh, ratio, knee, guardDb);
-        return downwardCurve(inputDb, thresh, ratio, knee, charType);
+        if (modeType == Mode::Leveler)
+            return levelerCurve(inputDb, thresh);
+        const T down = downwardCurve(inputDb, thresh, ratio, knee, charType);
+        return modeType == Mode::Both ? down + lift(inputDb, thresh, knee, guardDb) : down;
+    }
+
+    /** @brief The mode a routing runs: the two-way and the levelling curves are
+     *  feed-forward ones, and in a loop the curve is the ratio's. */
+    [[nodiscard]] static constexpr Mode modeIn(Mode asked, Topology topoEff) noexcept
+    {
+        return (topoEff == Topology::FeedBack && asked != Mode::Upward) ? Mode::Downward : asked;
+    }
+
+    /** @brief Whether a mode only ever takes level off (the automatic makeups that add it back apply). */
+    [[nodiscard]] static constexpr bool reducesOnly(Mode modeType) noexcept
+    {
+        return modeType == Mode::Downward || modeType == Mode::Leveler;
+    }
+
+    /**
+     * @brief The levelling curve: the gain 1 / (1 + level / threshold), in
+     *        decibels. Nothing far under the threshold, 6 dB at it, and all
+     *        that the level is over it far above.
+     */
+    [[nodiscard]] static T levelerCurve(T inputDb, T thresh) noexcept
+    {
+        const T over = inputDb - thresh;
+        if (over <= T(-120)) return T(0);
+        return static_cast<T>(-20.0 / std::numbers::ln10) * std::log1p(decibelsToGain(over));
+    }
+
+    /** @brief The upward half of Mode::Both: the rise under the lower threshold, up to its range. */
+    [[nodiscard]] T lift(T inputDb, T thresh, T knee, T guardDb) const noexcept
+    {
+        return std::min(computeGainUpward(inputDb, thresh - liftBelowDb_, liftRatioIn_, knee, guardDb), liftRangeDb_);
     }
 
     /**
@@ -4856,7 +4959,7 @@ protected:
         // Sustained-level guard of the Upward curve, on the frame's top level.
         T guardDb = levelDb[0];
         for (int j = 1; j < count; ++j) guardDb = std::max(guardDb, levelDb[j]);
-        if (cfg.modeType == Mode::Upward)
+        if (cfg.modeType == Mode::Upward || cfg.modeType == Mode::Both)
         {
             T& guard = upwardGuardDb_[c];
             guard = std::max(guardDb, guard - upwardGuardDecay_);
@@ -5080,6 +5183,7 @@ protected:
         bool loop = false;          ///< The detector reads the output (feedback).
         bool autoThreshold = false; ///< The threshold counts from the key's peak.
         int soft = 0;               ///< How the target meets the range (a RangeShape).
+        T liftBelow = T(0), liftRatio = T(1), liftRange = T(0);   ///< The upward half of Mode::Both.
         bool valid = false;         ///< False until the first solve.
 
         bool operator==(const MakeupModelKey&) const = default;
@@ -5115,6 +5219,9 @@ protected:
         key.loop = loop;
         key.autoThreshold = autoThreshold_.load(std::memory_order_relaxed);
         key.soft = rangeShape_.load(std::memory_order_relaxed);
+        key.liftBelow = liftBelowDb_;
+        key.liftRatio = liftRatioIn_;
+        key.liftRange = liftRangeDb_;
         key.valid = true;
         if (!(key == makeupKey_))
         {
@@ -5492,6 +5599,10 @@ protected:
     T asymDecay_ = T(0);
     std::array<T, kMaxChannels> asymCrest_ {};      ///< The crest of each channel's key.
     bool audioExtras_ = false;                      ///< The gain is not a plain product (tone or leak).
+
+    // The upward half of Mode::Both (setLift()), and as the audio thread took it.
+    std::atomic<T> liftBelow_ { T(30) }, liftRatio_ { T(2) }, liftRange_ { T(6) };
+    T liftBelowDb_ = T(30), liftRatioIn_ = T(2), liftRangeDb_ = T(6);
     bool adaptiveMakeupActive_ = false; ///< Adaptive makeup ran last (audio thread).
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).

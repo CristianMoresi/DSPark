@@ -6,6 +6,9 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Equalizer::getAnalogBandResponse()`: the response of a band of the analog
+  response as its sections are at this moment, a glide in flight included
+  (audio thread).
 - `setTimeFocus()` in `TonalBalance`, `ResonanceSuppressor` and
   `SpectralDynamicEQ` (off by default), and `SpectralFilter::setTimeFocus()`
   under the last two: the analysis reads each frequency through a stretch of
@@ -1699,6 +1702,23 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Equalizer` in `LinearPhase`: the design keeps each band's magnitude curve
+  on its grid, so a change computes the curve of the band that changed and
+  one product of the curves, where every section of every band was evaluated
+  again. A change of one bell of order 4 was heard 4, 11 and 19 whole hops
+  later with 1, 8 and 16 such bells (3, 5 and 7 of order 1) and is now heard
+  after 4 with any number of them (3 of order 1), from a kernel that is, bit
+  for bit, the one a fresh instance designs. The curves kept take
+  `MaxBands` x (kernel + 1) floats: 2 MB with 16 bands at 48 kHz.
+- `Equalizer`, bands of the analog response: a band that moves goes through
+  the designs of the parameters in between (one for every quarter of an octave
+  of frequency, every 12 dB of gain and every octave of Q, the coefficients
+  interpolated from each to the next) where its five coefficients went in one
+  straight line from the old design to the new. On its way from 200 Hz to
+  3.2 kHz a bell of +12 dB and Q 4 was a blend of the two bells, 12 dB off the
+  bell of the frequency in between; it is now that bell to within half a
+  decibel (its top within 0.01 octaves), whatever the block size and a sample
+  at a time. A design costs half a microsecond per section.
 - `TonalBalance` weighs each band by how audible it is (nothing under its
   threshold in quiet, in full from 10 dB over it), and reads a dip as a band
   under the audible bands both below and above it and a peak as a band over
@@ -2934,6 +2954,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Equalizer`, leaving `LinearPhase`: the bands had not run since the mode was
+  entered and resumed from the memory of the audio they last played. They are
+  now cleared and run over the input the linear-phase engine still holds (one
+  to two partitions, 43 to 85 ms with the default kernel) before the first
+  block: its first 10 ms stand 45 dB under the programme from an equaliser
+  that never left `MinimumPhase`, where they stood 14 dB under it (80 dB and
+  49 dB a tenth of a second later).
 - `TonalBalance`: what lay far under the programme was raised like a hole in
   it. A programme with nothing over 4 kHz, on a noise 50 dB under it, had
   that noise raised by the whole range (6 dB over 8 kHz). A band more than

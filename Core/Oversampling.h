@@ -23,7 +23,9 @@
  *   The round trip is an exact integer delay at every frequency.
  *   Depth::Deep (opt-in) keeps a preset's band and makes every stage at
  *   least 100 dB deep, for nonlinear processing whose harmonics fill the
- *   oversampled band.
+ *   oversampled band. Band::Audible (opt-in) fits the first stage to the
+ *   host rate: it keeps 20 kHz whole and stops the image of 20 kHz, so the
+ *   higher the rate the shorter the stage.
  * - **Polyphase IIR (opt-in, Mode::PolyphaseIir).** Elliptic half-band
  *   filters realised as two first-order allpass cascades in z^-2
  *   (Valenzuela and Constantinides, IEE Proc. 1983), the coefficients
@@ -38,7 +40,8 @@
  *   low audio range. getLatency() reports it rounded at low frequencies.
  *
  * Features:
- * - Factors 1/2/4/8/16 with four quality presets and two stopband depths.
+ * - Factors 1/2/4/8/16 with four quality presets, two stopband depths and
+ *   two bands.
  * - Block-based streaming; variable block sizes are supported and give
  *   bit-identical output for any partition of the stream.
  * - Zero allocations after prepare(); upsample()/downsample() are noexcept.
@@ -86,9 +89,9 @@ namespace dspark {
  * Threading: prepare() and reset() belong to the setup thread (prepare
  * allocates). upsample() and downsample() belong to the audio thread and are
  * noexcept and allocation-free. There are no runtime setters -- factor,
- * quality, mode and depth are fixed at construction and all filter state is
- * only touched by the audio thread -- so no cross-thread synchronisation is
- * needed.
+ * quality, mode, depth and band are fixed at construction and all filter
+ * state is only touched by the audio thread -- so no cross-thread
+ * synchronisation is needed.
  *
  * @tparam T           Sample type (float or double).
  * @tparam MaxChannels Maximum number of channels supported.
@@ -147,18 +150,67 @@ public:
     };
 
     /**
+     * @brief The band the first stage keeps (see the constructor).
+     *
+     * - Preset (default): the quality preset's own transition band, a fixed
+     *   share of the host rate around its Nyquist frequency (High: from 0.460
+     *   to 0.540 of the rate), whatever the rate.
+     * - Audible: the first stage keeps everything up to 20 kHz and stops
+     *   everything from the image of 20 kHz (the host rate less 20 kHz) up,
+     *   to the depth of the preset; what lies between, which nobody hears,
+     *   is neither kept whole nor stopped. The transition is then
+     *   1/2 - 20 kHz / rate of the 2x rate: 0.046 at 44.1 kHz, 0.083 at
+     *   48 kHz, 0.292 at 96 kHz and 0.396 at 192 kHz, against a fixed 0.040
+     *   for High. prepare() takes the shortest kernel that measures the
+     *   preset's depth over that stopband, so the stage gets shorter as the
+     *   rate rises (and where the preset's own band is the wider one, as Low
+     *   and Medium are at 44.1 kHz, it stays). Later stages keep their
+     *   designs: they pass 20 kHz and stop its images with room to spare.
+     *   The latency is known after prepare() and stays a whole number of
+     *   samples. In Mode::PolyphaseIir the first stage gets the same band
+     *   and the coefficient count that reaches the depth over it (at 96 kHz
+     *   High delays 2.27 samples at 1 kHz in place of 3.07).
+     *
+     * First stage of High, in taps, at 44.1, 48, 88.2, 96, 176.4 and 192 kHz:
+     * 111, 63, 23, 19, 15 and 15 against 127, which at 2x is a latency of 56,
+     * 32, 12, 10, 8 and 8 samples against 64. At 96 kHz Low, Medium and
+     * Maximum take 7, 15 and 27 taps against 31, 63 and 255, and Depth::Deep
+     * 27 against 163. What folds under 20 kHz at 96 kHz measures -82.6 dB or
+     * less for High (the preset's first stage: -79.2) and a 19.9 kHz tone
+     * comes back within 0.0006 dB.
+     *
+     * What Audible gives up: content of the input between 20 kHz and its
+     * Nyquist frequency is not carried whole to the high rate, and its images
+     * are not removed whole; on the way down, what a process leaves between
+     * the Nyquist frequency and the image of 20 kHz folds back above 20 kHz.
+     * Nothing folds below 20 kHz that the preset would have stopped. At
+     * 96 kHz with High a 30 kHz tone comes back at 0.948 of its level and a
+     * 40 kHz one at 0.672, where the preset returns both whole.
+     */
+    enum class Band
+    {
+        Preset,  ///< The preset's transition band (default).
+        Audible  ///< The first stage keeps 20 kHz and stops its image, by the host rate.
+    };
+
+    /**
      * @brief Constructs the oversampling engine.
      * @param factor  Oversampling factor. Must be a power of two (1, 2, 4, 8, 16).
      * @param quality Filter quality preset. Default is High (-80 dB).
      * @param mode    Filter family. Default is the linear-phase FIR.
      * @param depth   Stopband depth. Default is the preset's (Depth::Preset).
+     * @param band    Band of the first stage. Default is the preset's
+     *                (Band::Preset); Band::Audible fits it to the host rate
+     *                at prepare().
      * @pre factor >= 1 and is a power of 2.
      * @note Release builds normalise an invalid factor into range and round it
      *       down to a power of two (debug builds assert).
      */
     explicit Oversampling(int factor = 2, Quality quality = Quality::High,
-                          Mode mode = Mode::LinearPhaseFir, Depth depth = Depth::Preset)
-        : quality_(quality), mode_(mode), depth_(depth)
+                          Mode mode = Mode::LinearPhaseFir, Depth depth = Depth::Preset,
+                          Band band = Band::Preset)
+        : quality_(quality), mode_(mode), depth_(depth), band_(band),
+          firstStage_(firStageDesign(quality, depth, 0)), firstTransition_(firTransition(quality))
     {
         assert(factor >= 1 && (factor & (factor - 1)) == 0 && "Factor must be a power of 2");
         assert(factor <= (1 << kMaxStages) && "Factor must be <= 16 (kMaxStages stages)");
@@ -187,11 +239,19 @@ public:
      * @brief Pre-allocates buffers and computes FIR filter coefficients.
      * @param spec The audio specification at the base (1x) sample rate.
      * @post The processor is ready to handle up to `spec.maxBlockSize` base samples.
+     * @note With Band::Audible the first stage is fitted to spec.sampleRate
+     *       here, so getLatency() and getDecimationDelay() are those of this
+     *       rate from now on (before the first prepare() they are the
+     *       preset's). The fit tries a few lengths and windows and measures
+     *       each, which takes longer the longer the stage: for High, 0.2 to
+     *       0.4 ms at 96 kHz, 1 to 1.7 ms at 48 kHz and 3 to 7 ms at
+     *       44.1 kHz; for Maximum at 44.1 kHz, 5 to 8 ms (six builds).
      */
     void prepare(const AudioSpec& spec)
     {
         baseSpec_ = spec;
         upBuffer_.resize(spec.numChannels, spec.maxBlockSize * factor_);
+        fitFirstStage(spec.sampleRate);
 
         for (int stage = 0; stage < numStages_; ++stage)
         {
@@ -203,7 +263,7 @@ public:
             }
             else
             {
-                const StageDesign d = firStageDesign(quality_, depth_, stage);
+                const StageDesign d = stageDesign(stage);
                 filters_[static_cast<size_t>(stage)].design(d.taps, static_cast<T>(d.beta),
                                                             spec.numChannels, stageMaxSamples);
             }
@@ -264,6 +324,35 @@ public:
 
     /** @brief Returns the stopband depth (Depth::Preset or Depth::Deep). */
     [[nodiscard]] Depth getDepth() const noexcept { return depth_; }
+
+    /** @brief Returns the band of the first stage (Band::Preset or Band::Audible). */
+    [[nodiscard]] Band getBand() const noexcept { return band_; }
+
+    /**
+     * @brief Length of a linear-phase stage's kernel, in taps at its high rate.
+     *
+     * Half of them (the odd ones from the centre) are the half-band's zeros
+     * and cost nothing. With Band::Audible the first stage's length is that
+     * of the rate of the last prepare().
+     *
+     * @param stage Stage, 0 the first (the one at the lowest rate).
+     * @return The length, or 0 for a stage the engine does not have or in
+     *         Mode::PolyphaseIir.
+     */
+    [[nodiscard]] int getStageLength(int stage) const noexcept
+    {
+        if (mode_ != Mode::LinearPhaseFir || stage < 0 || stage >= numStages_) return 0;
+        return stageDesign(stage).taps;
+    }
+
+    /**
+     * @brief Transition band of the first stage, as a fraction of the 2x rate.
+     *
+     * The stage keeps everything under (1/4 - half of this) of the 2x rate
+     * and stops everything over (1/4 + half of it): the preset's own figure,
+     * or 1/2 - 20 kHz / rate with Band::Audible where that is wider.
+     */
+    [[nodiscard]] double getFirstStageTransition() const noexcept { return firstTransition_; }
 
     /**
      * @brief Round-trip (upsample + downsample) delay at the BASE rate, in samples.
@@ -944,6 +1033,141 @@ private:
         return kHigh[s];
     }
 
+    /// The design a linear-phase stage runs: the table's, or for the first
+    /// stage the one fitted to the host rate (Band::Audible).
+    [[nodiscard]] StageDesign stageDesign(int stage) const noexcept
+    {
+        return stage == 0 ? firstStage_ : firStageDesign(quality_, depth_, stage);
+    }
+
+    /// Depth of a preset's first stage, measured, in dB (Depth::Deep: Maximum's).
+    static constexpr double firstStageDepthDb(Quality q, Depth depth) noexcept
+    {
+        if (depth == Depth::Deep) return 100.1;
+        switch (q)
+        {
+            case Quality::Low:     return 38.9;
+            case Quality::Medium:  return 59.5;
+            case Quality::High:    return 79.2;
+            case Quality::Maximum: return 100.1;
+        }
+        return 79.2;
+    }
+
+    /// Top of the band Band::Audible keeps whole, in Hz.
+    static constexpr double kAudibleEdgeHz = 20000.0;
+    /// Shortest kernel the fit gives (the shortest of the tables).
+    static constexpr int kShortestFit = 7;
+
+    /// Kaiser's window parameter for a stopband depth in dB (his estimate).
+    static double kaiserBeta(double depthDb) noexcept
+    {
+        if (depthDb > 50.0) return 0.1102 * (depthDb - 8.7);
+        if (depthDb > 21.0) return 0.5842 * std::pow(depthDb - 21.0, 0.4) + 0.07886 * (depthDb - 21.0);
+        return 0.0;
+    }
+
+    /**
+     * Largest response of a half-band kernel over its stopband, in dB: from
+     * `edge` (a fraction of the 2x rate) to its Nyquist frequency, on a grid
+     * of sixteen points to the lobe. It reads the kernel the stage would run:
+     * the centre tap and the taps at odd distances from it (the others are
+     * the half-band's zeros and are left out), which pair up as cosines; the
+     * cosines of the odd multiples come from one another, without a
+     * trigonometric call per tap.
+     */
+    static double halfBandStopPeakDb(int taps, double beta, double edge)
+    {
+        const std::vector<double> full = FIRDesign<double>::lowPass(1.0, 0.25, taps, beta);
+        const int half = (taps - 1) / 2;
+        const int points = std::max(64, 4 * taps);
+        double peak = 0.0;
+        for (int p = 0; p <= points; ++p)
+        {
+            const double f = edge + (0.5 - edge) * static_cast<double>(p) / static_cast<double>(points);
+            const double theta = 2.0 * 3.14159265358979323846 * f;
+            const double twice = 2.0 * std::cos(2.0 * theta);
+            double before = std::cos(theta), now = before;   // cos(-theta), cos(theta)
+            double sum = full[static_cast<size_t>(half)];
+            for (int k = 1; k <= half; k += 2)
+            {
+                sum += (full[static_cast<size_t>(half + k)] + full[static_cast<size_t>(half - k)]) * now;
+                const double next = twice * now - before;       // cos((k + 2) theta)
+                before = now;
+                now = next;
+            }
+            peak = std::max(peak, std::abs(sum));
+        }
+        return 20.0 * std::log10(std::max(peak, 1e-12));
+    }
+
+    /**
+     * The shortest half-band kernel (half order odd, so the stage's delay is
+     * a whole number of base samples) whose stopband over a transition
+     * measures `depthDb` or deeper, with the Kaiser window that goes deepest
+     * at that length: lengths from two steps under Kaiser's estimate, and
+     * for each the window parameter in steps of 0.25 around his and then of
+     * 0.05 around the best of those. `otherwise` if none shorter than it does.
+     */
+    static StageDesign fitHalfBand(double transition, double depthDb, StageDesign otherwise)
+    {
+        const double edge = 0.25 + 0.5 * transition;
+        const double estimate = (depthDb - 7.95) / (14.36 * transition) + 1.0;
+        int taps = 4 * static_cast<int>(estimate / 4.0) + 3 - 8;
+        if (taps < kShortestFit) taps = kShortestFit;
+        const double centre = kaiserBeta(depthDb);
+        for (; taps < otherwise.taps; taps += 4)
+        {
+            double bestBeta = centre, bestPeak = halfBandStopPeakDb(taps, centre, edge);
+            for (int i = -8; i <= 16; ++i)
+            {
+                const double beta = centre + 0.25 * static_cast<double>(i);
+                if (i == 0 || beta < 0.5) continue;
+                const double peak = halfBandStopPeakDb(taps, beta, edge);
+                if (peak < bestPeak) { bestPeak = peak; bestBeta = beta; }
+            }
+            const double around = bestBeta;
+            for (int i = -4; i <= 4; ++i)
+            {
+                const double beta = around + 0.05 * static_cast<double>(i);
+                if (i == 0 || beta < 0.5) continue;
+                const double peak = halfBandStopPeakDb(taps, beta, edge);
+                if (peak < bestPeak) { bestPeak = peak; bestBeta = beta; }
+            }
+            if (bestPeak <= -depthDb) return { taps, bestBeta };
+        }
+        return otherwise;
+    }
+
+    /**
+     * The first stage for a host rate. Band::Preset: the table's. Band::Audible:
+     * the transition from 20 kHz to its image, rate - 20 kHz, is
+     * 1/2 - 20 kHz / rate of the 2x rate; where that is wider than the
+     * preset's the stage is fitted to it (a rate that is not a positive
+     * finite number keeps the preset). Sets the delays the engine reports.
+     */
+    void fitFirstStage(double sampleRate)
+    {
+        firstStage_ = firStageDesign(quality_, depth_, 0);
+        firstTransition_ = firTransition(quality_);
+        if (band_ != Band::Audible || numStages_ == 0) return;
+
+        if (sampleRate > 2.0 * kAudibleEdgeHz && sampleRate < 1e12)
+        {
+            const double wide = 0.5 - kAudibleEdgeHz / sampleRate;
+            if (wide > firstTransition_)
+            {
+                firstTransition_ = wide;
+                if (mode_ == Mode::LinearPhaseFir)
+                    firstStage_ = fitHalfBand(wide, firstStageDepthDb(quality_, depth_), firstStage_);
+            }
+        }
+        if (mode_ == Mode::PolyphaseIir)
+            iir_[0].design(iirCoefficientCountOver(firstStageDepthDb(quality_, depth_), firstTransition_),
+                           firstTransition_);
+        computeDelays();
+    }
+
     /// Stage-0 transition of the FIR preset (Kaiser's estimate), as a fraction
     /// of the 2x rate; the IIR stages reuse it so both modes keep the same band.
     static constexpr double firTransition(Quality q) noexcept
@@ -971,18 +1195,15 @@ private:
     /// or as Maximum's with Depth::Deep.
     static int iirCoefficientCount(Quality q, Depth depth, int stage) noexcept
     {
-        double target = 79.2;
-        switch (q)
-        {
-            case Quality::Low:     target = 38.9; break;
-            case Quality::Medium:  target = 59.5; break;
-            case Quality::High:    target = 79.2; break;
-            case Quality::Maximum: target = 100.1; break;
-        }
-        if (depth == Depth::Deep) target = 100.1;
-        const double t = iirTransition(q, stage);
+        return iirCoefficientCountOver(firstStageDepthDb(q, depth), iirTransition(q, stage));
+    }
+
+    /// Smallest even coefficient count that reaches a depth over a transition.
+    static int iirCoefficientCountOver(double depthDb, double transition) noexcept
+    {
         int n = 2;
-        while (n < 2 * PolyphaseIirHalfBand::kMaxPairs && PolyphaseIirHalfBand::attenuationDb(n, t) < target)
+        while (n < 2 * PolyphaseIirHalfBand::kMaxPairs
+               && PolyphaseIirHalfBand::attenuationDb(n, transition) < depthDb)
             n += 2;
         return n;
     }
@@ -1027,7 +1248,7 @@ private:
         int latency = 0, decimation = 0;
         for (int s = 0; s < numStages_; ++s)
         {
-            const int halfOrder = (firStageDesign(quality_, depth_, s).taps - 1) / 2;
+            const int halfOrder = (stageDesign(s).taps - 1) / 2;
             latency += (halfOrder + 1) / (1 << s);                  // exact by design
             decimation += halfOrder * (factor_ >> (s + 1));
         }
@@ -1040,6 +1261,9 @@ private:
     Quality quality_;
     Mode mode_;
     Depth depth_;
+    Band band_;
+    StageDesign firstStage_;          ///< The first stage's design in use (Band::Audible: fitted at prepare()).
+    double firstTransition_;          ///< Its transition, as a fraction of the 2x rate.
     int latency_ = 0;
     int decimationDelay_ = 0;
     AudioSpec baseSpec_ {};
@@ -1082,8 +1306,10 @@ public:
     /**
      * @brief Sizes the path for an engine.
      * @param spec   The specification the engine was prepared with (base rate).
-     * @param engine The engine whose round trip the dry signal has to match.
-     *               Only its factor, quality, mode and depth are read.
+     * @param engine The engine whose round trip the dry signal has to match,
+     *               already prepared with the same specification (with
+     *               Oversampling::Band::Audible its delay is known only then).
+     *               Its factor, quality, mode, depth, band and latency are read.
      */
     void prepare(const AudioSpec& spec, const Engine& engine)
     {
@@ -1098,7 +1324,7 @@ public:
         if (engine.getMode() == Engine::Mode::PolyphaseIir)
         {
             twin_ = std::make_unique<Engine>(engine.getFactor(), engine.getQuality(),
-                                             engine.getMode(), engine.getDepth());
+                                             engine.getMode(), engine.getDepth(), engine.getBand());
             twin_->prepare(spec);
         }
         else

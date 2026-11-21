@@ -6,6 +6,56 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `ResonanceSuppressor::setMix()`: how much of the filter is applied, taken
+  inside it (its gain becomes 1 - mix + mix * gain before the minimum-phase
+  design), so the part left alone and the part reduced never meet in two
+  phases: a line taken 11.15 dB down at a mix of 1 sits 3.90 dB down at
+  0.5, which is the mix of its two amplitudes. State key `mix`.
+- `ResonanceSuppressor::setKnee()`, 0 to 12 dB: a soft knee at the
+  threshold. A line that hovers there moves a quarter less from frame to
+  frame with a knee of 6 dB (0.60 to 0.45 dB). State key `knee`.
+- `ResonanceSuppressor::setPersistence()`, 0 to 500 ms: the excess of each
+  bin is averaged over that time while it grows and followed at once when
+  it falls, so only what lasts counts. White noise read with no threshold
+  loses 1.43 dB counted at once, 0.77 with 20 ms, 0.25 with 60 ms and 0.04
+  with 150; a click keeps its peak (0.83 dB down at once, 0.16 with 60 ms)
+  and a line that rings is taken as before. State key `persistence`.
+- `ResonanceSuppressor::setQuietLevel()`, -120 to 0 dBFS: each bin is read
+  as its amplitude plus that level, so quiet passages, tails and the noise
+  of a room show no resonance. With it at -60 dBFS a line taken 11.1 dB
+  down at full level is taken 2.3 dB down forty decibels lower and left
+  alone sixty lower (without it, 11.15 dB at any level). State key
+  `quietLevel`.
+- `ResonanceSuppressor::setAuditoryWeighting()`: the amount weighed by the
+  threshold of hearing in quiet (a third of its distance in dB to its lowest
+  point comes off the weight): the same excess weighs 0.44 at 150 Hz and as
+  before at 3 kHz. State key `auditory`.
+- `ResonanceSuppressor::setEnvelopePasses()` and `setWidthTaper()`, on
+  `SpectralEnvelope::setPasses()` and `setTaper()`: two passes of the
+  envelope's smoothing keep its width and lose its tails (a line of 20 dB
+  stands half a decibel further out; wide rises are read alike), and the
+  taper narrows the smoothing above a corner (a rise of 10 dB an octave wide
+  stands 0.9 dB over an envelope a third of an octave wide, and 0.1 dB over
+  one tapered with an exponent of 1). `SpectralEnvelope::excess()` gives the
+  spectrum less its envelope with its sign. State keys `envelopePasses`,
+  `taperHz` and `taperExponent`.
+- `SpectralFilter::setShortKernel()` and `ResonanceSuppressor::setShortKernel()`:
+  the filter's impulse response cut to half the transform and tapered over
+  its whole length. Of the response of a cut of 24 dB, the energy past half
+  a window falls from -33 to -43 dB, at the same depth. State key
+  `shortKernel`.
+- `ResonanceSuppressor::setQualityFollowsRender()` and
+  `setOfflineRendering()`: with the first on, a `prepare()` made while the
+  host renders offline takes the Offline quality whatever `setQuality()`
+  says (`getQualityInUse()` tells which); the latency is the same in both.
+  State key `qualityFollowsRender`.
+- `ResonanceSuppressor::setRemovalBand()`: what `setRemovalListen()` plays,
+  in one band alone (a line inside it is heard as in the whole removal, one
+  outside it 34 dB lower).
+- `SpectralFilter`: a key that is the programme itself is read as no key,
+  with one transform per channel and hop instead of two (the suppressor
+  keyed by its own programme: 378 to 357 ns per stereo frame, the cost of
+  the unkeyed one).
 - `TapeMachine::Speed::IPS_3_75`: 3.75 ips, with 90 us and the low-frequency
   constant in both standards. The head loses more of the top (at full losses
   10 kHz is 8.7 dB down, against 4.1 at 7.5 ips, 2.0 at 15 and 1.0 at 30),
@@ -2812,6 +2862,10 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `ResonanceSuppressor::setSensitivityBand()`: a new sensitivity curve was
+  written over the one in use an eighth at a time, so for seven hops the low
+  bins were weighed by the new curve and the high ones by the old. It is
+  computed aside and taken whole.
 - `TapeMachine`: DC at the input reached the tape and leaned its loop to one
   side, a second harmonic that no later stage removed (the output coupling
   only took the DC itself): a 1 kHz tone at -12 dBFS over a DC of 0.1

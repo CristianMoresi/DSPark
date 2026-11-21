@@ -6167,3 +6167,323 @@ DSPARK_TEST(Equalizer_ladder_structure_matches_the_direct_form)
     }
     EXPECT_LT(worst / peak, 1e-4);
 }
+
+// ============================================================================
+// The comb loop that glides and closes, the crossover's slopes, the multiband
+// mix and its output clipper
+// ============================================================================
+
+namespace {
+
+// A mono render in blocks of 256 with a hook before each block.
+template <class Setup, class Hook>
+Sat8Vec m6Run(const Sat8Vec& in, Setup&& setup, Hook&& hook)
+{
+    auto s = std::make_unique<Sat8>();
+    setup(*s);
+    s->prepare(AudioSpec{ 48000.0, 256, 1 });
+    Sat8Vec x = in;
+    for (size_t off = 0; off < x.size(); off += 256)
+    {
+        hook(*s, off);
+        float* p = x.data() + off;
+        s->processBlock(AudioBufferView<float>(&p, 1, static_cast<int>(std::min<size_t>(256, x.size() - off))));
+    }
+    return x;
+}
+
+// A crossover run on one channel: every band's output.
+std::vector<Sat8Vec> m6Split(CrossoverFilter<float, 6>& x, const Sat8Vec& in, int bands)
+{
+    std::vector<Sat8Vec> out(static_cast<size_t>(bands), Sat8Vec(in.size(), 0.0f));
+    Sat8Vec feed = in;
+    for (size_t off = 0; off < in.size(); off += 256)
+    {
+        const int n = static_cast<int>(std::min<size_t>(256, in.size() - off));
+        float* ip = feed.data() + off;
+        float* ptr[6] = {};
+        std::array<AudioBufferView<float>, 6> views;
+        for (int b = 0; b < bands; ++b)
+        {
+            ptr[b] = out[static_cast<size_t>(b)].data() + off;
+            views[static_cast<size_t>(b)] = AudioBufferView<float>(&ptr[b], 1, n);
+        }
+        x.processBlock(AudioBufferView<float>(&ip, 1, n), views.data(), bands);
+    }
+    return out;
+}
+
+Sat8Vec m6Noise(int n, double amp, uint32_t seed)
+{
+    Sat8Vec v(static_cast<size_t>(n));
+    for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = static_cast<float>(amp * (static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0)); }
+    return v;
+}
+
+} // namespace
+
+// Defect: a new frequency of the comb loop moved the read point of its line
+// at once, by a whole number of samples: a cut in a signal that recirculates,
+// a click each time. The delay now glides to its new length (an octave in a
+// tenth of a second) and is read between samples on the way.
+DSPARK_TEST(Saturation_comb_loop_glides_to_a_new_frequency)
+{
+    const Sat8Vec in = sat8Sine(150.0, 0.2, 48000);
+    const size_t at = 256 * 100;
+    const Sat8Vec out = m6Run(in, [](Sat8& s) { s.setCombLoop(0.9f, 200.0f); },
+                              [&](Sat8& s, size_t off) { if (off == at) s.setCombLoop(0.9f, 150.0f); });
+    // The largest step between samples before the change, on the way and
+    // once the loop has settled on the new frequency (where the tone has
+    // another level): the way adds no step of its own.
+    double steady = 0.0, moving = 0.0, settled = 0.0;
+    for (size_t i = at - 9600; i < at; ++i) steady = std::max(steady, std::abs(static_cast<double>(out[i]) - out[i - 1]));
+    for (size_t i = at; i < at + 9600; ++i) moving = std::max(moving, std::abs(static_cast<double>(out[i]) - out[i - 1]));
+    for (size_t i = out.size() - 4800; i < out.size(); ++i) settled = std::max(settled, std::abs(static_cast<double>(out[i]) - out[i - 1]));
+    std::printf("  [comb] largest step of the output: %.5f before the new frequency, %.5f while the loop moves to it, %.5f settled on it\n",
+                steady, moving, settled);
+    EXPECT_LT(moving, 1.5 * std::max(steady, settled));
+    // It lands on the new frequency: a loop of 150 Hz at the end.
+    const Sat8Vec direct = m6Run(in, [](Sat8& x) { x.setCombLoop(0.9f, 150.0f); }, [](Sat8&, size_t) {});
+    double apart = 0.0;
+    for (size_t i = in.size() - 4800; i < in.size(); ++i) apart = std::max(apart, std::abs(static_cast<double>(out[i]) - direct[i]));
+    EXPECT_LT(apart, 1e-3);
+}
+
+// New: setCombLoopClosing(true). With a loop gain near one the comb rings on
+// after the programme has stopped; closing follows the level of the input
+// and shuts the loop once there is none.
+DSPARK_TEST(Saturation_comb_loop_closes_when_the_programme_stops)
+{
+    Sat8Vec in = m6Noise(48000, 0.3, 7u);
+    std::fill(in.begin() + 24000, in.end(), 0.0f);
+    const auto tail = [&](bool closing) {
+        const Sat8Vec out = m6Run(in, [=](Sat8& s) { s.setCombLoop(0.95f, 200.0f); s.setCombLoopClosing(closing); }, [](Sat8&, size_t) {});
+        // From 250 to 350 ms after the programme stops, in dB.
+        return 20.0 * std::log10(sat8Rms(out, 24000 + 12000, 24000 + 16800) + 1e-30);
+    };
+    const double open = tail(false), closed = tail(true);
+    std::printf("  [comb] the ring 300 ms after the programme stops: %.1f dB as it was, %.1f dB closing\n", open, closed);
+    EXPECT_LT(closed, open - 20.0);
+    // While there is programme it changes nothing.
+    const Sat8Vec loud = m6Noise(24000, 0.3, 9u);
+    const Sat8Vec a = m6Run(loud, [](Sat8& s) { s.setCombLoop(0.9f, 200.0f); }, [](Sat8&, size_t) {});
+    const Sat8Vec b = m6Run(loud, [](Sat8& s) { s.setCombLoop(0.9f, 200.0f); s.setCombLoopClosing(true); }, [](Sat8&, size_t) {});
+    double apart = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) apart = std::max(apart, std::abs(static_cast<double>(a[i]) - b[i]));
+    EXPECT_LT(apart, 1e-6);
+    Sat8 state;
+    state.setCombLoopClosing(true);
+    const auto blob = state.getState();
+    Sat8 other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.getCombLoopClosing());
+}
+
+// New: a split of 6 dB per octave is a first-order low-pass and its
+// complement: the bands add up to the input itself, in the minimum-phase
+// engine with either structure, and to the delayed input in linear phase.
+DSPARK_TEST(CrossoverFilter_six_decibel_split_sums_to_the_input)
+{
+    using X = CrossoverFilter<float, 6>;
+    const Sat8Vec in = m6Noise(24000, 0.5, 21u);
+    for (const X::Structure structure : { X::Structure::DirectForm, X::Structure::Ladder })
+    {
+        auto x = std::make_unique<X>();
+        x->setNumBands(4);
+        x->setOrder(6);
+        x->setStructure(structure);
+        x->setCrossoverFrequency(0, 200.0f);
+        x->setCrossoverFrequency(1, 1000.0f);
+        x->setCrossoverFrequency(2, 5000.0f);
+        x->prepare(AudioSpec{ 48000.0, 256, 1 });
+        EXPECT_EQ(x->getOrder(), 6);
+        const auto bands = m6Split(*x, in, 4);
+        double worst = 0.0;
+        for (size_t i = 0; i < in.size(); ++i)
+        {
+            double sum = 0.0;
+            for (const auto& band : bands) sum += static_cast<double>(band[i]);
+            worst = std::max(worst, std::abs(sum - static_cast<double>(in[i])));
+        }
+        EXPECT_LT(worst, 2e-6);
+    }
+    // The slope: an octave over the split, the low band of a two-band split is 7 dB down (a first-order filter).
+    {
+        auto x = std::make_unique<X>();
+        x->setNumBands(2);
+        x->setOrder(6);
+        x->setCrossoverFrequency(0, 1000.0f);
+        x->prepare(AudioSpec{ 48000.0, 256, 1 });
+        const Sat8Vec tone = sat8Sine(2000.0, 0.25, 24000);
+        const auto bands = m6Split(*x, tone, 2);
+        EXPECT_NEAR(sat8Line(bands[0], 2000.0) - sat8Line(tone, 2000.0), -7.0, 0.3);
+    }
+    // Linear phase: the bands sum to the input, late by the latency.
+    {
+        auto x = std::make_unique<X>();
+        x->setNumBands(3);
+        x->setOrder(6);
+        x->setFilterMode(X::FilterMode::LinearPhase);
+        x->setCrossoverFrequency(0, 300.0f);
+        x->setCrossoverFrequency(1, 3000.0f);
+        x->prepare(AudioSpec{ 48000.0, 256, 1 });
+        const auto bands = m6Split(*x, in, 3);
+        const auto lat = static_cast<size_t>(x->getLatency());
+        double worst = 0.0;
+        for (size_t i = lat; i < in.size(); ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(bands[0][i]) + bands[1][i] + bands[2][i] - in[i - lat]));
+        EXPECT_LT(worst, 1e-4);
+    }
+}
+
+// New: a split of 36 dB per octave (two third-order Butterworth filters per
+// branch). The bands sum flat, each branch is 6 dB down at the split and 36
+// dB down an octave past it, in both structures and in linear phase.
+DSPARK_TEST(CrossoverFilter_thirty_six_decibel_split_is_flat_and_steep)
+{
+    using X = CrossoverFilter<float, 6>;
+    const auto make = [](int bands, X::Structure structure, X::FilterMode mode) {
+        auto x = std::make_unique<X>();
+        x->setNumBands(bands);
+        x->setOrder(36);
+        x->setStructure(structure);
+        x->setFilterMode(mode);
+        if (bands == 2) x->setCrossoverFrequency(0, 1000.0f);
+        else { x->setCrossoverFrequency(0, 250.0f); x->setCrossoverFrequency(1, 1000.0f); x->setCrossoverFrequency(2, 4000.0f); }
+        x->prepare(AudioSpec{ 48000.0, 256, 1 });
+        return x;
+    };
+    for (const X::Structure structure : { X::Structure::DirectForm, X::Structure::Ladder })
+    {
+        // The branches of one split.
+        for (const double hz : { 500.0, 1000.0, 2000.0 })
+        {
+            auto x = make(2, structure, X::FilterMode::MinimumPhase);
+            const Sat8Vec tone = sat8Sine(hz, 0.25, 24000);
+            const auto bands = m6Split(*x, tone, 2);
+            const double low = sat8Line(bands[0], hz) - sat8Line(tone, hz), high = sat8Line(bands[1], hz) - sat8Line(tone, hz);
+            if (hz == 1000.0) { EXPECT_NEAR(low, -6.02, 0.05); EXPECT_NEAR(high, -6.02, 0.05); }
+            if (hz == 2000.0) { EXPECT_NEAR(low, -36.1, 0.5); }
+            if (hz == 500.0) { EXPECT_NEAR(high, -36.1, 0.5); }
+        }
+        // Four bands sum flat at the splits and between them.
+        for (const double hz : { 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 10000.0 })
+        {
+            auto x = make(4, structure, X::FilterMode::MinimumPhase);
+            const Sat8Vec tone = sat8Sine(hz, 0.25, 24000);
+            const auto bands = m6Split(*x, tone, 4);
+            Sat8Vec sum(tone.size(), 0.0f);
+            for (const auto& band : bands)
+                for (size_t i = 0; i < sum.size(); ++i) sum[i] += band[i];
+            EXPECT_NEAR(sat8Line(sum, hz) - sat8Line(tone, hz), 0.0, 0.01);
+        }
+    }
+    // Linear phase: the same slope, and the bands sum to the delayed input.
+    {
+        auto x = make(2, X::Structure::DirectForm, X::FilterMode::LinearPhase);
+        const Sat8Vec tone = sat8Sine(2000.0, 0.25, 24000);
+        const auto bands = m6Split(*x, tone, 2);
+        EXPECT_NEAR(sat8Line(bands[0], 2000.0) - sat8Line(tone, 2000.0), -36.2, 0.7);
+        const Sat8Vec noise = m6Noise(24000, 0.5, 33u);
+        auto y = make(4, X::Structure::DirectForm, X::FilterMode::LinearPhase);
+        const auto split = m6Split(*y, noise, 4);
+        const auto lat = static_cast<size_t>(y->getLatency());
+        double worst = 0.0;
+        for (size_t i = lat; i < noise.size(); ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(split[0][i]) + split[1][i] + split[2][i] + split[3][i] - noise[i - lat]));
+        EXPECT_LT(worst, 1e-4);
+    }
+    // Slopes that do not exist are still ignored.
+    X x;
+    x.setOrder(36);
+    x.setOrder(18);
+    EXPECT_EQ(x.getOrder(), 36);
+}
+
+// New: MultibandSaturation::setMix(). The dry side is the programme as the
+// crossover leaves it, as late as the bands, so any mix is as flat as the
+// crossover: at the splits too, where a dry signal in another phase would
+// carve a notch.
+DSPARK_TEST(MultibandSaturation_mix_keeps_the_phase_of_the_crossover)
+{
+    const auto three = [](float mix) {
+        return [=](MbSat& m) {
+            m.setNumBands(3);
+            m.setCrossoverFrequency(0, 300.0f);
+            m.setCrossoverFrequency(1, 3000.0f);
+            m.getBandSaturation(1).setOversampling(4);     // the bands are not equally late
+            m.setMix(mix);
+        };
+    };
+    for (const double hz : { 100.0, 300.0, 1000.0, 3000.0, 10000.0 })
+    {
+        const Sat8Vec in = sat8Sine(hz, 0.01, 24000);
+        const auto amplitude = [&](float mix) { return std::pow(10.0, sat8Line(mbRun(in, in, three(mix))[0], hz) / 20.0); };
+        const double source = std::pow(10.0, sat8Line(in, hz) / 20.0);
+        const double dry = amplitude(0.0f), half = amplitude(0.5f), wet = amplitude(1.0f);
+        EXPECT_NEAR(dry / source, 1.0, 0.005);                 // the dry side: the flat sum of the crossover
+        // It meets the bands in phase. Under the lowest split the bands' own
+        // filters (each Saturation's 20 Hz high-pass and its DC filter) lead
+        // the dry side a little: 20 degrees at 100 Hz, 0.14 dB at this mix.
+        EXPECT_NEAR(half, 0.5 * (dry + wet), (hz < 200.0 ? 0.02 : 0.003) * source);
+    }
+    // A driven band under a mix of one half: half way, in amplitude, between the dry and the wet.
+    const Sat8Vec in = sat8Sine(1000.0, 0.25, 24000);
+    const auto driven = [](float mix) {
+        return [=](MbSat& m) { m.setNumBands(2); m.setCrossoverFrequency(0, 200.0f); m.setBandLevel(1, -12.0f); m.setMix(mix); };
+    };
+    const double dry = std::pow(10.0, sat8Line(mbRun(in, in, driven(0.0f))[0], 1000.0) / 20.0);
+    const double wet = std::pow(10.0, sat8Line(mbRun(in, in, driven(1.0f))[0], 1000.0) / 20.0);
+    const double half = std::pow(10.0, sat8Line(mbRun(in, in, driven(0.5f))[0], 1000.0) / 20.0);
+    EXPECT_NEAR(half, 0.5 * (dry + wet), 0.01 * dry);
+    EXPECT_LT(wet, 0.5 * dry);
+    // Part of the state.
+    MbSat m;
+    m.setMix(0.25f);
+    m.setOutputClip(true);
+    m.setOutputCeiling(-6.0f);
+    const auto blob = m.getState();
+    MbSat other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(other.getMix()), 0.25, 1e-6);
+    EXPECT_TRUE(other.getOutputClip());
+    EXPECT_NEAR(static_cast<double>(other.getOutputCeiling()), -6.0, 1e-6);
+}
+
+// New: MultibandSaturation::setOutputClip(). Driven bands add up to more than
+// full scale; with the clipper after the sum no sample leaves over its
+// ceiling, and a programme under the ceiling leaves as it would without it,
+// late by the clipper's latency.
+DSPARK_TEST(MultibandSaturation_output_clip_holds_its_ceiling)
+{
+    const Sat8Vec loud = m6Noise(24000, 0.9, 41u);
+    const auto six = [](bool clip, float ceilingDb, float level) {
+        return [=](MbSat& m) {
+            m.setNumBands(6);
+            for (int b = 0; b < 6; ++b) { m.setBandDrive(b, 24.0f); m.setBandLevel(b, level); }
+            m.setOutputClip(clip);
+            m.setOutputCeiling(ceilingDb);
+        };
+    };
+    const auto peak = [](const Sat8Vec& v) { double top = 0.0; for (float x : v) top = std::max(top, std::abs(static_cast<double>(x))); return top; };
+    const double free = peak(mbRun(loud, loud, six(false, 0.0f, 6.0f))[0]);
+    const double held = peak(mbRun(loud, loud, six(true, 0.0f, 6.0f))[0]);
+    const double lower = peak(mbRun(loud, loud, six(true, -6.0f, 6.0f))[0]);
+    std::printf("  [clip] six driven bands peak at %.2f of full scale; %.4f with the clipper, %.4f with its ceiling at -6 dB\n", free, held, lower);
+    EXPECT_GT(free, 1.5);
+    EXPECT_LT(held, 1.0 + 1e-6);
+    EXPECT_LT(lower, 0.5012 + 1e-6);
+    // Under the ceiling: the same signal, late by the clipper.
+    const Sat8Vec quiet = sat8Sine(1000.0, 0.05, 24000);
+    const auto calm = [](bool clip) { return [=](MbSat& m) { m.setNumBands(3); m.setOutputClip(clip); }; };
+    const auto plain = mbRun(quiet, quiet, calm(false)), clipped = mbRun(quiet, quiet, calm(true));
+    MbSat a, b;
+    calm(false)(a); calm(true)(b);
+    a.prepare(AudioSpec{ 48000.0, 512, 2 }); b.prepare(AudioSpec{ 48000.0, 512, 2 });
+    const int late = b.getLatency() - a.getLatency();
+    EXPECT_GT(late, 0);
+    double apart = 0.0;
+    for (size_t i = 4800; i + static_cast<size_t>(late) < quiet.size(); ++i)
+        apart = std::max(apart, std::abs(static_cast<double>(clipped[0][i + static_cast<size_t>(late)]) - plain[0][i]));
+    EXPECT_LT(apart, 1e-4);
+}

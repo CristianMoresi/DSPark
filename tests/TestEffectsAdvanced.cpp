@@ -9135,3 +9135,36 @@ DSPARK_TEST(TonalBalance_keeps_the_loudness_within_a_narrow_range)
     TonalBalance<float> fresh;
     EXPECT_EQ(fresh.getLoudnessChange(), 0.0f);
 }
+
+// New: MultibandCompressor::setMix() sets the mix of every band. Each band
+// blends with itself as the crossover leaves it, so the dry side keeps the
+// crossover's phase: a mix of zero is the input's level at every frequency
+// whatever the compression, and a mix of one half sits between the two.
+DSPARK_TEST(MultibandCompressor_mix_of_every_band_keeps_the_phase)
+{
+    const auto level = [](double hz, float mix) {
+        auto mbc = std::make_unique<MultibandCompressor<float>>();
+        mbc->prepare(spec(48000.0, 256, 2));
+        mbc->setNumBands(3);
+        mbc->setCrossoverFrequency(0, 300.0f);
+        mbc->setCrossoverFrequency(1, 3000.0f);
+        for (int b = 0; b < 3; ++b)
+        {
+            mbc->getBandCompressor(b).setThreshold(-40.0f);
+            mbc->getBandCompressor(b).setRatio(8.0f);
+        }
+        mbc->setMix(mix);
+        const size_t n = 256 * 190;
+        const std::vector<float> in = l13Add(std::vector<float>(n, 0.0f), hz, 0.25);
+        const auto out = l13Run(*mbc, in, in);
+        return l13Line(out.first, hz, n - 9600, 9600) - l13Line(in, hz, n - 9600, 9600);
+    };
+    for (const double hz : { 100.0, 300.0, 1000.0, 3000.0, 8000.0 })
+    {
+        const double dry = level(hz, 0.0f), half = level(hz, 0.5f), wet = level(hz, 1.0f);
+        EXPECT_NEAR(dry, 0.0, 0.05);
+        EXPECT_LT(wet, -6.0);
+        EXPECT_LT(half, dry - 1.0);
+        EXPECT_GT(half, wet + 1.0);
+    }
+}

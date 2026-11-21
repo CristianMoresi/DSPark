@@ -32,8 +32,9 @@
  * out; prepare(spec, 0) picks the transform size by the rate (2048 at 44.1
  * and 48 kHz, doubling by octaves); setFilterMode(true) applies the gains as
  * a minimum-phase filter designed every hop (SpectralFilter: no pre-echo, a
- * transform padded twice, the same latency), where setLink() mixes the gains
- * of the channels bin by bin (1: one filter for both).
+ * transform padded twice, the same latency), where setLink() takes the power
+ * each channel is read by part of the way to the mean of the pair, bin by
+ * bin and within the same frame (1: one detector and one filter for both).
  *
  * Latency is the STFT's (fftSize samples). All per-bin state is per channel;
  * the profile is shared. The decision-directed weight is per STFT hop, so its
@@ -119,8 +120,7 @@ public:
         heldGain_.assign(static_cast<size_t>(numChannels_ + 1),
                          std::vector<float>(static_cast<size_t>(std::max(numBins_, filterBins_)), 1.0f));
         gains_.assign(static_cast<size_t>(std::max(numBins_, filterBins_)), 1.0f);
-        linkedGains_.assign(static_cast<size_t>(numChannels_ + 1),
-                            std::vector<float>(static_cast<size_t>(filterBins_), 1.0f));
+        detect_.assign(static_cast<size_t>(filterBins_), 0.0f);
         weight_.assign(static_cast<size_t>(numBins_), 1.0f);
         release_.assign(static_cast<size_t>(numBins_), 0.0f);
         releaseFilter_.assign(static_cast<size_t>(filterBins_), 0.0f);
@@ -202,7 +202,7 @@ public:
     void setRemovalListen(bool on) noexcept { removalListen_.store(on, std::memory_order_relaxed); }
     /** @brief Applies the gains as a minimum-phase filter (see the file comment). */
     void setFilterMode(bool on) noexcept { filterMode_.store(on, std::memory_order_relaxed); }
-    /** @brief In filter mode, the gains of the channels mixed bin by bin, 0 to 1 (default 0). */
+    /** @brief In filter mode, how far the power each channel is read by goes to the mean of the pair, 0 (each its own, default) to 1 (one detector and one filter). */
     void setLink(T amount) noexcept
     {
         if (!std::isfinite(amount)) return;
@@ -493,30 +493,30 @@ private:
                 learnRate = 1.0f / static_cast<float>(learnFrames_);
             }
             auto& clean = filterClean_[static_cast<size_t>(c)];
+            // A partial link: the rule reads this channel part of the way to
+            // the mean of the pair (the other channel's frame of this hop),
+            // so the two channels are treated alike. The profile learns from
+            // the channel itself.
+            const T* other = link > 0.0f && ch >= 0 && nChEff == 2 ? filter_.getFramePower(1 - ch) : nullptr;
+            const float part = 0.5f * link;
             for (int k = 0; k < bins; ++k)
             {
-                const float p = static_cast<float>(power[k]);
+                const float own = static_cast<float>(power[k]);
+                const float p = other != nullptr ? own + part * (static_cast<float>(other[k]) - own) : own;
+                detect_[static_cast<size_t>(k)] = p;
                 const int sk = std::min(k / 2, numBins_ - 1);
-                if (learning && (k & 1) == 0 && std::isfinite(p))
-                    profile_[static_cast<size_t>(sk)] += learnRate * (p / toFilter - profile_[static_cast<size_t>(sk)]);
+                if (learning && (k & 1) == 0 && std::isfinite(own))
+                    profile_[static_cast<size_t>(sk)] += learnRate * (own / toFilter - profile_[static_cast<size_t>(sk)]);
                 const float noise = 0.5f * (profile_[static_cast<size_t>(sk)] + profile_[static_cast<size_t>(std::min(sk + (k & 1), numBins_ - 1))]) * toFilter;
                 const float fl = weighted_ ? std::pow(10.0f, -reductionDb * weight_[static_cast<size_t>(sk)] / 20.0f) : floorGain;
                 gains_[static_cast<size_t>(k)] = std::isfinite(p) ? binGain(p, noise, clean[static_cast<size_t>(k)], overSub, fl) : 0.0f;
             }
             shapeGains(gains_.data(), bins, heldGain_[static_cast<size_t>(c)], releaseFilter_);
-            // The link mixes this channel's gains with the others' last ones.
-            auto& mine = linkedGains_[static_cast<size_t>(c)];
-            for (int k = 0; k < bins; ++k) mine[static_cast<size_t>(k)] = gains_[static_cast<size_t>(k)];
-            if (link > 0.0f && ch >= 0 && nChEff == 2)
-            {
-                const auto& other = linkedGains_[static_cast<size_t>(1 - ch)];
-                for (int k = 0; k < bins; ++k)
-                    gains_[static_cast<size_t>(k)] += link * 0.5f * (other[static_cast<size_t>(k)] - gains_[static_cast<size_t>(k)]);
-            }
             for (int k = 0; k < bins; ++k)
             {
                 const float g = gains_[static_cast<size_t>(k)];
-                clean[static_cast<size_t>(k)] = g * g * static_cast<float>(power[k]);
+                const float p = detect_[static_cast<size_t>(k)];
+                clean[static_cast<size_t>(k)] = std::isfinite(p) ? g * g * p : 0.0f;
                 gain[k] = static_cast<T>(g);
             }
         });
@@ -533,8 +533,8 @@ private:
     std::atomic<bool> removalListen_ { false }, filterMode_ { false }, weightDirty_ { true };
     bool weighted_ = false;
     float smoothNow_ = 0.0f, releaseNow_ = 0.0f, releaseFor_ = -1.0f;
-    std::vector<std::vector<float>> filterClean_, heldGain_, linkedGains_;
-    std::vector<float> gains_, weight_, release_, releaseFilter_;
+    std::vector<std::vector<float>> filterClean_, heldGain_;
+    std::vector<float> gains_, weight_, release_, releaseFilter_, detect_;
 
     static constexpr float kDDAlpha = 0.98f;           ///< Decision-directed weight per hop.
     static constexpr float kMinPrioriSnr = 0.003162f;  ///< -25 dB a priori SNR floor.

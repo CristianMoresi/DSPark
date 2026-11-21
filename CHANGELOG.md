@@ -6,6 +6,32 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Compressor::setHoldMode(HoldMode::EveryPeak)`: the hold keeps every gain
+  change for the hold time after it has passed (the deepest of a sliding
+  window, exact to a 256th of the hold time). On a 50 Hz tone that dies away
+  with a hold of 60 ms, the reduction of the default mode (`Deepest`, as
+  before) goes deeper again 27 times, by up to 1.4 dB, each time a hold ends
+  inside the wave; with `EveryPeak` it comes back in steps and never goes
+  deeper again. It costs 5 ns per frame more. State key `holdMode`.
+- `Compressor::setLookaheadShape(LookaheadShape::Ramp)`: the gain reaches
+  each reduction exactly when its peak leaves the lookahead's delay, along an
+  S-shaped ramp as long as the lookahead (the deepest gain change of the next
+  lookahead, through two moving averages), and holds it for the lookahead
+  after the peak. On a level that jumps 20 dB with an attack of 0.1 ms and a
+  lookahead of 5 ms, the gain of the default shape (`Lead`, as before) falls
+  2.8 dB per sample a whole lookahead before the jump arrives; the ramp moves
+  0.12 dB per sample at most and has the settled reduction when the jump
+  arrives (within 0.03 dB). State key `lookaheadShape`.
+- `Compressor::setFeedbackKeyed(true)`: a feedback loop closed around the key
+  ahead of the audio, so the lookahead (with its latency, its shape and the
+  latency kept for it) and an external key act in `Topology::FeedBack` and in
+  the characters that always detect in feedback. With the programme as the
+  key and no lookahead it is the same compressor. Off by default (a feedback
+  loop reads its output: no lookahead, an external key ignored). State key
+  `feedbackKeyed`.
+- `KeyMonitor` (in `Core/KeyEqualizer.h`): the key of a dynamics processor as
+  it is listened to, late by the processor's latency and held under full
+  scale.
 - `SpectralFilter::getFramePower(channel)`: every hop reads the power of all
   the channels before the first filter is designed, so the design of one
   channel can look at the others of the same frame. `GraphicBank::setGains()`
@@ -2729,6 +2755,19 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Compressor`, `NoiseGate`, `Expander`: the listened key (`setSidechainListen()`)
+  left without the delay of the lookahead, so with a lookahead it played
+  early by the whole latency the processor reports and the track moved when
+  the listen was switched; and an equalized key went out as loud as its
+  bands made it (a tone at half scale under a bell of +24 dB: 7.9 times full
+  scale). It now leaves late by the latency and is held under full scale.
+  Under full scale and without a latency it is the key itself, as before.
+- `Compressor` with a latency kept for the lookahead (`setMaxLookahead()`):
+  moving the lookahead jumped the gain to another point of its own past, a
+  step of level whenever the gain was moving (a level swelling at 3 Hz, the
+  lookahead taken from 8 to 0 ms: a step 370 times the largest of the steady
+  signal). The delay of the gain now slides to its new value a quarter of a
+  sample per sample: no step.
 - `ResonanceSuppressor`: a link between 0 and 1 behaved as 0, because each
   channel designed its filter without the power of the other. With a line on
   the left only, the right channel took 1.3 dB at the line unlinked

@@ -42,7 +42,7 @@
  * in its state; it still passes to the output for that sample.
  * getGainReductionDb()/getLatency() are metering/host reads (relaxed).
  *
- * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, CharacterStage.h,
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, Biquad.h, CharacterStage.h,
  *               SmoothedValue.h, RingBuffer.h, DenormalGuard.h, Hilbert.h,
  *               KeyEqualizer.h, TruePeakDetector.h, StateBlob.h.
  */
@@ -50,6 +50,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/AudioBuffer.h"
+#include "../Core/Biquad.h"
 #include "../Core/CharacterStage.h"
 #include "../Core/SmoothedValue.h"
 #include "../Core/RingBuffer.h"
@@ -516,6 +517,10 @@ public:
                      ? fbLastOutput_[channel] : input);
         if (scHpf) detectorIn = applySidechainHPF(detectorIn, channel);
         detectorIn = keyEq_.processSample(detectorIn, channel);
+        // The settings of the audio path that are not the plain gain, once per frame.
+        if (channel == 0) (void)syncAudioPath();
+        const T detectorRead = (asymAmount_ != T(0) && rectifies(detTypeEff)) ? asymmetric(detectorIn, channel)
+                                                                              : detectorIn;
 
         const bool layered = isLayered(profile, modeType);
         syncLayerState(layered);
@@ -536,7 +541,7 @@ public:
             }
         }
 
-        T levelDb = detectLevel(detectorIn, channel, detTypeEff);
+        T levelDb = detectLevel(detectorRead, channel, detTypeEff);
 
         const GainPathConfig cfg { charType, modeType, topoEff, fbImplicit, splitAdaptive, decoupled,
                                    feedbackDetectorDelay(detTypeEff), program_.active, layered };
@@ -593,9 +598,10 @@ public:
             makeup += analyticSmooth_.getCurrentValue();
         }
 
-        T output = (colorAmt > T(0) && profile.colour == Colour::PushPull)
-                 ? pushPullElement(input, smoothedGainLinear, colorAmt)
-                 : input * smoothedGainLinear;
+        const bool pushPull = colorAmt > T(0) && profile.colour == Colour::PushPull;
+        const bool extras = audioExtras_ && !pushPull;
+        T output = pushPull ? pushPullElement(input, smoothedGainLinear, colorAmt)
+                 : (extras ? gained(input, smoothedGainLinear, channel) : input * smoothedGainLinear);
         if (colorAmt > T(0) && profile.colour == Colour::SecondOrder)
         {
             // Same 2nd-order FET channel modulation as the block path.
@@ -608,7 +614,7 @@ public:
         // The feedback detector reads the compressed signal BEFORE makeup:
         // makeup is applied after the element, so feeding it back would shift
         // the static curve by the makeup (and run away with auto makeup).
-        fbLastOutput_[channel] = heardApart ? input * loopGainLinear : output;
+        fbLastOutput_[channel] = (heardApart || extras) ? input * loopGainLinear : output;
         output *= makeupToGain(makeup);
         gainReductionDb_.store(smoothedGR_Db, std::memory_order_relaxed);
         // Key listen: what the detector heard goes out instead.
@@ -621,6 +627,9 @@ public:
     void reset() noexcept
     {
         keyEq_.reset();
+        toneLow_.reset();
+        toneHigh_.reset();
+        toneActive_ = false;       // designed again, for the rate in use, at the next block
         linkLL_ = linkRR_ = linkLR_ = 0.0;
         stageBefore_.reset();
         stageAfter_.reset();
@@ -652,6 +661,8 @@ public:
             gainSmoothB_[ch] = 0.0;
             landingDb_[ch] = 0.0;
             networkLow_[ch] = 0.0;
+            leakBase_[ch] = T(1);
+            asymCrest_[ch] = T(0);
             balanceBands_[ch] = {};
             hybridMeanSq_[ch] = 0.0;
             lookaheadBuffers_[ch].reset();
@@ -1459,6 +1470,101 @@ public:
     /** @brief Corner of the network in the control path, in Hz (setControlNetwork()). */
     [[nodiscard]] T getControlNetworkCorner() const noexcept { return networkCornerHz_.load(std::memory_order_relaxed); }
 
+    /** @brief Corner of the low shelf of the tone that follows the reduction, in Hz (setReductionTone()). */
+    static constexpr double kReductionToneLowHz = 200.0;
+    /** @brief Corner of its high shelf, in Hz. */
+    static constexpr double kReductionToneHighHz = 4000.0;
+
+    /**
+     * @brief Makes the tone change with the reduction.
+     *
+     * The gain then acts on a copy of the signal that has passed a nearly
+     * flat filter F, and what that copy loses is taken off the signal:
+     * y = x - (1 - g) F(x). With no reduction the output is the input, bit
+     * for bit; as the gain falls the response leans in proportion to what is
+     * taken off, as it does with a gain element that sits inside a network
+     * that depends on frequency. F is a low shelf at 200 Hz and a high shelf
+     * at 4 kHz, each with its own gain. Where F is over 0 dB the reduction is
+     * deeper than the gain asked for, and where it is under, shallower: with
+     * 12 dB of reduction, +1 dB makes it 3.9 dB deeper and -1 dB 2.4 dB
+     * shallower. A negative `highDb` keeps the top while the compressor
+     * works, and a negative `lowDb` the weight. Both at 0 (the default): off.
+     *
+     * It does not act with the push-pull element (setCharacterColor() on
+     * Varimu), which applies the gain through its own curve, and a feedback
+     * loop keeps reading the plain gain. While it is on, processBlock() runs
+     * frame by frame instead of in the passes of the feed-forward path.
+     *
+     * State keys "toneLow" and "toneHigh" (absent = 0).
+     *
+     * @param lowDb  Gain of F under 200 Hz, -3 to +3 dB. Non-finite values are ignored.
+     * @param highDb Gain of F over 4 kHz, -3 to +3 dB. Non-finite values are ignored.
+     */
+    void setReductionTone(T lowDb, T highDb) noexcept
+    {
+        if (std::isfinite(lowDb)) toneLowDb_.store(std::clamp(lowDb, T(-3), T(3)), std::memory_order_relaxed);
+        if (std::isfinite(highDb)) toneHighDb_.store(std::clamp(highDb, T(-3), T(3)), std::memory_order_relaxed);
+    }
+
+    /** @brief Gain under 200 Hz of the tone that follows the reduction, in dB (setReductionTone()). */
+    [[nodiscard]] T getReductionToneLow() const noexcept { return toneLowDb_.load(std::memory_order_relaxed); }
+
+    /** @brief Its gain over 4 kHz, in dB. */
+    [[nodiscard]] T getReductionToneHigh() const noexcept { return toneHighDb_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Lets the moves of the gain leak into the audio as low thumps
+     *        (0, the default, is off).
+     *
+     * What a gain element lets through of its own control: the gain, through
+     * a high-pass of 5 Hz, is added to the output of the element. A settled
+     * gain adds nothing; every attack and every release leaves a thump under
+     * the programme, in proportion to how far the gain moved. At 1 a gain
+     * that falls at once from 1 to a half leaves a thump that starts at
+     * -32 dBFS. A feedback loop keeps reading the plain gain. While it is
+     * on, processBlock() runs frame by frame.
+     *
+     * State key "controlLeak" (absent = 0).
+     *
+     * @param amount 0 to 1. Non-finite values are ignored.
+     */
+    void setControlLeak(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        controlLeak_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief How much of the moves of the gain leaks into the audio (setControlLeak()). */
+    [[nodiscard]] T getControlLeak() const noexcept { return controlLeak_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Makes the detector read the two halves of the wave differently
+     *        (0, the default, is off).
+     *
+     * A share of the key's own crest (its peak, held for 50 ms) is added to
+     * the key before it is rectified, and the sum is scaled back so that the
+     * half the share favours still reads the crest: the other half reads
+     * (1 - |a|) / (1 + |a|) of it. The gain then moves at the frequency of
+     * the signal and not at twice it, which gives the modulation the colour
+     * of a second harmonic, as an unbalanced rectifier does, and a signal
+     * that is not symmetric is read differently from its inverse. The level
+     * a held tone settles on is the same. It acts with the detectors that
+     * rectify the key (Peak, TruePeak and Hybrid); positive values favour
+     * the positive half. While it is on, processBlock() runs frame by frame.
+     *
+     * State key "detectorAsymmetry" (absent = 0).
+     *
+     * @param amount -1 to +1. Non-finite values are ignored.
+     */
+    void setDetectorAsymmetry(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        detectorAsymmetry_.store(std::clamp(amount, T(-1), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief How differently the detector reads the two halves of the wave (setDetectorAsymmetry()). */
+    [[nodiscard]] T getDetectorAsymmetry() const noexcept { return detectorAsymmetry_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Selects the Clean character's feed-forward ballistics.
      *
@@ -1712,6 +1818,10 @@ public:
         w.write("releaseLanding", static_cast<float>(landingMs_.load(std::memory_order_relaxed)));
         w.write("networkDepth", static_cast<float>(networkDepthDb_.load(std::memory_order_relaxed)));
         w.write("networkCorner", static_cast<float>(networkCornerHz_.load(std::memory_order_relaxed)));
+        w.write("toneLow", static_cast<float>(toneLowDb_.load(std::memory_order_relaxed)));
+        w.write("toneHigh", static_cast<float>(toneHighDb_.load(std::memory_order_relaxed)));
+        w.write("controlLeak", static_cast<float>(controlLeak_.load(std::memory_order_relaxed)));
+        w.write("detectorAsymmetry", static_cast<float>(detectorAsymmetry_.load(std::memory_order_relaxed)));
         return w.blob();
     }
 
@@ -1773,6 +1883,9 @@ public:
         setGainSmoothing(static_cast<T>(r.read("gainSmoothing", 0.0f)));
         setReleaseLanding(static_cast<T>(r.read("releaseLanding", 0.0f)));
         setControlNetwork(static_cast<T>(r.read("networkDepth", 0.0f)), static_cast<T>(r.read("networkCorner", 10.0f)));
+        setReductionTone(static_cast<T>(r.read("toneLow", 0.0f)), static_cast<T>(r.read("toneHigh", 0.0f)));
+        setControlLeak(static_cast<T>(r.read("controlLeak", 0.0f)));
+        setDetectorAsymmetry(static_cast<T>(r.read("detectorAsymmetry", 0.0f)));
         return true;
     }
 
@@ -1831,6 +1944,9 @@ protected:
             updateHpfCoefficients();
         const bool keyEqOn = keyEq_.sync();
         const bool listen = scListen_.load(std::memory_order_relaxed);
+        // What is not the plain gain (a tone that follows the reduction, the
+        // leak of the control, a detector that is not symmetric) runs frame by frame.
+        const bool sampleWise = syncAudioPath();
 
         // Apply a pending RMS window change here, on the audio thread.
         if (rmsWindowDirty_.exchange(false, std::memory_order_acquire))
@@ -1944,7 +2060,7 @@ protected:
         const bool feedForward = topoEff == Topology::FeedForward;
         const bool element = profile.colour == Colour::PushPull
                           && (colorAmt > T(0) || colorSmooth_.isSmoothing());
-        if (feedForward && !precise && !element)
+        if (feedForward && !precise && !element && !sampleWise)
         {
             const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
                                          activeLookahead, scHpf, shared, decoupled,
@@ -1962,6 +2078,7 @@ protected:
         // kDetectorPoints points per sample, kDetectorDelay samples late, and
         // the audio waits for them. The others keep one level per sample.
         const bool points = precise && readsBetweenSamples(detTypeEff);
+        const bool lopsided = asymAmount_ != T(0) && rectifies(detTypeEff);
         const int count = points ? kDetectorPoints : 1;
         const int audioDelay = activeLookahead + (points ? kDetectorDelay : 0);
         const int gainDelay = (feedForward || keyedLoop) ? activeLookahead - lookaheadSamples_ : 0;
@@ -2030,6 +2147,7 @@ protected:
                 if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
                 if (keyEqOn) detectorIn = keyEq_.processSample(detectorIn, ch);
                 heard[ch] = detectorIn;
+                if (lopsided) detectorIn = asymmetric(detectorIn, ch);
 
                 // dB is monotonic in the linear level, so the linked level is
                 // the dB of the largest linear level (one log per frame and
@@ -2751,8 +2869,10 @@ protected:
         // outLin is the gain that is heard (gainLin scaled by the amount);
         // gainLin is the one the loop reads back.
         const Colour colour = profileOf(charType).colour;
-        T wet = (colorAmt > T(0) && colour == Colour::PushPull) ? pushPullElement(input, outLin, colorAmt)
-                                                                : input * outLin;
+        const bool pushPull = colorAmt > T(0) && colour == Colour::PushPull;
+        const bool extras = audioExtras_ && !pushPull;
+        T wet = pushPull ? pushPullElement(input, outLin, colorAmt)
+                         : (extras ? gained(input, outLin, ch) : input * outLin);
         if (colorAmt > T(0) && colour == Colour::SecondOrder)
         {
             // 2nd-order FET channel modulation: the drain-source resistance
@@ -2769,7 +2889,7 @@ protected:
         // The feedback detector reads the compressed signal before makeup
         // (makeup sits after the element; feeding it back would shift the
         // static curve and run away with auto makeup).
-        fbLastOutput_[ch] = (outLin == gainLin) ? wet : input * gainLin;
+        fbLastOutput_[ch] = (outLin == gainLin && !extras) ? wet : input * gainLin;
         const T kept = wet;
         wet *= makeupLin;
 
@@ -2873,6 +2993,8 @@ protected:
             const double corner = static_cast<double>(networkCornerHz_.load(std::memory_order_relaxed));
             networkShare_ = (depth > 0.0) ? std::pow(10.0, -depth / 20.0) : 1.0;
             networkRate_ = 1.0 - std::exp(-2.0 * std::numbers::pi * corner / rate);
+            leakCoeff_ = static_cast<T>(1.0 - std::exp(-2.0 * std::numbers::pi * kLeakCornerHz / rate));
+            asymDecay_ = static_cast<T>(std::exp(-1.0 / (rate * kAsymCrestSeconds)));
         }
 
         // The attack as it is observed (a feedback loop, below, changes the
@@ -3780,6 +3902,92 @@ protected:
         const double u = std::exp(std::clamp(drive * static_cast<double>(input), -30.0, 30.0));
         const double pair = 0.5 * std::log1p(e * (u - 1.0 / u) / (1.0 + e / u));
         return static_cast<T>(pair * (g / slope) / drive);
+    }
+
+    // ---- The audio path beyond the plain gain ----
+
+    /** @brief Whether a detector rectifies the key (the ones an asymmetry makes sense for). */
+    [[nodiscard]] static bool rectifies(DetectorType detType) noexcept
+    {
+        return detType == DetectorType::Peak || detType == DetectorType::TruePeak || detType == DetectorType::Hybrid;
+    }
+
+    /**
+     * @brief Takes the settings of the audio path that are not the plain gain
+     *        (the tone that follows the reduction, the leak of the control,
+     *        the asymmetry of the detector). Audio thread only.
+     * @return Whether the block has to run frame by frame for any of them.
+     */
+    bool syncAudioPath() noexcept
+    {
+        const T low = toneLowDb_.load(std::memory_order_relaxed), high = toneHighDb_.load(std::memory_order_relaxed);
+        const bool tone = low != T(0) || high != T(0);
+        if (tone && (!toneActive_ || low != toneLowIn_ || high != toneHighIn_))
+        {
+            toneLow_.setCoeffsNow(BiquadCoeffs::makeLowShelfMatched(sampleRate_, kReductionToneLowHz,
+                                                                   static_cast<double>(low)));
+            toneHigh_.setCoeffsNow(BiquadCoeffs::makeHighShelfMatched(sampleRate_, kReductionToneHighHz,
+                                                                     static_cast<double>(high)));
+            if (!toneActive_)
+            {
+                toneLow_.reset();
+                toneHigh_.reset();
+            }
+            toneLowIn_ = low;
+            toneHighIn_ = high;
+        }
+        toneActive_ = tone;
+
+        // The leak starts from the gain that is sounding: switching it on leaves no thump.
+        const T leak = controlLeak_.load(std::memory_order_relaxed);
+        if (leak > T(0) && !(leakAmount_ > T(0)))
+            leakBase_.fill(decibelsToGain(gainReductionDb_.load(std::memory_order_relaxed)));
+        leakAmount_ = leak;
+
+        asymAmount_ = detectorAsymmetry_.load(std::memory_order_relaxed);
+        audioExtras_ = toneActive_ || leakAmount_ > T(0);
+        return audioExtras_ || asymAmount_ != T(0);
+    }
+
+    /**
+     * @brief The gain on one sample of a channel when it is not a plain
+     *        product: through the tone that follows the reduction, and with
+     *        what leaks of the control.
+     */
+    [[nodiscard]] T gained(T input, T gain, int ch) noexcept
+    {
+        T wet = input * gain;
+        if (toneActive_)
+        {
+            // y = x - (1 - g) F(x): at no reduction, the input itself.
+            const T shaped = toneHigh_.processSample(
+                toneLow_.processSample(std::isfinite(input) ? input : T(0), ch), ch);
+            wet = input - (T(1) - gain) * shaped;
+        }
+        if (leakAmount_ > T(0))
+        {
+            // The gain through a high-pass: what it is over its own slow copy.
+            T& base = leakBase_[static_cast<size_t>(ch)];
+            const T moved = gain - base;
+            if (std::abs(moved) < T(1e-7)) base = gain;     // (end the tail: a settled gain adds exactly nothing)
+            else
+            {
+                base += leakCoeff_ * moved;
+                wet += leakAmount_ * static_cast<T>(kLeakLevel) * moved;
+            }
+        }
+        return wet;
+    }
+
+    /**
+     * @brief The key with a share of its own crest added, scaled so that the
+     *        half the share favours still reads the crest.
+     */
+    [[nodiscard]] T asymmetric(T key, int ch) noexcept
+    {
+        T& crest = asymCrest_[static_cast<size_t>(ch)];
+        crest = std::max(std::abs(key), crest * asymDecay_);
+        return (key + asymAmount_ * crest) / (T(1) + std::abs(asymAmount_));
     }
 
     /** @brief Whether anything stands between the ballistics and the gain: the landing, the network or the smoothing. */
@@ -5266,6 +5474,24 @@ protected:
     double networkRate_ = 0.0;                      ///< Coefficient of its low-pass.
     std::array<double, kMaxChannels> networkLow_ {};
     bool networkActive_ = false;
+
+    // The audio path beyond the plain gain.
+    static constexpr double kLeakCornerHz = 5.0;    ///< High-pass the gain leaks through.
+    static constexpr double kLeakLevel = 0.05;      ///< What a gain that moves by 1 leaks, at an amount of 1.
+    static constexpr double kAsymCrestSeconds = 0.05;   ///< Fall of the crest the asymmetric detector adds.
+    std::atomic<T> toneLowDb_ { T(0) }, toneHighDb_ { T(0) };   ///< setReductionTone().
+    std::atomic<T> controlLeak_ { T(0) };           ///< setControlLeak().
+    std::atomic<T> detectorAsymmetry_ { T(0) };     ///< setDetectorAsymmetry().
+    Biquad<T, kMaxChannels> toneLow_ {}, toneHigh_ {};   ///< The filter F of the tone (audio thread).
+    T toneLowIn_ = T(0), toneHighIn_ = T(0);        ///< The gains those were designed for.
+    bool toneActive_ = false;                       ///< The tone is in the path.
+    T leakAmount_ = T(0);                           ///< The leak as the audio thread took it.
+    T leakCoeff_ = T(0);
+    std::array<T, kMaxChannels> leakBase_ {};       ///< The slow copy of each channel's gain.
+    T asymAmount_ = T(0);                           ///< The asymmetry as the audio thread took it.
+    T asymDecay_ = T(0);
+    std::array<T, kMaxChannels> asymCrest_ {};      ///< The crest of each channel's key.
+    bool audioExtras_ = false;                      ///< The gain is not a plain product (tone or leak).
     bool adaptiveMakeupActive_ = false; ///< Adaptive makeup ran last (audio thread).
     std::array<T, kMaxChannels> upwardGuardDb_ {};  ///< Peak-held sustained level (Upward guard).
     T upwardGuardDecay_ = T(0.00125);               ///< Guard decay per sample (60 dB/s).

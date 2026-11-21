@@ -6,6 +6,18 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Resonant shelves and a second-order tilt. `AnalogSection::lowShelfQ()` and
+  `highShelfQ()` take the Q of the section: above 0.7071 the response rises
+  over the plateau before the corner and dips after it (0.78, 4.58 and 9.79 dB
+  over a plateau of +12 dB at a Q of 1, 2 and 4), with the plateau, the half
+  gain at the corner and the inverse cut exact, and `FilterDesign::lowShelf()`
+  and `highShelf()` take that Q for the sharpest pair of a shelf of a higher
+  order; the digital section follows within 0.01 dB to 20 kHz at 48 kHz.
+  `AnalogSection::tiltSecondOrder()` tilts by 12 dB per octave at most (5.10 dB
+  an octave above the pivot for a tilt of 12 dB, where the first-order one
+  gives 3.26). In `Equalizer`, `setResonantShelves()` (off by default, where a
+  shelf's Q above 0.7071 is read as 0.7071, as before) lets a shelf take such
+  a Q, and a `Tilt` of order 2 is the second-order one.
 - `Equalizer::getAnalogBandResponse()`: the response of a band of the analog
   response as its sections are at this moment, a glide in flight included
   (audio thread).

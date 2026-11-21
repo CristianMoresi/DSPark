@@ -3172,3 +3172,87 @@ DSPARK_TEST(SpectralFilter_short_kernel_rings_for_less_time)
         EXPECT_LT(depth[1], -6.0);
     }
 }
+
+// New: SpectralFocus. The complex spectrum smoothed across frequency, with
+// the time origin on the window's peak: each bin is read through a window of
+// its own, shorter as frequency rises. A noise reads the same through it (the
+// powers are scaled by each bin's own window), and a tone that starts is seen
+// sooner in the top than through the whole window.
+DSPARK_TEST(SpectralFocus_shortens_the_window_as_frequency_rises)
+{
+    constexpr int kN = 2048, kBins = kN / 2 + 1, kHop = 64;
+    std::vector<double> window(kN);
+    WindowFunctions<double>::hann(window.data(), kN, true);
+    FFTReal<double> fft(kN);
+    SpectralFocus<double> focus;
+    focus.prepare(window.data(), kN, kN, 1.0 / 3.0);
+    EXPECT_EQ(focus.getNumBins(), kBins);
+    std::vector<double> frame(kN), spectrum(kN + 2), focused(kBins), plain(kBins);
+
+    // A white noise, many frames: the mean power per octave through the focus against the plain one.
+    {
+        const std::vector<float> noise = sfNoise(48000 * 2, 5u);
+        std::vector<double> sumFocused(kBins, 0.0), sumPlain(kBins, 0.0);
+        for (size_t at = 0; at + kN <= noise.size(); at += 512)
+        {
+            for (int i = 0; i < kN; ++i) frame[static_cast<size_t>(i)] = static_cast<double>(noise[at + static_cast<size_t>(i)]) * window[static_cast<size_t>(i)];
+            fft.forward(frame.data(), spectrum.data());
+            focus.power(spectrum.data(), focused.data());
+            for (int k = 0; k < kBins; ++k)
+            {
+                sumFocused[static_cast<size_t>(k)] += focused[static_cast<size_t>(k)];
+                sumPlain[static_cast<size_t>(k)] += spectrum[2 * static_cast<size_t>(k)] * spectrum[2 * static_cast<size_t>(k)]
+                                                  + spectrum[2 * static_cast<size_t>(k) + 1] * spectrum[2 * static_cast<size_t>(k) + 1];
+            }
+        }
+        double worst = 0.0;
+        for (int lo = 8; lo < kBins / 2; lo *= 2)
+        {
+            double a = 0.0, b = 0.0;
+            for (int k = lo; k < 2 * lo; ++k) { a += sumFocused[static_cast<size_t>(k)]; b += sumPlain[static_cast<size_t>(k)]; }
+            worst = std::max(worst, std::abs(10.0 * std::log10(a / b)));
+            std::printf("  [focus] bins %d to %d: %+.2f dB\n", lo, 2 * lo - 1, 10.0 * std::log10(a / b));
+        }
+        std::printf("  [focus] a white noise by octaves: the focused power stands within %.2f dB of the plain one\n", worst);
+        EXPECT_LT(worst, 0.4);
+    }
+
+    // A tone that starts: hops until its bin reaches 10 % and 90 % of its final power.
+    const auto rise = [&](double hz, bool useFocus) {
+        const int start = 4096, total = 4096 + 3 * kN;
+        std::vector<double> x(static_cast<size_t>(total), 0.0);
+        for (int i = start; i < total; ++i) x[static_cast<size_t>(i)] = std::sin(2.0 * 3.14159265358979323846 * hz * (i - start) / 48000.0);
+        const int bin = static_cast<int>(std::lround(hz / 48000.0 * kN));
+        std::vector<double> track;
+        for (int at = start - kN; at + kN <= total; at += kHop)
+        {
+            for (int i = 0; i < kN; ++i) frame[static_cast<size_t>(i)] = x[static_cast<size_t>(at + i)] * window[static_cast<size_t>(i)];
+            fft.forward(frame.data(), spectrum.data());
+            if (useFocus)
+            {
+                focus.power(spectrum.data(), focused.data());
+                track.push_back(focused[static_cast<size_t>(bin)]);
+            }
+            else
+            {
+                track.push_back(spectrum[2 * static_cast<size_t>(bin)] * spectrum[2 * static_cast<size_t>(bin)]
+                              + spectrum[2 * static_cast<size_t>(bin) + 1] * spectrum[2 * static_cast<size_t>(bin) + 1]);
+            }
+        }
+        const double last = track.back();
+        int low = -1, high = -1;
+        for (size_t i = 0; i < track.size(); ++i)
+        {
+            if (low < 0 && track[i] >= 0.1 * last) low = static_cast<int>(i);
+            if (high < 0 && track[i] >= 0.9 * last) high = static_cast<int>(i);
+        }
+        return 1000.0 * (high - low) * kHop / 48000.0;   // ms
+    };
+    const double plainTop = rise(8000.0, false), focusTop = rise(8000.0, true);
+    const double plainLow = rise(100.0, false), focusLow = rise(100.0, true), focusMid = rise(1000.0, true);
+    std::printf("  [focus] a tone that starts, 10 to 90 %% of its power: 8 kHz in %.1f ms through the focus (%.1f plain), 1 kHz in %.1f, 100 Hz in %.1f (%.1f plain)\n",
+                focusTop, plainTop, focusMid, focusLow, plainLow);
+    EXPECT_LT(focusTop, 0.5 * plainTop);
+    EXPECT_LT(focusTop, focusMid);
+    EXPECT_LT(focusMid, focusLow + 1.0);
+}

@@ -29,7 +29,10 @@
  * with its gain), and is kept only when it brings the response nearer: a
  * shape the sections cannot follow (a zigzag from band to band, finer than
  * their width) keeps the regularized first solution, its section gains
- * bounded (30 dB).
+ * bounded (30 dB). A caller whose gains move a little at a time can refine
+ * one call in several and ask the others to carry what the last refinement
+ * added (kCarryRefinement): the response then does not step back and forth
+ * between the refined solution and the plain one.
  *
  * One channel runs on a LaneCascade (the cascade on the lanes of a vector,
  * latency Lanes - 1 samples); two or more run on a BiquadCascade, which
@@ -69,6 +72,8 @@ class GraphicBank
 {
 public:
     static constexpr int kMaxBands = 256;
+    /** @brief setGains(): no refining step; the correction of the last refining call is added instead. */
+    static constexpr int kCarryRefinement = -1;
 
     /**
      * @brief Lays the bank out (allocates).
@@ -164,6 +169,7 @@ public:
         response_.assign(static_cast<size_t>(grid_), 0.0);
         gains_.assign(static_cast<size_t>(nb_), 0.0);
         candidate_.assign(static_cast<size_t>(nb_), 0.0);
+        correction_.assign(static_cast<size_t>(nb_), 0.0);
         useLanes_ = channels <= 1;
         if (useLanes_)
         {
@@ -189,7 +195,8 @@ public:
      * @brief The gains asked of the bands.
      * @param gainsDb     getNumBands() gains in dB (clamped to +-24).
      * @param rampSamples Samples over which the sections glide to them.
-     * @param refine      Refining steps (0 to 3) on the real response.
+     * @param refine      Refining steps (0 to 3) on the real response, or
+     *                    kCarryRefinement.
      */
     void setGains(const T* gainsDb, int rampSamples, int refine = 1) noexcept
     {
@@ -202,6 +209,15 @@ public:
         }
         solve(target_.data(), gains_.data(), false);
         for (auto& g : gains_) g = std::clamp(g, -kMaxSectionDb, kMaxSectionDb);
+        if (refine == kCarryRefinement)
+        {
+            for (int s = 0; s < nb_; ++s)
+                gains_[static_cast<size_t>(s)] = std::clamp(gains_[static_cast<size_t>(s)] + correction_[static_cast<size_t>(s)], -kMaxSectionDb, kMaxSectionDb);
+        }
+        else
+        {
+            correction_ = gains_;   // the plain solution, until the refinement is known
+        }
         // Refining: a step on what the real response misses, kept only if it
         // brings the response nearer (a shape the sections cannot follow,
         // such as a zigzag from band to band, keeps the first solution).
@@ -220,6 +236,10 @@ public:
                 err = next;
             }
         }
+        // What the refinement added to the plain solution (nothing without it).
+        if (refine != kCarryRefinement)
+            for (int s = 0; s < nb_; ++s)
+                correction_[static_cast<size_t>(s)] = gains_[static_cast<size_t>(s)] - correction_[static_cast<size_t>(s)];
         if (useLanes_)
         {
             for (int s = 0; s < nb_; ++s)
@@ -332,7 +352,7 @@ private:
 
     double fs_ = 48000.0;
     int nb_ = 0, grid_ = 0;
-    std::vector<double> cw_, alpha_, centre_, p_, target_, response_, gains_, candidate_;
+    std::vector<double> cw_, alpha_, centre_, p_, target_, response_, gains_, candidate_, correction_;
     std::vector<std::complex<double>> z1_;
     bool useLanes_ = true;
     LaneCascade<T, Lanes> lanes_;

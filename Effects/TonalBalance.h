@@ -20,8 +20,11 @@
  * spread). In each band the covariance of the two channels is smoothed in
  * time, longer in the low end, and the band's power is its larger
  * eigenvalue: the level of the dominant component wherever it sits in the
- * stereo image. The specific loudness of each band (the power law over the
- * threshold in quiet) is smoothed in time and read in decibels of power.
+ * stereo image. The cross term of that covariance is complex (one spectrum
+ * times the conjugate of the other), so a channel that is the other one
+ * delayed reads as one source and leaves no comb in the band powers. The
+ * specific loudness of each band (the power law over the threshold in
+ * quiet) is smoothed in time and read in decibels of power.
  *
  * Each band counts by how audible it is: nothing while its power is under
  * its threshold in quiet, in full from 10 dB over it. In the bands at the
@@ -44,16 +47,20 @@
  * corrections are limited
  * (setRange()), faded at the edges of setFrequencyRange() over one Bark, and
  * then offset so the total loudness of the programme does not change (the
- * correction redistributes). setLevelCompensation(true) converts loudness
- * to decibels with each band's own loudness exponent (the low end, whose
- * loudness grows faster with level, moves less in decibels for the same
- * change of loudness).
+ * correction redistributes): the offset is solved with the limits and the
+ * edges of the range in place, so the sum is exact whenever the bands in
+ * range have room to move (getLoudnessChange() reads what is left).
+ * setLevelCompensation(true) converts loudness to decibels with each band's
+ * own loudness exponent (the low end, whose loudness grows faster with
+ * level, moves less in decibels for the same change of loudness).
  *
  * The gains drive a GraphicBank (a bell per band, a shelf at each end,
  * their gains solved by least squares so the bank's response is the one
- * asked for) whose sections glide over each hop. The programme is delayed
- * to line up with the analysis. processBlock(buffer, key) analyses an
- * external key instead, with a fade of 50 ms when the key comes and goes.
+ * asked for) whose sections glide over each hop; the bank refines its
+ * solution one hop in eight and carries that correction over the others, so
+ * its response does not step with a period of eight hops. The programme is
+ * delayed to line up with the analysis. processBlock(buffer, key) analyses
+ * an external key instead, with a fade of 50 ms when the key comes and goes.
  *
  * Latency: the analysis delay, about 16 ms at 48 kHz, plus 7 samples of the
  * bank in mono (getLatency()).
@@ -138,7 +145,7 @@ public:
         frame_.assign(static_cast<size_t>(fft_), 0.0);
         binPower_.assign(static_cast<size_t>(bins_), 0.0);
         binSmooth_.assign(static_cast<size_t>(bins_), 0.0);
-        for (auto* v : { &ll_, &rr_, &lr_, &loud_, &corr_, &tmpA_, &tmpB_, &tmpC_ }) v->assign(kBands, 0.0);
+        for (auto* v : { &ll_, &rr_, &lr_, &li_, &loud_, &corr_, &tmpA_, &tmpB_, &tmpC_, &tmpD_ }) v->assign(kBands, 0.0);
         for (int b = 0; b < kBands; ++b)
         {
             const double tau = 0.001 * std::clamp(200.0 * std::pow(1000.0 / bands_.getCentre(b), 0.3), 20.0, 2000.0);
@@ -153,7 +160,7 @@ public:
     {
         for (auto& r : ring_) std::fill(r.begin(), r.end(), 0.0);
         for (auto& d : delay_) std::fill(d.begin(), d.end(), T(0));
-        for (auto* v : { &ll_, &rr_, &lr_, &loud_, &corr_ }) std::fill(v->begin(), v->end(), 0.0);
+        for (auto* v : { &ll_, &rr_, &lr_, &li_, &loud_, &corr_ }) std::fill(v->begin(), v->end(), 0.0);
         ringPos_ = delayPos_ = hopCounter_ = hops_ = 0;
         keyFade_ = 0.0;
         warm_ = false;
@@ -161,6 +168,7 @@ public:
         std::array<T, kBands> zero {};
         bank_.setGains(zero.data(), 0, 0);
         for (auto& g : published_) g.store(T(0), std::memory_order_relaxed);
+        loudnessChange_.store(T(0), std::memory_order_relaxed);
     }
 
     // -- Controls ------------------------------------------------------------
@@ -210,6 +218,13 @@ public:
     {
         return published_[static_cast<size_t>(std::clamp(band, 0, kBands - 1))].load(std::memory_order_relaxed);
     }
+    /**
+     * @return The change of the programme's total loudness the corrections
+     *         make, in dB of the loudness ratio: 0 while it is conserved,
+     *         away from 0 only when the limits leave the bands in range no
+     *         room to make up for it (a readout for any thread).
+     */
+    [[nodiscard]] T getLoudnessChange() const noexcept { return loudnessChange_.load(std::memory_order_relaxed); }
     /** @return The bank's response at a frequency in dB (audio thread or after processing). */
     [[nodiscard]] double getResponse(double hz) const noexcept { return bank_.responseDb(hz); }
 
@@ -342,6 +357,7 @@ private:
         {
             bandsOf([&](int k) { return powerScale_ * (s1[2 * k] * s1[2 * k] + s1[2 * k + 1] * s1[2 * k + 1]); }, tmpB_);
             bandsOf([&](int k) { return powerScale_ * (s0[2 * k] * s1[2 * k] + s0[2 * k + 1] * s1[2 * k + 1]); }, tmpC_);
+            bandsOf([&](int k) { return powerScale_ * (s0[2 * k + 1] * s1[2 * k] - s0[2 * k] * s1[2 * k + 1]); }, tmpD_);
         }
         // The covariance in time, longer in the low end; the dominant power.
         for (int b = 0; b < kBands; ++b)
@@ -353,7 +369,8 @@ private:
             {
                 rr_[i] = tmpB_[i] + c * (rr_[i] - tmpB_[i]);
                 lr_[i] = tmpC_[i] + c * (lr_[i] - tmpC_[i]);
-                tmpA_[i] = AuditoryScale::dominantPower(ll_[i], rr_[i], lr_[i]);
+                li_[i] = tmpD_[i] + c * (li_[i] - tmpD_[i]);
+                tmpA_[i] = AuditoryScale::dominantPower(ll_[i], rr_[i], lr_[i], li_[i]);
             }
             else
             {
@@ -454,29 +471,76 @@ private:
             c = std::clamp(c, -range, range) * weight[i];
             corr_[i] = c;
         }
-        // The total loudness stays: offset every band by the same loudness ratio.
-        double before = 0.0, after = 0.0;
+        // The total loudness stays: every band in range takes the same
+        // loudness ratio (by its weight), found with the limits in place: a
+        // band at its limit or out of the range gives nothing, so the others
+        // make up for it. The loudness after an offset rises with it; a few
+        // steps on its logarithm (exact in one when no band is held) with a
+        // bracket find where it meets the loudness before.
+        constexpr double kPerDb = 0.23025850929940457;   // ln(10) / 10
+        std::array<double, kBands> part {};
+        double before = 0.0;
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            const double w = (b == 0 || b == kBands - 1) ? 0.5 : 1.0;
-            before += w * loud_[i];
-            after += w * loud_[i] * std::pow(10.0, exponent[i] * corr_[i] / 10.0);
+            part[i] = ((b == 0 || b == kBands - 1) ? 0.5 : 1.0) * loud_[i];
+            before += part[i];
         }
-        const double k = after > 1e-20 ? before / after : 1.0;
+        const auto loudnessAt = [&](double offset, double& slope) {
+            double sum = 0.0;
+            slope = 0.0;
+            for (int b = 0; b < kBands; ++b)
+            {
+                const auto i = static_cast<size_t>(b);
+                const double raw = corr_[i] + offset * weight[i] / exponent[i];
+                const double l = part[i] * std::exp(kPerDb * exponent[i] * std::clamp(raw, -range, range));
+                sum += l;
+                if (raw > -range && raw < range) slope += l * kPerDb * weight[i];
+            }
+            return sum;
+        };
+        double offset = 0.0, change = 0.0;
+        if (before > 1e-20)
+        {
+            double under = -kOffsetLimit, over = kOffsetLimit;   // the offset lies between them
+            bool measured = false;   // whether `change` was read at the offset kept
+            for (int step = 0; step < kOffsetSteps; ++step)
+            {
+                double slope = 0.0;
+                const double after = loudnessAt(offset, slope);
+                change = std::log(std::max(after, 1e-300) / before);
+                measured = true;
+                if (std::abs(change) < 1e-9 || !(slope > 1e-30 * before)) break;
+                if (change > 0.0) over = offset; else under = offset;
+                const double next = offset - change * after / slope;
+                offset = next > under && next < over ? next : 0.5 * (under + over);
+                measured = false;
+            }
+            if (!measured)
+            {
+                double slope = 0.0;
+                change = std::log(std::max(loudnessAt(offset, slope), 1e-300) / before);
+            }
+            change /= kPerDb;
+        }
+        loudnessChange_.store(static_cast<T>(change), std::memory_order_relaxed);
         std::array<T, kBands> gains {};
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            corr_[i] = std::clamp(corr_[i] + 10.0 * std::log10(k) / exponent[i] * weight[i], -range, range);
+            corr_[i] = std::clamp(corr_[i] + offset * weight[i] / exponent[i], -range, range);
             gains[i] = static_cast<T>(corr_[i]);
             published_[i].store(gains[i], std::memory_order_relaxed);
         }
-        bank_.setGains(gains.data(), hop_, (hops_++ & 7) == 0 ? 1 : 0);
+        // The bank refines one hop in eight and carries that correction over
+        // the others, so its response does not step with a period of eight hops.
+        bank_.setGains(gains.data(), hop_, (hops_++ & 7) == 0 ? 1 : GraphicBank<T, 8>::kCarryRefinement);
     }
 
     static constexpr double kAudibleSpan = 10.0;  ///< dB over the threshold in quiet from which a band counts in full.
     static constexpr double kSidePole = 0.9;      ///< Pole of the one-sided averages a dip or a peak is read against.
+    static constexpr double kOffsetLimit = 60.0;  ///< Largest loudness offset looked for, in dB.
+    static constexpr int kOffsetSteps = 8;        ///< Steps of the search for the loudness offset.
 
     double fs_ = 48000.0, powerScale_ = 1.0, keyFade_ = 0.0;
     int channels_ = 0, fft_ = 2048, hop_ = 128, bins_ = 1025, analysisDelay_ = 0;
@@ -487,6 +551,7 @@ private:
     std::atomic<T> range_ { T(6) }, knee_ { T(3) }, loHz_ { T(40) }, hiHz_ { T(16000) }, referenceSpl_ { T(100) };
     std::atomic<bool> levelComp_ { false }, refDirty_ { false };
     std::array<std::atomic<T>, kBands> published_ {};
+    std::atomic<T> loudnessChange_ { T(0) };
 
     std::unique_ptr<FFTReal<double>> transform_;
     AuditoryBands<double> bands_;
@@ -495,7 +560,7 @@ private:
     std::vector<double> window_, frame_, binPower_, binSmooth_;
     std::vector<std::vector<double>> ring_, spectra_;
     std::vector<std::vector<T>> delay_;
-    std::vector<double> ll_, rr_, lr_, loud_, corr_, tmpA_, tmpB_, tmpC_;
+    std::vector<double> ll_, rr_, lr_, li_, loud_, corr_, tmpA_, tmpB_, tmpC_, tmpD_;
     std::array<double, kBands> timeCoeff_ {};
 };
 

@@ -110,6 +110,18 @@ struct AuditoryScale
     {
         return dominantPairPower(ll, rr, lr);
     }
+
+    /**
+     * @return The dominant power of a pair read in a band of frequencies,
+     *         whose cross term is complex (the mean of one spectrum times
+     *         the conjugate of the other): a channel that is the other one
+     *         delayed reads as one source, whatever the delay turns the
+     *         phase to in the band.
+     */
+    [[nodiscard]] static double dominantPower(double ll, double rr, double lrReal, double lrImag) noexcept
+    {
+        return dominantPairPower(ll, rr, std::sqrt(lrReal * lrReal + lrImag * lrImag));
+    }
 };
 
 /**

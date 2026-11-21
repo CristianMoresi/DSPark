@@ -122,6 +122,16 @@ public:
      *        not asked for the low end only a loud one can show).
      */
     enum class Reference { FlatLoudness, EvenPower };
+
+    /**
+     * @brief How the analysis follows the programme in time (setResponse()).
+     *        ByBand, the default: two smoothings with the same time per band,
+     *        longer in the low end (200 ms at 1 kHz, 400 ms at 100 Hz). Common:
+     *        a short integration per band (a few periods of its centre, 8 to
+     *        100 ms) and then one response time for every band
+     *        (setResponseTime()), so the whole curve moves together.
+     */
+    enum class Response { ByBand, Common };
     static constexpr int kMaxChannels = 2; ///< Channels processed (more pass through).
 
     /** @brief Allocates for a rate and a layout (an invalid spec is ignored). */
@@ -165,6 +175,9 @@ public:
         {
             const double tau = 0.001 * std::clamp(200.0 * std::pow(1000.0 / bands_.getCentre(b), 0.3), 20.0, 2000.0);
             timeCoeff_[static_cast<size_t>(b)] = std::exp(-static_cast<double>(hop_) / (tau * fs_));
+            // The short integration of Response::Common: four periods of the centre, 8 to 100 ms.
+            const double brief = std::clamp(4.0 / bands_.getCentre(b), 0.008, 0.1);
+            briefCoeff_[static_cast<size_t>(b)] = std::exp(-static_cast<double>(hop_) / (brief * fs_));
         }
         prepared_ = true;
         reset();
@@ -234,6 +247,25 @@ public:
     {
         reference_.store(r == Reference::EvenPower ? Reference::EvenPower : Reference::FlatLoudness, std::memory_order_relaxed);
     }
+    /** @brief How the analysis follows the programme in time (see Response; out-of-range values read as ByBand). */
+    void setResponse(Response r) noexcept
+    {
+        response_.store(r == Response::Common ? Response::Common : Response::ByBand, std::memory_order_relaxed);
+    }
+    /** @brief The response time of Response::Common, 10 to 2000 ms (default 60). */
+    void setResponseTime(T ms) noexcept { store(responseMs_, ms, T(10), T(2000)); }
+    /**
+     * @brief Compensates a listening level this many dB lower than the one
+     *        the programme is balanced at, -30 to +30 (default 0). The ear
+     *        loses the two ends first as the level falls (their loudness
+     *        grows faster with level), so each band is raised by the level
+     *        times one minus the ratio of the mid exponent to its own: with
+     *        20 dB, 4.7 dB at 50 Hz and 3.3 dB at 12 kHz against 1.2 dB at
+     *        1 kHz, before the offset that keeps the total loudness (the
+     *        volume does not change). Negative values compensate a louder
+     *        listening. Limited by setRange() like every correction.
+     */
+    void setListeningCompensation(T db) noexcept { store(listening_, db, T(-30), T(30)); }
     /** @brief Loudness to decibels with each band's exponent (default off: one exponent). */
     void setLevelCompensation(bool on) noexcept { levelComp_.store(on, std::memory_order_relaxed); }
     /** @brief The SPL a full-scale sine stands for, 60 to 130 dB (default 100). */
@@ -251,6 +283,9 @@ public:
     [[nodiscard]] T getHighFrequency() const noexcept { return hiHz_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool getLevelCompensation() const noexcept { return levelComp_.load(std::memory_order_relaxed); }
     [[nodiscard]] Reference getReference() const noexcept { return reference_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Response getResponse() const noexcept { return response_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getResponseTime() const noexcept { return responseMs_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getListeningCompensation() const noexcept { return listening_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getReferenceLevel() const noexcept { return referenceSpl_.load(std::memory_order_relaxed); }
 
     /** @return The latency in samples (the analysis delay plus the bank's). */
@@ -312,6 +347,9 @@ public:
         w.write("hiHz", static_cast<float>(getHighFrequency()));
         w.write("levelComp", getLevelCompensation());
         w.write("reference", static_cast<int32_t>(getReference()));
+        w.write("response", static_cast<int32_t>(getResponse()));
+        w.write("responseMs", static_cast<float>(getResponseTime()));
+        w.write("listening", static_cast<float>(getListeningCompensation()));
         w.write("refSpl", static_cast<float>(getReferenceLevel()));
         return w.blob();
     }
@@ -331,6 +369,9 @@ public:
         setFrequencyRange(static_cast<T>(r.read("loHz", 40.0f)), static_cast<T>(r.read("hiHz", 16000.0f)));
         setLevelCompensation(r.read("levelComp", false));
         setReference(r.read("reference", 0) == 1 ? Reference::EvenPower : Reference::FlatLoudness);
+        setResponse(r.read("response", 0) == 1 ? Response::Common : Response::ByBand);
+        setResponseTime(static_cast<T>(r.read("responseMs", 60.0f)));
+        setListeningCompensation(static_cast<T>(r.read("listening", 0.0f)));
         setReferenceLevel(static_cast<T>(r.read("refSpl", 100.0f)));
         return true;
     }
@@ -421,11 +462,17 @@ private:
             bandsOf([&](int k) { return powerScale_ * (s0[2 * k] * s1[2 * k] + s0[2 * k + 1] * s1[2 * k + 1]); }, tmpC_);
             bandsOf([&](int k) { return powerScale_ * (s0[2 * k + 1] * s1[2 * k] - s0[2 * k] * s1[2 * k + 1]); }, tmpD_);
         }
-        // The covariance in time, longer in the low end; the dominant power.
+        // The two smoothings in time: by band (both the band's own time,
+        // longer in the low end) or a short integration per band and then a
+        // response common to all.
+        const bool common = response_.load(std::memory_order_relaxed) == Response::Common;
+        const double commonCoeff = std::exp(-static_cast<double>(hop_)
+            / (0.001 * static_cast<double>(responseMs_.load(std::memory_order_relaxed)) * fs_));
+        // The covariance in time; the dominant power.
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            const double c = warm_ ? timeCoeff_[i] : 0.0;
+            const double c = warm_ ? (common ? briefCoeff_[i] : timeCoeff_[i]) : 0.0;
             ll_[i] = tmpA_[i] + c * (ll_[i] - tmpA_[i]);
             if (nCh > 1)
             {
@@ -453,7 +500,7 @@ private:
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            const double c = warm_ ? timeCoeff_[i] : 0.0;
+            const double c = warm_ ? (common ? commonCoeff : timeCoeff_[i]) : 0.0;
             loud_[i] = tmpB_[i] + c * (loud_[i] - tmpB_[i]);
             evenLoud_[i] = tmpC_[i] + c * (evenLoud_[i] - tmpC_[i]);
         }
@@ -470,7 +517,7 @@ private:
         // level would read as a hole of tens of decibels: it neither shapes
         // the trend nor takes a correction (filling it would raise content
         // nobody hears, the ends of the band first).
-        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, audible {}, weighed {}, present {};
+        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, audible {}, weighed {}, present {}, inRange {};
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
@@ -484,7 +531,8 @@ private:
             trend[i] = audible[i] * level[i];
             weighed[i] = audible[i];
             const double z = bands_.getBark(b);
-            weight[i] = std::clamp(z - zLo + 0.5, 0.0, 1.0) * std::clamp(zHi - z + 0.5, 0.0, 1.0) * audible[i];
+            inRange[i] = std::clamp(z - zLo + 0.5, 0.0, 1.0) * std::clamp(zHi - z + 0.5, 0.0, 1.0);
+            weight[i] = inRange[i] * audible[i];
         }
         // How far under the programme each band lies: one setFloor() dB under
         // the loudest audible band (in the model's level) is no part of the
@@ -551,6 +599,8 @@ private:
         const double knee = static_cast<double>(knee_.load(std::memory_order_relaxed));
         const auto soft = [knee](double d) { return std::copysign(std::sqrt(d * d + knee * knee) - knee, d); };
         const double rangeKnee = static_cast<double>(rangeKnee_.load(std::memory_order_relaxed));
+        const double listening = static_cast<double>(listening_.load(std::memory_order_relaxed));
+        const double midExponent = AuditoryScale::loudnessExponent(3300.0);
         // The limit of the range: hard, or the smaller of the correction and
         // the range through a hyperbola (set to pass through 0 and to settle
         // on the range).
@@ -573,6 +623,9 @@ private:
             double c = -balance * soft(global);
             if (present[i] < 1.0) c = limited(c) * present[i];
             c = limited(c - trimPeaks * soft(peak) - fillDips * soft(dip)) * weight[i];
+            // The listening level: a fixed contour, whatever the programme.
+            if (listening != 0.0)
+                c = std::clamp(c + listening * (1.0 - midExponent / bands_.getExponent(b)) * inRange[i], -range, range);
             corr_[i] = c;
         }
         // The total loudness stays: every band in range takes the same
@@ -677,6 +730,8 @@ private:
     std::atomic<T> range_ { T(6) }, knee_ { T(3) }, loHz_ { T(40) }, hiHz_ { T(16000) }, referenceSpl_ { T(100) };
     std::atomic<bool> levelComp_ { false }, refDirty_ { false };
     std::atomic<Reference> reference_ { Reference::FlatLoudness };
+    std::atomic<Response> response_ { Response::ByBand };
+    std::atomic<T> responseMs_ { T(60) }, listening_ { T(0) };
     std::array<std::atomic<T>, kBands> published_ {};
     std::atomic<T> loudnessChange_ { T(0) }, raised_ { T(0) }, lowered_ { T(0) }, total_ { T(-200) }, centroidShift_ { T(0) };
     std::atomic<T> rangeKnee_ { T(0) }, floor_ { T(30) };
@@ -689,7 +744,7 @@ private:
     std::vector<std::vector<double>> ring_, spectra_;
     std::vector<std::vector<T>> delay_;
     std::vector<double> ll_, rr_, lr_, li_, loud_, evenLoud_, corr_, tmpA_, tmpB_, tmpC_, tmpD_;
-    std::array<double, kBands> timeCoeff_ {};
+    std::array<double, kBands> timeCoeff_ {}, briefCoeff_ {};
 };
 
 } // namespace dspark

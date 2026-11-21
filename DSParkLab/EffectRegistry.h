@@ -176,13 +176,16 @@ inline EffectSlot makeEqualizer()
     }
     // Structure (index 31): the minimum-phase bands as normalized ladders.
     s.addChoice("Structure", {"Direct Form","Ladder"}, 0);
+    // Resonant Shelves (index 32): the Q of a shelf above 0.71 makes it rise
+    // over its plateau next to the corner (and dip on the other side).
+    s.addToggle("Resonant Shelves", false);
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {
         return static_cast<EQ::BandType>(std::clamp(static_cast<int>(v), 0, 11));
     };
     auto toSlope = [](float v) { return std::clamp(v, 0.0f, 96.0f); };
-    auto toOrder = [](float v) { return std::clamp(static_cast<int>(v + 0.5f), 1, 16); };
+    auto toOrder = [](float v) { return std::clamp(v, 1.0f, 16.0f); };   // whole or not
     // Equalizer docs require prepare() BEFORE setNumBands() so bands
     // know the sample rate when auto-spacing frequencies.
     s.prepareFn = [p](auto& sp) { p->prepare(sp); p->setNumBands(4); };
@@ -191,6 +194,7 @@ inline EffectSlot makeEqualizer()
     s.setParamFn = [p, toType, toSlope, toOrder](int i, float v) {
         if (i == 22) { p->setAnalogResponse(v > 0.5f); return; }
         if (i == 31) { p->setStructure(static_cast<EQ::Structure>(std::clamp(static_cast<int>(v), 0, 1))); return; }
+        if (i == 32) { p->setResonantShelves(v > 0.5f); return; }
         if (i >= 27 && i <= 30)
         {
             auto cfg = p->getBandConfig(i - 27);
@@ -255,7 +259,7 @@ inline EffectSlot makeEqualizer()
     s.group("Band 2", { 5, 6, 7, 8, 9, 24, 28 });
     s.group("Band 3", { 10, 11, 12, 13, 14, 25, 29 });
     s.group("Band 4", { 15, 16, 17, 18, 19, 26, 30 });
-    s.group("Engine", { 20, 21, 22, 31 });
+    s.group("Engine", { 20, 21, 22, 31, 32 });
     return s;
 }
 
@@ -1561,8 +1565,16 @@ inline EffectSlot makeDynamicEQ()
     (*ui)[1] = { 3000.0f, 1.0f, 0.0f, -20.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
                   3.0f, -6.0f, 10.0f, 80.0f,   1.0f, 6.0f, 10.0f, 120.0f };
 
-    auto buildCfg = [](const std::array<float, kFields>& v) {
+    // The zone a band listens to (on, low edge, high edge), kept apart from
+    // the fields of the band so their indices stay where the curves expect them.
+    auto zones = std::make_shared<std::array<std::array<float, 3>, 2>>();
+    (*zones)[0] = { 0.0f, 50.0f, 120.0f };
+    (*zones)[1] = { 0.0f, 5000.0f, 10000.0f };
+
+    auto buildCfg = [](const std::array<float, kFields>& v, const std::array<float, 3>& zone) {
         DEQ::BandConfig c{};
+        c.listenLow  = zone[0] > 0.5f ? zone[1] : 0.0f;
+        c.listenHigh = zone[0] > 0.5f ? zone[2] : 0.0f;
         c.frequency = v[0];
         c.q         = std::max(0.1f, v[1]);
         c.shape     = static_cast<DEQ::BandShape>(std::clamp(static_cast<int>(v[2]), 0, 2));
@@ -1617,20 +1629,28 @@ inline EffectSlot makeDynamicEQ()
     s.addToggle("Hear Removed", false);       // 36: what the bands take out (or add)
     s.addChoice("Link Mode", {"Loudest","Dominant"}, 0);   // 37: stereo bands read the dominant component
     s.addChoice("Structure", {"Direct Form","Ladder"}, 0); // 38: the band filter as a normalized ladder
+    // 39 to 44: a zone of its own for each band's detector; 45: the key a band hears.
+    s.addToggle("B1 Own Zone", false);
+    s.addSlider("B1 Zone Low",  20, 20000, (*zones)[0][1], "Hz", true);
+    s.addSlider("B1 Zone High", 20, 20000, (*zones)[0][2], "Hz", true);
+    s.addToggle("B2 Own Zone", false);
+    s.addSlider("B2 Zone Low",  20, 20000, (*zones)[1][1], "Hz", true);
+    s.addSlider("B2 Zone High", 20, 20000, (*zones)[1][2], "Hz", true);
+    s.addChoice("Hear Key", {"Off","Band 1","Band 2"}, 0);
     // Linear phase is a setup call: the interface records the wish and the
     // audio thread prepares the processor again between blocks.
     auto linearWanted  = std::make_shared<std::atomic<bool>>(false);
     auto linearApplied = std::make_shared<std::atomic<bool>>(false);
     auto lastSpec = std::make_shared<dspark::AudioSpec>();
-    s.prepareFn = [p, ui, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
+    s.prepareFn = [p, ui, zones, buildCfg, linearWanted, linearApplied, lastSpec](auto& sp) {
         const bool want = linearWanted->load(std::memory_order_relaxed);
         p->setLinearPhase(want);
         linearApplied->store(want, std::memory_order_relaxed);
         *lastSpec = sp;
         p->prepare(sp);
         p->setNumBands(2);
-        p->setBand(0, buildCfg((*ui)[0]));
-        p->setBand(1, buildCfg((*ui)[1]));
+        p->setBand(0, buildCfg((*ui)[0], (*zones)[0]));
+        p->setBand(1, buildCfg((*ui)[1], (*zones)[1]));
     };
     s.processFn = [p, linearWanted, linearApplied, lastSpec](auto b) {
         const bool want = linearWanted->load(std::memory_order_relaxed);
@@ -1642,7 +1662,14 @@ inline EffectSlot makeDynamicEQ()
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, ui, buildCfg, linearWanted](int i, float v) {
+    s.setParamFn = [p, ui, zones, buildCfg, linearWanted](int i, float v) {
+        if (i >= kGlobal + 5 && i < kGlobal + 11) {
+            const int band = (i - kGlobal - 5) / 3, field = (i - kGlobal - 5) % 3;
+            (*zones)[static_cast<std::size_t>(band)][static_cast<std::size_t>(field)] = v;
+            p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)], (*zones)[static_cast<std::size_t>(band)]));
+            return;
+        }
+        if (i == kGlobal + 11) { p->setKeyListen(static_cast<int>(v) - 1); return; }
         switch (i - kGlobal) {
             case 0: p->setMixedBands(v > 0.5f); return;
             case 1: linearWanted->store(v > 0.5f, std::memory_order_relaxed); return;
@@ -1654,7 +1681,7 @@ inline EffectSlot makeDynamicEQ()
         if (i < 0 || i >= kGlobal) return;
         const int band = i / kFields, field = i % kFields;
         (*ui)[static_cast<std::size_t>(band)][static_cast<std::size_t>(field)] = v;
-        p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)]));
+        p->setBand(band, buildCfg((*ui)[static_cast<std::size_t>(band)], (*zones)[static_cast<std::size_t>(band)]));
     };
     // The engine's own curves (getBandMagnitude): what is drawn is what plays.
     // Live: each band at the gain it applies now. Behind it: the bands at the
@@ -1695,6 +1722,7 @@ inline EffectSlot makeDynamicEQ()
     s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 });
     s.group("Band 2", { 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 });
     s.group("Engine", { 34, 35, 36, 37, 38 });
+    s.group("Listening", { 39, 40, 41, 42, 43, 44, 45 });
     return s;
 }
 

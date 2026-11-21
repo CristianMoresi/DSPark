@@ -6,6 +6,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TonalBalance::setQuality(Quality::Render)`: half the hop and the bank
+  refined three times at every hop, for a bounce: the bank's response
+  misses the corrections asked by 0.055 dB in place of 0.086, at about
+  three times the cost and the same latency. `setQualityFollowsRender()`
+  with `setOfflineRendering()` takes it by itself at the `prepare()` of an
+  offline render (`getQualityInUse()` tells which). State keys `quality`
+  and `qualityFollowsRender`.
 - `TonalBalance::setLocalSlope()`: what a band lacks or has in excess is
   turned into decibels with the slope of the loudness curve at the band's
   own level, in place of a fixed exponent. Near the threshold in quiet that

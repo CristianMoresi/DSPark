@@ -12,12 +12,16 @@
  * A dynamic bell set on a resonance acts on the whole bell when only one
  * frequency in it is loud. Here a band (a bell or a shelf, with its
  * frequency, Q and range) covers the frequencies where its static response
- * at full range is over one percent of that range, cut into up to 128
+ * at full range (its analog prototype's, so it keeps its width up to the top
+ * of the band) is over one percent of that range, cut into up to 128
  * cells (setBand(): `cells`) placed by the band's weight: equal steps of
  * its shape integrated over log frequency, so they crowd where the band
  * acts and the skirts take a few wide ones. Every hop the
  * level of a cell is the largest power of the key's spectrum in it,
- * weighted by the band's shape there; the threshold is relative to the
+ * weighted by the band's shape there; a cell also looks half a cell into
+ * each neighbour, with a weight that falls to nothing at the neighbour's
+ * centre, so a partial on a border belongs to both cells instead of
+ * changing hands. The threshold is relative to the
  * band's own recent peak (it rises at once and falls by 2 dB per second),
  * so it follows the programme's level; over the threshold the cell's action
  * is the excess times (1 - 1 / ratio), limited by the range, with an attack
@@ -27,6 +31,11 @@
  * band's base response, flat, and its extreme one, the full range) and the
  * bands add in decibels. The gain curve is applied by a SpectralFilter: a
  * minimum-phase FIR designed every hop, without pre-echo.
+ *
+ * When a band is edited at work, what each cell was doing is carried to the
+ * new cells by frequency (read on the log-frequency axis; nothing outside the
+ * span it had), and if its span moved, a second reference of level listens
+ * to the new span for half a second before it replaces the first.
  *
  * Latency: the analysis window, about 46 ms (doubling by octaves with the
  * rate; getLatency()).
@@ -38,14 +47,14 @@
  * any thread.
  * Non-finite fields are ignored.
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, Biquad.h, DspMath.h,
+ * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, FilterDesign.h,
  * SpectralFilter.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
-#include "../Core/Biquad.h"
 #include "../Core/DspMath.h"
+#include "../Core/FilterDesign.h"
 #include "../Core/SpectralFilter.h"
 #include "../Core/StateBlob.h"
 
@@ -245,30 +254,39 @@ private:
         std::array<int, kMaxCells + 1> edge {};
         int cells = 0;
         double peak = -200.0;
+        double candidate = -200.0;           ///< The reference of a span just moved, still listening.
+        int watching = 0;                    ///< Hops it still listens before it replaces the peak.
     };
 
     /** @brief Designs a band's shape, span and cells on the audio thread. */
     void redesign(int index) noexcept
     {
         auto& s = state_[static_cast<size_t>(index)];
+        // What the band was doing, to carry it to the new cells by frequency.
+        const bool wasActive = s.active && s.cells > 0;
+        const int oldCells = s.cells, oldLo = s.edge[0], oldHi = s.edge[static_cast<size_t>(std::max(0, s.cells))];
+        const auto oldCentre = s.centre, oldAction = s.action;
         s.band = getBand(index);
         const Band& b = s.band;
         s.active = b.shape != Shape::Off && std::abs(static_cast<double>(b.range)) > 1e-3;
         std::fill(s.shape.begin(), s.shape.end(), 0.0);
         std::fill(s.cellOf.begin(), s.cellOf.end(), -1);
         s.cells = 0;
+        s.watching = 0;
         if (!s.active) return;
         const double fs = spec_.sampleRate, binHz = filter_.getBinHz();
         const double f0 = std::clamp(static_cast<double>(b.frequency), 20.0, 0.45 * fs);
         const double range = static_cast<double>(b.range);
-        BiquadCoeffs c;
-        if (b.shape == Shape::Bell) c = BiquadCoeffs::makePeak(fs, f0, static_cast<double>(b.q), range);
-        else if (b.shape == Shape::LowShelf) c = BiquadCoeffs::makeLowShelf(fs, f0, range);
-        else c = BiquadCoeffs::makeHighShelf(fs, f0, range);
+        // The band's shape from its analog prototype: a bilinear design
+        // narrows toward the top of the band.
+        const double q = std::max(static_cast<double>(b.q), 0.025);
+        const AnalogSection proto = b.shape == Shape::Bell ? AnalogSection::peak(f0, q, range)
+                                  : b.shape == Shape::LowShelf ? AnalogSection::lowShelf(f0, range)
+                                  : AnalogSection::highShelf(f0, range);
         int lo = -1, hi = -1;
         for (int k = 1; k < bins_; ++k)
         {
-            const double db = 20.0 * std::log10(std::max(c.getMagnitude(k * binHz, fs), 1e-9));
+            const double db = proto.magnitudeDb(k * binHz);
             const double share = std::clamp(db / range, 0.0, 1.0);
             s.shape[static_cast<size_t>(k)] = share;
             if (share > 0.01) { if (lo < 0) lo = k; hi = k; }
@@ -308,6 +326,36 @@ private:
             s.attack[i] = std::exp(-hopSeconds / std::max(1e-4, 0.001 * static_cast<double>(b.attack) * scale));
             s.release[i] = std::exp(-hopSeconds / std::max(1e-3, 0.001 * static_cast<double>(b.release) * scale));
         }
+        // Each new cell takes what the band was doing at its frequency: the
+        // old actions read between the old centres on the log-frequency
+        // axis, and nothing outside the span the band had.
+        for (int j = 0; j < kMaxCells; ++j)
+        {
+            const auto i = static_cast<size_t>(j);
+            double carried = 0.0;
+            const double at = s.centre[i];
+            if (j < s.cells && wasActive && at >= oldLo && at < oldHi)
+            {
+                int m = 0;
+                while (m + 1 < oldCells && oldCentre[static_cast<size_t>(m + 1)] <= at) ++m;
+                const double c0 = oldCentre[static_cast<size_t>(m)], a0 = oldAction[static_cast<size_t>(m)];
+                if (m + 1 < oldCells && at > c0 && c0 > 0.0)
+                {
+                    const double c1 = oldCentre[static_cast<size_t>(m + 1)];
+                    const double t = std::clamp(std::log(at / c0) / std::log(c1 / c0), 0.0, 1.0);
+                    carried = a0 + t * (oldAction[static_cast<size_t>(m + 1)] - a0);
+                }
+                else carried = a0;
+            }
+            s.action[i] = carried;
+        }
+        // A span that moved has another level: a second reference listens
+        // to it for half a second, then replaces the first.
+        if (wasActive && (std::abs(lo - oldLo) > 1 || std::abs(hi + 1 - oldHi) > 1))
+        {
+            s.candidate = -200.0;
+            s.watching = std::max(1, static_cast<int>(0.5 / hopSeconds));
+        }
     }
 
     void run(AudioBufferView<T>& buffer, const AudioBufferView<T>* key) noexcept
@@ -333,13 +381,32 @@ private:
             {
                 const auto i = static_cast<size_t>(j);
                 double m = 0.0;
-                for (int k = s.edge[i]; k < std::min(s.edge[i + 1], bins); ++k)
+                const int first = s.edge[i], end = std::min(s.edge[i + 1], bins);
+                for (int k = first; k < end; ++k)
                     m = std::max(m, static_cast<double>(power[k]) * s.shape[static_cast<size_t>(k)]);
+                // Half a cell into each neighbour, fading to nothing at its centre.
+                if (j > 0)
+                {
+                    const double c0 = s.centre[i - 1], span = static_cast<double>(first) - c0;
+                    for (int k = static_cast<int>(std::ceil(c0)); k < first && span > 0.0; ++k)
+                        m = std::max(m, static_cast<double>(power[k]) * s.shape[static_cast<size_t>(k)] * ((k - c0) / span));
+                }
+                if (j + 1 < s.cells)
+                {
+                    const double c1 = s.centre[i + 1], span = c1 - static_cast<double>(end - 1);
+                    for (int k = end; k < bins && k < c1 && span > 0.0; ++k)
+                        m = std::max(m, static_cast<double>(power[k]) * s.shape[static_cast<size_t>(k)] * ((c1 - k) / span));
+                }
                 level[i] = 10.0 * std::log10(m + 1e-20);
                 top = std::max(top, level[i]);
             }
             // The band's recent peak: up at once, down by 2 dB per second.
             s.peak = top > s.peak ? top : std::max(top, s.peak - 2.0 * hopSeconds);
+            if (s.watching > 0)
+            {
+                s.candidate = top > s.candidate ? top : std::max(top, s.candidate - 2.0 * hopSeconds);
+                if (--s.watching == 0) s.peak = s.candidate;
+            }
             const double thr = s.peak + static_cast<double>(b.threshold);
             const double slope = 1.0 - 1.0 / static_cast<double>(b.ratio);
             const double range = std::abs(static_cast<double>(b.range));

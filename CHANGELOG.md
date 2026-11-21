@@ -6,6 +6,22 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `DynamicEQ`: a listening zone of its own for each band, and a key listen.
+  `BandConfig::listenLow` and `listenHigh` (0 by default: the detector
+  listens where the band acts) give the detector a zone of its own: a
+  high-pass at the low edge, a low-pass at the high one, or both, scaled when
+  both are there for a tone in the middle of the zone to read at its level.
+  A band at 300 Hz that listens between 50 and 90 Hz leaves a tone at 300 Hz
+  alone (0.00 dB, where it cut 10.5 listening to itself) and cuts 10.49 dB
+  for a tone in the middle of the zone and 9.69 for one on its edge, as the
+  curve says; with program timing the times come from the zone. In both
+  engines and in linear phase; kept by the state. `setKeyListen(band)` makes
+  the output what that band's detector hears: the key through its detector
+  filters (its zone when it has one), on the channels of its scope, late by
+  `getLatency()` (to the sample with no latency, with a lookahead and in
+  linear phase), in and out through a 10 ms fade while the bands keep working
+  underneath, so the processing is back bit for bit when it ends. A
+  monitoring control, not in the state.
 - Orders between whole ones. `FilterDesign::bell()`, `lowShelf()`,
   `highShelf()`, `bandPass()`, `bandStop()` and `allPass()` take a real order
   (1 to 16), and so does `Equalizer::BandConfig::order`: an order of 2.5 is a

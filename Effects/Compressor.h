@@ -1237,10 +1237,12 @@ public:
      *
      * The release time becomes the knob's after a brief reduction and up to
      * eight times the knob's after a sustained one. What tells them apart is
-     * a slow follower (1.5 s) of the depth of the gain change against the
-     * depth itself: a peak that comes and goes leaves it near zero and
-     * releases at the knob's time; a passage that has kept the compressor
-     * down for a second or more releases slowly, so the level does not pump
+     * a slow follower of the depth of the gain change against the depth
+     * itself, fifteen times as slow as the release (1.5 s at the default
+     * release of 100 ms), so that "sustained" means the same at any release:
+     * a peak that comes and goes leaves it near zero and releases at the
+     * knob's time; a passage that has kept the compressor down for ten
+     * release times or more releases slowly, so the level does not pump
      * back up between phrases. `amount` weighs it (0, the default, is the
      * fixed release).
      *
@@ -1318,7 +1320,8 @@ public:
      * @brief Deepens or softens the gain change while it attacks.
      *
      * After the ballistics, the difference between the gain and a copy of it
-     * smoothed over 30 ms is added back while the gain is falling: at +1 the
+     * smoothed over six times the attack (30 ms at the default attack of
+     * 5 ms) is added back while the gain is falling: at +1 the
      * leading edge of every reduction goes as far again past its smoothed
      * course (more bite on the transient), at -1 the attack follows the
      * smoothed copy (the transient is let through and the body is held). It
@@ -3301,8 +3304,12 @@ protected:
             midRate_ = pole(kBalanceHighHz);
             highRate_ = pole(std::min(kBalanceCeilingHz, 0.45 * rate));
             balanceRate_ = over(kBalanceSeconds);
-            sustainRate_ = over(kSustainSeconds);
-            emphasisRate_ = over(kEmphasisSeconds);
+            // The windows of the two measures count in the knobs' own times, so
+            // "sustained" and "the leading edge" mean the same at any setting.
+            const double attackSeconds = static_cast<double>(std::clamp(attMs, profile.attackFloorMs, profile.attackCeilMs)) / 1000.0;
+            const double releaseSeconds = static_cast<double>(std::clamp(relMs, profile.releaseFloorMs, profile.releaseCeilMs)) / 1000.0;
+            sustainRate_ = over(std::clamp(kSustainReleases * releaseSeconds, kSustainFloorSeconds, kSustainCeilSeconds));
+            emphasisRate_ = over(std::clamp(kEmphasisAttacks * attackSeconds, kEmphasisFloorSeconds, kEmphasisCeilSeconds));
         }
 
         // Upward silence-guard envelope: 60 dB/s linear decay.
@@ -5171,7 +5178,7 @@ protected:
     struct ProgramState
     {
         double sustained = 0.0; ///< Slow follower of the depth of the gain change (dB).
-        double smoothed = 0.0;  ///< The gain smoothed over kEmphasisSeconds (dB).
+        double smoothed = 0.0;  ///< The gain smoothed over kEmphasisAttacks times the attack (dB).
     };
 
     /** @brief State of the two bands the balance of one channel's key is read from. */
@@ -5876,12 +5883,16 @@ protected:
     double subDecSmoothCoeff_ = 0.0; ///< Decoupled smoothing coefficient of an eighth of a sample.
 
     // Programme-dependent timing (setProgramRelease() and the three after it).
-    static constexpr double kSustainSeconds = 1.5;      ///< Follower of the depth of the gain change.
+    static constexpr double kSustainReleases = 15.0;    ///< Follower of the depth of the gain change, in release times.
+    static constexpr double kSustainFloorSeconds = 0.1; ///< It is never shorter than this,
+    static constexpr double kSustainCeilSeconds = 60.0; ///< nor longer than this.
     static constexpr double kSustainFloorDb = 0.5;      ///< Depth under which a reduction does not count as sustained.
     static constexpr double kReleaseStretch = 7.0;      ///< The release grows up to 1 + this.
     static constexpr double kAttackStretch = 3.0;       ///< The attack grows up to 1 + this.
     static constexpr double kFullAttackDb = 6.0;        ///< Distance to the target from which the attack is the knob's.
-    static constexpr double kEmphasisSeconds = 0.03;    ///< Smoothing the emphasis of the attack measures against.
+    static constexpr double kEmphasisAttacks = 6.0;     ///< Smoothing the emphasis of the attack measures against, in attack times.
+    static constexpr double kEmphasisFloorSeconds = 0.002;  ///< It is never shorter than this,
+    static constexpr double kEmphasisCeilSeconds = 0.5;     ///< nor longer than this.
     static constexpr double kBalanceFloorHz = 30.0;     ///< The low band of the balance starts here.
     static constexpr double kBalanceLowHz = 200.0;      ///< And ends here.
     static constexpr double kBalanceHighHz = 2500.0;    ///< The high band starts here.

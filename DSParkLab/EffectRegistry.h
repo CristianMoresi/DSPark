@@ -2237,6 +2237,7 @@ inline EffectSlot makeTonalBalance()
     s.addSlider("Listening Level", -30, 30, 0, "dB");          // 13 - compensates a listening level this much lower
     s.addChoice("Response", {"By Band","Common"}, 0);          // 14 - order MUST match TonalBalance::Response
     s.addSlider("Response Time", 10, 2000, 60, "ms", true);    // 15
+    s.addToggle("Local Slope", false);                         // 16
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
     // The band centres exist once the processor is prepared; the display
     // reads them from this copy (taken where prepare() runs).
@@ -2290,6 +2291,7 @@ inline EffectSlot makeTonalBalance()
             case 13: p->setListeningCompensation(v); break;
             case 14: p->setResponse(static_cast<dspark::TonalBalance<float>::Response>(static_cast<int>(v))); break;
             case 15: p->setResponseTime(v); break;
+            case 16: p->setLocalSlope(v > 0.5f); break;
         }
     };
     return s;

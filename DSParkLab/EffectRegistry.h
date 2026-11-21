@@ -484,6 +484,10 @@ inline EffectSlot makeCompressor()
     s.addSlider("Stage Drift", 0, 1, 0, "");                    // 40
     s.addSlider("Stage Sag", 0, 1, 0, "");                      // 41
     s.addSlider("Stage Noise", -140, -40, -140, "dB");          // 42
+    s.addSlider("Hold", 0, 500, 0, "ms");                       // 43: the reduction kept after a peak
+    s.addChoice("Hold Mode", {"Deepest","Every peak"}, 0);      // 44: the hold as a sliding window
+    s.addChoice("Lookahead Shape", {"Lead","Ramp"}, 0);         // 45: the reduction arriving with the peak along a ramp
+    s.addToggle("Feedback Keyed", false);                       // 46: a feedback loop closed around the key (lookahead and external key in feedback)
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -556,6 +560,10 @@ inline EffectSlot makeCompressor()
                 p->setCharacterStageSettings(st);
                 break;
             }
+            case 43: p->setHoldTime(v); break;
+            case 44: p->setHoldMode(static_cast<dspark::Compressor<float>::HoldMode>(static_cast<int>(v))); break;
+            case 45: p->setLookaheadShape(static_cast<dspark::Compressor<float>::LookaheadShape>(static_cast<int>(v))); break;
+            case 46: p->setFeedbackKeyed(v > 0.5f); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };

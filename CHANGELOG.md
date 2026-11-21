@@ -6,6 +6,26 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TonalBalance::setReference(Reference::EvenPower)`: the programme is
+  compared against the loudness, band by band, of a programme with the same
+  power in every band of the ear's scale at its own level, read through the
+  same model, in place of a flat loudness. Such a programme is then balanced
+  at any level (corrections under 0.03 dB at -50, -30 and -10 dBFS over the
+  72 bands, where the flat reference asked for 3.1, 1.6 and 0.6 dB). State
+  key `reference`.
+- `TonalBalance::setFloor()`, 10 to 120 dB (default 30): how far under its
+  loudest band, in the model's level, a band may lie and still be given back
+  by the balance (see the fix below). State key `floor`.
+- `TonalBalance::setRangeKnee()`, 0 to 6 dB: rounds the approach to the
+  range, so the correction of a dip that deepens bends into its limit with
+  no corner (its sharpest bend falls from 0.63 to 0.42 dB with a knee of
+  2 dB). State key `rangeKnee`.
+- `TonalBalance::getLoudnessRaised()`, `getLoudnessLowered()`,
+  `getLoudness()` and `getCentroidShift()`: what the corrections do, for a
+  display: the share of the loudness the raised bands gain and the lowered
+  ones lose, the total, and how far its centre moves along the ear's scale
+  (a dark programme at a full balance: 0.045 raised, 0.045 lowered, 0.7 Bark
+  up).
 - `ResonanceSuppressor::setMix()`: how much of the filter is applied, taken
   inside it (its gain becomes 1 - mix + mix * gain before the minimum-phase
   design), so the part left alone and the part reduced never meet in two
@@ -2862,6 +2882,16 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `TonalBalance`: what lay far under the programme was raised like a hole in
+  it. A programme with nothing over 4 kHz, on a noise 50 dB under it, had
+  that noise raised by the whole range (6 dB over 8 kHz). A band more than
+  `setFloor()` dB under the loudest one no longer takes the balance nor the
+  offset that keeps the loudness (0.0 dB there now), and the last 10 dB
+  over the floor fade in; a dip between two sides that sound is filled as
+  before, and a dark programme is still given its top back.
+- `GraphicBank`: a sample that is not a number stayed in its sections for
+  good. It now leaves as silence and the sections start again from rest:
+  the next block comes out as from a bank that never saw it.
 - `ResonanceSuppressor::setSensitivityBand()`: a new sensitivity curve was
   written over the one in use an eighth at a time, so for seven hops the low
   bins were weighed by the new curve and the high ones by the old. It is

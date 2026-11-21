@@ -6,6 +6,30 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `CrossoverFilter::setOrder()` takes 6 and 36 dB per octave as well, in the
+  minimum-phase engine (both structures) and in linear phase. 36 is two
+  third-order Butterworth filters per branch (6 dB down at the split, 36 dB
+  an octave past it, the bands summing flat with a first-order and a
+  second-order allpass per split above). 6 is a first-order low-pass and its
+  complement: the bands add up to the input itself, with no phase
+  correction. `MultibandCompressor` and `MultibandSaturation` take both.
+- `MultibandSaturation::setMix()`: the sum of the bands against the programme
+  as the crossover leaves it (the bands summed before their curves, as late
+  as the slowest band), so any mix is as flat as the crossover, at the
+  splits too (each band's own 20 Hz high-pass and DC filter still lead the
+  phase at the bottom: 0.14 dB at 100 Hz at a mix of one half).
+  `MultibandCompressor::setMix()` sets the mix of every band, which is the
+  same thing there. State key `mix`.
+- `MultibandSaturation::setOutputClip()` and `setOutputCeiling()`: a clipper
+  four times oversampled after the sum, and no sample over its ceiling (six
+  driven bands add up to several times full scale). While on it adds its
+  latency, which `getLatency()` reports, and about a quarter of the cost.
+  State keys `outputClip` and `outputCeiling`.
+- `Saturation::setCombLoopClosing(true)`: the tuned feedback follows the
+  level of the input and closes once there is no programme (under -70 dBFS),
+  so a loop near unity does not ring on: with a loop of 0.95 at 200 Hz the
+  ring 300 ms after the programme stops falls from -41 to under -120 dBFS.
+  Off by default. State key `combLoopClosing`.
 - `Compressor::setHoldMode(HoldMode::EveryPeak)`: the hold keeps every gain
   change for the hold time after it has passed (the deepest of a sliding
   window, exact to a 256th of the hold time). On a 50 Hz tone that dies away
@@ -2755,6 +2779,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Saturation::setCombLoop()`: a new frequency moved the read point of the
+  feedback line at once, by a whole number of samples: a cut in a signal
+  that recirculates, a click each time (a tone under a loop of 0.9 taken
+  from 200 to 150 Hz: a step 62 times the largest of the steady signal).
+  The delay now glides to its new length, an octave in a tenth of a second,
+  read between samples on the way: no step. A loop that is not moving runs
+  as before, to the bit.
 - `Compressor`, `NoiseGate`, `Expander`: the listened key (`setSidechainListen()`)
   left without the delay of the lookahead, so with a lookahead it played
   early by the whole latency the processor reports and the track moved when

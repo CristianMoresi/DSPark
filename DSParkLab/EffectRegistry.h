@@ -2239,6 +2239,7 @@ inline EffectSlot makeTonalBalance()
     s.addSlider("Response Time", 10, 2000, 60, "ms", true);    // 15
     s.addToggle("Local Slope", false);                         // 16
     s.addChoice("Quality (on reload)", {"Realtime","Render"}, 0); // 17 - order MUST match TonalBalance::Quality
+    s.addToggle("Time Focus", false);                          // 18
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
     // The band centres exist once the processor is prepared; the display
     // reads them from this copy (taken where prepare() runs).
@@ -2294,6 +2295,7 @@ inline EffectSlot makeTonalBalance()
             case 15: p->setResponseTime(v); break;
             case 16: p->setLocalSlope(v > 0.5f); break;
             case 17: p->setQuality(static_cast<dspark::TonalBalance<float>::Quality>(static_cast<int>(v))); break;
+            case 18: p->setTimeFocus(v > 0.5f); break;
         }
     };
     return s;
@@ -2331,6 +2333,7 @@ inline EffectSlot makeResonanceSuppressor()
     s.addToggle("Short Kernel", false);                         // 23
     s.addSlider("Hear Band Low", 0, 20000, 0, "Hz");            // 24
     s.addSlider("Hear Band High", 0, 20000, 0, "Hz");           // 25 - 0: all of it
+    s.addToggle("Time Focus", false);                           // 26
     auto heardBand = std::make_shared<std::array<float, 2>>(std::array<float, 2>{ 0.0f, 0.0f });
     auto sens = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
@@ -2347,6 +2350,7 @@ inline EffectSlot makeResonanceSuppressor()
             case 21: p->setEnvelopePasses(static_cast<int>(v) + 1); break;
             case 22: p->setWidthTaper(2000.0f, v); break;
             case 23: p->setShortKernel(v > 0.5f); break;
+            case 26: p->setTimeFocus(v > 0.5f); break;
             case 24: (*heardBand)[0] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
             case 25: (*heardBand)[1] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
             case 0: p->setThreshold(v); break;
@@ -2400,7 +2404,7 @@ inline EffectSlot makeResonanceSuppressor()
     s.group("Main", { 0, 1, 2, 3, 4, 5, 6 });
     s.group("Stereo & Listen", { 7, 8, 9, 10, 11, 24, 25, 12 });
     s.group("Sensitivity", { 13, 14, 15, 20 });
-    s.group("Detection", { 16, 17, 18, 19, 21, 22, 23 });
+    s.group("Detection", { 16, 17, 18, 19, 21, 22, 23, 26 });
     return s;
 }
 
@@ -2425,6 +2429,7 @@ inline EffectSlot makeSpectralDynamicEQ()
         s.addSlider((n + "Release").c_str(), 5, 2000, 150, "ms", true);
         s.addSlider((n + "Cells").c_str(), 1, 128, 32, "");
     }
+    s.addToggle("Time Focus", false);                           // 18
     auto bands = std::make_shared<std::array<SD::Band, 2>>();
     (*bands)[0].frequency = 2500.0f;
     (*bands)[1].frequency = 7000.0f;
@@ -2432,6 +2437,7 @@ inline EffectSlot makeSpectralDynamicEQ()
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, bands](int i, float v) {
+        if (i == 18) { p->setTimeFocus(v > 0.5f); return; }
         if (i < 0 || i >= 18) return;
         auto& b = (*bands)[static_cast<std::size_t>(i / 9)];
         switch (i % 9) {
@@ -2479,6 +2485,7 @@ inline EffectSlot makeSpectralDynamicEQ()
     s.targetLabel = "Full range";
     s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8 });
     s.group("Band 2", { 9, 10, 11, 12, 13, 14, 15, 16, 17 });
+    s.group("Detection", { 18 });
     return s;
 }
 

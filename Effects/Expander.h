@@ -97,6 +97,7 @@ public:
         for (int ch = 0; ch < lookaheadChannels_; ++ch)
             lookahead_[static_cast<size_t>(ch)].prepare(maxLookaheadSamples_ + 1);
         keyEq_.prepare(sampleRate);
+        keyMonitor_.prepare(sampleRate, maxLookaheadSamples_ + 1);
         updateCoefficients();
         // Re-derive the hold counter for the (possibly new) rate: it used to
         // be computed only inside setHold() with the rate of that moment, so
@@ -282,8 +283,10 @@ public:
      *
      * Each channel puts out what the detector hears of it (the key after the
      * high-pass and the equalizer; the last key channel where it has none),
-     * not delayed by the lookahead, while the expander keeps working
-     * underneath. A monitoring switch: it is not part of the state.
+     * late by the lookahead (the latency the expander reports, so the track
+     * keeps its place) and held under full scale (KeyMonitor), while the
+     * expander keeps working underneath. A monitoring switch: it is not part
+     * of the state.
      */
     void setSidechainListen(bool on) noexcept { scListen_.store(on, std::memory_order_relaxed); }
 
@@ -372,6 +375,7 @@ public:
         std::fill(scHpfState_.begin(), scHpfState_.end(), T(0));
         std::fill(scHpfPrev_.begin(), scHpfPrev_.end(), T(0));
         keyEq_.reset();
+        keyMonitor_.reset();
         for (auto& line : lookahead_) line.reset();
         for (auto& a : analytic_) a.reset();
     }
@@ -532,6 +536,15 @@ protected:
             updateStateMachine(levelDb);
             T gain = computeGain(levelDb);
 
+            // The listened key: late by the lookahead and under full scale.
+            if (listen_)
+            {
+                T frame[MAX_CHANNELS];
+                for (int ch = 0; ch < detCh; ++ch) frame[ch] = heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)];
+                keyMonitor_.processFrame(frame, detCh, cachedLookahead_);
+                for (int ch = 0; ch < detCh; ++ch) heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)] = frame[ch];
+            }
+
             // 4. Apply Gain (to the lookahead-delayed audio when enabled)
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -670,6 +683,7 @@ protected:
     std::array<T, MAX_CHANNELS> scHpfState_{};
     std::array<T, MAX_CHANNELS> scHpfPrev_{};
     KeyEq keyEq_;                               ///< Equalizer of the key, after the high-pass.
+    KeyMonitor<T, 16> keyMonitor_;              ///< The listened key: late by the lookahead, under full scale.
     std::atomic<bool> scListen_ { false };      ///< The key goes out instead of the audio.
     bool keyOn_ = false;                        ///< The equalizer has bands in the path (audio thread).
     bool listen_ = false;                       ///< scListen_ as the audio thread took it.

@@ -121,6 +121,7 @@ public:
         for (int ch = 0; ch < lookaheadChannels_; ++ch)
             lookahead_[static_cast<size_t>(ch)].prepare(maxLookaheadSamples_ + 1);
         keyEq_.prepare(sampleRate);
+        keyMonitor_.prepare(sampleRate, maxLookaheadSamples_ + 1);
         syncParams();
         reset();
     }
@@ -181,6 +182,7 @@ public:
             T envelope = computeEnvelopeFollower(level);
             updateStateMachine(envelope);
             T gain = getCurrentGain();
+            if (listen_) keyMonitor_.processFrame(heard_.data(), std::min(nCh, kMaxScChannels), lookaheadSamples_);
 
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -263,6 +265,7 @@ public:
                 T envelope = computeEnvelopeFollower(scMax);
                 updateStateMachine(envelope);
                 T gain = getCurrentGain();
+                if (listen_) keyMonitor_.processFrame(heard_.data(), std::min(scCh, kMaxScChannels), lookaheadSamples_);
 
                 for (int ch = 0; ch < nCh; ++ch)
                 {
@@ -460,9 +463,10 @@ public:
      * @brief Plays the key instead of the gated audio.
      *
      * Each channel puts out what the detector hears of it (the key after the
-     * high-pass and the equalizer), not delayed by the lookahead, while the
-     * gate keeps working underneath. A monitoring switch: it is not part of
-     * the state.
+     * high-pass and the equalizer), late by the lookahead (the latency the
+     * gate reports, so the track keeps its place) and held under full scale
+     * (KeyMonitor), while the gate keeps working underneath. A monitoring
+     * switch: it is not part of the state.
      */
     void setSidechainListen(bool on) noexcept { scListen_.store(on, std::memory_order_relaxed); }
 
@@ -526,6 +530,7 @@ public:
         prevSign_ = false;
         estimatedPeriod_ = 0;
         for (auto& line : lookahead_) line.reset();
+        keyMonitor_.reset();
     }
 
 
@@ -815,6 +820,9 @@ protected:
         updateStateMachine(envelope);
         input = delayed(input, ch);
 
+        // The listened key: late by the lookahead and under full scale.
+        if (listen_) keyMonitor_.processFrame(&sidechain, 1, lookaheadSamples_);
+
         if (cachedGateMode_ == GateMode::Frequency)
         {
             (void)getCurrentGain();
@@ -868,6 +876,7 @@ protected:
     std::array<T, kMaxScChannels> scHpfState_ {};
     std::array<T, kMaxScChannels> scHpfPrev_ {};
     KeyEq keyEq_;                               ///< Equalizer of the key, after the high-pass.
+    KeyMonitor<T, 16> keyMonitor_;              ///< The listened key: late by the lookahead, under full scale.
     std::atomic<bool> scListen_ { false };      ///< The key goes out instead of the audio.
     bool keyOn_ = false;                        ///< The equalizer has bands in the path (audio thread).
     bool listen_ = false;                       ///< scListen_ as the audio thread took it.

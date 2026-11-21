@@ -4889,3 +4889,60 @@ DSPARK_TEST(FilterDesign_tilt_slope_stays_within_a_ceiling)
     EXPECT_TRUE(std::isnan(FilterDesign::tiltSlopeWithin(1000.0, nan, 36.0)));
     EXPECT_EQ(FilterDesign::tiltSlopeWithin(20.0, 6.0, 0.0), 6.0);
 }
+
+// New: a caller whose gains move a little at a time refines one call in
+// several and has the others carry that correction. With the gains where
+// they were, the carried solution is the refined one; with the gains moved a
+// little it stays nearer the response asked for than the plain solution.
+DSPARK_TEST(GraphicBank_carries_its_refinement)
+{
+    using Bank = GraphicBank<float, 8>;
+    constexpr int kBands = 24;
+    std::vector<double> centres(kBands);
+    const double z0 = AuditoryScale::hzToBark(50.0), z1 = AuditoryScale::hzToBark(16000.0);
+    for (int b = 0; b < kBands; ++b) centres[static_cast<size_t>(b)] = AuditoryScale::barkToHz(z0 + (z1 - z0) * b / (kBands - 1.0));
+    Bank bank;
+    bank.prepare(48000.0, centres.data(), kBands, 2);
+    std::vector<float> curve(kBands), moved(kBands);
+    for (int b = 0; b < kBands; ++b)
+    {
+        curve[static_cast<size_t>(b)] = static_cast<float>(10.0 * std::sin(0.45 * b));
+        moved[static_cast<size_t>(b)] = curve[static_cast<size_t>(b)] + static_cast<float>(0.4 * std::cos(1.3 * b));
+    }
+    const auto missed = [&](const std::vector<float>& asked) {
+        double worst = 0.0;
+        for (int b = 2; b < kBands - 2; ++b)
+            worst = std::max(worst, std::abs(bank.responseDb(centres[static_cast<size_t>(b)]) - static_cast<double>(asked[static_cast<size_t>(b)])));
+        return worst;
+    };
+    const auto sections = [&] {
+        std::vector<double> g(kBands);
+        for (int b = 0; b < kBands; ++b) g[static_cast<size_t>(b)] = bank.getSectionGain(b);
+        return g;
+    };
+    bank.setGains(curve.data(), 0, 0);
+    const double plain = missed(curve);
+    bank.setGains(curve.data(), 0, 1);
+    const double refined = missed(curve);
+    const std::vector<double> refinedSections = sections();
+    bank.setGains(curve.data(), 0, Bank::kCarryRefinement);
+    const std::vector<double> carriedSections = sections();
+    double apart = 0.0;
+    for (int b = 0; b < kBands; ++b) apart = std::max(apart, std::abs(carriedSections[static_cast<size_t>(b)] - refinedSections[static_cast<size_t>(b)]));
+    EXPECT_LT(refined, plain);
+    EXPECT_LT(apart, 1e-9);
+    // The gains moved by a few tenths: carried against plain.
+    bank.setGains(moved.data(), 0, Bank::kCarryRefinement);
+    const double carriedMoved = missed(moved);
+    bank.setGains(moved.data(), 0, 0);
+    const double plainMoved = missed(moved);
+    std::cout << "  [bank] the response misses " << plain << " dB plain and " << refined << " dB refined; moved a little, " << plainMoved
+              << " dB plain and " << carriedMoved << " dB carried\n";
+    EXPECT_LT(carriedMoved, plainMoved);
+    // A plain call forgets the correction: carrying after it adds nothing.
+    bank.setGains(curve.data(), 0, 0);
+    const std::vector<double> plainSections = sections();
+    bank.setGains(curve.data(), 0, Bank::kCarryRefinement);
+    const std::vector<double> after = sections();
+    for (int b = 0; b < kBands; ++b) EXPECT_EQ(after[static_cast<size_t>(b)], plainSections[static_cast<size_t>(b)]);
+}

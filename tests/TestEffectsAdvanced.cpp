@@ -8884,3 +8884,254 @@ DSPARK_TEST(PitchShifter_default_frame_follows_the_rate)
         EXPECT_EQ(ps->getLatency(), 2 * e.frame);
     }
 }
+
+// ============================================================================
+// Spectral effects: the link of a pair, the two qualities, the bank between
+// refinements, a delayed channel, the loudness kept within a narrow range
+// ============================================================================
+
+namespace {
+
+// The deepest reduction the suppressor shows on a channel around a
+// frequency, averaged over the second half of a programme.
+double m4ReductionAt(ResonanceSuppressor<float>& rs, const std::vector<float>& left, const std::vector<float>& right, int channel, double hz)
+{
+    using RS = ResonanceSuppressor<float>;
+    const int point = static_cast<int>(std::lround((RS::kDisplayPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+    std::vector<float> l = left, r = right;
+    double sum = 0.0;
+    int count = 0;
+    for (size_t off = 0; off + 256 <= l.size(); off += 256)
+    {
+        float* ch[2] = { l.data() + off, r.data() + off };
+        rs.processBlock(AudioBufferView<float>(ch, 2, 256));
+        if (off < l.size() / 2) continue;
+        double deepest = 0.0;
+        for (int p = point - 1; p <= point + 1; ++p) deepest = std::min(deepest, static_cast<double>(rs.getDisplayReduction(channel, p)));
+        sum += deepest;
+        ++count;
+    }
+    return sum / std::max(1, count);
+}
+
+// Steady partials from 40 Hz to 14 kHz with a tilt: a programme whose
+// analysis stands still once it has settled.
+std::vector<float> m4Partials(size_t n, double tiltDbPerOctave)
+{
+    std::vector<float> v(n, 0.0f);
+    for (int p = 0; p < 40; ++p)
+    {
+        const double hz = 40.0 * std::pow(350.0, p / 39.0);
+        const double amp = 0.02 * std::pow(10.0, tiltDbPerOctave * std::log2(hz / 1000.0) / 20.0);
+        for (size_t i = 0; i < n; ++i)
+            v[i] += static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / 48000.0 + 0.7 * p));
+    }
+    return v;
+}
+
+} // namespace
+
+// Defect: a link between 0 and 1 behaved as 0: each channel designed its
+// filter without the power of the other. With a line on the left only, the
+// right channel takes nothing of it unlinked and the pair's whole reduction
+// linked; in between it now takes a part.
+DSPARK_TEST(ResonanceSuppressor_partial_link_sits_between_its_ends)
+{
+    using RS = ResonanceSuppressor<float>;
+    const size_t n = 256 * 560;
+    const std::vector<float> left = l13Add(l13Pinkish(n, 7u), 3000.0, 0.2), right = l13Pinkish(n, 19u);
+    const auto rightAt = [&](float amount) {
+        auto rs = std::make_unique<RS>();
+        rs->setLink(amount); rs->setStrength(1.0f); rs->setRange(24.0f);
+        rs->prepare(spec(48000.0, 256, 2));
+        return m4ReductionAt(*rs, left, right, 1, 3000.0);
+    };
+    const double apart = rightAt(0.0f), half = rightAt(0.5f), joined = rightAt(1.0f);
+    std::printf("  [link] the right channel at the left's line: unlinked %.2f, half %.2f, linked %.2f dB\n", apart, half, joined);
+    EXPECT_GT(apart, -3.0);
+    EXPECT_LT(joined, apart - 6.0);
+    EXPECT_LT(half, apart - 1.0);
+    EXPECT_GT(half, joined + 1.0);
+}
+
+// Defect: the detector's smoothings were counted in hops and in bins, so the
+// Offline quality (four times the hops and four times the bins of Realtime)
+// smoothed a quarter as long and a quarter as wide and found other
+// resonances. They are now times and widths in hertz: both qualities take
+// the same lines out, by about the same amount.
+DSPARK_TEST(ResonanceSuppressor_qualities_find_the_same_resonances)
+{
+    using RS = ResonanceSuppressor<float>;
+    const size_t n = 256 * 420;
+    const std::vector<float> x = l13Add(l13Add(l13Pinkish(n, 31u), 500.0, 0.1), 6000.0, 0.05);
+    double at[2][3] = {};
+    int q = 0;
+    for (const auto quality : { RS::Quality::Realtime, RS::Quality::Offline })
+    {
+        int k = 0;
+        for (const double hz : { 500.0, 6000.0, 1500.0 })
+        {
+            auto rs = std::make_unique<RS>();
+            rs->setQuality(quality); rs->setStrength(1.0f); rs->setRange(24.0f);
+            rs->prepare(spec(48000.0, 256, 2));
+            at[q][k++] = m4ReductionAt(*rs, x, x, 0, hz);
+        }
+        ++q;
+    }
+    std::printf("  [quality] 500 Hz %.2f / %.2f, 6 kHz %.2f / %.2f, between the lines %.2f / %.2f dB (Realtime / Offline)\n",
+                at[0][0], at[1][0], at[0][1], at[1][1], at[0][2], at[1][2]);
+    for (int k = 0; k < 3; ++k) EXPECT_NEAR(at[1][k], at[0][k], 1.5);
+    EXPECT_LT(at[1][0], -4.0);
+    EXPECT_LT(at[1][1], -6.0);
+}
+
+// Defect: in filter mode a partial link mixed the gains of the channels, and
+// the first channel read the second one's gains of the frame before: the two
+// channels were not treated alike. The link now acts on the power each
+// channel is read by, within the same frame, so swapping the channels of the
+// programme swaps the output, to the bit.
+DSPARK_TEST(SpectralDenoiser_partial_link_treats_both_channels_alike)
+{
+    const size_t n = 256 * 420;
+    const std::vector<float> room = l13Noise(48000, 0.02f, 5u);
+    const std::vector<float> a = l13Add(l13Noise(n, 0.02f, 7u), 1000.0, 0.2), b = l13Noise(n, 0.02f, 9u);
+    const auto render = [&](float link, bool swapped) {
+        auto d = std::make_unique<SpectralDenoiser<float>>();
+        d->setFilterMode(true);
+        d->setLink(link);
+        d->prepare(spec(48000.0, 256, 2));
+        d->setLearning(true);
+        (void)l13Run(*d, room, room);
+        d->setLearning(false);
+        return swapped ? l13Run(*d, b, a) : l13Run(*d, a, b);
+    };
+    const auto plain = render(0.5f, false), turned = render(0.5f, true);
+    size_t differing = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (plain.first[i] != turned.second[i] || plain.second[i] != turned.first[i]) ++differing;
+    EXPECT_EQ(differing, static_cast<size_t>(0));
+    // The link does something: the noisy channel next to the tone is read
+    // with part of the tone, so less of its noise is taken out around it.
+    const auto apart = render(0.0f, false);
+    const double linked = l13BandDb(plain.second, 1000.0, 6.0, n / 2, n), alone = l13BandDb(apart.second, 1000.0, 6.0, n / 2, n);
+    std::printf("  [denoiser link] the noise of the other channel around the tone: alone %.2f dB, linked by half %.2f dB\n", alone, linked);
+    EXPECT_GT(linked, alone + 1.0);
+}
+
+// Defect: the bank's solution was refined one hop in eight and left plain on
+// the other seven, so on a steady programme the response stepped between two
+// curves with a period of eight hops. The hops in between now carry the
+// correction the refinement found.
+DSPARK_TEST(TonalBalance_response_does_not_step_every_eight_hops)
+{
+    auto tb = std::make_unique<TonalBalance<float>>();
+    tb->setBalance(1.0f);
+    tb->setRange(12.0f);
+    tb->prepare(spec(48000.0, 128, 2));
+    const size_t n = 128 * 3000;
+    std::vector<float> l = m4Partials(n, -4.5), r = l;
+    std::vector<std::array<double, 3>> rows;
+    const double probes[3] = { 1000.0, 4000.0, 9000.0 };
+    for (size_t off = 0; off < n; off += 128)
+    {
+        float* ch[2] = { l.data() + off, r.data() + off };
+        tb->processBlock(AudioBufferView<float>(ch, 2, 128));
+        if (off + 128 * 64 < n) continue;
+        std::array<double, 3> row {};
+        for (int k = 0; k < 3; ++k) row[static_cast<size_t>(k)] = tb->getResponse(probes[k]);
+        rows.push_back(row);
+    }
+    double worst = 0.0, moved = 0.0;
+    for (int k = 0; k < 3; ++k)
+    {
+        moved = std::max(moved, std::abs(rows.back()[static_cast<size_t>(k)]));
+        for (int phase = 0; phase < 8; ++phase)
+        {
+            double in = 0.0, out = 0.0;
+            int ni = 0, no = 0;
+            for (size_t i = 0; i < rows.size(); ++i)
+            {
+                const double v = rows[i][static_cast<size_t>(k)];
+                if (static_cast<int>(i % 8) == phase) { in += v; ++ni; } else { out += v; ++no; }
+            }
+            if (ni > 0 && no > 0) worst = std::max(worst, std::abs(in / ni - out / no));
+        }
+    }
+    std::printf("  [bank] one hop in eight stands %.4f dB apart from the others; the response reaches %.2f dB\n", worst, moved);
+    EXPECT_GT(moved, 3.0);
+    EXPECT_LT(worst, 0.01);
+}
+
+// Defect: the cross term of the stereo covariance kept only its real part.
+// With the right channel a delayed copy of the left, the real part turns with
+// frequency (the cosine of the delay's phase) and the dominant power took a
+// comb of up to 3 dB, which the equalizer then tried to level. With the whole
+// cross term the pair reads as one source: the corrections are those of two
+// equal channels.
+DSPARK_TEST(TonalBalance_reads_a_delayed_channel_as_one_source)
+{
+    const size_t n = 256 * 1400;
+    const std::vector<float> left = l13MixLike(n, 41u);
+    std::vector<float> late(n, 0.0f);
+    for (size_t i = 12; i < n; ++i) late[i] = left[i - 12];               // a quarter of a millisecond
+    const auto corrections = [&](const std::vector<float>& right) {
+        auto tb = std::make_unique<TonalBalance<float>>();
+        tb->setBalance(0.0f); tb->setFillDips(1.0f); tb->setTrimPeaks(1.0f); tb->setRange(12.0f);
+        tb->prepare(spec(48000.0, 256, 2));
+        (void)l13Run(*tb, left, right);
+        std::array<double, TonalBalance<float>::kBands> c {};
+        for (int b = 0; b < TonalBalance<float>::kBands; ++b) c[static_cast<size_t>(b)] = static_cast<double>(tb->getCorrection(b));
+        return c;
+    };
+    const auto equal = corrections(left), delayed = corrections(late);
+    auto probe = std::make_unique<TonalBalance<float>>();
+    probe->prepare(spec(48000.0, 256, 2));
+    double worst = 0.0;
+    for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+    {
+        const double hz = probe->getBandCentre(b);
+        if (hz < 100.0 || hz > 2000.0) continue;                           // where a band is narrower than the comb
+        worst = std::max(worst, std::abs(delayed[static_cast<size_t>(b)] - equal[static_cast<size_t>(b)]));
+    }
+    std::printf("  [delayed] corrections under 2 kHz against two equal channels: %.3f dB apart at most\n", worst);
+    EXPECT_LT(worst, 0.35);
+}
+
+// Defect: the loudness offset was scaled by each band's weight and then
+// limited, so with a narrow frequency range, or with the corrections at
+// their limit, the programme's total loudness moved. The offset is now
+// solved with the limits and the weights in place.
+DSPARK_TEST(TonalBalance_keeps_the_loudness_within_a_narrow_range)
+{
+    const size_t n = 256 * 1100;
+    std::vector<float> dark = l13MixLike(n, 51u);
+    {
+        double z = 0.0;
+        for (float& x : dark) { z += 0.08 * (static_cast<double>(x) - z); x = static_cast<float>(0.4 * x + 2.0 * z); }
+    }
+    struct Case { float lo, hi, range; };
+    for (const Case c : { Case { 40.0f, 16000.0f, 6.0f }, Case { 200.0f, 5000.0f, 6.0f }, Case { 500.0f, 2000.0f, 12.0f } })
+    {
+        auto tb = std::make_unique<TonalBalance<float>>();
+        tb->setBalance(1.0f);
+        tb->setRange(c.range);
+        tb->setFrequencyRange(c.lo, c.hi);
+        tb->prepare(spec(48000.0, 256, 2));
+        std::vector<float> l = dark, r = dark;
+        double worst = 0.0, deepest = 0.0;
+        for (size_t off = 0; off < n; off += 256)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            tb->processBlock(AudioBufferView<float>(ch, 2, 256));
+            if (off < n / 2) continue;
+            worst = std::max(worst, std::abs(static_cast<double>(tb->getLoudnessChange())));
+        }
+        for (int b = 0; b < TonalBalance<float>::kBands; ++b) deepest = std::max(deepest, std::abs(static_cast<double>(tb->getCorrection(b))));
+        std::printf("  [loudness] %.0f Hz to %.0f Hz, range %.0f dB: total loudness moved %.4f dB at most; largest correction %.2f dB\n",
+                    static_cast<double>(c.lo), static_cast<double>(c.hi), static_cast<double>(c.range), worst, deepest);
+        EXPECT_LT(worst, 0.002);
+        EXPECT_GT(deepest, 1.0);
+    }
+    TonalBalance<float> fresh;
+    EXPECT_EQ(fresh.getLoudnessChange(), 0.0f);
+}

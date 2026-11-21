@@ -31,7 +31,9 @@
  * channels and one filter serves them all (half the cost in stereo).
  * setRemovalListen(true) applies one minus the filter: what it takes out. A key
  * (processBlock(buffer, &key, design)) replaces the programme in the power
- * the callback reads; the filter still runs on the programme.
+ * the callback reads; the filter still runs on the programme. Each hop reads
+ * the power of every channel before any filter is designed, so a callback
+ * can look at the other channels of the same frame (getFramePower()).
  *
  * SpectralReadout publishes a per-bin quantity of the last frame (a gain
  * curve, a reduction) at 128 points for a display read from any thread.
@@ -116,6 +118,7 @@ public:
         frame_.assign(static_cast<size_t>(m_ + 2), 0.0);
         kernel_.assign(static_cast<size_t>(m_ + 2), 0.0);
         power_.assign(static_cast<size_t>(bins_), T(0));
+        powers_.assign(static_cast<size_t>(ch), std::vector<T>(static_cast<size_t>(bins_), T(0)));
         gain_.assign(static_cast<size_t>(bins_), T(1));
         channels_ = ch;
         prepared_ = true;
@@ -135,6 +138,16 @@ public:
     [[nodiscard]] int getNumBins() const noexcept { return bins_; }
     [[nodiscard]] double getBinHz() const noexcept { return fs_ / static_cast<double>(m_); }
     [[nodiscard]] double getSampleRate() const noexcept { return fs_; }
+    /**
+     * @return The power of a channel's frame this hop (getNumBins() values),
+     *         for the design callback of an unlinked filter: the frames of
+     *         every channel are read before the first design runs. nullptr
+     *         for a channel out of range.
+     */
+    [[nodiscard]] const T* getFramePower(int channel) const noexcept
+    {
+        return channel >= 0 && channel < static_cast<int>(powers_.size()) ? powers_[static_cast<size_t>(channel)].data() : nullptr;
+    }
 
     /** @brief Clears the input, the output and the hop phase. */
     void reset() noexcept
@@ -240,8 +253,9 @@ private:
         };
         const auto powerOf = [&](int ch) {
             const double* s = detectorSpectrum(ch);
+            T* p = powers_[static_cast<size_t>(ch)].data();
             for (int k = 0; k < bins_; ++k)
-                power_[static_cast<size_t>(k)] = static_cast<T>(scale * (s[2 * k] * s[2 * k] + s[2 * k + 1] * s[2 * k + 1]));
+                p[k] = static_cast<T>(scale * (s[2 * k] * s[2 * k] + s[2 * k + 1] * s[2 * k + 1]));
         };
         if (linked_ && nCh > 1)
         {
@@ -259,11 +273,12 @@ private:
         }
         else
         {
+            // Every channel's power first: a design may read the others'.
+            for (int ch = 0; ch < nCh; ++ch) powerOf(ch);
             for (int ch = 0; ch < nCh; ++ch)
             {
-                powerOf(ch);
                 std::fill(gain_.begin(), gain_.end(), T(1));
-                design(ch, power_.data(), gain_.data(), bins_);
+                design(ch, powers_[static_cast<size_t>(ch)].data(), gain_.data(), bins_);
                 apply(ch, buildKernel());
             }
         }
@@ -349,6 +364,7 @@ private:
     std::vector<double> window_, taper_, frame_, kernel_, keySpectrum_;
     std::vector<std::vector<double>> ring_, keyRing_, accum_, spectra_;
     std::vector<T> power_, gain_;
+    std::vector<std::vector<T>> powers_;
 };
 
 /**

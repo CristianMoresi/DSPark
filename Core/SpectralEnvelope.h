@@ -45,10 +45,14 @@ public:
      * @brief Sets the bins and the width.
      * @param numBins      Bins of the spectra (fftSize / 2 + 1), at least 2.
      * @param widthOctaves Width of the smoothing, 0.05 to 4 octaves.
+     * @param minBins      Narrowest smoothing, in bins (1 by default; a
+     *                     spectrum padded q times more keeps the same
+     *                     width in hertz with q).
      */
-    void prepare(int numBins, double widthOctaves = 1.0 / 3.0)
+    void prepare(int numBins, double widthOctaves = 1.0 / 3.0, double minBins = 1.0)
     {
         n_ = std::max(2, numBins);
+        minBins_ = std::isfinite(minBins) ? std::max(1.0, minBins) : 1.0;
         coeff_.assign(static_cast<size_t>(n_), T(0));
         setWidth(widthOctaves);
     }
@@ -60,11 +64,11 @@ public:
         width_ = std::clamp(widthOctaves, 0.05, 4.0);
         // A one-pole run both ways has an equivalent width of about
         // 2 c / (1 - c) bins; the width wanted at bin k is k (2^(w/2) -
-        // 2^(-w/2)) bins, at least one.
+        // 2^(-w/2)) bins, at least minBins_.
         const double span = std::pow(2.0, 0.5 * width_) - std::pow(2.0, -0.5 * width_);
         for (int k = 0; k < n_; ++k)
         {
-            const double bins = std::max(1.0, span * k);
+            const double bins = std::max(minBins_, span * k);
             coeff_[static_cast<size_t>(k)] = static_cast<T>(bins / (bins + 2.0));
         }
     }
@@ -99,7 +103,7 @@ public:
 
 private:
     int n_ = 0;
-    double width_ = 1.0 / 3.0;
+    double width_ = 1.0 / 3.0, minBins_ = 1.0;
     std::vector<T> coeff_;
 };
 

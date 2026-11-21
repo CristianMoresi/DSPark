@@ -26,15 +26,21 @@
  * and cut to the room the padding leaves, so a reduction never starts before
  * the event.
  *
- * Stereo: Link::PerBin mixes each bin's power with the mean of the channels
- * (setLink() 0 to 1); at 1 both channels share the detector and the filter
- * (half the cost); Link::MidSide processes the mid and the side, the side's
+ * Stereo: Link::PerBin takes the level each channel is read by towards that
+ * of the pair's mean power, bin by bin (setLink() 0 to 1: at 0 each channel
+ * reads itself; in between, that share of the way, in decibels in
+ * Mode::Smooth and in amplitude in Mode::Deep, so what a channel takes of a
+ * resonance of the other grows evenly with the link); at 1 both channels
+ * share the detector and the filter (half the cost); Link::MidSide processes the mid and the side, the side's
  * reduction scaled by setSideWeight(). setRemovalListen(true) outputs what is
  * taken out; setFocusListen(true) outputs the programme through the
  * sensitivity curve (where the suppressor listens); both are monitoring
  * controls and stay out of the state. setQuality(Offline)
  * pads the transform 8 times and overlaps 16 frames per window (for
- * renders); Realtime pads twice and overlaps four.
+ * renders); Realtime pads twice and overlaps four. The smoothings of the
+ * detector are widths in hertz and times in seconds, so the two qualities
+ * find the same resonances: Offline draws the filter finer and follows the
+ * programme four times as often.
  * getDisplayReduction() and getDisplayExcess() give, at 128 points, what
  * the last frame takes out and what it found, for a display on any thread.
  *
@@ -93,10 +99,20 @@ public:
         const bool offline = quality_.load(std::memory_order_relaxed) == Quality::Offline;
         filter_.prepare(spec, window, offline ? 8 : 2, offline ? 16 : 4);
         bins_ = filter_.getNumBins();
-        envelope_.prepare(bins_, static_cast<double>(width_.load(std::memory_order_relaxed)));
+        // The detector's smoothings, the same in hertz and in seconds at any
+        // quality: against the padding of two and the four frames per window
+        // of Realtime (where they are three bins, a half per hop and a half
+        // per bin).
+        const double finer = static_cast<double>(filter_.getTransformSize()) / (2.0 * filter_.getWindowSize());
+        binHalf_ = std::max(1, static_cast<int>(std::lround(0.5 * (std::sqrt(8.0 * finer * finer + 1.0) - 1.0))));
+        timeSmooth_ = static_cast<T>(1.0 - std::pow(0.5, 4.0 * filter_.getHopSize() / static_cast<double>(filter_.getWindowSize())));
+        acrossBins_ = static_cast<T>(std::pow(0.5, 1.0 / finer));
+        envelope_.prepare(bins_, static_cast<double>(width_.load(std::memory_order_relaxed)), finer);
         lastWidth_ = width_.load(std::memory_order_relaxed);
         const auto chans = static_cast<size_t>(std::max(1, std::min(spec.numChannels, 2)));
-        smoothPower_.assign(chans, std::vector<T>(static_cast<size_t>(bins_), T(0)));
+        smoothPower_.assign(chans + 1, std::vector<T>(static_cast<size_t>(bins_), T(0)));   // the channels, and the pair's mean
+        linked_.assign(static_cast<size_t>(bins_), T(0));
+        channels_ = static_cast<int>(chans);
         gainDb_.assign(chans + 1, std::vector<T>(static_cast<size_t>(bins_), T(0)));
         work_.assign(static_cast<size_t>(bins_), T(0));
         db_.assign(static_cast<size_t>(bins_), T(0));
@@ -302,7 +318,7 @@ private:
     void run(AudioBufferView<T>& buffer, const AudioBufferView<T>* key) noexcept
     {
         if (!prepared_) return;
-        const int nCh = std::min(buffer.getNumChannels(), static_cast<int>(smoothPower_.size()));
+        const int nCh = std::min(buffer.getNumChannels(), channels_);
         const int nS = buffer.getNumSamples();
         if (nCh <= 0 || nS <= 0) return;
         if (timesDirty_.exchange(false, std::memory_order_acquire)) refreshTimes();
@@ -311,6 +327,9 @@ private:
         const bool ms = nCh == 2 && link_.load(std::memory_order_relaxed) == Link::MidSide;
         const T linkAmount = linkAmount_.load(std::memory_order_relaxed);
         filter_.setLinked(!ms && nCh == 2 && linkAmount >= T(1));
+        // In between, each channel keeps its own filter and reads its power
+        // that share of the way to the mean of the two.
+        const T share = !ms && nCh == 2 && linkAmount > T(0) && linkAmount < T(1) ? linkAmount : T(0);
         filter_.setRemovalListen(removalListen_.load(std::memory_order_relaxed));
         if (ms)
         {
@@ -322,7 +341,7 @@ private:
         // A key replaces the programme in the power the design reads (its
         // mid and side in MidSide are read as its first two channels).
         filter_.processBlock(buffer, key, [&](int ch, const T* power, T* gain, int bins) noexcept {
-            design(ch, power, gain, bins, ms, focus);
+            design(ch, power, gain, bins, ms, focus, share);
         });
         if (ms)
         {
@@ -332,8 +351,8 @@ private:
         }
     }
 
-    /** @brief The gain curve of one frame (channel -1: linked). */
-    void design(int ch, const T* power, T* gain, int bins, bool ms, bool focus) noexcept
+    /** @brief The gain curve of one frame (channel -1: linked; share: how far the power goes to the mean of the pair). */
+    void design(int ch, const T* power, T* gain, int bins, bool ms, bool focus, T share) noexcept
     {
         if (focus)
         {
@@ -346,29 +365,28 @@ private:
             publish(ch, bins);
             return;
         }
-        const auto c = static_cast<size_t>(ch < 0 ? 0 : std::min(ch, static_cast<int>(smoothPower_.size()) - 1));
-        auto& smooth = smoothPower_[c];
-        // Power across three bins, a floor 80 dB under the frame's maximum,
-        // a one-pole in time.
-        T top = T(0);
-        for (int k = 0; k < bins; ++k)
-        {
-            const T p = (power[std::max(0, k - 1)] + power[k] + power[std::min(bins - 1, k + 1)]) / T(3);
-            work_[static_cast<size_t>(k)] = p;
-            top = std::max(top, p);
-        }
-        const T floor = std::max(top * T(1e-8), T(1e-14));
-        for (int k = 0; k < bins; ++k)
-        {
-            const T p = std::max(work_[static_cast<size_t>(k)], floor);
-            smooth[static_cast<size_t>(k)] += T(0.5) * (p - smooth[static_cast<size_t>(k)]);
-        }
+        const auto c = static_cast<size_t>(ch < 0 ? 0 : std::min(ch, channels_ - 1));
         const bool decibels = mode_.load(std::memory_order_relaxed) == Mode::Smooth;
-        for (int k = 0; k < bins; ++k)
+        // A partial link: the level this channel is read by goes part of the
+        // way to the level of the pair's mean power (read once per hop, with
+        // the first channel, from the frames of both).
+        if (share > T(0) && ch >= 0)
         {
-            const T p = smooth[static_cast<size_t>(k)];
-            db_[static_cast<size_t>(k)] = decibels ? T(10) * std::log10(p) : std::sqrt(p);
+            const T* left = filter_.getFramePower(0);
+            const T* right = filter_.getFramePower(1);
+            if (left == nullptr || right == nullptr) share = T(0);
+            else if (ch == 0)
+            {
+                for (int k = 0; k < bins; ++k) env_[static_cast<size_t>(k)] = T(0.5) * (left[k] + right[k]);
+                levels(env_.data(), smoothPower_[static_cast<size_t>(channels_)], linked_.data(), bins, decibels);
+                linkedInDecibels_ = decibels;
+            }
+            if (linkedInDecibels_ != decibels) share = T(0);   // the mode changed between the two channels of a hop
         }
+        levels(power, smoothPower_[c], db_.data(), bins, decibels);
+        if (share > T(0) && ch >= 0)
+            for (int k = 0; k < bins; ++k)
+                db_[static_cast<size_t>(k)] += share * (linked_[static_cast<size_t>(k)] - db_[static_cast<size_t>(k)]);
         envelope_.resonances(db_.data(), env_.data());
         const T threshold = threshold_.load(std::memory_order_relaxed);
         const T strength = strength_.load(std::memory_order_relaxed);
@@ -394,9 +412,52 @@ private:
         // Across bins, then to gains.
         for (int k = 1; k < bins; ++k) mixed_[static_cast<size_t>(k)] = g[static_cast<size_t>(k)];
         mixed_[0] = g[0];
-        AuditoryBands<T>::smoothAcross(mixed_.data(), bins, T(0.5));
+        AuditoryBands<T>::smoothAcross(mixed_.data(), bins, acrossBins_);
         for (int k = 0; k < bins; ++k) gain[k] = std::pow(T(10), mixed_[static_cast<size_t>(k)] / T(20));
         publish(ch, bins);
+    }
+
+    /**
+     * @brief The level of each bin as the detector reads it: the power across
+     *        a few bins (three at the padding of two; the same width at any
+     *        other), a floor 80 dB under the frame's maximum, a one-pole in
+     *        time, and decibels or amplitude.
+     */
+    void levels(const T* power, std::vector<T>& smooth, T* out, int bins, bool decibels) noexcept
+    {
+        T top = T(0);
+        if (binHalf_ == 1)
+        {
+            for (int k = 0; k < bins; ++k)
+            {
+                const T p = (power[std::max(0, k - 1)] + power[k] + power[std::min(bins - 1, k + 1)]) / T(3);
+                work_[static_cast<size_t>(k)] = p;
+                top = std::max(top, p);
+            }
+        }
+        else
+        {
+            const T each = T(1) / static_cast<T>(2 * binHalf_ + 1);
+            for (int k = 0; k < bins; ++k)
+            {
+                T sum = T(0);
+                for (int j = k - binHalf_; j <= k + binHalf_; ++j) sum += power[std::clamp(j, 0, bins - 1)];
+                const T p = sum * each;
+                work_[static_cast<size_t>(k)] = p;
+                top = std::max(top, p);
+            }
+        }
+        const T floor = std::max(top * T(1e-8), T(1e-14));
+        for (int k = 0; k < bins; ++k)
+        {
+            const T p = std::max(work_[static_cast<size_t>(k)], floor);
+            smooth[static_cast<size_t>(k)] += timeSmooth_ * (p - smooth[static_cast<size_t>(k)]);
+        }
+        for (int k = 0; k < bins; ++k)
+        {
+            const T p = smooth[static_cast<size_t>(k)];
+            out[k] = decibels ? T(10) * std::log10(p) : std::sqrt(p);
+        }
     }
 
     /** @brief The display curves of one frame: the reduction in mixed_, what was found in work_. */
@@ -410,8 +471,9 @@ private:
     }
 
     AudioSpec spec_ {};
-    int bins_ = 0, weightPos_ = 0;
-    bool prepared_ = false, weightPending_ = false;
+    int bins_ = 0, weightPos_ = 0, binHalf_ = 1, channels_ = 0;
+    T timeSmooth_ = T(0.5), acrossBins_ = T(0.5);
+    bool prepared_ = false, weightPending_ = false, linkedInDecibels_ = true;
     T lastWidth_ = T(1.0 / 3.0);
     std::atomic<T> threshold_ { T(3) }, strength_ { T(0.7) }, range_ { T(12) }, width_ { T(1.0 / 3.0) };
     std::atomic<T> attackMs_ { T(5) }, releaseMs_ { T(80) }, linkAmount_ { T(1) }, sideWeight_ { T(1) };
@@ -425,7 +487,7 @@ private:
     KeyEqualizer<T, 2> sensitivity_;
     std::vector<std::vector<T>> smoothPower_, gainDb_;
     typename KeyEqualizer<T, 2>::Response sensResponse_ {};
-    std::vector<T> work_, db_, env_, mixed_, weight_, attack_, release_;
+    std::vector<T> work_, db_, env_, mixed_, weight_, attack_, release_, linked_;
 };
 
 } // namespace dspark

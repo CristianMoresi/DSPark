@@ -5355,15 +5355,25 @@ DSPARK_TEST(Compressor_key_listen_plays_what_the_detector_hears)
     EXPECT_LT(compFarthest(out[1], heardRight), 1e-6);
     EXPECT_LT(gr, -3.0);
 
-    // With a lookahead the key is heard as it arrives.
+    // With a latency the key leaves late by it, like the audio would: the
+    // lookahead (5 ms: 240 samples), or the 7 samples the detector of
+    // Precision::High reads late (the per-sample loop of the block path).
+    const auto farthestLate = [&](const std::vector<Vec>& got, size_t late) {
+        double worst = 0.0;
+        for (size_t i = late; i < got[0].size(); ++i)
+        {
+            worst = std::max(worst, std::abs(static_cast<double>(got[0][i]) - static_cast<double>(heardLeft[i - late])));
+            worst = std::max(worst, std::abs(static_cast<double>(got[1][i]) - static_cast<double>(heardRight[i - late])));
+        }
+        return worst;
+    };
     out = render([&](C& c) { listening(c); c.setLookahead(5.0f); }, 512, false, gr);
-    EXPECT_LT(compFarthest(out[0], heardLeft), 1e-6);
-    EXPECT_LT(compFarthest(out[1], heardRight), 1e-6);
+    EXPECT_LT(farthestLate(out, 240), 1e-6);
 
-    // The per-sample loop of the block path (Precision::High) and processSample().
     out = render([&](C& c) { listening(c); c.setPrecision(C::Precision::High); }, 512, false, gr);
-    EXPECT_LT(compFarthest(out[0], heardLeft), 1e-6);
-    EXPECT_LT(compFarthest(out[1], heardRight), 1e-6);
+    EXPECT_LT(farthestLate(out, 7), 1e-6);
+
+    // processSample() has no latency: the key as it arrives.
     {
         auto c = std::make_unique<C>();
         c->setThreshold(-24.0f);
@@ -8326,4 +8336,363 @@ DSPARK_TEST(DynamicEQ_mixed_band_follows_a_change_of_range_without_a_bump)
     EXPECT_NEAR(before, -6.0, 0.3);
     EXPECT_NEAR(settled, -18.0, 0.3);
     EXPECT_LT(highest, before + 0.5);
+}
+
+// ============================================================================
+// The listened key, the lookahead inside a kept latency, the hold's window
+// ============================================================================
+
+namespace {
+
+// A pair of equal channels through a processor with a key of its own.
+template <class P>
+void m5RunKeyed(P& p, std::vector<float>& audio, std::vector<float>& key)
+{
+    std::vector<float> audio2 = audio, key2 = key;
+    for (size_t off = 0; off < audio.size(); off += 256)
+    {
+        const int n = static_cast<int>(std::min<size_t>(256, audio.size() - off));
+        float* ch[2] = { audio.data() + off, audio2.data() + off };
+        float* kc[2] = { key.data() + off, key2.data() + off };
+        p.processBlock(AudioBufferView<float>(ch, 2, n), AudioBufferView<float>(kc, 2, n));
+    }
+}
+
+// How late an impulse in the key leaves when the key is listened to.
+template <class P>
+int m5ListenedDelay(P& p)
+{
+    const size_t n = 4096, at = 600;
+    std::vector<float> audio(n, 0.0f), key(n, 0.0f);
+    key[at] = 0.5f;
+    m5RunKeyed(p, audio, key);
+    size_t top = 0;
+    for (size_t i = 1; i < n; ++i)
+        if (std::abs(audio[i]) > std::abs(audio[top])) top = i;
+    return static_cast<int>(top) - static_cast<int>(at);
+}
+
+// The largest sample that goes out of a processor whose key, a tone at half
+// scale under a bell of +24 dB, is listened to.
+template <class P>
+double m5ListenedPeak()
+{
+    auto p = std::make_unique<P>();
+    typename P::KeyBand bell;
+    bell.shape = decltype(bell.shape)::Bell;
+    bell.frequency = 1000.0f;
+    bell.gainDb = 24.0f;
+    bell.q = 1.0f;
+    p->setSidechainBand(0, bell);
+    p->setSidechainListen(true);
+    p->prepare(AudioSpec{ 48000.0, 256, 2 });
+    const auto out = m3Run(*p, 1000.0, 48000.0, 24000, 0.5, [](size_t) {});
+    double top = 0.0;
+    for (size_t i = 12000; i < out.size(); ++i) top = std::max(top, std::abs(static_cast<double>(out[i])));
+    return top;
+}
+
+template <class P>
+int m5ListenedDelayWithLookahead(float ms)
+{
+    auto p = std::make_unique<P>();
+    p->setLookahead(ms);
+    p->setSidechainListen(true);
+    p->prepare(AudioSpec{ 48000.0, 256, 2 });
+    const int late = m5ListenedDelay(*p);
+    return late - p->getLatency();
+}
+
+} // namespace
+
+// Defect: the listened key left without the delay of the lookahead, so with a
+// lookahead it played early by the whole latency the processor reports, and
+// an equalized key went out as loud as its bands made it. It now leaves late
+// by the latency and held under full scale, in the compressor, the gate and
+// the expander; without a lookahead and under full scale it is the key
+// itself.
+DSPARK_TEST(Dynamics_listened_key_keeps_its_place_and_stays_under_full_scale)
+{
+    EXPECT_EQ(m5ListenedDelayWithLookahead<Compressor<float>>(5.0f), 0);
+    EXPECT_EQ(m5ListenedDelayWithLookahead<NoiseGate<float>>(5.0f), 0);
+    EXPECT_EQ(m5ListenedDelayWithLookahead<Expander<float>>(5.0f), 0);
+    EXPECT_EQ(m5ListenedDelayWithLookahead<Compressor<float>>(0.0f), 0);
+    {
+        auto c = std::make_unique<Compressor<float>>();
+        c->setLookahead(5.0f);
+        c->prepare(AudioSpec{ 48000.0, 256, 2 });
+        EXPECT_EQ(c->getLatency(), 240);
+    }
+    const double comp = m5ListenedPeak<Compressor<float>>(), gate = m5ListenedPeak<NoiseGate<float>>(),
+                 expander = m5ListenedPeak<Expander<float>>();
+    std::cout << "  [listen] a key with a bell of +24 dB goes out at " << comp << " (compressor), " << gate << " (gate), "
+              << expander << " (expander) of full scale\n";
+    for (const double peak : { comp, gate, expander })
+    {
+        EXPECT_LT(peak, 1.0 + 1e-6);
+        EXPECT_GT(peak, 0.9);
+    }
+    // Under full scale and with no lookahead the listened key is the key.
+    {
+        auto c = std::make_unique<Compressor<float>>();
+        c->setSidechainListen(true);
+        c->prepare(AudioSpec{ 48000.0, 256, 2 });
+        const auto out = m3Run(*c, 440.0, 48000.0, 4096, 0.4, [](size_t) {});
+        size_t differing = 0;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (out[i] != static_cast<float>(0.4 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * static_cast<double>(i) / 48000.0))) ++differing;
+        EXPECT_EQ(differing, static_cast<size_t>(0));
+    }
+}
+
+// Defect: with a latency kept for the lookahead, moving the lookahead jumped
+// the gain to another point of its own past: a step of level whenever the
+// gain was moving. The delay of the gain now slides to its new value.
+DSPARK_TEST(Compressor_lookahead_moves_inside_its_latency_without_a_step)
+{
+    auto c = std::make_unique<Compressor<float>>();
+    c->setThreshold(-20.0f);
+    c->setRatio(4.0f);
+    c->setAttack(5.0f);
+    c->setRelease(60.0f);
+    c->setMaxLookahead(10.0f);
+    c->setLookahead(8.0f);
+    c->prepare(AudioSpec{ 48000.0, 256, 2 });
+    const size_t n = 256 * 560, at = 256 * 375;
+    std::vector<float> l(n), r;
+    for (size_t i = 0; i < n; ++i)
+        l[i] = static_cast<float>(0.5 * (1.0 + 0.6 * std::sin(2.0 * 3.14159265358979323846 * 3.0 * static_cast<double>(i) / 48000.0)));
+    r = l;
+    for (size_t off = 0; off < n; off += 256)
+    {
+        if (off == at) c->setLookahead(0.0f);
+        float* ch[2] = { l.data() + off, r.data() + off };
+        c->processBlock(AudioBufferView<float>(ch, 2, 256));
+    }
+    double steady = 0.0, moving = 0.0;
+    for (size_t i = 24000; i < at; ++i) steady = std::max(steady, std::abs(static_cast<double>(l[i]) - l[i - 1]));
+    for (size_t i = at; i < at + 9600; ++i) moving = std::max(moving, std::abs(static_cast<double>(l[i]) - l[i - 1]));
+    std::cout << "  [lookahead] largest step of the output: " << steady << " before the move, " << moving << " during it\n";
+    EXPECT_LT(moving, 3.0 * steady);
+    EXPECT_EQ(c->getLatency(), 480);
+}
+
+// New: HoldMode::EveryPeak holds every gain change for the hold time (the
+// deepest of a sliding window). On a tone that dies away, with a hold longer
+// than its period, the reduction comes back in steps from crest to crest;
+// with HoldMode::Deepest it falls into the wave whenever a hold ends. Either
+// way a reduction is kept for the hold time, and then let go.
+DSPARK_TEST(Compressor_hold_every_peak_follows_the_crests)
+{
+    using C = Compressor<float>;
+    const auto make = [](C::HoldMode mode, float holdMs, float releaseMs) {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-40.0f);
+        c->setRatio(4.0f);
+        c->setAttack(0.1f);
+        c->setRelease(releaseMs);
+        c->setHoldTime(holdMs);
+        c->setHoldMode(mode);
+        c->prepare(AudioSpec{ 48000.0, 8, 2 });
+        return c;
+    };
+    const auto trace = [](C& c, const std::vector<float>& x) {
+        std::vector<float> l = x, r = x;
+        std::vector<double> gr;
+        for (size_t off = 0; off + 8 <= l.size(); off += 8)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            c.processBlock(AudioBufferView<float>(ch, 2, 8));
+            gr.push_back(static_cast<double>(c.getGainReductionDb()));
+        }
+        return gr;
+    };
+    // A 50 Hz tone that dies away; a hold of three periods.
+    std::vector<float> dying(96000);
+    for (size_t i = 0; i < dying.size(); ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        dying[i] = static_cast<float>(0.8 * std::exp(-1.5 * t) * std::sin(2.0 * 3.14159265358979323846 * 50.0 * t));
+    }
+    const auto deeperAgain = [&](C::HoldMode mode) {
+        auto c = make(mode, 60.0f, 20.0f);
+        const auto gr = trace(*c, dying);
+        double shallowest = -1e9, again = 0.0;
+        for (size_t i = 480; i < gr.size(); ++i)   // from 80 ms on
+        {
+            shallowest = std::max(shallowest, gr[i]);
+            again = std::max(again, shallowest - gr[i]);
+        }
+        return again;
+    };
+    const double deepest = deeperAgain(C::HoldMode::Deepest), every = deeperAgain(C::HoldMode::EveryPeak);
+    std::cout << "  [hold] on a tone that dies away the reduction goes deeper again by " << deepest << " dB (deepest) and "
+              << every << " dB (every peak)\n";
+    EXPECT_GT(deepest, 4.0 * every);
+    EXPECT_LT(every, 1.0);
+    // A level that stops: the reduction stays for the hold time, then goes.
+    std::vector<float> burst(48000, 0.0f);
+    for (size_t i = 0; i < 4800; ++i) burst[i] = 0.5f;
+    for (const C::HoldMode mode : { C::HoldMode::Deepest, C::HoldMode::EveryPeak })
+    {
+        auto c = make(mode, 100.0f, 5.0f);
+        const auto gr = trace(*c, burst);
+        const double held = gr[(4800 + 4300) / 8], atEnd = gr[(4800 + 4800 + 1500) / 8], depth = gr[4700 / 8];
+        EXPECT_LT(depth, -6.0);
+        EXPECT_NEAR(held, depth, 0.5);       // 90 ms after the level stopped
+        EXPECT_GT(atEnd, -1.0);              // 30 ms after the hold ended
+    }
+    // The mode is part of the state.
+    auto from = std::make_unique<C>();
+    from->setHoldMode(C::HoldMode::EveryPeak);
+    const auto blob = from->getState();
+    auto to = std::make_unique<C>();
+    EXPECT_TRUE(to->setState(blob.data(), blob.size()));
+    EXPECT_TRUE(to->getHoldMode() == C::HoldMode::EveryPeak);
+    EXPECT_TRUE(std::make_unique<C>()->getHoldMode() == C::HoldMode::Deepest);
+}
+
+// New: LookaheadShape::Ramp brings each reduction in along an S-shaped ramp
+// that ends exactly when its peak leaves the delay. On a level that jumps
+// 20 dB with a fast attack, the gain of the default shape falls in a few
+// samples a whole lookahead early; the ramp takes the lookahead to come
+// down, has the settled reduction when the jump arrives and lets no more
+// through than the default.
+DSPARK_TEST(Compressor_lookahead_ramp_arrives_with_the_peak)
+{
+    using C = Compressor<float>;
+    struct Reading { double atArrival = 0.0, settled = 0.0, step = 0.0, peakOver = 0.0; };
+    const auto read = [](C::LookaheadShape shape, float keptMs) {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-30.0f);
+        c->setRatio(4.0f);
+        c->setAttack(0.1f);
+        c->setRelease(50.0f);
+        if (keptMs > 0.0f) c->setMaxLookahead(keptMs);
+        c->setLookahead(5.0f);
+        c->setLookaheadShape(shape);
+        c->prepare(AudioSpec{ 48000.0, 256, 2 });
+        const size_t n = 256 * 300, at = 38400, len = 4800;
+        std::vector<float> l(n, 0.03f), r;
+        for (size_t i = at; i < at + len; ++i) l[i] = 0.3f;
+        r = l;
+        const std::vector<float> in = l;
+        for (size_t off = 0; off < n; off += 256)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            c->processBlock(AudioBufferView<float>(ch, 2, 256));
+        }
+        const auto lat = static_cast<size_t>(c->getLatency());
+        const auto gainAt = [&](size_t i) { return 20.0 * std::log10(std::max(1e-9, static_cast<double>(l[i]) / in[i - lat])); };
+        const size_t arrive = at + lat;
+        Reading out;
+        out.atArrival = gainAt(arrive);
+        out.settled = gainAt(arrive + len - 10);
+        double top = 0.0;
+        for (size_t i = arrive - 2000; i < arrive + len; ++i) out.step = std::max(out.step, std::abs(gainAt(i) - gainAt(i - 1)));
+        for (size_t i = arrive; i < arrive + len; ++i) top = std::max(top, static_cast<double>(l[i]));
+        out.peakOver = 20.0 * std::log10(top / static_cast<double>(l[arrive + len - 10]));
+        return out;
+    };
+    const Reading lead = read(C::LookaheadShape::Lead, 0.0f), ramp = read(C::LookaheadShape::Ramp, 0.0f),
+                  kept = read(C::LookaheadShape::Ramp, 10.0f);
+    std::cout << "  [ramp] largest step of the gain: " << lead.step << " dB per sample (lead), " << ramp.step << " (ramp), " << kept.step
+              << " (ramp inside a kept latency); gain when the jump arrives " << ramp.atArrival << " dB, settled " << ramp.settled
+              << " dB; the output peaks " << ramp.peakOver << " dB over its settled level (lead " << lead.peakOver << ")\n";
+    EXPECT_LT(ramp.step, 0.2 * lead.step);
+    EXPECT_LT(kept.step, 0.2 * lead.step);
+    EXPECT_NEAR(ramp.atArrival, ramp.settled, 0.3);
+    EXPECT_NEAR(kept.atArrival, kept.settled, 0.3);
+    EXPECT_LT(ramp.peakOver, 0.3);
+    EXPECT_LT(ramp.settled, -10.0);
+    // The shape is part of the state.
+    auto from = std::make_unique<C>();
+    from->setLookaheadShape(C::LookaheadShape::Ramp);
+    const auto blob = from->getState();
+    auto to = std::make_unique<C>();
+    EXPECT_TRUE(to->setState(blob.data(), blob.size()));
+    EXPECT_TRUE(to->getLookaheadShape() == C::LookaheadShape::Ramp);
+    EXPECT_TRUE(std::make_unique<C>()->getLookaheadShape() == C::LookaheadShape::Lead);
+}
+
+// New: setFeedbackKeyed(true) closes a feedback loop around the key ahead of
+// the audio. With the programme as the key and no lookahead it is the same
+// compressor; a lookahead then acts in feedback, with its latency and the
+// same settled level; and an external key, which a plain feedback loop
+// ignores, drives the reduction.
+DSPARK_TEST(Compressor_feedback_keyed_takes_a_lookahead_and_an_external_key)
+{
+    using C = Compressor<float>;
+    const size_t n = 256 * 190;
+    std::vector<float> programme(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        programme[i] = static_cast<float>((0.25 + 0.25 * std::sin(2.0 * 3.14159265358979323846 * 2.0 * t))
+                                          * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * t));
+    }
+    struct Run { std::vector<float> out; int latency = 0; double reduction = 0.0; };
+    const auto render = [&](const std::vector<float>& x, const std::vector<float>* key, float ratio, bool keyed, float lookaheadMs) {
+        auto c = std::make_unique<C>();
+        c->setCharacter(C::Character::FET);
+        c->setThreshold(-24.0f);
+        c->setRatio(ratio);
+        c->setFeedbackKeyed(keyed);
+        c->setLookahead(lookaheadMs);
+        c->prepare(AudioSpec{ 48000.0, 256, 2 });
+        Run run;
+        run.out = x;
+        std::vector<float> right = x, keyL, keyR;
+        if (key != nullptr) { keyL = *key; keyR = *key; }
+        for (size_t off = 0; off < n; off += 256)
+        {
+            float* ch[2] = { run.out.data() + off, right.data() + off };
+            if (key != nullptr)
+            {
+                float* kc[2] = { keyL.data() + off, keyR.data() + off };
+                c->processBlock(AudioBufferView<float>(ch, 2, 256), AudioBufferView<float>(kc, 2, 256));
+            }
+            else c->processBlock(AudioBufferView<float>(ch, 2, 256));
+        }
+        run.latency = c->getLatency();
+        run.reduction = static_cast<double>(c->getGainReductionDb());
+        return run;
+    };
+    // The same compressor with the programme as its key.
+    const Run plain = render(programme, nullptr, 4.0f, false, 0.0f), keyed = render(programme, nullptr, 4.0f, true, 0.0f);
+    double apart = 0.0;
+    for (size_t i = 0; i < n; ++i) apart = std::max(apart, std::abs(static_cast<double>(plain.out[i]) - keyed.out[i]));
+    EXPECT_LT(apart, 1e-6);
+    EXPECT_EQ(keyed.latency, 0);
+    // A lookahead: ignored by the plain loop, taken by the keyed one, which settles at the same level.
+    std::vector<float> steady(n);
+    for (size_t i = 0; i < n; ++i) steady[i] = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / 48000.0));
+    for (const float ratio : { 4.0f, 20.0f })
+    {
+        const Run none = render(steady, nullptr, ratio, false, 3.0f), ahead = render(steady, nullptr, ratio, true, 3.0f);
+        EXPECT_EQ(none.latency, 0);
+        EXPECT_EQ(ahead.latency, 144);
+        const double a = m3RmsDb(none.out, n - 12000, n), b = m3RmsDb(ahead.out, n - 12000, n);
+        std::cout << "  [keyed] ratio " << ratio << ": settled level " << a << " dB plain, " << b << " dB keyed with a lookahead\n";
+        EXPECT_NEAR(b, a, 0.05);
+    }
+    // An external key over a quiet programme.
+    std::vector<float> quiet(n), loud(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        quiet[i] = static_cast<float>(0.03 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / 48000.0));
+        loud[i] = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979323846 * 300.0 * static_cast<double>(i) / 48000.0));
+    }
+    const Run ignored = render(quiet, &loud, 4.0f, false, 0.0f), driven = render(quiet, &loud, 4.0f, true, 0.0f);
+    std::cout << "  [keyed] a loud key over a quiet programme: reduction " << ignored.reduction << " dB plain, " << driven.reduction << " dB keyed\n";
+    EXPECT_GT(ignored.reduction, -0.5);
+    EXPECT_LT(driven.reduction, -6.0);
+    // Part of the state.
+    auto from = std::make_unique<C>();
+    from->setFeedbackKeyed(true);
+    const auto blob = from->getState();
+    auto to = std::make_unique<C>();
+    EXPECT_TRUE(to->setState(blob.data(), blob.size()));
+    EXPECT_TRUE(to->isFeedbackKeyed());
+    EXPECT_FALSE(std::make_unique<C>()->isFeedbackKeyed());
 }

@@ -23,6 +23,7 @@
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dsplab {
@@ -97,6 +98,13 @@ struct ParamDesc
     std::vector<std::string> choices;       // Only for Choice type
     bool        logarithmic = false;        // Log-scale slider
     std::string group;                      // Tab the control sits on (empty: the first tab)
+};
+
+/// One control of a preset: its name in the interface and the value it takes.
+struct PresetValue
+{
+    const char* control;
+    float       value;
 };
 
 // --- Effect slot (one per processor instance) --------------------------------
@@ -177,6 +185,20 @@ public:
     // Multiband display: fills crossover frequencies (Hz) and per-band gain
     // reduction (dB, positive = attenuation); returns the active band count.
     std::function<int(float* crossoverHz, float* bandGrDb, int maxBands)> multibandFn;
+
+    // --- Presets: settings to start listening from --------------------------------
+
+    /// A named setting: every control at its default, with these on top.
+    struct Preset
+    {
+        std::string name;
+        std::string note;                              // what it shows, and what to compare
+        std::vector<std::pair<int, float>> values;     // control index and value, in the order given
+    };
+    std::vector<Preset> presets;
+    int currentPreset = -1;          // UI: the preset last applied (-1: none)
+    int presetSettle = 0;            // UI frames until the preset's values go in a second time
+    std::string presetErrors;        // Controls a preset named that this slot does not have
 
     // --- Builder helpers ---
 
@@ -260,6 +282,69 @@ public:
         {
             values[i] = params[i].defaultVal;
             if (setParamFn) setParamFn(i, values[i]);
+        }
+        currentPreset = -1;
+        presetSettle = 0;
+    }
+
+    // --- Presets ---
+
+    /// The index of the control with this name, or -1.
+    [[nodiscard]] int indexOf(const char* control) const
+    {
+        for (int i = 0; i < static_cast<int>(params.size()); ++i)
+            if (params[static_cast<size_t>(i)].name == control) return i;
+        return -1;
+    }
+
+    /// Adds a preset by the names of its controls (call it once every control
+    /// of the slot exists). A name the slot does not have is left out and
+    /// noted in presetErrors, which the interface shows.
+    void addPreset(const char* presetName, const char* note,
+                   std::initializer_list<PresetValue> controls)
+    {
+        Preset p;
+        p.name = presetName;
+        p.note = note;
+        for (const PresetValue& control : controls)
+        {
+            const int index = indexOf(control.control);
+            if (index < 0)
+            {
+                presetErrors += std::string(presetName) + ": no control named " + control.control + "\n";
+                continue;
+            }
+            p.values.emplace_back(index, control.value);
+        }
+        presets.push_back(std::move(p));
+    }
+
+    /// Every control to its default, then the preset's own, in order.
+    void applyPreset(int index)
+    {
+        if (index < 0 || index >= static_cast<int>(presets.size())) return;
+        applyAllDefaults();
+        applyPresetValues(index);
+        currentPreset = index;
+        // A processor that loads a set of its own when a mode changes (a reverb
+        // type) does so a moment later, on the audio thread: the preset's
+        // values go in again once it has.
+        presetSettle = 12;
+    }
+
+    /// Call once per interface frame while the slot is shown.
+    void settlePreset()
+    {
+        if (presetSettle > 0 && --presetSettle == 0 && currentPreset >= 0) applyPresetValues(currentPreset);
+    }
+
+private:
+    void applyPresetValues(int index)
+    {
+        for (const auto& value : presets[static_cast<size_t>(index)].values)
+        {
+            const ParamDesc& d = params[static_cast<size_t>(value.first)];
+            applyParam(value.first, std::clamp(value.second, d.min, d.max));
         }
     }
 };

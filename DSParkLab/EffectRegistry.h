@@ -5,6 +5,7 @@
 
 #include "../DSPark.h"
 #include "EffectSlot.h"
+#include "Presets.h"
 
 #include <array>
 #include <complex>
@@ -492,6 +493,19 @@ inline EffectSlot makeCompressor()
     s.addChoice("Hold Mode", {"Deepest","Every peak"}, 0);      // 44: the hold as a sliding window
     s.addChoice("Lookahead Shape", {"Lead","Ramp"}, 0);         // 45: the reduction arriving with the peak along a ramp
     s.addToggle("Feedback Keyed", false);                       // 46: a feedback loop closed around the key (lookahead and external key in feedback)
+    s.addChoice("Mode", {"Downward","Upward","Both","Leveler"}, 0);   // 47: the curve of the gain computer
+    s.addSlider("Lift Below", 0, 80, 30, "dB");                 // 48: Both: the lower threshold, under the main one
+    s.addSlider("Lift Ratio", 1, 20, 2, ":1");                  // 49
+    s.addSlider("Lift Range", 0, 40, 6, "dB");                  // 50: the most it raises
+    s.addChoice("Range Shape", {"Corner","Asymptotic","Local"}, 0);   // 51: how the gain change meets the range
+    s.addSlider("Release Landing", 0, 2000, 0, "ms");           // 52: the last decibels of a release come back slowly
+    s.addSlider("Network Depth", 0, 12, 0, "dB");               // 53: only a share of a fast move of the gain at once
+    s.addSlider("Network Corner", 1, 100, 10, "Hz");            // 54
+    s.addSlider("Tone Low", -3, 3, 0, "dB");                    // 55: the tone that follows the reduction, under 200 Hz
+    s.addSlider("Tone High", -3, 3, 0, "dB");                   // 56: and over 4 kHz
+    s.addSlider("Control Leak", 0, 1, 0, "");                   // 57: the moves of the gain as low thumps
+    s.addSlider("Detector Asymmetry", -1, 1, 0, "");            // 58: the two halves of the wave read differently
+    s.addChoice("Route", {"Stereo","Mid + Side","Mid","Side","Mid keys Side","Side keys Mid"}, 0);   // 59
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -568,6 +582,19 @@ inline EffectSlot makeCompressor()
             case 44: p->setHoldMode(static_cast<dspark::Compressor<float>::HoldMode>(static_cast<int>(v))); break;
             case 45: p->setLookaheadShape(static_cast<dspark::Compressor<float>::LookaheadShape>(static_cast<int>(v))); break;
             case 46: p->setFeedbackKeyed(v > 0.5f); break;
+            case 47: p->setMode(static_cast<dspark::Compressor<float>::Mode>(static_cast<int>(v))); break;
+            case 48: p->setLift(v, p->getLiftRatio(), p->getLiftRange()); break;
+            case 49: p->setLift(p->getLiftBelow(), v, p->getLiftRange()); break;
+            case 50: p->setLift(p->getLiftBelow(), p->getLiftRatio(), v); break;
+            case 51: p->setRangeShape(static_cast<dspark::Compressor<float>::RangeShape>(static_cast<int>(v))); break;
+            case 52: p->setReleaseLanding(v); break;
+            case 53: p->setControlNetwork(v, p->getControlNetworkCorner()); break;
+            case 54: p->setControlNetwork(p->getControlNetworkDepth(), v); break;
+            case 55: p->setReductionTone(v, p->getReductionToneHigh()); break;
+            case 56: p->setReductionTone(p->getReductionToneLow(), v); break;
+            case 57: p->setControlLeak(v); break;
+            case 58: p->setDetectorAsymmetry(v); break;
+            case 59: p->setRoute(static_cast<dspark::Compressor<float>::Route>(static_cast<int>(v))); break;
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -588,6 +615,8 @@ inline EffectSlot makeCompressor()
     s.group("Timing", { 13, 14, 15, 20, 21, 22, 23, 32 });
     s.group("Key", { 24, 25, 26, 27, 28, 29, 30, 31, 33 });
     s.group("Colour Stage", { 36, 37, 38, 39, 40, 41, 42 });
+    s.group("Curve", { 47, 48, 49, 50, 51, 59 });
+    s.group("Control Path", { 52, 53, 54, 55, 56, 57, 58 });
     return s;
 }
 
@@ -2519,7 +2548,7 @@ inline EffectSlot makeSpectralDynamicEQ()
 
 inline std::vector<EffectSlot> createAllEffects()
 {
-    return {
+    std::vector<EffectSlot> all {
         // Filters
         makeFilterEngine(),
         makeEqualizer(),
@@ -2570,6 +2599,9 @@ inline std::vector<EffectSlot> createAllEffects()
         makeResonanceSuppressor(),
         makeSpectralDynamicEQ(),
     };
+    // Settings to start listening from, by effect (Presets.h).
+    addLabPresets(all);
+    return all;
 }
 
 } // namespace dsplab

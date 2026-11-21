@@ -215,6 +215,15 @@ private:
         if (ImGui::IsKeyPressed(ImGuiKey_B, false)) engine.setBypass(!engine.isBypassed());
         if (sel && ImGui::IsKeyPressed(ImGuiKey_E, false)) sel->enabled = !sel->enabled.get();
         if (sel && ImGui::IsKeyPressed(ImGuiKey_R, false)) sel->applyAllDefaults();
+        // The presets of the effect, one after another.
+        if (sel && !sel->presets.empty())
+        {
+            const int count = static_cast<int>(sel->presets.size());
+            if (ImGui::IsKeyPressed(ImGuiKey_RightBracket, false))
+                sel->applyPreset(sel->currentPreset < 0 ? 0 : (sel->currentPreset + 1) % count);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false))
+                sel->applyPreset(sel->currentPreset <= 0 ? count - 1 : sel->currentPreset - 1);
+        }
     }
 
     // --- Top bar: file, transport, seek, A/B --------------------------------------------
@@ -402,6 +411,39 @@ private:
         if (ImGui::Button("Reset"))
             sel->applyAllDefaults();
         ImGui::SetItemTooltip("Every control to its default (R)");
+
+        // Presets: a setting to start listening from. Choosing one puts every
+        // control at its default and then sets the preset's own.
+        sel->settlePreset();
+        if (!sel->presets.empty())
+        {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(px(300.0f));
+            const int current = sel->currentPreset;
+            const char* shown = current >= 0 ? sel->presets[static_cast<size_t>(current)].name.c_str() : "Presets...";
+            if (ImGui::BeginCombo("##preset", shown, ImGuiComboFlags_HeightLarge))
+            {
+                for (int i = 0; i < static_cast<int>(sel->presets.size()); ++i)
+                {
+                    const auto& preset = sel->presets[static_cast<size_t>(i)];
+                    if (ImGui::Selectable(preset.name.c_str(), i == current)) sel->applyPreset(i);
+                    if (!preset.note.empty()) ImGui::SetItemTooltip("%s", preset.note.c_str());
+                }
+                ImGui::EndCombo();
+            }
+            else
+            {
+                ImGui::SetItemTooltip("A setting to start from: every control to its default, then the preset's own. [ and ] step through them.");
+            }
+            if (!sel->presetErrors.empty())
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.30f, 1.0f), "(!)");
+                ImGui::SetItemTooltip("%s", sel->presetErrors.c_str());
+            }
+            if (sel->currentPreset >= 0 && !sel->presets[static_cast<size_t>(sel->currentPreset)].note.empty())
+                ImGui::TextDisabled("%s", sel->presets[static_cast<size_t>(sel->currentPreset)].note.c_str());
+        }
 
         if (sel->loadIRFn)
         {

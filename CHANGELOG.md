@@ -6,6 +6,58 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Compressor`: three stages between the ballistics and the gain, all off by
+  default. `setReleaseLanding(ms)` makes the last decibels of a release come
+  back slowly: the gain that is heard takes every deeper reduction at once
+  and returns behind the ballistics, slower the nearer it is (with 300 ms on
+  a release of 100 ms, the first 6 dB of 12 come back in 94 ms instead of 70
+  and the stretch from 1 dB to 0.1 dB takes 481 ms instead of 230).
+  `setControlNetwork(depthDb, cornerHz)` puts a lead-lag network in the
+  control path: of a sudden move of the gain a share arrives at once and the
+  rest with the time constant of the corner, with a gain at 0 Hz that is 1 by
+  construction (6 dB at 5 Hz: 53 % of a step 2 ms after it, the settled
+  reduction within 0.001 dB, and the ripple of the gain on a 40 Hz tone down
+  from 1.80 to 0.91 dB). `setRangeShape(Local)` bends the gain change only in
+  a stretch around the range, exact under it and over it (the asymptotic
+  curve of `setSoftRange()` stays as `Asymptotic`).
+- `Compressor::setReductionTone(lowDb, highDb)`: a tone that changes with the
+  reduction. The gain acts on a copy of the signal that has passed a nearly
+  flat filter F (a low shelf at 200 Hz and a high shelf at 4 kHz) and what
+  that copy loses is taken off the signal, y = x - (1 - g) F(x): with no
+  reduction the output is the input bit for bit, and under 12 dB of it a
+  shelf of +1 dB makes the reduction 3.9 dB deeper there and one of -1 dB
+  2.4 dB shallower (measured within 0.001 dB of the expression at five
+  frequencies).
+- `Compressor::setControlLeak(amount)`: the moves of the gain, through a
+  high-pass of 5 Hz, are added to the output of the element, as a gain
+  element leaks its own control: a thump at each attack and release in
+  proportion to the amount (0.034 of full scale at 1 for a gain that falls
+  12 dB) and nothing under a settled gain (under 1.3e-7).
+- `Compressor::setDetectorAsymmetry(amount)`: the detector reads the two
+  halves of the wave differently (a share of the key's own crest is added
+  before it is rectified). A signal with peaks of +0.3 and -0.6 gets 2.90 dB
+  less reduction than its inverse at 0.5 (none at 0), the gain of a low tone
+  moves at its own frequency (second harmonic from -225 dBc at 0 to -21, -17
+  and -16 dBc at 0.2, 0.5 and 0.9, with the third falling), and a symmetric
+  tone settles where it did. With the Peak, TruePeak and Hybrid detectors.
+- `Compressor::Mode::Both` and `Mode::Leveler`. Both brings what is over the
+  threshold down with the ratio and what is under a second, lower threshold
+  up with a ratio and a range of its own (`setLift()`), from one detector;
+  with no rise it is Downward bit for bit. Leveler has no ratio and no knee:
+  the gain is 1 / (1 + level / threshold), 6.02 dB at the threshold and
+  harder by itself until the output stays at the threshold. Both static
+  curves measure within 0.001 dB of their expressions from -80 to 0 dBFS.
+  Feed-forward curves: in a feedback loop the mode is Downward.
+- `Compressor::setRoute()`: the compressor on the middle and the sides of a
+  pair in place of left and right (`MidSide`), on one of the two (`Mid`,
+  `Side`: the other passes untouched, late by the latency of the gain path,
+  within 1.9e-8 of what went in) or on one with the gain the other asks for
+  (`MidKeysSide`, `SideKeysMid`). A key given apart is split the same way.
+- DSParkLab: presets. Each effect has a list of settings to start listening
+  from in its header (and the keys [ and ] step through them): a preset puts
+  every control at its default and sets its own, and says under the header
+  what it shows and what to compare. 180 presets over 37 effects, with the
+  controls of everything above in the Compressor.
 - `DynamicEQ`: a listening zone of its own for each band, and a key listen.
   `BandConfig::listenLow` and `listenHigh` (0 by default: the detector
   listens where the band acts) give the detector a zone of its own: a
@@ -2996,6 +3048,15 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `Compressor`: the measures of `setProgramRelease()` and
+  `setAttackEmphasis()` had fixed windows (1.5 s and 30 ms), so "sustained"
+  and "the leading edge" meant different things at different settings: with
+  a release of 2 s the sustain measure was faster than the release itself.
+  They now count in the knobs' own times (fifteen releases and six attacks,
+  which are the old figures at the default 100 ms and 5 ms). A reduction held
+  for three release times lengthens the release 1.82, 1.83 and 1.83 times at
+  50 ms, 100 ms and 1 s, and the emphasis goes 5.58 and 5.59 dB past the
+  plain attack at 2 and 20 ms.
 - `Equalizer`, leaving `LinearPhase`: the bands had not run since the mode was
   entered and resumed from the memory of the audio they last played. They are
   now cleared and run over the input the linear-phase engine still holds (one

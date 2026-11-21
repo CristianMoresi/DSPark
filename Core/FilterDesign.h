@@ -531,8 +531,9 @@ public:
     }
 
     /**
-     * @brief Low shelf of any order: gainDb below the corner, half of it (in
-     *        decibels) at the corner, 6 dB per octave of transition per order.
+     * @brief Low shelf of any order from 1, whole or not: gainDb below the
+     *        corner, half of it (in decibels) at the corner, 6 dB per octave
+     *        of transition per order.
      *
      * A Butterworth shelf (S. J. Orfanidis, "High-Order Digital Parametric
      * Equalizer Design", J. Audio Eng. Soc., 2005): it never overshoots, and
@@ -544,7 +545,7 @@ public:
      * the plateau, the half gain at the corner and the inverse cut
      * stay as they are.
      */
-    [[nodiscard]] static AnalogCascade lowShelf(double hz, double gainDb, int order, double q = kButterworthQ) noexcept
+    [[nodiscard]] static AnalogCascade lowShelf(double hz, double gainDb, double order, double q = kButterworthQ) noexcept
     {
         AnalogCascade out = shelfPrototype(gainDb, order, q);
         const double omega = omegaOf(hz);
@@ -553,7 +554,7 @@ public:
     }
 
     /** @brief High shelf of any order: lowShelf() mirrored about the corner. */
-    [[nodiscard]] static AnalogCascade highShelf(double hz, double gainDb, int order, double q = kButterworthQ) noexcept
+    [[nodiscard]] static AnalogCascade highShelf(double hz, double gainDb, double order, double q = kButterworthQ) noexcept
     {
         AnalogCascade out = shelfPrototype(gainDb, order, q);
         const double omega = omegaOf(hz);
@@ -567,9 +568,10 @@ public:
      *
      * Order 1 is AnalogSection::peak(). The gain is gainDb at the centre and
      * half of it (in decibels) at the two edges hz / q apart, whatever the
-     * order; a cut is the exact inverse of the boost. One biquad per order.
+     * order, whole or not; a cut is the exact inverse of the boost. One biquad
+     * per order (a part of an order takes one more).
      */
-    [[nodiscard]] static AnalogCascade bell(double hz, double q, double gainDb, int order) noexcept
+    [[nodiscard]] static AnalogCascade bell(double hz, double q, double gainDb, double order) noexcept
     {
         AnalogCascade out;
         const AnalogCascade proto = shelfPrototype(gainDb, order);
@@ -592,9 +594,11 @@ public:
     /**
      * @brief Butterworth band-pass: 0 dB at the centre, -3 dB at the two
      *        edges hz / q apart, 6 dB per octave on each side per order. One
-     *        biquad per order.
+     *        biquad per order (a part of an order takes one more: between
+     *        whole orders the band is that of highCut() at that slope, moved
+     *        to the centre).
      */
-    [[nodiscard]] static AnalogCascade bandPass(double hz, double q, int order) noexcept
+    [[nodiscard]] static AnalogCascade bandPass(double hz, double q, double order) noexcept
     {
         return bandFilter(hz, q, order, false);
     }
@@ -602,9 +606,9 @@ public:
     /**
      * @brief Butterworth band-stop: a null at the centre, -3 dB at the two
      *        edges hz / q apart, and a floor that widens with the order. One
-     *        biquad per order.
+     *        biquad per order (a part of an order takes one more).
      */
-    [[nodiscard]] static AnalogCascade bandStop(double hz, double q, int order) noexcept
+    [[nodiscard]] static AnalogCascade bandStop(double hz, double q, double order) noexcept
     {
         return bandFilter(hz, q, order, true);
     }
@@ -614,13 +618,47 @@ public:
      *        turns 180 degrees per order around the frequency.
      *
      * The poles are those of the cut of the same order (q acts on the sharpest
-     * pair, from order 2 up).
+     * pair, from order 2 up). The order is any from 1, whole or not: the phase
+     * at the frequency moves 90 degrees per order all the way.
      */
-    [[nodiscard]] static AnalogCascade allPass(double hz, double q, int order) noexcept
+    [[nodiscard]] static AnalogCascade allPass(double hz, double q, double order) noexcept
     {
         AnalogCascade out;
-        const int n = std::clamp(order, 1, kMaxOrder);
+        const double nu = wholeOrPart(order);
         const double w = omegaOf(hz), w2 = w * w;
+        if (nu != std::floor(nu))
+        {
+            // Between whole orders: whole pairs at the angles of the order and
+            // one section with what is left, which turns the phase at the
+            // frequency by 90 degrees per order of its share. Under one order
+            // it is a real pole that comes in from far above; over one, a
+            // pair whose second pole comes in the same way while its damping
+            // goes to that of the pair of the next whole order.
+            const int pairs = static_cast<int>(std::floor(0.5 * nu));
+            const double rest = nu - 2.0 * pairs;                       // in (0, 2), not 1
+            const double sharpest = kButterworthQ / std::clamp(q, 0.1, 100.0);
+            for (int i = 0; i < pairs; ++i)
+            {
+                const double a1 = 2.0 * std::sin(kPi * (2 * i + 1) / (2.0 * nu)) * (i == 0 ? sharpest : 1.0) * w;
+                out.add(AnalogSection::make(1.0, -a1, w2, 1.0, a1, w2));
+            }
+            const double turn = std::tan(0.25 * kPi * rest);
+            if (rest < 1.0)
+            {
+                out.add(AnalogSection::make(0.0, -turn, w, 0.0, turn, w));
+            }
+            else
+            {
+                const double part = rest - 1.0;
+                const double narrow = 2.0 * std::sin(kPi * (2 * pairs + 1) / (2.0 * (2 * pairs + 2)));
+                double damping = std::pow(narrow, part);
+                if (pairs == 0) damping *= std::pow(sharpest, part);
+                const double second = std::clamp(1.0 - damping / turn, 0.0, 1.0);
+                out.add(AnalogSection::make(second, -damping * w, w2, second, damping * w, w2));
+            }
+            return out;
+        }
+        const int n = static_cast<int>(nu);
         for (int i = 0; i < n / 2; ++i)
         {
             double damping = 2.0 * std::sin(kPi * (2 * i + 1) / (2.0 * n));
@@ -1340,24 +1378,69 @@ private:
 
     /**
      * @brief Butterworth low shelf with its corner at 1 rad/s: gainDb at DC,
-     *        half of it (in decibels) at the corner, 0 dB far above.
+     *        half of it (in decibels) at the corner, 0 dB far above. Of any
+     *        order from 1, whole or not.
      */
-    [[nodiscard]] static AnalogCascade shelfPrototype(double gainDb, int order, double q = kButterworthQ) noexcept
+    [[nodiscard]] static AnalogCascade shelfPrototype(double gainDb, double order, double q = kButterworthQ) noexcept
     {
         AnalogCascade out;
-        const int n = std::clamp(order, 1, kMaxOrder);
+        const double nu = wholeOrPart(order);
         const double db = std::isfinite(gainDb) ? std::clamp(gainDb, -120.0, 120.0) : 0.0;
-        const double g = std::pow(10.0, db / (20.0 * n)), beta = std::pow(10.0, -db / (40.0 * n));
         // The Q acts on the sharpest pair, in its zeros as in its poles: the
         // gain of the pair at the corner does not depend on its damping.
         const double sharpest = kButterworthQ / (std::isfinite(q) ? std::clamp(q, 0.05, 100.0) : kButterworthQ);
-        for (int i = 0; i < n / 2; ++i)
+        const double g = std::pow(10.0, db / (20.0 * nu)), beta = std::pow(10.0, -db / (40.0 * nu));
+        if (nu == std::floor(nu))
         {
-            const double s = std::sin(kPi * (2 * i + 1) / (2.0 * n)) * (i == 0 ? sharpest : 1.0);
+            const int n = static_cast<int>(nu);
+            for (int i = 0; i < n / 2; ++i)
+            {
+                const double s = std::sin(kPi * (2 * i + 1) / (2.0 * n)) * (i == 0 ? sharpest : 1.0);
+                out.add(AnalogSection::make(1.0, 2.0 * g * s * beta, g * g * beta * beta, 1.0, 2.0 * s * beta, beta * beta));
+            }
+            if (n % 2 == 1) out.add(AnalogSection::make(0.0, 1.0, g * beta, 0.0, 1.0, beta));
+            return out;
+        }
+        // Between whole orders. Every section has its share of the gain and
+        // its own corner factor (gain times the factor squared is 1), so the
+        // plateaus and the half gain at the corner hold whatever the shares
+        // and the dampings: whole pairs at the angles of the order, each with
+        // two orders' worth of the gain, and one section with what is left.
+        const int pairs = static_cast<int>(std::floor(0.5 * nu));
+        const double rest = nu - 2.0 * pairs;                       // in (0, 2), not 1
+        for (int i = 0; i < pairs; ++i)
+        {
+            const double s = std::sin(kPi * (2 * i + 1) / (2.0 * nu)) * (i == 0 ? sharpest : 1.0);
             out.add(AnalogSection::make(1.0, 2.0 * g * s * beta, g * g * beta * beta, 1.0, 2.0 * s * beta, beta * beta));
         }
-        if (n % 2 == 1) out.add(AnalogSection::make(0.0, 1.0, g * beta, 0.0, 1.0, beta));
+        if (rest < 1.0)
+        {
+            // Under one order: a first-order shelf with that share, which leaves as the share goes to nothing.
+            const double share = std::pow(g, rest), factor = 1.0 / std::sqrt(share);
+            out.add(AnalogSection::make(0.0, 1.0, share * factor, 0.0, 1.0, factor));
+        }
+        else
+        {
+            // Over one: a pair. With one order's share it is the first-order
+            // section times a root that its zero cancels (a damping of
+            // g^(1/4) + g^(-1/4)); with two, the pair of the next whole
+            // order. In between the damping goes from one to the other in
+            // its logarithm.
+            const double part = rest - 1.0;
+            const double share = std::pow(g, 0.5 * rest), factor = 1.0 / std::sqrt(share);
+            const double wide = std::pow(g, 0.25) + std::pow(g, -0.25);
+            const double narrow = 2.0 * std::sin(kPi * (2 * pairs + 1) / (2.0 * (2 * pairs + 2)));
+            double damping = std::exp((1.0 - part) * std::log(wide) + part * std::log(narrow));
+            if (pairs == 0) damping *= std::pow(sharpest, part);     // the Q comes in between orders 1 and 2
+            out.add(AnalogSection::make(1.0, damping * share * factor, share * share * factor * factor, 1.0, damping * factor, factor * factor));
+        }
         return out;
+    }
+
+    /** @brief An order from 1 to kMaxOrder, whole or not (1 for a value that is not a number). */
+    [[nodiscard]] static double wholeOrPart(double order) noexcept
+    {
+        return std::isfinite(order) ? std::clamp(order, 1.0, static_cast<double>(kMaxOrder)) : 1.0;
     }
 
     /// The two quadratics a pair of low-pass roots turns into around a centre: s^2 + c1 s + c0 each.
@@ -1374,22 +1457,93 @@ private:
      */
     [[nodiscard]] static BandPair bandPair(double c1, double c0, double width, double w0) noexcept
     {
+        BandPair pair;
+        if (c1 * c1 > 4.0 * c0)
+        {
+            // Two real roots: each is a quadratic of its own around the centre.
+            const double spread = std::sqrt(c1 * c1 - 4.0 * c0);
+            pair.upper1 = 0.5 * (c1 + spread) * width; pair.upper0 = w0 * w0;
+            pair.lower1 = 0.5 * (c1 - spread) * width; pair.lower0 = w0 * w0;
+            return pair;
+        }
         const std::complex<double> root(-0.5 * c1, 0.5 * std::sqrt(std::max(0.0, 4.0 * c0 - c1 * c1)));
         const std::complex<double> sum = root * width;
         const std::complex<double> spread = std::sqrt(sum * sum - 4.0 * w0 * w0);
         std::complex<double> above = 0.5 * (sum + spread), below = 0.5 * (sum - spread);
         if (std::norm(above) < std::norm(below)) std::swap(above, below);
-        BandPair pair;
         pair.upper1 = -2.0 * above.real(); pair.upper0 = std::norm(above);
         pair.lower1 = -2.0 * below.real(); pair.lower0 = std::norm(below);
         return pair;
     }
 
-    [[nodiscard]] static AnalogCascade bandFilter(double hz, double q, int order, bool stop) noexcept
+    /// What a polynomial p2 S^2 + p1 S + p0 of a low-pass turns into around a centre: its quadratics and its leading term.
+    struct BandFactors
+    {
+        double c1[2] = {}, c0[2] = {};
+        int count = 0;
+        double lead = 1.0;
+    };
+
+    [[nodiscard]] static BandFactors bandFactors(double p2, double p1, double p0, double width, double w0) noexcept
+    {
+        BandFactors f;
+        if (p2 != 0.0)
+        {
+            const BandPair pair = bandPair(p1 / p2, p0 / p2, width, w0);
+            f.c1[0] = pair.upper1; f.c0[0] = pair.upper0;
+            f.c1[1] = pair.lower1; f.c0[1] = pair.lower0;
+            f.count = 2;
+            f.lead = p2;
+        }
+        else if (p1 != 0.0)
+        {
+            f.c1[0] = p0 / p1 * width; f.c0[0] = w0 * w0;
+            f.count = 1;
+            f.lead = p1;
+        }
+        else
+        {
+            f.lead = p0;
+        }
+        return f;
+    }
+
+    /**
+     * @brief Adds the band-pass form of a low-pass section with its corner at
+     *        1 rad/s: S = (s^2 + w0^2) / (width s). Each quadratic of the
+     *        denominator takes one of the numerator while there are, then
+     *        width s.
+     */
+    static void addBandForm(const AnalogSection& s, double width, double w0, AnalogCascade& out) noexcept
+    {
+        const BandFactors num = bandFactors(s.b2, s.b1, s.b0, width, w0), den = bandFactors(s.a2, s.a1, s.a0, width, w0);
+        double gain = den.lead != 0.0 ? num.lead / den.lead : 1.0;
+        for (int i = 0; i < den.count; ++i)
+        {
+            if (i < num.count) out.add(AnalogSection::make(gain, gain * num.c1[i], gain * num.c0[i], 1.0, den.c1[i], den.c0[i]));
+            else out.add(AnalogSection::make(0.0, gain * width, 0.0, 1.0, den.c1[i], den.c0[i]));
+            gain = 1.0;
+        }
+    }
+
+    [[nodiscard]] static AnalogCascade bandFilter(double hz, double q, double order, bool stop) noexcept
     {
         AnalogCascade out;
-        const int n = std::clamp(order, 1, kMaxOrder);
+        const double nu = wholeOrPart(order);
         const double w0 = omegaOf(hz), w02 = w0 * w0, width = w0 / std::clamp(q, 1e-3, 1e3);
+        if (nu != std::floor(nu))
+        {
+            // Between whole orders: the cut of that slope around the centre
+            // (for the band-stop, turned over first: S to 1 / S).
+            const AnalogCascade proto = cutPrototype(6.0 * nu, kButterworthQ);
+            for (int i = 0; i < proto.count; ++i)
+            {
+                const AnalogSection& p = proto.sections[static_cast<size_t>(i)];
+                addBandForm(stop ? AnalogSection::make(p.b0, p.b1, p.b2, p.a0, p.a1, p.a2) : p, width, w0, out);
+            }
+            return out;
+        }
+        const int n = static_cast<int>(nu);
         const double b2 = stop ? 1.0 : 0.0, b1 = stop ? 0.0 : width, b0 = stop ? w02 : 0.0;
         for (int i = 0; i < n / 2; ++i)
         {

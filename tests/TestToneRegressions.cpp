@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <random>
@@ -768,4 +769,204 @@ DSPARK_TEST(Tone_level_follower_silence_reads_the_floor)
     for (int i = 0; i < static_cast<int>(fs * 3.5) / 4096; ++i)
         m.process(AudioBufferView<const float>(&p, 1, 4096));
     EXPECT_LT(m.getRmsLevelDb(0), -99.9f);
+}
+
+// New: the linear-phase design keeps each band's magnitude curve. A change
+// computes the curve of the band that changed and one product of the curves,
+// so it is heard as soon with sixteen bands as with one (every section of
+// every band was evaluated again: whole hops 4, 11 and 19 with 1, 8 and 16
+// bells of order 4, and 3, 5 and 7 of order 1), and the kernel is the one a
+// fresh instance designs, bit for bit.
+DSPARK_TEST(Tone_eq_linear_phase_change_is_heard_as_soon_with_many_bands)
+{
+    using EQ = Equalizer<float>;
+    const double fs = 48000.0;
+    const int block = 64, settle = 48000, after = 72000;
+    int hops[3] = { 0, 0, 0 }, simple[3] = { 0, 0, 0 };
+    double apart = 0.0;
+    for (const int order : { 4, 1 })
+    {
+        int at = 0;
+        for (const int count : { 1, 8, 16 })
+        {
+            const auto configure = [&](EQ& eq, float gain) {
+                eq.setFilterMode(EQ::FilterMode::LinearPhase);
+                eq.setNumBands(count);
+                for (int b = 0; b < count; ++b)
+                {
+                    EQ::BandConfig cfg;
+                    cfg.type = EQ::BandType::Peak;
+                    cfg.frequency = b == 0 ? 1000.0f : 60.0f * std::pow(1.42f, static_cast<float>(b));
+                    cfg.gain = b == 0 ? gain : (b % 2 == 0 ? 2.0f : -2.0f);
+                    cfg.q = 2.0f;
+                    cfg.order = order;
+                    eq.setBand(b, cfg);
+                }
+            };
+            auto eq = std::make_unique<EQ>();
+            configure(*eq, 3.0f);
+            eq->prepare(spec(fs, block, 1));
+            const int part = (eq->getLatency() * 16 / 9) / 16;   // latency = kernel/2 + kernel/16
+            Planar x(1, settle + after);
+            fillSine(x, 1000.0, fs, 0.3f);
+            // Settled, then the first band up by 6 dB.
+            runBlocks(*eq, x, block, 0, settle);
+            float steady = 0.0f;
+            for (int i = settle - 480; i < settle; ++i) steady = std::max(steady, std::abs(x.d[0][static_cast<size_t>(i)]));
+            {
+                EQ::BandConfig cfg = eq->getBandConfig(0);
+                cfg.gain = 9.0f;
+                eq->setBand(0, cfg);
+            }
+            runBlocks(*eq, x, block, settle, settle + after);
+            int heard = -1;
+            for (int i = settle; i < settle + after && heard < 0; ++i)
+                if (std::abs(x.d[0][static_cast<size_t>(i)]) > 1.03f * steady) heard = i - settle;
+            (order == 4 ? hops : simple)[at] = heard < 0 ? -1 : heard / part;
+            // The same settings from the start: the same output once both have landed.
+            if (order == 4)
+            {
+                auto fresh = std::make_unique<EQ>();
+                configure(*fresh, 9.0f);
+                fresh->prepare(spec(fs, block, 1));
+                Planar y(1, settle + after);
+                fillSine(y, 1000.0, fs, 0.3f);
+                runBlocks(*fresh, y, block, 0, settle + after);
+                for (int i = settle + after - 4800; i < settle + after; ++i)
+                    apart = std::max(apart, static_cast<double>(std::abs(x.d[0][static_cast<size_t>(i)] - y.d[0][static_cast<size_t>(i)])));
+            }
+            ++at;
+        }
+    }
+    std::printf("  [eq] linear phase, a change is heard after %d, %d and %d hops with 1, 8 and 16 bells of order 4 (%d, %d and %d of order 1); against a fresh design %.2e\n",
+                hops[0], hops[1], hops[2], simple[0], simple[1], simple[2], apart);
+    EXPECT_GT(hops[0], 0);
+    EXPECT_EQ(hops[1], hops[0]);
+    EXPECT_EQ(hops[2], hops[0]);
+    EXPECT_EQ(simple[1], simple[0]);
+    EXPECT_EQ(simple[2], simple[0]);
+    EXPECT_LT(apart, 1e-7);
+}
+
+// New: leaving LinearPhase, the bands start conditioned. They had not run
+// since the mode was entered and resumed from the memory of the audio they
+// last played, a second old here (the first 10 ms stood 14 dB under the
+// programme from an equaliser that never left MinimumPhase); now they are
+// cleared and run over the input the linear-phase engine still holds, and
+// they stand 45 dB under it.
+DSPARK_TEST(Tone_eq_leaving_linear_phase_starts_from_conditioned_bands)
+{
+    using EQ = Equalizer<float>;
+    const double fs = 48000.0;
+    const int block = 64, enter = 48000, leave = 48000 * 2 + 4032, total = 48000 * 3;
+    Planar x(1, total), y(1, total);
+    for (int i = 0; i < total; ++i)
+    {
+        const double t = static_cast<double>(i) / fs;
+        const float v = static_cast<float>(0.2 * std::sin(2.0 * kPiT * 83.0 * t) + 0.15 * std::sin(2.0 * kPiT * 117.0 * t + 0.4)
+                                           + 0.1 * std::sin(2.0 * kPiT * 1013.0 * t + 1.1));
+        x.d[0][static_cast<size_t>(i)] = v;
+        y.d[0][static_cast<size_t>(i)] = v;
+    }
+    const auto make = [&] {
+        auto eq = std::make_unique<EQ>();
+        eq->setBand(0, 100.0f, 12.0f, 4.0f);
+        EQ::BandConfig cut;
+        cut.type = EQ::BandType::HighPass;
+        cut.frequency = 60.0f;
+        cut.slope = 24.0f;
+        eq->setBand(1, cut);
+        eq->prepare(spec(fs, block, 1));
+        return eq;
+    };
+    auto steady = make();
+    runBlocks(*steady, x, block);
+    auto moved = make();
+    runBlocks(*moved, y, block, 0, enter);
+    moved->setFilterMode(EQ::FilterMode::LinearPhase);
+    runBlocks(*moved, y, block, enter, leave);
+    moved->setFilterMode(EQ::FilterMode::MinimumPhase);
+    runBlocks(*moved, y, block, leave, total);
+    double peak = 0.0, first = 0.0, later = 0.0;
+    for (int i = leave; i < leave + 480; ++i)
+    {
+        peak = std::max(peak, static_cast<double>(std::abs(x.d[0][static_cast<size_t>(i)])));
+        first = std::max(first, static_cast<double>(std::abs(x.d[0][static_cast<size_t>(i)] - y.d[0][static_cast<size_t>(i)])));
+    }
+    for (int i = leave + 4800; i < leave + 5280; ++i)
+        later = std::max(later, static_cast<double>(std::abs(x.d[0][static_cast<size_t>(i)] - y.d[0][static_cast<size_t>(i)])));
+    std::printf("  [eq] leaving linear phase: the first 10 ms stand %.1f dB under the programme from a band that never left (%.1f dB 100 ms later)\n",
+                20.0 * std::log10(std::max(first / peak, 1e-12)), 20.0 * std::log10(std::max(later / peak, 1e-12)));
+    EXPECT_LT(first, 0.03 * peak);
+    EXPECT_LT(later, 0.003 * peak);
+}
+
+// New: a band of the analog response glides through the designs of the
+// parameters in between. Its five coefficients went in one straight line
+// from the old design to the new: a bell that jumped four octaves was, on the
+// way, a blend of the two bells (12 dB off the bell of the frequency in
+// between). Now it is that bell to within half a decibel, whatever the block
+// and in the per-sample path, and it lands on the design asked for.
+DSPARK_TEST(Tone_eq_analog_band_glides_through_the_bands_in_between)
+{
+    using EQ = Equalizer<float>;
+    const double fs = 48000.0;
+    const auto start = [&](int block) {
+        auto eq = std::make_unique<EQ>();
+        eq->setAnalogResponse(true);
+        eq->setBand(0, 200.0f, 12.0f, 4.0f);
+        eq->prepare(spec(fs, block, 1));
+        Planar quiet(1, 4800);
+        runBlocks(*eq, quiet, block);
+        eq->setBand(0, 3200.0f, 12.0f, 4.0f);
+        return eq;
+    };
+    // The top of the response and where it is.
+    const auto top = [&](const EQ& eq, double& hz) {
+        double best = -1e9;
+        for (double f = 100.0; f < 8000.0; f *= std::pow(2.0, 1.0 / 96.0))
+        {
+            const double g = static_cast<double>(eq.getAnalogBandResponse(0, static_cast<float>(f)));
+            if (g > best) { best = g; hz = f; }
+        }
+        return best;
+    };
+    double worstHz = 0.0, worstDb = 0.0, blocks = 0.0, single = 0.0;
+    // The jump takes 10 ms: 480 samples.
+    for (const int at : { 135, 255, 375 })
+    {
+        const double wanted = 200.0 * std::pow(16.0, at / 480.0);
+        auto eq = start(480);
+        Planar x(1, at);
+        runBlocks(*eq, x, at);
+        double hz = 0.0;
+        const double gain = top(*eq, hz);
+        worstHz = std::max(worstHz, std::abs(std::log2(hz / wanted)));
+        worstDb = std::max(worstDb, std::abs(gain - 12.0));
+        // In blocks of 7, and a sample at a time: the same band.
+        auto small = start(7);
+        Planar y(1, at);
+        runBlocks(*small, y, 7);
+        auto one = start(480);
+        for (int i = 0; i < at; ++i) (void)one->processSample(0.0f, 0);
+        for (const double f : { 300.0, 800.0, 2000.0 })
+        {
+            const double whole = static_cast<double>(eq->getAnalogBandResponse(0, static_cast<float>(f)));
+            blocks = std::max(blocks, std::abs(static_cast<double>(small->getAnalogBandResponse(0, static_cast<float>(f))) - whole));
+            single = std::max(single, std::abs(static_cast<double>(one->getAnalogBandResponse(0, static_cast<float>(f))) - whole));
+        }
+    }
+    auto landed = start(64);
+    Planar z(1, 960);
+    runBlocks(*landed, z, 64);
+    double hz = 0.0;
+    const double gain = top(*landed, hz);
+    std::printf("  [eq] a bell on its way from 200 Hz to 3.2 kHz: top within %.3f octaves and %.2f dB of the bell of the frequency in between; blocks of 7 within %.2e dB, a sample at a time %.2e; landed at %.0f Hz, %.2f dB\n",
+                worstHz, worstDb, blocks, single, hz, gain);
+    EXPECT_LT(worstHz, 0.06);
+    EXPECT_LT(worstDb, 0.8);
+    EXPECT_LT(blocks, 1e-6);
+    EXPECT_LT(single, 1e-6);
+    EXPECT_NEAR(hz, 3200.0, 30.0);
+    EXPECT_NEAR(gain, 12.0, 0.05);
 }

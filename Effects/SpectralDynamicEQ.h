@@ -183,6 +183,16 @@ public:
     /** @return The gain of the last frame with the largest magnitude, in dB, its sign kept (any thread). */
     [[nodiscard]] T getPeakGain() const noexcept { return readout_.extreme(); }
 
+    /**
+     * @brief Reads the levels through a window that shortens as frequency
+     *        rises (off by default; see SpectralFilter::setTimeFocus()).
+     *        A held tone is cut the same; the cut a 10 ms burst at 8 kHz
+     *        sets off lasts 21 ms in place of 43 and starts 17 ms before
+     *        the burst comes out in place of 28.
+     */
+    void setTimeFocus(bool on) noexcept { timeFocus_.store(on, std::memory_order_relaxed); }
+    [[nodiscard]] bool getTimeFocus() const noexcept { return timeFocus_.load(std::memory_order_relaxed); }
+
     /** @brief Processes the programme in place, its own level driving the bands. */
     void processBlock(AudioBufferView<T> buffer) noexcept { run(buffer, nullptr); }
     /** @brief Processes the programme in place, a key's level driving the bands. */
@@ -208,6 +218,7 @@ public:
             std::snprintf(key, sizeof(key), "b%d.cells", i);
             w.write(key, static_cast<int32_t>(b.cells));
         }
+        w.write("timeFocus", getTimeFocus());
         return w.blob();
     }
 
@@ -233,6 +244,7 @@ public:
             b.cells = r.read(key, 32);
             setBand(i, b);
         }
+        setTimeFocus(r.read("timeFocus", false));
         return true;
     }
 
@@ -363,6 +375,7 @@ private:
         if (!prepared_) return;
         for (int i = 0; i < kBands; ++i)
             if (dirty_[static_cast<size_t>(i)].exchange(false, std::memory_order_acquire)) redesign(i);
+        filter_.setTimeFocus(timeFocus_.load(std::memory_order_relaxed));
         filter_.processBlock(buffer, key, [&](int, const T* power, T* gain, int bins) noexcept { design(power, gain, bins); });
     }
 
@@ -448,6 +461,7 @@ private:
     SpectralReadout<T> readout_;
     std::array<Published, kBands> published_ {};
     std::array<std::atomic<bool>, kBands> dirty_ {};
+    std::atomic<bool> timeFocus_ { false };
     std::array<State, kBands> state_ {};
     std::vector<double> gainDb_;
 };

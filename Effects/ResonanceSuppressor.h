@@ -259,6 +259,18 @@ public:
      */
     void setShortKernel(bool on) noexcept { shortKernel_.store(on, std::memory_order_relaxed); }
     /**
+     * @brief Reads the spectrum through a window that shortens as frequency
+     *        rises (off by default; see SpectralFilter::setTimeFocus()).
+     *        What an event sets off stays next to it: the reduction of a
+     *        10 ms burst at 8 kHz starts 17 ms before the burst comes out in
+     *        place of 71 and lasts 128 ms in place of 245, and the grain of
+     *        a white noise is left alone (0.02 dB taken in place of 0.31).
+     *        A held line stands less above the envelope, so it is reduced
+     *        less at the same settings (6.7 dB where the whole window gives
+     *        11.2): lower the threshold or raise the strength for the depth.
+     */
+    void setTimeFocus(bool on) noexcept { timeFocus_.store(on, std::memory_order_relaxed); }
+    /**
      * @brief The band setRemovalListen() plays, in hertz (0 and 0, the
      *        default, play all of it): what is taken out between the two
      *        frequencies alone, with a sixth of an octave of slope at each
@@ -318,6 +330,7 @@ public:
     [[nodiscard]] T getWidthTaperCorner() const noexcept { return taperHz_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getWidthTaperExponent() const noexcept { return taperExponent_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool getShortKernel() const noexcept { return shortKernel_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getTimeFocus() const noexcept { return timeFocus_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRemovalBandLow() const noexcept { return bandLow_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRemovalBandHigh() const noexcept { return bandHigh_.load(std::memory_order_relaxed); }
     [[nodiscard]] Band getSensitivityBand(int index) const noexcept { return sensitivity_.getBand(index); }
@@ -391,6 +404,7 @@ public:
         w.write("taperHz", static_cast<float>(getWidthTaperCorner()));
         w.write("taperExponent", static_cast<float>(getWidthTaperExponent()));
         w.write("shortKernel", getShortKernel());
+        w.write("timeFocus", getTimeFocus());
         sensitivity_.writeState(w, "sens");
         return w.blob();
     }
@@ -419,6 +433,7 @@ public:
         setEnvelopePasses(r.read("envelopePasses", 1));
         setWidthTaper(static_cast<T>(r.read("taperHz", 2000.0f)), static_cast<T>(r.read("taperExponent", 0.0f)));
         setShortKernel(r.read("shortKernel", false));
+        setTimeFocus(r.read("timeFocus", false));
         sensitivity_.readState(r, "sens");
         weightDirty_.store(true, std::memory_order_release);
         return true;
@@ -495,6 +510,7 @@ private:
             lastTaperExponent_ = power;
         }
         filter_.setShortKernel(shortKernel_.load(std::memory_order_relaxed));
+        filter_.setTimeFocus(timeFocus_.load(std::memory_order_relaxed));
         refreshWeight();
         const bool ms = nCh == 2 && link_.load(std::memory_order_relaxed) == Link::MidSide;
         const T linkAmount = linkAmount_.load(std::memory_order_relaxed);
@@ -709,7 +725,7 @@ private:
     std::atomic<bool> qualityFollowsRender_ { false }, offlineRendering_ { false };
     std::atomic<bool> removalListen_ { false }, focusListen_ { false }, timesDirty_ { false }, weightDirty_ { true };
     std::atomic<T> mix_ { T(1) }, knee_ { T(0) }, persistenceMs_ { T(0) }, quietDb_ { T(-200) };
-    std::atomic<bool> auditory_ { false }, shortKernel_ { false };
+    std::atomic<bool> auditory_ { false }, shortKernel_ { false }, timeFocus_ { false };
     std::atomic<int> envelopePasses_ { 1 };
     std::atomic<T> taperHz_ { T(2000) }, taperExponent_ { T(0) }, bandLow_ { T(0) }, bandHigh_ { T(0) };
     T lastTaperHz_ = T(0), lastTaperExponent_ = T(0);

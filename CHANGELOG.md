@@ -6,6 +6,14 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `SpectralFilter::getFramePower(channel)`: every hop reads the power of all
+  the channels before the first filter is designed, so the design of one
+  channel can look at the others of the same frame. `GraphicBank::setGains()`
+  takes `kCarryRefinement` for the calls between two refined ones (the last
+  refinement's correction is added). `TonalBalance::getLoudnessChange()`
+  reads what the corrections leave of a change of the total loudness.
+  `AuditoryScale::dominantPower()` takes a complex cross term, and
+  `SpectralEnvelope::prepare()` the narrowest smoothing in bins.
 - `BucketBrigade`: `prepare(rate, stages, corner, 2)` runs a line at twice
   the host's rate (the input interpolated half way between samples, the
   output read every other step after its low-pass), so the images of a clock
@@ -2721,6 +2729,40 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `ResonanceSuppressor`: a link between 0 and 1 behaved as 0, because each
+  channel designed its filter without the power of the other. With a line on
+  the left only, the right channel took 1.3 dB at the line unlinked
+  and 22.2 dB linked, and the same 1.3 dB at any link in
+  between; it now takes 12.2 dB at a link of one half. The level each
+  channel is read by goes that share of the way to the level of the pair's
+  mean power, in decibels in `Mode::Smooth` and in amplitude in `Mode::Deep`.
+- `ResonanceSuppressor` with `Quality::Offline`: the detector's smoothings
+  were counted in hops and in bins, so with four times the hops and four
+  times the bins of `Quality::Realtime` it smoothed a quarter as long and a
+  quarter as wide, and found other resonances (pink noise with three lines:
+  the reductions of the two qualities 1.3 dB apart on average over the
+  curve, 4.5 dB at the worst point; a 500 Hz line taken 9.9 dB down in one
+  and 14.1 dB in the other). They are now times and widths in hertz: 0.04 dB
+  apart on average, 1.0 dB at the worst point, the line 9.9 and 9.4 dB down.
+  `Quality::Realtime` is unchanged to the bit.
+- `SpectralDenoiser` in filter mode with a link between 0 and 1: the gains of
+  the two channels were mixed, the first channel reading the second one's
+  gains of the frame before, so the channels were not treated alike
+  (swapping the channels of the programme did not swap the output) and a
+  tone on one channel lost 2.3 dB at a link of one half. The link now acts
+  on the power each channel is read by, within the same frame: the output
+  swaps with the input to the bit and the tone keeps its level (0.17 dB).
+- `TonalBalance`: the cross term of the stereo covariance kept only its real
+  part, so with one channel a delayed copy of the other the band powers took
+  a comb and the corrections followed it (a delay of a quarter of a
+  millisecond: corrections up to 0.78 dB away from those of two equal
+  channels; now 0.19 dB). The bank's solution was refined one hop in eight
+  and left plain on the other seven, so on a steady programme the response
+  stepped with a period of eight hops (0.09 dB at 9 kHz with corrections of
+  12 dB; now under 0.001 dB: the hops in between carry the correction). And
+  the loudness offset was scaled by each band's weight and then limited,
+  which left the total loudness up to 0.02 dB away; it is now solved with
+  the limits and the weights in place. The analysis costs 9 % more.
 - `DeEsser` and `DynamicEQ`: the detector's band-pass (and the low-pass and
   high-pass of the shelves) was a bilinear design, which narrows toward
   Nyquist, so near the top of the band the detector heard a narrower band

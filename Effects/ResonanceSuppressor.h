@@ -26,6 +26,14 @@
  * and cut to the room the padding leaves, so a reduction never starts before
  * the event.
  *
+ * Off by default, for the detection: setPersistence() counts only what
+ * lasts (the excess is averaged while it grows), setQuietLevel() lets go of
+ * what is quiet, setKnee() rounds the threshold, setAuditoryWeighting()
+ * weighs the amount by the ear's threshold, and setEnvelopePasses() and
+ * setWidthTaper() shape the envelope. For the filter: setMix() is taken
+ * inside it, before the minimum-phase design, and setShortKernel() tapers
+ * its impulse response over its whole length.
+ *
  * Stereo: Link::PerBin takes the level each channel is read by towards that
  * of the pair's mean power, bin by bin (setLink() 0 to 1: at 0 each channel
  * reads itself; in between, that share of the way, in decibels in
@@ -96,7 +104,9 @@ public:
         spec_ = spec;
         const int octaves = std::max(0, static_cast<int>(std::lround(std::log2(std::max(spec.sampleRate, 44100.0) / 44100.0))));
         const int window = std::min(2048 << octaves, 16384);
-        const bool offline = quality_.load(std::memory_order_relaxed) == Quality::Offline;
+        const bool offline = quality_.load(std::memory_order_relaxed) == Quality::Offline
+            || (qualityFollowsRender_.load(std::memory_order_relaxed) && offlineRendering_.load(std::memory_order_relaxed));
+        qualityInUse_.store(offline ? Quality::Offline : Quality::Realtime, std::memory_order_relaxed);
         filter_.prepare(spec, window, offline ? 8 : 2, offline ? 16 : 4);
         bins_ = filter_.getNumBins();
         // The detector's smoothings, the same in hertz and in seconds at any
@@ -119,6 +129,10 @@ public:
         env_.assign(static_cast<size_t>(bins_), T(0));
         mixed_.assign(static_cast<size_t>(bins_), T(0));
         weight_.assign(static_cast<size_t>(bins_), T(1));
+        weightNext_.assign(static_cast<size_t>(bins_), T(1));
+        held_.assign(chans + 1, std::vector<T>(static_cast<size_t>(bins_), T(0)));
+        earBest_ = 1e9;
+        for (double hz = 1000.0; hz <= 6000.0; hz += 100.0) earBest_ = std::min(earBest_, AuditoryScale::thresholdInQuietDb(hz));
         attack_.assign(static_cast<size_t>(bins_), T(0));
         release_.assign(static_cast<size_t>(bins_), T(0));
         sensitivity_.prepare(spec.sampleRate);
@@ -136,6 +150,7 @@ public:
         filter_.reset();
         for (auto& v : smoothPower_) std::fill(v.begin(), v.end(), T(0));
         for (auto& v : gainDb_) std::fill(v.begin(), v.end(), T(0));
+        for (auto& v : held_) std::fill(v.begin(), v.end(), T(0));
         reduction_.clear();
         excess_.clear();
     }
@@ -166,8 +181,111 @@ public:
     void setRemovalListen(bool on) noexcept { removalListen_.store(on, std::memory_order_relaxed); }
     /** @brief Outputs the programme through the sensitivity curve. */
     void setFocusListen(bool on) noexcept { focusListen_.store(on, std::memory_order_relaxed); }
+    /**
+     * @brief How much of the filter is applied, 0 to 1 (default 1). The mix
+     *        is taken inside the filter: its gain becomes 1 - mix + mix * gain
+     *        before the minimum-phase filter is designed, so the part left
+     *        alone and the part reduced never meet in two phases.
+     */
+    void setMix(T amount) noexcept { store(mix_, amount, T(0), T(1)); }
+    /**
+     * @brief Soft knee at the threshold, 0 to 12 dB (0, the default, is the
+     *        hard knee). With a knee an excess at the threshold is already
+     *        reduced by half the knee times the strength and the reduction
+     *        grows smoothly on both sides, so a resonance that hovers at the
+     *        threshold moves less from frame to frame (a quarter less with a
+     *        knee of 6 dB).
+     */
+    void setKnee(T db) noexcept { store(knee_, db, T(0), T(12)); }
+    /**
+     * @brief Persistence, 0 to 500 ms (0, the default, is off): the excess of
+     *        each bin is averaged over this time while it grows and followed
+     *        at once when it falls, so only what lasts counts as a
+     *        resonance. A click, a consonant or the grain of a noise are over
+     *        before they weigh (white noise read with no threshold loses
+     *        1.4 dB counted at once and 0.25 dB with 60 ms); a ringing line
+     *        is found as before.
+     */
+    void setPersistence(T ms) noexcept { store(persistenceMs_, ms, T(0), T(500)); }
+    /**
+     * @brief Level under which the suppressor lets go, -120 to 0 dBFS (off
+     *        at -200, the default; anything under -190 turns it off). Each
+     *        bin is read as its amplitude plus this level, so what lies well
+     *        over it is treated as before and what lies under it shows no
+     *        resonance: quiet passages, tails and the noise of a room are
+     *        left alone.
+     */
+    void setQuietLevel(T dbfs) noexcept
+    {
+        if (std::isfinite(dbfs)) quietDb_.store(dbfs < T(-190) ? T(-200) : std::clamp(dbfs, T(-120), T(0)), std::memory_order_relaxed);
+    }
+    /**
+     * @brief Weighs the amount by how well the ear hears each frequency (off
+     *        by default): a third of the distance in dB from the threshold of
+     *        hearing in quiet to its lowest point comes off the weight, so
+     *        the same excess weighs at 150 Hz under half of what it does at
+     *        3 kHz.
+     */
+    void setAuditoryWeighting(bool on) noexcept
+    {
+        auditory_.store(on, std::memory_order_relaxed);
+        weightDirty_.store(true, std::memory_order_release);
+    }
+    /**
+     * @brief Passes of the envelope's smoothing: 1 (the default) or 2. Two
+     *        passes keep the width and lose the long tails of one: a wide
+     *        rise of the spectrum is read as before, and a narrow line
+     *        raises the envelope under itself less, so it stands a little
+     *        further out (half a decibel more of a line of 20 dB).
+     */
+    void setEnvelopePasses(int passes) noexcept { envelopePasses_.store(passes >= 2 ? 2 : 1, std::memory_order_relaxed); }
+    /**
+     * @brief Narrows the envelope's smoothing above a corner: its width in
+     *        octaves falls as (corner / frequency) to the exponent (0, the
+     *        default, keeps setWidth() everywhere; 1 keeps it constant in
+     *        hertz above the corner). Non-finite values are ignored.
+     * @param cornerHz The corner, 200 Hz to 20 kHz.
+     * @param exponent 0 to 2.
+     */
+    void setWidthTaper(T cornerHz, T exponent) noexcept
+    {
+        store(taperHz_, cornerHz, T(200), T(20000));
+        store(taperExponent_, exponent, T(0), T(2));
+    }
+    /**
+     * @brief Tapers the filter's impulse response over its whole length (off
+     *        by default; see SpectralFilter::setShortKernel()): a cut rings
+     *        for a shorter time after the event, at the same depth.
+     */
+    void setShortKernel(bool on) noexcept { shortKernel_.store(on, std::memory_order_relaxed); }
+    /**
+     * @brief The band setRemovalListen() plays, in hertz (0 and 0, the
+     *        default, play all of it): what is taken out between the two
+     *        frequencies alone, with a sixth of an octave of slope at each
+     *        end. A listening aid like the listen itself: not part of the
+     *        state. Non-finite values are ignored.
+     */
+    void setRemovalBand(T lowHz, T highHz) noexcept
+    {
+        if (!std::isfinite(lowHz) || !std::isfinite(highHz)) return;
+        bandLow_.store(std::max(T(0), std::min(lowHz, highHz)), std::memory_order_relaxed);
+        bandHigh_.store(std::max(T(0), std::max(lowHz, highHz)), std::memory_order_relaxed);
+    }
     /** @brief Realtime or Offline (applies at the next prepare()). */
     void setQuality(Quality q) noexcept { quality_.store(q == Quality::Offline ? Quality::Offline : Quality::Realtime, std::memory_order_relaxed); }
+    /**
+     * @brief With it on, a prepare() made while the host renders offline
+     *        takes the Offline quality whatever setQuality() says (off by
+     *        default): a bounce is made at the best quality with no setting
+     *        to remember. The latency is the same in both.
+     */
+    void setQualityFollowsRender(bool on) noexcept { qualityFollowsRender_.store(on, std::memory_order_relaxed); }
+    /**
+     * @brief Tells the suppressor whether the host renders offline (read by
+     *        the next prepare(); a plugin forwards its host's notice here
+     *        before it prepares).
+     */
+    void setOfflineRendering(bool on) noexcept { offlineRendering_.store(on, std::memory_order_relaxed); }
     /** @brief One band of the sensitivity curve (KeyEqualizer bands; the curve is a weight, its gain in dB / 12 + 1, clamped 0 to 2). */
     void setSensitivityBand(int index, const Band& band) noexcept
     {
@@ -188,6 +306,20 @@ public:
     [[nodiscard]] bool getRemovalListen() const noexcept { return removalListen_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool getFocusListen() const noexcept { return focusListen_.load(std::memory_order_relaxed); }
     [[nodiscard]] Quality getQuality() const noexcept { return quality_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getQualityFollowsRender() const noexcept { return qualityFollowsRender_.load(std::memory_order_relaxed); }
+    /** @return The quality the last prepare() took (setQuality(), or Offline for an offline render it follows). */
+    [[nodiscard]] Quality getQualityInUse() const noexcept { return qualityInUse_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getKnee() const noexcept { return knee_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getPersistence() const noexcept { return persistenceMs_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getQuietLevel() const noexcept { return quietDb_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getAuditoryWeighting() const noexcept { return auditory_.load(std::memory_order_relaxed); }
+    [[nodiscard]] int getEnvelopePasses() const noexcept { return envelopePasses_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getWidthTaperCorner() const noexcept { return taperHz_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getWidthTaperExponent() const noexcept { return taperExponent_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getShortKernel() const noexcept { return shortKernel_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getRemovalBandLow() const noexcept { return bandLow_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getRemovalBandHigh() const noexcept { return bandHigh_.load(std::memory_order_relaxed); }
     [[nodiscard]] Band getSensitivityBand(int index) const noexcept { return sensitivity_.getBand(index); }
     /** @return The latency in samples. */
     [[nodiscard]] int getLatency() const noexcept { return filter_.getLatency(); }
@@ -249,6 +381,16 @@ public:
         w.write("link", static_cast<float>(getLink()));
         w.write("sideWeight", static_cast<float>(getSideWeight()));
         w.write("quality", static_cast<int32_t>(getQuality()));
+        w.write("qualityFollowsRender", getQualityFollowsRender());
+        w.write("mix", static_cast<float>(getMix()));
+        w.write("knee", static_cast<float>(getKnee()));
+        w.write("persistence", static_cast<float>(getPersistence()));
+        w.write("quietLevel", static_cast<float>(getQuietLevel()));
+        w.write("auditory", getAuditoryWeighting());
+        w.write("envelopePasses", static_cast<int32_t>(getEnvelopePasses()));
+        w.write("taperHz", static_cast<float>(getWidthTaperCorner()));
+        w.write("taperExponent", static_cast<float>(getWidthTaperExponent()));
+        w.write("shortKernel", getShortKernel());
         sensitivity_.writeState(w, "sens");
         return w.blob();
     }
@@ -268,6 +410,15 @@ public:
         setLink(static_cast<T>(r.read("link", 1.0f)));
         setSideWeight(static_cast<T>(r.read("sideWeight", 1.0f)));
         setQuality(r.read("quality", 0) == 1 ? Quality::Offline : Quality::Realtime);
+        setQualityFollowsRender(r.read("qualityFollowsRender", false));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setKnee(static_cast<T>(r.read("knee", 0.0f)));
+        setPersistence(static_cast<T>(r.read("persistence", 0.0f)));
+        setQuietLevel(static_cast<T>(r.read("quietLevel", -200.0f)));
+        setAuditoryWeighting(r.read("auditory", false));
+        setEnvelopePasses(r.read("envelopePasses", 1));
+        setWidthTaper(static_cast<T>(r.read("taperHz", 2000.0f)), static_cast<T>(r.read("taperExponent", 0.0f)));
+        setShortKernel(r.read("shortKernel", false));
         sensitivity_.readState(r, "sens");
         weightDirty_.store(true, std::memory_order_release);
         return true;
@@ -294,12 +445,17 @@ private:
         }
     }
 
-    /** @brief A share of the sensitivity curve per hop (the whole curve over eight hops). */
+    /**
+     * @brief A share of the sensitivity curve per call (the whole curve over
+     *        eight), computed aside and taken whole once it is complete: no
+     *        frame is weighed by a curve that is part old and part new.
+     */
     void refreshWeight() noexcept
     {
         if (weightDirty_.exchange(false, std::memory_order_acquire))
         {
             sensResponse_ = sensitivity_.getResponse();
+            weightAuditory_ = auditory_.load(std::memory_order_relaxed);
             weightPos_ = 0;
             weightPending_ = true;
         }
@@ -308,11 +464,18 @@ private:
         const int end = std::min(bins_, weightPos_ + share);
         for (int k = weightPos_; k < end; ++k)
         {
-            const double db = sensResponse_.magnitudeDb(std::max(1.0, k * filter_.getBinHz()));
-            weight_[static_cast<size_t>(k)] = static_cast<T>(std::clamp(1.0 + db / 12.0, 0.0, 2.0));
+            const double hz = std::max(1.0, k * filter_.getBinHz());
+            double w = std::clamp(1.0 + sensResponse_.magnitudeDb(hz) / 12.0, 0.0, 2.0);
+            if (weightAuditory_)
+                w *= std::clamp(std::pow(10.0, -(AuditoryScale::thresholdInQuietDb(std::max(20.0, hz)) - earBest_) / 60.0), 0.05, 1.0);
+            weightNext_[static_cast<size_t>(k)] = static_cast<T>(w);
         }
         weightPos_ = end;
-        if (weightPos_ >= bins_) weightPending_ = false;
+        if (weightPos_ >= bins_)
+        {
+            weight_.swap(weightNext_);
+            weightPending_ = false;
+        }
     }
 
     void run(AudioBufferView<T>& buffer, const AudioBufferView<T>* key) noexcept
@@ -323,6 +486,15 @@ private:
         if (nCh <= 0 || nS <= 0) return;
         if (timesDirty_.exchange(false, std::memory_order_acquire)) refreshTimes();
         if (const T w = width_.load(std::memory_order_relaxed); w != lastWidth_) { envelope_.setWidth(static_cast<double>(w)); lastWidth_ = w; }
+        if (const int passes = envelopePasses_.load(std::memory_order_relaxed); passes != envelope_.getPasses()) envelope_.setPasses(passes);
+        if (const T hz = taperHz_.load(std::memory_order_relaxed), power = taperExponent_.load(std::memory_order_relaxed);
+            hz != lastTaperHz_ || power != lastTaperExponent_)
+        {
+            envelope_.setTaper(static_cast<double>(hz) / filter_.getBinHz(), static_cast<double>(power));
+            lastTaperHz_ = hz;
+            lastTaperExponent_ = power;
+        }
+        filter_.setShortKernel(shortKernel_.load(std::memory_order_relaxed));
         refreshWeight();
         const bool ms = nCh == 2 && link_.load(std::memory_order_relaxed) == Link::MidSide;
         const T linkAmount = linkAmount_.load(std::memory_order_relaxed);
@@ -331,6 +503,14 @@ private:
         // that share of the way to the mean of the two.
         const T share = !ms && nCh == 2 && linkAmount > T(0) && linkAmount < T(1) ? linkAmount : T(0);
         filter_.setRemovalListen(removalListen_.load(std::memory_order_relaxed));
+        // The settings of this block's frames.
+        {
+            const double ms0 = static_cast<double>(persistenceMs_.load(std::memory_order_relaxed));
+            const double hopSeconds = static_cast<double>(filter_.getHopSize()) / spec_.sampleRate;
+            persistNow_ = ms0 > 0.0 ? static_cast<T>(std::exp(-hopSeconds / (0.001 * ms0))) : T(0);
+            const T quiet = quietDb_.load(std::memory_order_relaxed);
+            quietNow_ = quiet > T(-190) ? std::pow(T(10), quiet / T(20)) : T(0);
+        }
         if (ms)
         {
             T* l = buffer.getChannel(0);
@@ -387,12 +567,19 @@ private:
         if (share > T(0) && ch >= 0)
             for (int k = 0; k < bins; ++k)
                 db_[static_cast<size_t>(k)] += share * (linked_[static_cast<size_t>(k)] - db_[static_cast<size_t>(k)]);
-        envelope_.resonances(db_.data(), env_.data());
+        // With persistence the excess keeps its sign until it has been held:
+        // what falls under the envelope pulls the average down.
+        const T persist = persistNow_;
+        const bool lasting = persist > T(0);
+        if (lasting) envelope_.excess(db_.data(), env_.data());
+        else envelope_.resonances(db_.data(), env_.data());
         const T threshold = threshold_.load(std::memory_order_relaxed);
         const T strength = strength_.load(std::memory_order_relaxed);
         const T range = range_.load(std::memory_order_relaxed);
+        const T knee = knee_.load(std::memory_order_relaxed);
         const T side = ms && ch == 1 ? sideWeight_.load(std::memory_order_relaxed) : T(1);
         auto& g = gainDb_[c];
+        auto& held = held_[c];
         for (int k = 0; k < bins; ++k)
         {
             const auto i = static_cast<size_t>(k);
@@ -402,9 +589,18 @@ private:
             else
             {
                 const T amp = db_[i], over = env_[i];
-                excess = over > T(0) ? T(20) * std::log10(amp / std::max(amp - over, amp * T(1e-3))) : T(0);
+                excess = (over > T(0) || lasting) ? T(20) * std::log10(amp / std::max(amp - over, amp * T(1e-3))) : T(0);
             }
-            const T found = std::max(T(0), excess - threshold) * weight_[i] * side;
+            if (lasting)
+            {
+                // Averaged while it grows, followed at once when it falls.
+                T& h = held[i];
+                h = excess > h ? excess + persist * (h - excess) : excess;
+                excess = h;
+            }
+            const T past = excess - threshold;
+            const T found = (knee > T(0) ? T(0.5) * (past + std::sqrt(past * past + knee * knee)) : std::max(T(0), past))
+                          * weight_[i] * side;
             work_[i] = found;
             const T target = -std::min(range, strength * found);
             g[i] = target + (target < g[i] ? attack_[i] : release_[i]) * (g[i] - target);
@@ -414,6 +610,28 @@ private:
         mixed_[0] = g[0];
         AuditoryBands<T>::smoothAcross(mixed_.data(), bins, acrossBins_);
         for (int k = 0; k < bins; ++k) gain[k] = std::pow(T(10), mixed_[static_cast<size_t>(k)] / T(20));
+        // The mix, inside the filter: the curve shown is the one applied.
+        if (const T mix = mix_.load(std::memory_order_relaxed); mix < T(1))
+            for (int k = 0; k < bins; ++k)
+            {
+                gain[k] = T(1) - mix + mix * gain[k];
+                mixed_[static_cast<size_t>(k)] = T(20) * std::log10(std::max(gain[k], T(1e-6)));
+            }
+        // The band the removal is heard in: outside it the filter is left at one.
+        if (const T low = bandLow_.load(std::memory_order_relaxed), high = bandHigh_.load(std::memory_order_relaxed);
+            high > T(0) && removalListen_.load(std::memory_order_relaxed))
+        {
+            const double binHz = filter_.getBinHz(), slope = 6.0;   // a sixth of an octave at each end
+            for (int k = 0; k < bins; ++k)
+            {
+                const double octLow = low > T(0) ? std::log2(std::max(1e-3, k * binHz) / static_cast<double>(low)) : 1e9;
+                const double octHigh = std::log2(static_cast<double>(high) / std::max(1e-3, k * binHz));
+                const double edge = std::clamp(0.5 + slope * std::min(octLow, octHigh), 0.0, 1.0);
+                const T inside = static_cast<T>(0.5 - 0.5 * std::cos(3.141592653589793 * edge));
+                gain[k] = T(1) - inside * (T(1) - gain[k]);
+                mixed_[static_cast<size_t>(k)] = T(20) * std::log10(std::max(gain[k], T(1e-6)));
+            }
+        }
         publish(ch, bins);
     }
 
@@ -421,7 +639,8 @@ private:
      * @brief The level of each bin as the detector reads it: the power across
      *        a few bins (three at the padding of two; the same width at any
      *        other), a floor 80 dB under the frame's maximum, a one-pole in
-     *        time, and decibels or amplitude.
+     *        time, and decibels or amplitude (of the amplitude plus the
+     *        quiet level, when there is one).
      */
     void levels(const T* power, std::vector<T>& smooth, T* out, int bins, bool decibels) noexcept
     {
@@ -456,7 +675,12 @@ private:
         for (int k = 0; k < bins; ++k)
         {
             const T p = smooth[static_cast<size_t>(k)];
-            out[k] = decibels ? T(10) * std::log10(p) : std::sqrt(p);
+            if (quietNow_ > T(0))
+            {
+                const T amp = std::sqrt(p) + quietNow_;
+                out[k] = decibels ? T(20) * std::log10(amp) : amp;
+            }
+            else out[k] = decibels ? T(10) * std::log10(p) : std::sqrt(p);
         }
     }
 
@@ -473,21 +697,30 @@ private:
     AudioSpec spec_ {};
     int bins_ = 0, weightPos_ = 0, binHalf_ = 1, channels_ = 0;
     T timeSmooth_ = T(0.5), acrossBins_ = T(0.5);
-    bool prepared_ = false, weightPending_ = false, linkedInDecibels_ = true;
+    bool prepared_ = false, weightPending_ = false, linkedInDecibels_ = true, weightAuditory_ = false;
+    T persistNow_ = T(0), quietNow_ = T(0);   ///< This block's persistence coefficient and quiet level (amplitude).
+    double earBest_ = 0.0;                     ///< The lowest threshold of hearing, in dB.
     T lastWidth_ = T(1.0 / 3.0);
     std::atomic<T> threshold_ { T(3) }, strength_ { T(0.7) }, range_ { T(12) }, width_ { T(1.0 / 3.0) };
     std::atomic<T> attackMs_ { T(5) }, releaseMs_ { T(80) }, linkAmount_ { T(1) }, sideWeight_ { T(1) };
     std::atomic<Mode> mode_ { Mode::Smooth };
     std::atomic<Link> link_ { Link::PerBin };
-    std::atomic<Quality> quality_ { Quality::Realtime };
+    std::atomic<Quality> quality_ { Quality::Realtime }, qualityInUse_ { Quality::Realtime };
+    std::atomic<bool> qualityFollowsRender_ { false }, offlineRendering_ { false };
     std::atomic<bool> removalListen_ { false }, focusListen_ { false }, timesDirty_ { false }, weightDirty_ { true };
+    std::atomic<T> mix_ { T(1) }, knee_ { T(0) }, persistenceMs_ { T(0) }, quietDb_ { T(-200) };
+    std::atomic<bool> auditory_ { false }, shortKernel_ { false };
+    std::atomic<int> envelopePasses_ { 1 };
+    std::atomic<T> taperHz_ { T(2000) }, taperExponent_ { T(0) }, bandLow_ { T(0) }, bandHigh_ { T(0) };
+    T lastTaperHz_ = T(0), lastTaperExponent_ = T(0);
     SpectralFilter<T> filter_;
     SpectralReadout<T> reduction_, excess_;
     SpectralEnvelope<T> envelope_;
     KeyEqualizer<T, 2> sensitivity_;
     std::vector<std::vector<T>> smoothPower_, gainDb_;
     typename KeyEqualizer<T, 2>::Response sensResponse_ {};
-    std::vector<T> work_, db_, env_, mixed_, weight_, attack_, release_, linked_;
+    std::vector<T> work_, db_, env_, mixed_, weight_, weightNext_, attack_, release_, linked_;
+    std::vector<std::vector<T>> held_;   ///< The excess as the persistence holds it, per channel (and the pair).
 };
 
 } // namespace dspark

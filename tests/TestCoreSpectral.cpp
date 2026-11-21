@@ -20,6 +20,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -3076,4 +3077,98 @@ DSPARK_TEST(SpectralReadout_keeps_the_largest_magnitude_between_points)
     EXPECT_EQ(r->value(0, R::kPoints), 0.0f);
     r->clear();
     EXPECT_EQ(r->extreme(), 0.0f);
+}
+
+// New: SpectralEnvelope::setPasses() and setTaper(). Two passes of a
+// smoothing 1 / sqrt(2) as wide keep the equivalent width and lose the tails
+// of one pass: a narrow line raises the envelope under itself less, so it
+// stands over it more. The taper narrows the smoothing above its corner.
+DSPARK_TEST(SpectralEnvelope_two_passes_and_taper)
+{
+    const int n = 2049, centre = 512;
+    std::vector<float> in(static_cast<size_t>(n)), out(static_cast<size_t>(n));
+    // A rise of 10 dB about an octave wide, in decibels, and a line of 20 dB on its crown.
+    for (int k = 0; k < n; ++k)
+    {
+        const double oct = std::log2(std::max(1, k) / static_cast<double>(centre));
+        in[static_cast<size_t>(k)] = static_cast<float>(10.0 * std::exp(-oct * oct / 0.5));
+    }
+    const std::vector<float> plain = in;
+    in[static_cast<size_t>(centre)] += 20.0f;
+    SpectralEnvelope<float> e;
+    e.prepare(n, 1.0 / 3.0);
+    const auto read = [&](const std::vector<float>& spectrum, double& rise, double& line) {
+        e.resonances(spectrum.data(), out.data());
+        rise = 0.0;
+        for (int k = centre / 4; k < centre * 4; ++k) rise = std::max(rise, static_cast<double>(out[static_cast<size_t>(k)]));
+        line = static_cast<double>(out[static_cast<size_t>(centre)]);
+    };
+    double rise1 = 0.0, rise2 = 0.0, riseTaper = 0.0, line1 = 0.0, line2 = 0.0, unused = 0.0;
+    read(plain, rise1, unused);
+    read(in, unused, line1);
+    e.setPasses(2);
+    EXPECT_EQ(e.getPasses(), 2);
+    read(plain, rise2, unused);
+    read(in, unused, line2);
+    e.setTaper(128.0, 1.0);
+    read(plain, riseTaper, unused);
+    std::printf("  [envelope] the rise stands %.2f dB over one pass, %.2f over two, %.2f with the taper; the line %.2f and %.2f dB\n",
+                rise1, rise2, riseTaper, line1, line2);
+    EXPECT_GT(line2, line1);
+    EXPECT_LT(riseTaper, rise2);
+    e.setPasses(-3);
+    EXPECT_EQ(e.getPasses(), 1);
+    e.setTaper(std::numeric_limits<double>::quiet_NaN(), 1.0);
+    e.setTaper(0.0, 0.0);
+    read(plain, unused, line1);
+    EXPECT_NEAR(unused, rise1, 1e-6);
+}
+
+// New: SpectralFilter::setShortKernel(). The impulse response is cut to half
+// the transform and tapered over its whole length: a cut rings for a shorter
+// time after the event (the energy of the response past half a window falls
+// by some 10 dB) and keeps its depth.
+DSPARK_TEST(SpectralFilter_short_kernel_rings_for_less_time)
+{
+    const AudioSpec s = spec(48000.0, 512, 1);
+    for (const int half : { 3, 12 })
+    {
+        // A cut of 24 dB, `half` bins to each side of 3 kHz.
+        const auto cut = [half](int, const float*, float* gain, int bins) noexcept {
+            const int centre = static_cast<int>(std::lround(3000.0 / 24000.0 * (bins - 1)));
+            for (int k = centre - half; k <= centre + half; ++k)
+                if (k >= 0 && k < bins) gain[k] = 0.0631f;
+        };
+        double late[2] = { 0.0, 0.0 }, depth[2] = { 0.0, 0.0 };
+        for (const int kind : { 0, 1 })
+        {
+            SpectralFilter<float> f;
+            f.prepare(s, 1024, 2, 4);
+            f.setShortKernel(kind == 1);
+            EXPECT_TRUE(f.isShortKernel() == (kind == 1));
+            std::vector<float> click(16384, 0.0f);
+            click[4096] = 1.0f;
+            const auto h = sfRun(f, click, 512, cut);
+            // The response starts 1024 samples after the click: its energy from half a window on, against all of it.
+            double all = 0.0, tail = 0.0;
+            for (size_t i = 4096 + 1024; i < h.size(); ++i)
+            {
+                const double e = static_cast<double>(h[i]) * h[i];
+                all += e;
+                if (i >= 4096 + 1024 + 512) tail += e;
+            }
+            late[kind] = 10.0 * std::log10(std::max(tail / all, 1e-30));
+            f.reset();
+            std::vector<float> tone(24000);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979323846 * 3000.0 * static_cast<double>(i) / 48000.0));
+            const auto y = sfRun(f, tone, 512, cut);
+            double in2 = 0.0, out2 = 0.0;
+            for (size_t i = 12000; i < tone.size(); ++i) { in2 += static_cast<double>(tone[i]) * tone[i]; out2 += static_cast<double>(y[i]) * y[i]; }
+            depth[kind] = 10.0 * std::log10(std::max(out2 / in2, 1e-30));
+        }
+        std::printf("  [filter] a cut %d bins wide: past half a window %.1f dB of the response's energy, %.1f with the short kernel; depth %.1f and %.1f dB\n",
+                    2 * half + 1, late[0], late[1], depth[0], depth[1]);
+        EXPECT_LT(late[1], late[0] - 3.0);
+        EXPECT_LT(depth[1], -6.0);
+    }
 }

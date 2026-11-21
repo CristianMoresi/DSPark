@@ -9168,3 +9168,351 @@ DSPARK_TEST(MultibandCompressor_mix_of_every_band_keeps_the_phase)
         EXPECT_GT(half, wet + 1.0);
     }
 }
+
+// ============================================================================
+// The resonance suppressor: the mix inside the filter, the soft knee, the
+// persistence, the quiet level, the auditory weighting, the sensitivity
+// curve taken whole.
+// ============================================================================
+
+namespace {
+
+using Rs8 = ResonanceSuppressor<float>;
+
+// The level of a line through a suppressor against its level going in, in dB.
+template <class Setup>
+double m8LineChange(Setup&& setup, const std::vector<float>& in, double hz)
+{
+    auto rs = std::make_unique<Rs8>();
+    setup(*rs);
+    rs->prepare(spec(48000.0, 256, 2));
+    const size_t late = static_cast<size_t>(rs->getLatency());
+    const auto out = l13Run(*rs, in, in);
+    const size_t from = in.size() / 2, len = in.size() - from;
+    return l13Line(out.first, hz, from, len) - l13Line(in, hz, from - late, len);
+}
+
+std::vector<float> m8Scaled(std::vector<float> v, float gain)
+{
+    for (auto& x : v) x *= gain;
+    return v;
+}
+
+} // namespace
+
+// New: setMix(). The mix is taken inside the filter (its gain becomes
+// 1 - mix + mix * gain before the minimum-phase design), so a line is left at
+// the amplitude that mix of its two gains gives, and at no mix nothing moves.
+DSPARK_TEST(ResonanceSuppressor_mix_is_taken_inside_the_filter)
+{
+    const std::vector<float> rung = l13Add(l13Noise(48000 * 3, 0.1f, 7u), 2000.0, 0.2);
+    const double whole = m8LineChange([](Rs8&) {}, rung, 2000.0);
+    const double half = m8LineChange([](Rs8& rs) { rs.setMix(0.5f); }, rung, 2000.0);
+    const double none = m8LineChange([](Rs8& rs) { rs.setMix(0.0f); }, rung, 2000.0);
+    std::printf("  [suppressor] the line: %.2f dB at a mix of 1, %.2f at 0.5, %.2f at 0\n", whole, half, none);
+    EXPECT_LT(whole, -6.0);
+    EXPECT_NEAR(half, 20.0 * std::log10(0.5 + 0.5 * std::pow(10.0, whole / 20.0)), 0.3);
+    EXPECT_NEAR(none, 0.0, 0.01);
+}
+
+// New: setKnee(). A line that hovers at the threshold was taken in one frame
+// and left in the next (the reduction starts at an angle there); with a knee
+// the reduction grows smoothly through the threshold and moves a quarter
+// less from frame to frame.
+DSPARK_TEST(ResonanceSuppressor_knee_steadies_a_line_at_the_threshold)
+{
+    const size_t n = 48000 * 3;
+    const std::vector<float> noise = l13Noise(n, 0.1f, 15u);
+    const int point = static_cast<int>(std::lround((Rs8::kDisplayPoints - 1) * std::log(2000.0 / 20.0) / std::log(1000.0)));
+    // Standard deviation of the reduction at the line, hop by hop, over the second half.
+    const auto wander = [&](float knee, double amp) {
+        auto rs = std::make_unique<Rs8>();
+        rs->setThreshold(6.0f);
+        rs->setStrength(1.0f);
+        rs->setRange(48.0f);
+        rs->setKnee(knee);
+        rs->prepare(spec(48000.0, 256, 2));
+        std::vector<float> l = l13Add(noise, 2000.0, amp), r = l;
+        double sum = 0.0, squares = 0.0;
+        int count = 0;
+        for (size_t off = 0; off + 512 <= n; off += 512)
+        {
+            float* ch[2] = { l.data() + off, r.data() + off };
+            rs->processBlock(AudioBufferView<float>(ch, 2, 512));
+            if (off < n / 2) continue;
+            const double v = static_cast<double>(rs->getDisplayReduction(0, point));
+            sum += v;
+            squares += v * v;
+            ++count;
+        }
+        const double mean = sum / count;
+        return std::sqrt(std::max(0.0, squares / count - mean * mean));
+    };
+    // The line whose excess sits at the threshold is the one that wanders most with the hard knee.
+    double worst = 0.0, worstAmp = 0.0;
+    for (double amp = 0.002; amp < 0.05; amp *= 1.3)
+        if (const double w = wander(0.0f, amp); w > worst) { worst = w; worstAmp = amp; }
+    const double kneed = wander(6.0f, worstAmp);
+    std::printf("  [suppressor] a line at the threshold (amplitude %.4f): the reduction wanders %.2f dB with the hard knee, %.2f with a knee of 6 dB\n",
+                worstAmp, worst, kneed);
+    EXPECT_GT(worst, 0.2);
+    EXPECT_LT(kneed, 0.9 * worst);
+}
+
+// New: setPersistence(). The grain of a noise stands over its envelope in
+// every frame, somewhere else each time: counted at once it is turned down
+// like a resonance. Averaged while it grows and dropped when it falls, it
+// barely counts, while a line that rings is found as before.
+DSPARK_TEST(ResonanceSuppressor_persistence_counts_only_what_lasts)
+{
+    const size_t n = 48000 * 4;
+    const std::vector<float> noise = l13Noise(n, 0.2f, 21u);
+    const auto loss = [&](float ms) {
+        auto rs = std::make_unique<Rs8>();
+        rs->setThreshold(0.0f);
+        rs->setPersistence(ms);
+        rs->prepare(spec(48000.0, 256, 2));
+        const size_t late = static_cast<size_t>(rs->getLatency());
+        const auto out = l13Run(*rs, noise, noise);
+        return l13RmsDb(noise, n / 2 - late, n - late) - l13RmsDb(out.first, n / 2, n);
+    };
+    const double atOnce = loss(0.0f), lasting = loss(60.0f);
+    const std::vector<float> rung = l13Add(noise, 2000.0, 0.3);
+    const double line = m8LineChange([](Rs8& rs) { rs.setPersistence(60.0f); }, rung, 2000.0);
+    std::printf("  [suppressor] white noise loses %.2f dB counted at once, %.2f with a persistence of 60 ms; a line then falls %.2f dB\n",
+                atOnce, lasting, line);
+    EXPECT_GT(atOnce, 0.1);
+    EXPECT_LT(lasting, 0.5 * atOnce);
+    EXPECT_LT(line, -6.0);
+}
+
+// New: setQuietLevel(). Without it the same programme 40 dB down is treated
+// the same; with a quiet level under the loud programme and over the quiet
+// one, the loud one is treated as before and the quiet one is let go.
+DSPARK_TEST(ResonanceSuppressor_quiet_level_lets_go_of_what_is_quiet)
+{
+    const std::vector<float> rung = l13Add(l13Noise(48000 * 3, 0.1f, 7u), 2000.0, 0.2);
+    const auto change = [&](float quietDb, float gain) {
+        return m8LineChange([=](Rs8& rs) { rs.setQuietLevel(quietDb); }, m8Scaled(rung, gain), 2000.0);
+    };
+    const double loud = change(-200.0f, 1.0f), far = change(-200.0f, 0.01f);
+    const double loudOver = change(-60.0f, 1.0f), nearIt = change(-60.0f, 0.01f), under = change(-60.0f, 0.001f);
+    std::printf("  [suppressor] the line: %.2f dB at full level and %.2f at -40 dB with no quiet level;"
+                " with it at -60 dBFS %.2f, %.2f and %.2f at -60 dB\n", loud, far, loudOver, nearIt, under);
+    EXPECT_NEAR(far, loud, 0.5);
+    EXPECT_NEAR(loudOver, loud, 1.0);
+    EXPECT_GT(nearIt, 0.5 * loud);
+    EXPECT_GT(under, -0.5);
+}
+
+// New: setAuditoryWeighting(). The same excess weighs less where the ear
+// hears less: a line at 150 Hz is reduced by under 0.6 of what it was, one at
+// 3 kHz by as much as before.
+DSPARK_TEST(ResonanceSuppressor_auditory_weighting_follows_the_ear)
+{
+    const size_t n = 48000 * 3;
+    const std::vector<float> x = l13Add(l13Add(l13Noise(n, 0.1f, 5u), 150.0, 0.3), 3000.0, 0.05);
+    const auto reduction = [&](bool ear, double hz) {
+        auto rs = std::make_unique<Rs8>();
+        rs->setStrength(0.3f);
+        rs->setRange(48.0f);
+        rs->setAuditoryWeighting(ear);
+        rs->prepare(spec(48000.0, 256, 2));
+        return m4ReductionAt(*rs, x, x, 0, hz);
+    };
+    const double low = reduction(false, 150.0), lowEar = reduction(true, 150.0);
+    const double mid = reduction(false, 3000.0), midEar = reduction(true, 3000.0);
+    std::printf("  [suppressor] 150 Hz: %.2f dB, %.2f with the ear's weighting; 3 kHz: %.2f, %.2f\n", low, lowEar, mid, midEar);
+    EXPECT_LT(low, -0.5);
+    EXPECT_GT(lowEar, 0.6 * low);
+    EXPECT_NEAR(midEar, mid, 0.1 * std::abs(mid) + 0.1);
+}
+
+// Defect: a new sensitivity curve was written over the one in use an eighth
+// at a time, so for seven hops the low bins were weighed by the new curve
+// and the high ones by the old. It is now computed aside and taken whole: a
+// curve that closes everything closes a low line and a high one in the same
+// hop.
+DSPARK_TEST(ResonanceSuppressor_takes_a_new_sensitivity_curve_whole)
+{
+    const size_t n = 48000 * 2, at = 512 * 120;
+    std::vector<float> l = l13Add(l13Add(l13Noise(n, 0.05f, 9u), 200.0, 0.2), 9000.0, 0.2), r = l;
+    const auto pointOf = [](double hz) {
+        return static_cast<int>(std::lround((Rs8::kDisplayPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+    };
+    auto rs = std::make_unique<Rs8>();
+    rs->prepare(spec(48000.0, 512, 2));
+    int lowGone = -1, highGone = -1;
+    for (size_t off = 0; off + 512 <= n; off += 512)
+    {
+        if (off == at)
+        {
+            Rs8::Band closed;
+            closed.shape = KeyEqualizer<float, 2>::Shape::LowCut;
+            closed.frequency = 20000.0f;
+            closed.slope = 48.0f;
+            rs->setSensitivityBand(0, closed);
+        }
+        float* ch[2] = { l.data() + off, r.data() + off };
+        rs->processBlock(AudioBufferView<float>(ch, 2, 512));
+        if (off < at) continue;
+        const int hop = static_cast<int>((off - at) / 512);
+        const auto found = [&](double hz) {
+            float top = 0.0f;
+            for (int p = pointOf(hz) - 1; p <= pointOf(hz) + 1; ++p) top = std::max(top, rs->getDisplayExcess(0, p));
+            return top;
+        };
+        if (lowGone < 0 && found(200.0) < 0.05f) lowGone = hop;
+        if (highGone < 0 && found(9000.0) < 0.05f) highGone = hop;
+    }
+    std::printf("  [suppressor] a curve that closes everything: the low line is let go %d hops after it, the high one %d\n", lowGone, highGone);
+    EXPECT_GT(lowGone, -1);
+    EXPECT_EQ(lowGone, highGone);
+}
+
+// New: a key that is the programme itself is read as no key (one transform
+// per channel and hop instead of two): the same output, to the bit. And the
+// new controls clamp, ignore what is not a number and travel with the state.
+DSPARK_TEST(ResonanceSuppressor_key_that_is_the_programme_and_new_controls)
+{
+    const std::vector<float> rung = l13Add(l13Noise(48000, 0.1f, 7u), 2000.0, 0.2);
+    auto plain = std::make_unique<Rs8>(), keyed = std::make_unique<Rs8>();
+    plain->prepare(spec(48000.0, 256, 2));
+    keyed->prepare(spec(48000.0, 256, 2));
+    std::vector<float> l1 = rung, r1 = rung, l2 = rung, r2 = rung;
+    double apart = 0.0;
+    for (size_t off = 0; off + 256 <= rung.size(); off += 256)
+    {
+        float* a[2] = { l1.data() + off, r1.data() + off };
+        float* b[2] = { l2.data() + off, r2.data() + off };
+        plain->processBlock(AudioBufferView<float>(a, 2, 256));
+        AudioBufferView<float> programme(b, 2, 256);
+        keyed->processBlock(programme, programme);
+        for (int i = 0; i < 256; ++i) apart = std::max(apart, std::abs(static_cast<double>(a[0][i]) - b[0][i]));
+    }
+    EXPECT_EQ(apart, 0.0);
+
+    Rs8 a;
+    a.setMix(0.4f);
+    a.setKnee(5.0f);
+    a.setPersistence(70.0f);
+    a.setQuietLevel(-55.0f);
+    a.setAuditoryWeighting(true);
+    a.setMix(std::numeric_limits<float>::quiet_NaN());
+    a.setKnee(std::numeric_limits<float>::infinity());
+    const auto blob = a.getState();
+    Rs8 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(b.getMix()), 0.4, 1e-6);
+    EXPECT_NEAR(static_cast<double>(b.getKnee()), 5.0, 1e-6);
+    EXPECT_NEAR(static_cast<double>(b.getPersistence()), 70.0, 1e-6);
+    EXPECT_NEAR(static_cast<double>(b.getQuietLevel()), -55.0, 1e-6);
+    EXPECT_TRUE(b.getAuditoryWeighting());
+    // The quality follows an offline render when asked to, at the next prepare().
+    Rs8 render;
+    render.setOfflineRendering(true);
+    render.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(render.getQualityInUse() == Rs8::Quality::Realtime);
+    render.setQualityFollowsRender(true);
+    render.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(render.getQualityInUse() == Rs8::Quality::Offline);
+    EXPECT_TRUE(render.getQuality() == Rs8::Quality::Realtime);
+    EXPECT_EQ(render.getLatency(), 2048);
+    render.setOfflineRendering(false);
+    render.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(render.getQualityInUse() == Rs8::Quality::Realtime);
+    const auto followed = render.getState();
+    Rs8 restored;
+    EXPECT_TRUE(restored.setState(followed.data(), followed.size()));
+    EXPECT_TRUE(restored.getQualityFollowsRender());
+    b.setKnee(40.0f);
+    b.setPersistence(-3.0f);
+    b.setQuietLevel(-195.0f);
+    EXPECT_NEAR(static_cast<double>(b.getKnee()), 12.0, 1e-6);
+    EXPECT_NEAR(static_cast<double>(b.getPersistence()), 0.0, 1e-6);
+    EXPECT_NEAR(static_cast<double>(b.getQuietLevel()), -200.0, 1e-6);
+}
+
+// New: setEnvelopePasses() and setWidthTaper(). Two passes keep the width of
+// the envelope's smoothing and lose its tails: a wide rise of the spectrum is
+// read as before, and a line on top of it stands a little further out. The
+// taper narrows the smoothing above its corner; the line is still taken.
+DSPARK_TEST(ResonanceSuppressor_envelope_passes_and_taper)
+{
+    const size_t n = 48000 * 3;
+    // White noise through a bell of +10 dB an octave wide at 6 kHz.
+    std::vector<float> wide = l13Noise(n, 0.05f, 31u);
+    {
+        const BiquadCoeffs bell = BiquadCoeffs::makePeak(48000.0, 6000.0, 1.4, 10.0);
+        double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+        for (auto& s : wide)
+        {
+            const double x = static_cast<double>(s);
+            const double y = bell.b0 * x + bell.b1 * x1 + bell.b2 * x2 - bell.a1 * y1 - bell.a2 * y2;
+            x2 = x1; x1 = x; y2 = y1; y1 = y;
+            s = static_cast<float>(y);
+        }
+    }
+    const std::vector<float> lined = l13Add(wide, 6000.0, 0.1);
+    // What the rise loses around the line (4.5 and 8 kHz), and the line.
+    const auto taken = [&](int passes, float exponent, double& rise, double& line) {
+        const auto setup = [=](Rs8& rs) {
+            rs.setThreshold(1.0f);
+            rs.setStrength(1.0f);
+            rs.setRange(48.0f);
+            rs.setEnvelopePasses(passes);
+            rs.setWidthTaper(2000.0f, exponent);
+        };
+        auto rs = std::make_unique<Rs8>();
+        setup(*rs);
+        rs->prepare(spec(48000.0, 256, 2));
+        rise = 0.5 * (m4ReductionAt(*rs, wide, wide, 0, 4500.0) + m4ReductionAt(*rs, wide, wide, 0, 8000.0));
+        line = m8LineChange(setup, lined, 6000.0);
+    };
+    double rise1 = 0.0, line1 = 0.0, rise2 = 0.0, line2 = 0.0, riseTaper = 0.0, lineTaper = 0.0;
+    taken(1, 0.0f, rise1, line1);
+    taken(2, 0.0f, rise2, line2);
+    taken(2, 0.5f, riseTaper, lineTaper);
+    std::printf("  [suppressor] a wide rise and a line on it: one pass %.2f and %.2f dB; two passes %.2f and %.2f; two and a taper of 0.5 %.2f and %.2f\n",
+                rise1, line1, rise2, line2, riseTaper, lineTaper);
+    EXPECT_NEAR(rise2, rise1, 0.3);
+    EXPECT_LT(line2, line1);
+    EXPECT_LT(lineTaper, -6.0);
+}
+
+// New: setRemovalBand(). The removal is heard in one band alone: a line
+// inside it is heard as in the whole removal, one outside it is not.
+DSPARK_TEST(ResonanceSuppressor_removal_is_heard_in_one_band)
+{
+    const size_t n = 48000 * 3;
+    const std::vector<float> x = l13Add(l13Add(l13Noise(n, 0.05f, 33u), 2000.0, 0.2), 7000.0, 0.2);
+    const auto heard = [&](float low, float high, double hz) {
+        auto rs = std::make_unique<Rs8>();
+        rs->setRemovalListen(true);
+        rs->setRemovalBand(low, high);
+        rs->prepare(spec(48000.0, 256, 2));
+        const auto out = l13Run(*rs, x, x);
+        return l13Line(out.first, hz, n / 2, n / 2);
+    };
+    const double all2k = heard(0.0f, 0.0f, 2000.0), all7k = heard(0.0f, 0.0f, 7000.0);
+    const double band2k = heard(1400.0f, 2800.0f, 2000.0), band7k = heard(1400.0f, 2800.0f, 7000.0);
+    std::printf("  [suppressor] removal heard: 2 kHz %.1f dB and 7 kHz %.1f dB in all; %.1f and %.1f in the band from 1.4 to 2.8 kHz\n",
+                all2k, all7k, band2k, band7k);
+    EXPECT_NEAR(band2k, all2k, 1.0);
+    EXPECT_LT(band7k, all7k - 30.0);
+    Rs8 a;
+    a.setRemovalBand(3000.0f, 500.0f);
+    EXPECT_NEAR(static_cast<double>(a.getRemovalBandLow()), 500.0, 1e-3);
+    EXPECT_NEAR(static_cast<double>(a.getRemovalBandHigh()), 3000.0, 1e-3);
+    a.setEnvelopePasses(7);
+    a.setWidthTaper(50.0f, 9.0f);
+    a.setShortKernel(true);
+    const auto blob = a.getState();
+    Rs8 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getEnvelopePasses(), 2);
+    EXPECT_NEAR(static_cast<double>(b.getWidthTaperCorner()), 200.0, 1e-3);
+    EXPECT_NEAR(static_cast<double>(b.getWidthTaperExponent()), 2.0, 1e-6);
+    EXPECT_TRUE(b.getShortKernel());
+    EXPECT_NEAR(static_cast<double>(b.getRemovalBandHigh()), 0.0, 1e-6);
+}

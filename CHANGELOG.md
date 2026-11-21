@@ -2721,6 +2721,39 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `AlgorithmicReverb::setTankLeveling()`: its level rose over 20 ms and fell
+  over 4 ms, so the reduction let go within each cycle of a low note (a
+  50 Hz tone at -10 dBFS came out with 52 % of harmonics, 100 Hz with 6 %,
+  200 Hz with 1.8 %) and the first 20 ms of a hit went through unreduced (a
+  20 ms hit and one 20 dB under it left tails 10.3 dB apart where the curve
+  gives 6.9). It now reads the peak of each sample; the reduction deepens at
+  once, holds 30 ms and comes back with a time constant of half a second:
+  0.0002 % on the 50 Hz tone, and the two hits 6.9 dB apart.
+- `AlgorithmicReverb`: the wet signal's level followed the mid decay alone,
+  so it moved with the damping, the bass multiplier and the decay bands (a
+  Hall from 0.3 to 12 s of decay across those settings: 5 dB), it rose as
+  the decay got short (the early field has its own energy) and a plate whose
+  decay is short against its round trip read up to 9 dB low. It now takes
+  back the energy of the tail as heard (the passes round the tank from the
+  loop gains of every band, the first pass through each line exactly) plus
+  that of the early field: on pink noise the six types sit within 0.7 dB of
+  the dry level at their presets, a Hall within 0.5 dB at any decay, size,
+  damping, bass multiplier or decay band, a plate within 0.6 dB and a
+  spring within 1.2 dB from 0.3 to 12 s at any size.
+- `AlgorithmicReverb::setSize()` (and a change of layout) slid the line
+  lengths: a glide of pitch of up to 4 % for most of a second (a steady
+  1 kHz tone lost most of its energy from the tone during the change). A
+  change beyond 0.2 % of a line's length now opens a second read head at
+  the new lengths (lines and in-loop allpasses, springs included) and
+  cross-fades to it at constant power over a quarter of a second: the
+  energy more than 20 Hz from the tone stays 47 dB under it, without
+  clicks. The loop gains now ramp sample by sample toward a new design (they
+  moved in steps of a chunk, which a resonating tail made audible).
+- `AlgorithmicReverb` with the Segments modulation: the straight segments
+  left a step of pitch at each corner. The lines now follow them through a
+  critically damped second-order filter and the segments alternate sides:
+  with a 3 kHz tone the energy more than 30 Hz from it goes from -50 to
+  -69 dB.
 - `Chorus` analog model: the right tap was the asymmetric triangle half a
   cycle on, not the left one inverted, so the two delays did not add up to
   a constant (in the Slow mode the sum swung by 15 to 17 samples at 44.1

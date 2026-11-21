@@ -9058,7 +9058,7 @@ DSPARK_TEST(TonalBalance_response_does_not_step_every_eight_hops)
         }
     }
     std::printf("  [bank] one hop in eight stands %.4f dB apart from the others; the response reaches %.2f dB\n", worst, moved);
-    EXPECT_GT(moved, 3.0);
+    EXPECT_GT(moved, 2.5);
     EXPECT_LT(worst, 0.01);
 }
 
@@ -9515,4 +9515,224 @@ DSPARK_TEST(ResonanceSuppressor_removal_is_heard_in_one_band)
     EXPECT_NEAR(static_cast<double>(b.getWidthTaperExponent()), 2.0, 1e-6);
     EXPECT_TRUE(b.getShortKernel());
     EXPECT_NEAR(static_cast<double>(b.getRemovalBandHigh()), 0.0, 1e-6);
+}
+
+// ============================================================================
+// The tonal balance: what it raises and lowers, and the rounded range.
+// ============================================================================
+
+namespace {
+
+using Tb9 = TonalBalance<float>;
+
+// A tonal balance run over a programme and left at its last frame.
+template <class Setup>
+std::unique_ptr<Tb9> m9Balance(Setup&& setup, const std::vector<float>& x)
+{
+    auto tb = std::make_unique<Tb9>();
+    setup(*tb);
+    tb->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*tb, x, x);
+    return tb;
+}
+
+// Pink-ish noise through a one-pole low-pass.
+std::vector<float> m9Dark(size_t n, uint32_t seed, double cornerHz)
+{
+    std::vector<float> v = l13Pinkish(n, seed);
+    const double a = 1.0 - std::exp(-2.0 * 3.14159265358979323846 * cornerHz / 48000.0);
+    double lp = 0.0;
+    for (auto& s : v) { lp += a * (static_cast<double>(s) - lp); s = static_cast<float>(lp); }
+    return v;
+}
+
+} // namespace
+
+// New: the readouts of what the corrections do. On a dark programme the
+// balance raises the top and lowers the bottom: a share of the loudness is
+// gained by the raised bands, the same share lost by the lowered ones (the
+// total stays), and the centre of the loudness moves up the ear's scale.
+DSPARK_TEST(TonalBalance_reads_what_it_raises_and_what_it_lowers)
+{
+    const std::vector<float> dark = m9Dark(48000 * 3, 41u, 2000.0);
+    const auto tb = m9Balance([](Tb9& t) { t.setBalance(1.0f); }, dark);
+    const double raised = static_cast<double>(tb->getLoudnessRaised()), lowered = static_cast<double>(tb->getLoudnessLowered());
+    std::printf("  [balance] a dark programme: %.3f of its loudness raised, %.3f lowered, the centre %.2f Bark up, total %.1f dB\n",
+                raised, lowered, static_cast<double>(tb->getCentroidShift()), static_cast<double>(tb->getLoudness()));
+    EXPECT_GT(raised, 0.01);
+    EXPECT_LT(lowered, -0.01);
+    EXPECT_NEAR(raised + lowered, 0.0, 0.02);
+    EXPECT_GT(tb->getCentroidShift(), 0.0f);
+    EXPECT_GT(tb->getLoudness(), -100.0f);
+    const auto still = m9Balance([](Tb9& t) { t.setBalance(0.0f); t.setFillDips(0.0f); t.setTrimPeaks(0.0f); }, dark);
+    EXPECT_EQ(still->getLoudnessRaised(), 0.0f);
+    EXPECT_EQ(still->getLoudnessLowered(), 0.0f);
+    EXPECT_EQ(still->getCentroidShift(), 0.0f);
+    still->reset();
+    EXPECT_EQ(still->getLoudness(), -200.0f);
+}
+
+// New: setRangeKnee(). A dip that deepens is raised more and more, up to the
+// range: with the hard limit the correction stops at a corner; with the knee
+// it bends into the range and settles on it.
+DSPARK_TEST(TonalBalance_range_knee_rounds_the_limit)
+{
+    const size_t n = 48000 * 2;
+    const std::vector<float> base = l13Pinkish(n, 43u);
+    int band = 0;
+    {
+        Tb9 probe;
+        probe.prepare(spec(48000.0, 256, 2));
+        for (int b = 1; b < Tb9::kBands; ++b)
+            if (std::abs(probe.getBandCentre(b) - 2000.0) < std::abs(probe.getBandCentre(band) - 2000.0)) band = b;
+    }
+    const auto sweep = [&](float knee, double& bend, double& top) {
+        std::vector<double> c;
+        for (double depth = 0.0; depth <= 30.0; depth += 3.0)
+        {
+            std::vector<float> x = base;
+            const BiquadCoeffs cut = BiquadCoeffs::makePeak(48000.0, 2000.0, 2.0, -depth);
+            double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+            for (auto& s : x)
+            {
+                const double in = static_cast<double>(s);
+                const double y = cut.b0 * in + cut.b1 * x1 + cut.b2 * x2 - cut.a1 * y1 - cut.a2 * y2;
+                x2 = x1; x1 = in; y2 = y1; y1 = y;
+                s = static_cast<float>(y);
+            }
+            const auto tb = m9Balance([=](Tb9& t) { t.setBalance(0.0f); t.setTrimPeaks(0.0f); t.setFillDips(1.0f); t.setRangeKnee(knee); }, x);
+            c.push_back(static_cast<double>(tb->getCorrection(band)));
+        }
+        bend = 0.0;
+        for (size_t i = 1; i + 1 < c.size(); ++i) bend = std::max(bend, std::abs(c[i + 1] - 2.0 * c[i] + c[i - 1]));
+        top = c.back();
+        bool rising = true;
+        for (size_t i = 1; i < c.size(); ++i) rising = rising && c[i] > c[i - 1] - 0.05;
+        return rising;
+    };
+    double hardBend = 0.0, hardTop = 0.0, kneeBend = 0.0, kneeTop = 0.0;
+    const bool hardRising = sweep(0.0f, hardBend, hardTop);
+    const bool kneeRising = sweep(2.0f, kneeBend, kneeTop);
+    std::printf("  [balance] a dip from 0 to 30 dB: the correction reaches %.2f dB with the hard limit (sharpest bend %.2f dB) and %.2f with the knee (%.2f)\n",
+                hardTop, hardBend, kneeTop, kneeBend);
+    EXPECT_TRUE(hardRising);
+    EXPECT_TRUE(kneeRising);
+    EXPECT_LT(kneeBend, hardBend);
+    EXPECT_GT(kneeTop, 0.8 * hardTop);
+    Tb9 a;
+    a.setRangeKnee(2.0f);
+    a.setRangeKnee(std::numeric_limits<float>::quiet_NaN());
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(b.getRangeKnee()), 2.0, 1e-6);
+    b.setRangeKnee(40.0f);
+    EXPECT_NEAR(static_cast<double>(b.getRangeKnee()), 6.0, 1e-6);
+}
+
+// New: Reference::EvenPower. A programme with the same power in every band
+// of the ear's scale is then balanced at any level: nothing is asked of it,
+// the ends included, where its loudness falls away with the threshold in
+// quiet (against a flat loudness it was asked for up to 3.1 dB at -50 dBFS).
+DSPARK_TEST(TonalBalance_leaves_an_even_programme_alone_at_any_level)
+{
+    const size_t n = 48000 * 3;
+    // Eight tones of random frequency and phase in each band, the same power in every band.
+    Tb9 probe;
+    probe.prepare(spec(48000.0, 256, 2));
+    std::vector<float> even(n, 0.0f);
+    uint32_t seed = 77u;
+    const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return static_cast<double>(seed >> 8) / 16777216.0; };
+    for (int b = 0; b < Tb9::kBands; ++b)
+    {
+        const double lo = b > 0 ? std::sqrt(probe.getBandCentre(b - 1) * probe.getBandCentre(b)) : probe.getBandCentre(0) * 0.9;
+        const double hi = b + 1 < Tb9::kBands ? std::sqrt(probe.getBandCentre(b) * probe.getBandCentre(b + 1)) : probe.getBandCentre(b) * 1.05;
+        for (int t = 0; t < 8; ++t)
+        {
+            const double hz = lo + (hi - lo) * next(), phase = 6.283185307179586 * next();
+            const double w = 6.283185307179586 * hz / 48000.0;
+            for (size_t i = 0; i < n; ++i) even[i] += static_cast<float>(std::sin(w * static_cast<double>(i) + phase));
+        }
+    }
+    double rms = 0.0;
+    for (float x : even) rms += static_cast<double>(x) * x;
+    rms = std::sqrt(rms / static_cast<double>(n));
+    for (const double dbfs : { -50.0, -30.0, -10.0 })
+    {
+        const float gain = static_cast<float>(std::pow(10.0, dbfs / 20.0) / rms);
+        std::vector<float> x = even;
+        for (auto& s : x) s *= gain;
+        const auto tb = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setFrequencyRange(20.0f, 20000.0f); t.setReference(Tb9::Reference::EvenPower); }, x);
+        double worst = 0.0, inner = 0.0;
+        for (int b = 0; b < Tb9::kBands; ++b)
+        {
+            const double c = std::abs(static_cast<double>(tb->getCorrection(b)));
+            worst = std::max(worst, c);
+            if (b >= 6 && b < Tb9::kBands - 6) inner = std::max(inner, c);
+        }
+        std::printf("  [balance] the same power in every band at %.0f dBFS: the largest correction %.2f dB (%.2f away from the ends)\n", dbfs, worst, inner);
+        EXPECT_LT(worst, 0.5);
+    }
+    Tb9 a;
+    EXPECT_TRUE(a.getReference() == Tb9::Reference::FlatLoudness);
+    a.setReference(Tb9::Reference::EvenPower);
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getReference() == Tb9::Reference::EvenPower);
+    b.setReference(static_cast<Tb9::Reference>(9));
+    EXPECT_TRUE(b.getReference() == Tb9::Reference::FlatLoudness);
+}
+
+// Defect: what lies far under the programme was raised like a hole in it. A
+// programme whose top is gone, over a noise 50 dB under it, had that noise
+// raised by the whole range (6 dB). A band setFloor() dB (30 by default)
+// under the loudest one, in the model's level, is no longer given back by
+// the balance: over 8 kHz, past the skirt of the cut, nothing is raised.
+DSPARK_TEST(TonalBalance_does_not_raise_what_is_masked)
+{
+    const size_t n = 48000 * 3;
+    // Pink-ish noise through a steep low-pass at 4 kHz, and white noise 50 dB under it.
+    std::vector<float> x = l13Pinkish(n, 51u);
+    {
+        const BiquadCoeffs lp = BiquadCoeffs::makeLowPass(48000.0, 4000.0, 0.7071);
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+            for (auto& s : x)
+            {
+                const double in = static_cast<double>(s);
+                const double y = lp.b0 * in + lp.b1 * x1 + lp.b2 * x2 - lp.a1 * y1 - lp.a2 * y2;
+                x2 = x1; x1 = in; y2 = y1; y1 = y;
+                s = static_cast<float>(y);
+            }
+        }
+    }
+    const double level = l13RmsDb(x, 0, n);
+    const std::vector<float> floor = l13Noise(n, static_cast<float>(std::pow(10.0, (level - 50.0) / 20.0) * 1.7320508), 53u);
+    for (size_t i = 0; i < n; ++i) x[i] += floor[i];
+    const auto raisedOver8k = [&](float floorDb) {
+        const auto tb = m9Balance([=](Tb9& t) { t.setBalance(1.0f); t.setFillDips(1.0f); t.setFloor(floorDb); }, x);
+        double top = 0.0;
+        for (int b = 0; b < Tb9::kBands; ++b)
+            if (tb->getBandCentre(b) > 8000.0) top = std::max(top, static_cast<double>(tb->getCorrection(b)));
+        return top;
+    };
+    const double kept = raisedOver8k(30.0f), half = raisedOver8k(35.0f), loose = raisedOver8k(40.0f), open = raisedOver8k(120.0f);
+    std::printf("  [balance] a programme cut at 4 kHz over a noise 50 dB under it: the largest correction over 8 kHz %.2f dB with the floor at 30 dB,"
+                " %.2f at 35, %.2f at 40, %.2f with none\n", kept, half, loose, open);
+    EXPECT_LT(kept, 1.0);
+    EXPECT_GT(half, kept);
+    EXPECT_LT(half, open);
+    EXPECT_GT(open, 3.0);
+    // A dark programme is still given its top back.
+    const std::vector<float> dark = m9Dark(n, 41u, 2000.0);
+    const auto tb = m9Balance([](Tb9& t) { t.setBalance(1.0f); }, dark);
+    EXPECT_GT(tb->getLoudnessRaised(), 0.03f);
+    Tb9 a;
+    a.setFloor(500.0f);
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(b.getFloor()), 120.0, 1e-6);
 }

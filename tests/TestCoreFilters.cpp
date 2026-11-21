@@ -4946,3 +4946,51 @@ DSPARK_TEST(GraphicBank_carries_its_refinement)
     const std::vector<double> after = sections();
     for (int b = 0; b < kBands; ++b) EXPECT_EQ(after[static_cast<size_t>(b)], plainSections[static_cast<size_t>(b)]);
 }
+
+// New: a sample that is not a number does not stay in the bank. It leaves as
+// silence, the sections start again from rest, and the next block comes out
+// as from a bank that never saw it.
+DSPARK_TEST(GraphicBank_flushes_a_sample_that_is_not_a_number)
+{
+    using Bank = GraphicBank<float, 8>;
+    constexpr int kBands = 24;
+    std::vector<double> centres(kBands);
+    const double z0 = AuditoryScale::hzToBark(50.0), z1 = AuditoryScale::hzToBark(16000.0);
+    for (int b = 0; b < kBands; ++b) centres[static_cast<size_t>(b)] = AuditoryScale::barkToHz(z0 + (z1 - z0) * b / (kBands - 1.0));
+    std::vector<float> curve(kBands);
+    for (int b = 0; b < kBands; ++b) curve[static_cast<size_t>(b)] = static_cast<float>(6.0 * std::sin(0.45 * b));
+    Bank hit, clean;
+    hit.prepare(48000.0, centres.data(), kBands, 2);
+    clean.prepare(48000.0, centres.data(), kBands, 2);
+    hit.setGains(curve.data(), 0, 1);
+    clean.setGains(curve.data(), 0, 1);
+    const auto noise = [](std::vector<float>& v, uint32_t seed) {
+        for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = 0.25f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f); }
+    };
+    std::vector<float> l(512), r(512);
+    noise(l, 3u);
+    noise(r, 5u);
+    l[100] = std::numeric_limits<float>::quiet_NaN();
+    r[200] = std::numeric_limits<float>::infinity();
+    {
+        float* ch[2] = { l.data(), r.data() };
+        hit.processBlock(AudioBufferView<float>(ch, 2, 512));
+    }
+    bool finite = true;
+    for (size_t i = 0; i < l.size(); ++i) finite = finite && std::isfinite(l[i]) && std::isfinite(r[i]);
+    EXPECT_TRUE(finite);
+    std::vector<float> l1(512), r1(512);
+    noise(l1, 7u);
+    noise(r1, 9u);
+    std::vector<float> l2 = l1, r2 = r1;
+    {
+        float* a[2] = { l1.data(), r1.data() };
+        float* b[2] = { l2.data(), r2.data() };
+        hit.processBlock(AudioBufferView<float>(a, 2, 512));
+        clean.processBlock(AudioBufferView<float>(b, 2, 512));
+    }
+    double apart = 0.0;
+    for (size_t i = 0; i < l1.size(); ++i)
+        apart = std::max({ apart, std::abs(static_cast<double>(l1[i]) - l2[i]), std::abs(static_cast<double>(r1[i]) - r2[i]) });
+    EXPECT_EQ(apart, 0.0);
+}

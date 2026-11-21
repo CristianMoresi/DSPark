@@ -194,7 +194,7 @@ public:
         T q             = T(0.707);         ///< Q factor (0.1 = wide, 10 = narrow).
         BandType type   = BandType::Peak;   ///< Filter type for this band.
         T slope         = T(12);            ///< Slope in dB/oct (LP/HP only): 6 to 48 in steps of 6, or any value from 0 to 96 with the analog response.
-        int order       = 1;                ///< Order of a bell, shelf, notch, band-pass or all-pass (1 to 16; 6 dB/oct each), or 2 for a Tilt of twelve decibels per octave. Above 1 the band runs with the analog response.
+        T order         = T(1);             ///< Order of a bell, shelf, notch, band-pass or all-pass, 1 to 16, whole or not (6 dB/oct each; a shelf is the same from 1 to 2), or 2 for a Tilt of twelve decibels per octave. Above 1 the band runs with the analog response.
         bool enabled    = true;             ///< False to bypass this band.
         Scope scope = Scope::Stereo;   ///< The channels the band acts on.
     };
@@ -568,7 +568,7 @@ public:
         if (static_cast<int>(cfg.scope) < 0 || static_cast<int>(cfg.scope) > static_cast<int>(Scope::Side))
             cfg.scope = prev.scope;
         cfg.slope = std::clamp(cfg.slope, T(0), T(96));
-        cfg.order = std::clamp(cfg.order, 1, kMaxBandSections);
+        cfg.order = std::isfinite(cfg.order) ? std::clamp(cfg.order, T(1), static_cast<T>(kMaxBandSections)) : prev.order;
 
         masterConfigs_[index] = cfg;
         staged_[index].publish(cfg);
@@ -1006,7 +1006,9 @@ public:
             std::snprintf(key, sizeof(key), "b%d.slopeDb", i);
             w.write(key, static_cast<float>(cfg.slope));
             std::snprintf(key, sizeof(key), "b%d.order", i);
-            w.write(key, static_cast<int32_t>(cfg.order));
+            w.write(key, static_cast<int32_t>(std::lround(static_cast<double>(cfg.order))));
+            std::snprintf(key, sizeof(key), "b%d.orderReal", i);
+            w.write(key, static_cast<float>(cfg.order));
             std::snprintf(key, sizeof(key), "b%d.on", i);
             w.write(key, cfg.enabled);
             std::snprintf(key, sizeof(key), "b%d.scope", i);
@@ -1047,7 +1049,9 @@ public:
             std::snprintf(key, sizeof(key), "b%d.slopeDb", i);
             cfg.slope = static_cast<T>(r.read(key, static_cast<float>(wholeSlope)));   // older blobs: the whole slope
             std::snprintf(key, sizeof(key), "b%d.order", i);
-            cfg.order = r.read(key, 1);
+            const int wholeOrder = r.read(key, 1);
+            std::snprintf(key, sizeof(key), "b%d.orderReal", i);
+            cfg.order = static_cast<T>(r.read(key, static_cast<float>(wholeOrder)));   // older blobs: the whole order
             std::snprintf(key, sizeof(key), "b%d.on", i);
             cfg.enabled = r.read(key, true);
             std::snprintf(key, sizeof(key), "b%d.scope", i);
@@ -1331,7 +1335,7 @@ protected:
         return analogResponse_.load(std::memory_order_relaxed)
             || filterMode_.load(std::memory_order_relaxed) == FilterMode::PrototypePhase
             || static_cast<int>(cfg.type) > static_cast<int>(BandType::Tilt)
-            || cfg.order > 1
+            || cfg.order > T(1)
             || (resonantShelves_.load(std::memory_order_relaxed)
                 && (cfg.type == BandType::LowShelf || cfg.type == BandType::HighShelf)
                 && static_cast<double>(effectiveQ(cfg)) > FilterDesign::kButterworthQ + 1e-4);
@@ -1343,7 +1347,7 @@ protected:
         const double f = std::clamp(static_cast<double>(cfg.frequency), 1.0, 80000.0);
         const double g = std::clamp(static_cast<double>(cfg.gain), -96.0, 96.0);
         const double q = std::max(static_cast<double>(effectiveQ(cfg)), 0.025);
-        const int order = std::clamp(cfg.order, 1, kMaxBandSections);
+        const double order = std::clamp(static_cast<double>(cfg.order), 1.0, static_cast<double>(kMaxBandSections));
         const double slope = static_cast<double>(cfg.slope);
         // The Q of a shelf: above 0.7071 only with setResonantShelves().
         const bool resonant = resonantShelves_.load(std::memory_order_relaxed);
@@ -1357,11 +1361,11 @@ protected:
                 one.add(AnalogSection::peak(f, q, g));
                 break;
             case BandType::LowShelf:
-                if (order > 1) return FilterDesign::lowShelf(f, g, order, shelfQ);
+                if (order > 1) return FilterDesign::lowShelf(f, g, std::max(order, 2.0), shelfQ);   // a shelf is of two orders at least
                 one.add(above ? AnalogSection::lowShelfQ(f, g, shelfQ) : AnalogSection::lowShelf(f, g, shelfSlopeFromQ(q, g)));
                 break;
             case BandType::HighShelf:
-                if (order > 1) return FilterDesign::highShelf(f, g, order, shelfQ);
+                if (order > 1) return FilterDesign::highShelf(f, g, std::max(order, 2.0), shelfQ);
                 one.add(above ? AnalogSection::highShelfQ(f, g, shelfQ) : AnalogSection::highShelf(f, g, shelfSlopeFromQ(q, g)));
                 break;
             case BandType::LowPass:      return FilterDesign::highCut(f, slope, q);
@@ -1429,11 +1433,12 @@ protected:
     [[nodiscard]] int rampSamples(const BandConfig& from, const BandConfig& to) const noexcept
     {
         double distance = 1.0;
-        if (from.type == to.type && from.order == to.order)
+        if (from.type == to.type)
         {
             const double f0 = std::max(static_cast<double>(from.frequency), 1.0), f1 = std::max(static_cast<double>(to.frequency), 1.0);
             const double q0 = std::max(static_cast<double>(from.q), 0.025), q1 = std::max(static_cast<double>(to.q), 0.025);
             distance = std::max({ std::abs(static_cast<double>(to.gain) - static_cast<double>(from.gain)) / 24.0,
+                                  std::abs(static_cast<double>(to.order) - static_cast<double>(from.order)) / 2.0,
                                   std::abs(std::log2(f1 / f0)) / 4.0,
                                   std::abs(std::log2(q1 / q0)) / 4.0,
                                   std::abs(static_cast<double>(to.slope) - static_cast<double>(from.slope)) / 48.0 });
@@ -2620,7 +2625,7 @@ protected:
         std::atomic<T>    q         { BandConfig{}.q };
         std::atomic<int>  type      { static_cast<int>(BandConfig{}.type) };
         std::atomic<T>    slope     { BandConfig{}.slope };
-        std::atomic<int>  order     { BandConfig{}.order };
+        std::atomic<T>    order     { BandConfig{}.order };
         std::atomic<bool> enabled   { BandConfig{}.enabled };
         std::atomic<int>  scope { static_cast<int>(BandConfig{}.scope) };
         std::atomic<unsigned> seq   { 0 };

@@ -357,6 +357,12 @@ public:
         stageBefore_.prepare(spec);
         stageAfter_.prepare(spec);
         stageScratch_.resize(std::min(spec.numChannels, kMaxChannels), spec.maxBlockSize);
+        // The routes of a pair: the key as its middle and its sides, and the
+        // line the part that is not treated waits in.
+        routeBlock_ = std::max(1, spec.maxBlockSize);
+        routeKey_.resize(2, routeBlock_);
+        routeReach_ = maxLaSamples;
+        routeDelay_.prepare(routeReach_ + 1);
         stageFade_.assign(static_cast<size_t>(std::max(1, spec.maxBlockSize)), 0.0);
         stageFadeStep_ = 1.0 / (0.020 * sampleRate_);
         {
@@ -386,7 +392,7 @@ public:
     {
         const StagePosition stage = stagePosition_.load(std::memory_order_relaxed);
         runStage(stageBefore_, stageWeightBefore_, stage == StagePosition::Before, buffer);
-        processBlockImpl(buffer, buffer);
+        processRouted(buffer, buffer);
         runStage(stageAfter_, stageWeightAfter_, stage == StagePosition::After, buffer);
     }
 
@@ -403,7 +409,7 @@ public:
     {
         const StagePosition stage = stagePosition_.load(std::memory_order_relaxed);
         runStage(stageBefore_, stageWeightBefore_, stage == StagePosition::Before, audio);
-        processBlockImpl(audio, sidechain);
+        processRouted(audio, sidechain);
         runStage(stageAfter_, stageWeightAfter_, stage == StagePosition::After, audio);
     }
 
@@ -639,6 +645,7 @@ public:
     void reset() noexcept
     {
         keyEq_.reset();
+        routeDelay_.reset();
         toneLow_.reset();
         toneHigh_.reset();
         toneActive_ = false;       // designed again, for the rate in use, at the next block
@@ -894,6 +901,44 @@ public:
 
     /** @return How a stereo pair is linked. */
     [[nodiscard]] LinkMode getLinkMode() const noexcept { return linkMode_.load(std::memory_order_relaxed); }
+
+    /** @brief What of a stereo pair the compressor works on (see setRoute()). */
+    enum class Route
+    {
+        Stereo,      ///< Left and right (default).
+        MidSide,     ///< The middle and the sides, each with its gain; setStereoLink() links the two.
+        Mid,         ///< The middle only: the sides pass untouched.
+        Side,        ///< The sides only: the middle passes untouched.
+        MidKeysSide, ///< The sides, with the gain the middle of the key asks for.
+        SideKeysMid  ///< The middle, with the gain the sides of the key ask for.
+    };
+
+    /**
+     * @brief Chooses what of a stereo pair is compressed, and from which part of the key.
+     *
+     * The pair is taken as its middle, (L + R) / 2, and its sides,
+     * (L - R) / 2, compressed as the route says and put back as left and
+     * right. A key given apart is split the same way. In the routes that
+     * treat one of the two, the other waits for it (it comes out late by
+     * the latency of the gain path, so the pair stays in time) and is
+     * otherwise untouched, and the makeup acts on the part that is treated.
+     * In the two crossed routes the detector reads one part and the gain is
+     * applied to the other, as with a key given apart: a feedback loop,
+     * which reads its own output, treats that part by itself. While the key
+     * or what is removed is listened to, the part that is not treated is
+     * left out.
+     *
+     * It acts in processBlock() on buffers of exactly two channels; any
+     * other width, and processSample(), run as Stereo. The audio thread
+     * takes a change at the next block and starts clean there (it may
+     * click: choose the route before playback).
+     *
+     * State key "route" (absent = Stereo).
+     */
+    void setRoute(Route route) noexcept { route_.store(clampEnum(route, Route::SideKeysMid), std::memory_order_relaxed); }
+
+    /** @brief What of a stereo pair is compressed (setRoute()). */
+    [[nodiscard]] Route getRoute() const noexcept { return route_.load(std::memory_order_relaxed); }
 
     /** @brief Sets dry/wet balance for parallel (New York) compression (1.0 = fully wet). */
     void setMix(T dryWet) noexcept
@@ -1782,6 +1827,15 @@ public:
      */
     [[nodiscard]] int getLatency() const noexcept
     {
+        const int coloured = (stagePosition_.load(std::memory_order_relaxed) != StagePosition::Off)
+                           ? stageBefore_.getLatency() : 0;
+        return gainPathLatency() + coloured;
+    }
+
+private:
+    /** @brief The latency of the gain path alone: the lookahead and the detector's reading (no colour stage). */
+    [[nodiscard]] int gainPathLatency() const noexcept
+    {
         const CharacterProfile& profile = profileOf(character_.load(std::memory_order_relaxed));
         const bool feedback = topologyFor(profile, topology_.load(std::memory_order_relaxed)) == Topology::FeedBack;
         const DetectorType detType = detectorFor(profile, detectorType_.load(std::memory_order_relaxed));
@@ -1792,9 +1846,7 @@ public:
         const bool layered = isLayered(profile, mode);
         const int reading = (precision_.load(std::memory_order_relaxed) == Precision::High && !layered
                              && readsBetweenSamples(detType) && (!feedback || solved)) ? kDetectorDelay : 0;
-        const int coloured = (stagePosition_.load(std::memory_order_relaxed) != StagePosition::Off)
-                           ? stageBefore_.getLatency() : 0;
-        if (feedback && !feedbackKeyed_.load(std::memory_order_relaxed)) return reading + coloured;
+        if (feedback && !feedbackKeyed_.load(std::memory_order_relaxed)) return reading;
         // Derive the lookahead from the published parameter rather than the
         // audio-thread cache: hosts re-read the latency right after a setter,
         // before the next block has consumed the coefficient-update flag.
@@ -1802,8 +1854,98 @@ public:
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
         const int kept = static_cast<int>(static_cast<T>(sampleRate_) * std::clamp(
             maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
-        return std::max(lookNow, kept) + reading + coloured;
+        return std::max(lookNow, kept) + reading;
     }
+
+    /**
+     * @brief The compressor on a pair as the route says: its middle and its
+     *        sides in place of left and right, one of the two, or one with
+     *        the key of the other. Anything but two channels runs as Stereo.
+     */
+    void processRouted(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
+    {
+        const Route route = route_.load(std::memory_order_relaxed);
+        const bool routed = route != Route::Stereo && audio.getNumChannels() == 2 && routeBlock_ > 0;
+        if (routed != routeWas_ || (routed && route != routeIn_))
+        {
+            // Every state would carry another signal: the route starts clean.
+            if (sampleRate_ > 0) reset();
+            routeWas_ = routed;
+            routeIn_ = route;
+        }
+        if (!routed)
+        {
+            processBlockImpl(audio, sidechain);
+            return;
+        }
+        if (!(sampleRate_ > 0)) return;
+
+        const int total = audio.getNumSamples();
+        const bool external = sidechain.getNumChannels() > 0 && sidechain.getNumSamples() >= total
+                           && sidechain.getChannel(0) != audio.getChannel(0);
+        for (int off = 0; off < total; off += routeBlock_)
+        {
+            const int m = std::min(routeBlock_, total - off);
+            T* const left = audio.getChannel(0) + off;
+            T* const right = audio.getChannel(1) + off;
+            // The pair as its middle and its sides, in place.
+            for (int i = 0; i < m; ++i)
+            {
+                const T l = left[i], r = right[i];
+                left[i] = (l + r) * T(0.5);
+                right[i] = (l - r) * T(0.5);
+            }
+            T* keyMid = left;
+            T* keySide = right;
+            if (external)
+            {
+                const T* const kl = sidechain.getChannel(0) + off;
+                const T* const kr = (sidechain.getNumChannels() > 1 ? sidechain.getChannel(1) : sidechain.getChannel(0)) + off;
+                keyMid = routeKey_.getChannel(0);
+                keySide = routeKey_.getChannel(1);
+                for (int i = 0; i < m; ++i)
+                {
+                    keyMid[i] = (kl[i] + kr[i]) * T(0.5);
+                    keySide[i] = (kl[i] - kr[i]) * T(0.5);
+                }
+            }
+
+            if (route == Route::MidSide)
+            {
+                T* pair[2] = { left, right };
+                T* keys[2] = { keyMid, keySide };
+                processBlockImpl(AudioBufferView<T>(pair, 2, m), AudioBufferView<T>(keys, 2, m));
+            }
+            else
+            {
+                const bool sides = route == Route::Side || route == Route::MidKeysSide;
+                const bool keyOfSides = route == Route::Side || route == Route::SideKeysMid;
+                T* treated[1] = { sides ? right : left };
+                T* key[1] = { keyOfSides ? keySide : keyMid };
+                T* const waiting = sides ? left : right;
+                processBlockImpl(AudioBufferView<T>(treated, 1, m), AudioBufferView<T>(key, 1, m));
+                // The other part waits for it; listened to, it is left out.
+                const int late = std::min(gainPathLatency(), routeReach_);
+                const bool listening = scListen_.load(std::memory_order_relaxed)
+                                    || removalListen_.load(std::memory_order_relaxed);
+                for (int i = 0; i < m; ++i)
+                {
+                    routeDelay_.push(waiting[i]);
+                    waiting[i] = listening ? T(0) : routeDelay_.read(late);
+                }
+            }
+
+            // Back to left and right.
+            for (int i = 0; i < m; ++i)
+            {
+                const T mid = left[i], side = right[i];
+                left[i] = mid + side;
+                right[i] = mid - side;
+            }
+        }
+    }
+
+public:
 
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
@@ -1823,6 +1965,7 @@ public:
         w.write("autoMakeupMode", static_cast<int32_t>(amMode));
         w.write("stereoLink", static_cast<float>(stereoLink_.load(std::memory_order_relaxed)));
         w.write("linkMode", static_cast<int32_t>(linkMode_.load(std::memory_order_relaxed)));
+        w.write("route", static_cast<int32_t>(getRoute()));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
@@ -1892,6 +2035,7 @@ public:
             std::clamp(r.read("autoMakeupMode", amLegacy), 0, 3)));
         setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
         setLinkMode(static_cast<LinkMode>(r.read("linkMode", 0)));
+        setRoute(static_cast<Route>(r.read("route", 0)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setHoldTime(static_cast<T>(r.read("hold", 0.0f)));
@@ -5599,6 +5743,14 @@ protected:
     T asymDecay_ = T(0);
     std::array<T, kMaxChannels> asymCrest_ {};      ///< The crest of each channel's key.
     bool audioExtras_ = false;                      ///< The gain is not a plain product (tone or leak).
+
+    // The routes of a pair (setRoute()).
+    std::atomic<Route> route_ { Route::Stereo };
+    Route routeIn_ = Route::Stereo;                 ///< The route the states carry (audio thread).
+    bool routeWas_ = false;                         ///< The last block ran a route.
+    int routeBlock_ = 0, routeReach_ = 0;
+    AudioBuffer<T> routeKey_;                       ///< A key given apart, as its middle and its sides.
+    RingBuffer<T> routeDelay_;                      ///< The part that is not treated waits here.
 
     // The upward half of Mode::Both (setLift()), and as the audio thread took it.
     std::atomic<T> liftBelow_ { T(30) }, liftRatio_ { T(2) }, liftRange_ { T(6) };

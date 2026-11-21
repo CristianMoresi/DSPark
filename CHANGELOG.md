@@ -2721,6 +2721,37 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `DeEsser` and `DynamicEQ`: the detector's band-pass (and the low-pass and
+  high-pass of the shelves) was a bilinear design, which narrows toward
+  Nyquist, so near the top of the band the detector heard a narrower band
+  than the one it moves. A tone half an octave under a 10 kHz band and one
+  half an octave over it, at the same level and at 44.1 kHz, read 5.2 and
+  3.2 dB of reduction in the de-esser and 4.2 and 2.7 dB in the equalizer;
+  with the detector matched to its analog prototype they read 6.5 and 6.6,
+  and 5.3 and 5.3. Low bands read as before (2 kHz: within 0.1 dB).
+- `DynamicEQ` with mixed bands: changing the range of a band at work moved
+  the weight of its end at once while the end's filter took its 20 ms, a
+  step of level on the way (a tone held 6 dB down, its range set to 18 dB,
+  came up to -3.5 dB first). The weight now follows the filter's glide: the
+  tone goes down without rising.
+- `SpectralDynamicEQ`: a band edited at work kept each cell's action by
+  index, so after moving its frequency, Q or cell count the reduction sat
+  at other frequencies. The actions are now carried to the new cells by
+  frequency (nothing outside the span the band had), and a span that moved
+  takes its level reference from the new span after half a second. A cell
+  also looks half a cell into its neighbours with a fading weight, so a
+  partial that crosses a border no longer changes hands (a tone with a slow
+  vibrato across the borders of a bell of 8 cells: largest step of the
+  reduction between 10 ms windows 1.56 dB before, 0.16 dB now, and the mean
+  reduction 11.1 dB where it was 9.7). The band's shape comes from its
+  analog prototype, so a band near the top of the audio band keeps its
+  width.
+- `Equalizer` with `BandType::ConstantTilt`: with the pivot at one end of
+  the band the other end rose without limit (a pivot at 20 Hz and +6 dB per
+  octave lifted 20 kHz by 60 dB). The end that rises is now held to 36 dB:
+  the slope comes down just enough (`FilterDesign::tiltSlopeWithin()`); a
+  pivot in the middle of the band keeps every slope, and the end that falls
+  is not limited.
 - `AlgorithmicReverb::setTankLeveling()`: its level rose over 20 ms and fell
   over 4 ms, so the reduction let go within each cycle of a low note (a
   50 Hz tone at -10 dBFS came out with 52 % of harmonics, 100 Hz with 6 %,

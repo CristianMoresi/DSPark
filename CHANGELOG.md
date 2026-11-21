@@ -6,6 +6,14 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TonalBalance::setLocalSlope()`: what a band lacks or has in excess is
+  turned into decibels with the slope of the loudness curve at the band's
+  own level, in place of a fixed exponent. Near the threshold in quiet that
+  slope is steeper (twice the exponent 10 dB over it), so the fixed
+  exponent overstated the difference: on a programme 40 dB down, the five
+  bands at the two ends were asked for 0.60 dB in all and are asked for
+  0.10 dB, and the middle for 0.22 dB in place of 0.35. State key
+  `localSlope`.
 - `TonalBalance::setListeningCompensation()`, -30 to +30 dB: compensates a
   listening level that much lower than the one the programme is balanced
   at. The ear loses the two ends first as the level falls, so each band is

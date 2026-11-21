@@ -1857,7 +1857,7 @@ inline EffectSlot makeTapeMachine()
     s.name = "Tape Machine"; s.category = "Analog";
     s.addSlider("Drive", -12, 24, 0, "dB");
     s.addSlider("Bias", 0, 1, 0.5f, "");
-    s.addChoice("Speed", {"7.5 ips","15 ips","30 ips"}, 1);
+    s.addChoice("Speed", {"7.5 ips","15 ips","30 ips","3.75 ips"}, 1);
     s.addChoice("Standard", {"NAB","CCIR"}, 0);
     s.addSlider("Loss", 0, 1, 0.5f, "");
     s.addSlider("Head Bump", 0, 1, 0.5f, "");
@@ -1882,6 +1882,7 @@ inline EffectSlot makeTapeMachine()
     s.addChoice("Monitor", {"Play Head","Record Head","Source"}, 0);                   // 22
     s.addToggle("Auto Oversampling", false);                               // 23
     s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0); // 24
+    s.addSlider("Record Emphasis", -6, 6, 0, "dB");                         // 25
     // setAutomaticOversampling() is a setup call (it re-prepares): the UI
     // records the wish and the audio thread applies it between blocks.
     auto autoWanted  = std::make_shared<std::atomic<int>>(0);
@@ -1943,12 +1944,13 @@ inline EffectSlot makeTapeMachine()
             case 22: p->setMonitor(static_cast<TM::Monitor>(static_cast<int>(v))); break;
             case 23: autoWanted->store(v > 0.5f ? 1 : 0, std::memory_order_relaxed); break;
             case 24: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
+            case 25: p->setRecordEmphasis(v); break;
         }
     };
     s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7 });
     s.group("Machine", { 8, 15, 16, 19, 20, 21, 22 });
     s.group("Noise & Colour", { 9, 10, 11, 12, 13, 14 });
-    s.group("Alignment", { 17, 18, 23, 24 });
+    s.group("Alignment", { 17, 18, 25, 23, 24 });
     return s;
 }
 

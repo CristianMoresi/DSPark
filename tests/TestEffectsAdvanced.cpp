@@ -3628,7 +3628,8 @@ DSPARK_TEST(AlgoReverb_size_changes_glide_without_clicks)
 {
     // Size used to switch every delay length at once (a click per change:
     // max second difference 0.14 on a 220 Hz tone toggled 0.3 <-> 0.9).
-    // The lengths now glide: measured 0.0014 (static 0.00007).
+    // A change now cross-fades two read heads, and the loop gains ramp
+    // sample by sample toward their new design: measured 0.0036.
     ARevF rev;
     rev.prepare(spec(48000.0, 256, 2));
     rev.setType(ARevF::Type::Hall);
@@ -4144,8 +4145,8 @@ DSPARK_TEST(AlgoReverb_decay_band_moves_the_decay_in_its_band)
 }
 
 // New: the wet signal keeps the dry signal's level. On pink noise (the
-// spectrum of programme material) at full mix every type sits within 3 dB of
-// the dry level (it was 7 to 16 dB under it), and a Hall keeps it as its
+// spectrum of programme material) at full mix every type sits within 1.5 dB
+// of the dry level (it was 7 to 16 dB under it), and a Hall keeps it as its
 // decay goes from 0.5 to 6 s. White noise would read the spring 4 dB low:
 // a spring tank passes no treble, where white noise has most of its energy.
 DSPARK_TEST(AlgoReverb_wet_signal_keeps_the_dry_level)
@@ -4181,11 +4182,136 @@ DSPARK_TEST(AlgoReverb_wet_signal_keeps_the_dry_level)
     {
         const double level = wetOf(type, 0.0f);
         std::cout << "  [reverb wet] type " << static_cast<int>(type) << " wet - dry " << level << " dB\n";
-        EXPECT_NEAR(level, 0.0, 3.0);
+        EXPECT_NEAR(level, 0.0, 1.5);
     }
     const double shortHall = wetOf(ARevF::Type::Hall, 0.5f), longHall = wetOf(ARevF::Type::Hall, 6.0f);
     std::cout << "  [reverb wet] hall 0.5 s " << shortHall << " dB, 6 s " << longHall << " dB\n";
-    EXPECT_NEAR(shortHall, longHall, 3.0);
+    EXPECT_NEAR(shortHall, longHall, 1.0);
+
+    // The level follows the energy of the tail as heard (every band's T60:
+    // the highs, the bass and the decay bands) plus that of the early field,
+    // so it holds whatever the decay, damping, bass and bands (the law by
+    // the mid decay alone moved it by 5 dB across these settings), and for a
+    // plate whose decay is short against its round trip (it read 9 dB low).
+    const auto wetWith = [&](ARevF::Type type, auto&& setup) {
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, type);
+        setup(*rev);
+        const auto out = l11Run(*rev, noise, noise, [](size_t) {});
+        return l11RmsDb(out.first, n / 2, n) - dry;
+    };
+    for (const float decay : { 0.3f, 3.0f, 12.0f })
+    {
+        const double plain = wetWith(ARevF::Type::Hall, [&](ARevF& r) { r.setDecay(decay); });
+        const double dark = wetWith(ARevF::Type::Hall, [&](ARevF& r) { r.setDecay(decay); r.setHighDecayMultiplier(0.3f); });
+        const double bass = wetWith(ARevF::Type::Hall, [&](ARevF& r) { r.setDecay(decay); r.setBassDecayMultiplier(2.0f); });
+        const double band = wetWith(ARevF::Type::Hall, [&](ARevF& r) {
+            r.setDecay(decay);
+            r.setDecayBand(0, { ARevF::DecayShape::Bell, 1000.0f, 0.7f, 4.0f });
+        });
+        std::cout << "  [reverb wet] hall " << decay << " s: plain " << plain << " dark " << dark << " bass " << bass
+                  << " band " << band << " dB\n";
+        for (const double level : { plain, dark, bass, band }) EXPECT_NEAR(level, 0.0, 1.2);
+    }
+    const double shortPlate = wetWith(ARevF::Type::Plate, [](ARevF& r) { r.setSize(1.0f); r.setDecay(0.3f); });
+    std::cout << "  [reverb wet] plate, size 1, 0.3 s " << shortPlate << " dB\n";
+    EXPECT_NEAR(shortPlate, 0.0, 1.5);
+}
+
+// New: the tank leveling reads the peak of each sample; its reduction deepens
+// at once, holds and comes back slowly. A low note is then not modulated
+// within its cycle (the level that rose over 20 ms and fell over 4 ms left
+// 52 % of harmonics on a 50 Hz tone and 6 % at 100 Hz), and a 20 ms hit is
+// leveled like a long one: 20 dB between two hits become the 6.9 dB of the
+// curve (10.3 dB before: the start of the hit went through).
+DSPARK_TEST(AlgoReverb_tank_leveling_holds_within_a_cycle_and_catches_a_hit)
+{
+    for (const double hz : { 50.0, 100.0 })
+    {
+        const size_t n = 48000 * 4;
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        rev->setModulation(0.0f);
+        rev->setTankLeveling(1.0f);
+        const auto in = l11Tone(hz, 0.316, n);
+        const auto out = l11Run(*rev, in, in, [](size_t) {}).first;
+        const double tone = l11Line(out, hz, n - 48000, 48000);
+        double worst = -300.0;
+        for (int k = 2; k <= 5; ++k) worst = std::max(worst, l11Line(out, hz * k, n - 48000, 48000));
+        std::cout << "  [tank leveling] " << hz << " Hz: strongest harmonic " << worst - tone << " dBc\n";
+        EXPECT_LT(worst - tone, -80.0);
+    }
+    const auto tail = [](float amp) {
+        const size_t n = 72000, start = 24000, burst = 960;
+        std::vector<float> in(n, 0.0f);
+        for (size_t i = 0; i < burst; ++i)
+            in[start + i] = amp * static_cast<float>(std::sin(2.0 * 3.14159265358979323846 * 1000.0 * static_cast<double>(i) / 48000.0));
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        rev->setModulation(0.0f);
+        rev->setTankLeveling(1.0f);
+        const auto out = l11Run(*rev, in, in, [](size_t) {}).first;
+        return l11RmsDb(out, start + 4800, start + 28800);
+    };
+    const double between = tail(0.5f) - tail(0.05f);
+    std::cout << "  [tank leveling] a 20 ms hit and one 20 dB under it: " << between << " dB apart\n";
+    EXPECT_NEAR(between, 6.9, 1.0);
+}
+
+// New: a change of size cross-fades two read heads instead of sliding the
+// lengths, so the pitch stays: with a steady 1 kHz tone and the size going
+// from 0.3 to 1, the energy more than 20 Hz from the tone during the change
+// is 30 dB under the tone's (sliding, most of the energy left the tone:
+// -1.3 dB). The Segments modulation rounds its corners: a 3 kHz tone keeps
+// its energy within 30 Hz to -60 dB (-50 dB with straight segments).
+DSPARK_TEST(AlgoReverb_size_changes_and_segments_keep_the_pitch)
+{
+    const size_t kN = 65536;
+    const auto spread = [&](const std::vector<float>& v, size_t from, double hz, double within, double lo, double hi) {
+        std::vector<double> frame(kN), spec(kN + 2);
+        for (size_t i = 0; i < kN; ++i)
+        {
+            const double a = 2.0 * 3.14159265358979323846 * static_cast<double>(i) / static_cast<double>(kN);
+            frame[i] = (0.35875 - 0.48829 * std::cos(a) + 0.14128 * std::cos(2.0 * a) - 0.01168 * std::cos(3.0 * a))
+                     * static_cast<double>(v[from + i]);
+        }
+        FFTReal<double> fft(kN);
+        fft.forward(frame.data(), spec.data());
+        double total = 0.0, inside = 0.0;
+        for (size_t k = 1; k <= kN / 2; ++k)
+        {
+            const double f = static_cast<double>(k) * 48000.0 / static_cast<double>(kN);
+            if (f < lo || f > hi) continue;
+            const double p = spec[2 * k] * spec[2 * k] + spec[2 * k + 1] * spec[2 * k + 1];
+            total += p;
+            if (std::abs(f - hz) <= within) inside += p;
+        }
+        return 10.0 * std::log10(std::max((total - inside) / total, 1e-30));
+    };
+    {
+        const size_t n = 48000 * 4, at = 48000 * 2;
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        rev->setModulation(0.0f);
+        rev->setSize(0.3f);
+        const auto in = l11Tone(1000.0, 0.2, n);
+        const auto out = l11Run(*rev, in, in, [&](size_t off) { if (off == at) rev->setSize(1.0f); }).first;
+        const double astray = spread(out, at, 1000.0, 20.0, 500.0, 2000.0);
+        std::cout << "  [size change] energy more than 20 Hz from the tone " << astray << " dB\n";
+        EXPECT_LT(astray, -30.0);
+    }
+    {
+        const size_t n = 48000 * 5;
+        auto rev = std::make_unique<ARevF>();
+        l11Wet(*rev, ARevF::Type::Hall);
+        rev->setModulationStyle(ARevF::ModulationStyle::Segments);
+        rev->setModulation(0.6f);
+        const auto in = l11Tone(3000.0, 0.1, n);
+        const auto out = l11Run(*rev, in, in, [](size_t) {}).first;
+        const double astray = spread(out, n - kN, 3000.0, 30.0, 2400.0, 3600.0);
+        std::cout << "  [segments] energy more than 30 Hz from the tone " << astray << " dB\n";
+        EXPECT_LT(astray, -60.0);
+    }
 }
 
 // New: the tail hold keeps the tail at its level and with its highs, and the

@@ -16,6 +16,12 @@
  * setNumBands(), setBand()'s enabled flag) crossfades in or out over 20 ms
  * instead of stepping.
  *
+ * A band of the analog response that moves goes through the designs of the
+ * parameters in between (one for every quarter of an octave of frequency,
+ * every 12 dB of gain and every octave of Q, its coefficients interpolated
+ * from each to the next), so on its way it is the band of those parameters
+ * to within half a decibel; getAnalogBandResponse() reads it as it is.
+ *
  * Analog response (setAnalogResponse(), off by default): every band is
  * designed from its analog prototype by FilterDesign, so its curve does not
  * shrink towards Nyquist, and runs in a BiquadCascade whose coefficients are
@@ -471,6 +477,7 @@ public:
                 if (slot == 0)
                 {
                     band.cascade.advanceRamps(1);
+                    advanceGlide(band, 1);
                     settleAnalogBand(band);
                 }
                 if (slot >= 0 && slot < kEngineChannels && !band.idle)
@@ -791,6 +798,38 @@ public:
         const FilterMode mode = filterMode_.load(std::memory_order_relaxed);
         if (mode == FilterMode::PrototypePhase) return prototype_ ? kPrototypeDelay : 0;
         return (mode == FilterMode::LinearPhase && lpFft_) ? lpKernelLength_ / 2 + lpPartition_ : 0;
+    }
+
+    /**
+     * @brief The response of a band of the analog response as its sections
+     *        are at this moment, a glide in flight included, in decibels
+     *        (0 for a band that rests, is off, or that the other engine runs).
+     *
+     * Audio thread, or with no block in flight: it reads the band's
+     * coefficients as they are. For the curve asked for, from any thread,
+     * see getMagnitudeForFrequencyArray().
+     *
+     * @param index Band index.
+     * @param hz    Frequency in hertz.
+     */
+    [[nodiscard]] T getAnalogBandResponse(int index, T hz) const noexcept
+    {
+        if (index < 0 || index >= MaxBands || !analog_ || !bandAnalog_[static_cast<size_t>(index)]
+            || !(spec_.sampleRate > 0.0)) return T(0);
+        const AnalogBand& band = (*analog_)[static_cast<size_t>(index)];
+        if (!band.configured || band.idle) return T(0);
+        const double w = 2.0 * pi<double> * std::clamp(static_cast<double>(hz), 0.0, 0.5 * spec_.sampleRate) / spec_.sampleRate;
+        const double c1 = std::cos(w), s1 = std::sin(w), c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
+        double power = 1.0;
+        for (int s = 0; s < band.cascade.getNumSections(); ++s)
+        {
+            if (!band.cascade.isSectionEnabled(s)) continue;
+            const BiquadCoeffs c = band.cascade.getCoeffs(s);
+            const double nRe = c.b0 + c.b1 * c1 + c.b2 * c2, nIm = -(c.b1 * s1 + c.b2 * s2);
+            const double dRe = 1.0 + c.a1 * c1 + c.a2 * c2, dIm = -(c.a1 * s1 + c.a2 * s2);
+            power *= (nRe * nRe + nIm * nIm) / std::max(dRe * dRe + dIm * dIm, 1e-300);
+        }
+        return static_cast<T>(10.0 * std::log10(std::max(power, 1e-30)));
     }
 
     /**
@@ -1231,6 +1270,8 @@ protected:
     static constexpr int kEngineChannels = 16;                             ///< Channels the band engines hold.
     static constexpr double kRampSlowMs = 40.0;    ///< Glide of a small move of a band of the analog response.
     static constexpr double kRampFastMs = 10.0;    ///< Glide of a jump.
+    static constexpr int kMaxStretches = 32;       ///< Most designs a glide goes through.
+    static constexpr int kStretchSamples = 16;     ///< Shortest stretch between two of them.
     static constexpr double kRestDb = 0.05;        ///< A gain band closer to 0 dB than this leaves the path.
     static constexpr double kTiltCeilingDb = 36.0; ///< Most a constant tilt lifts its rising end (20 Hz or 20 kHz).
 
@@ -1244,6 +1285,12 @@ protected:
         bool configured = false;
         bool resting = false;       ///< The design is transparent (a gain band at 0 dB).
         bool idle = false;          ///< Resting and landed: no section is computed.
+        BandConfig heading {};      ///< Where the coefficients are going now: config, or a design on the way to it.
+        BandConfig origin {};       ///< Where a glide in stretches set out from.
+        int stretches = 0;          ///< Designs the glide in flight goes through (0: none, or its last one).
+        int stretch = 0;            ///< The one being approached, from 1.
+        int stretchLength = 0;      ///< Samples of each.
+        int stretchLeft = 0;        ///< Samples to the one being approached.
     };
 
     /** @brief The slope the cookbook engine runs: 6 to 48 dB per octave, whole. */
@@ -1384,7 +1431,24 @@ protected:
         const bool fresh = snap || !band.configured;
         const int had = band.configured ? cascade.getNumSections() : 0;
         const int count = std::max(had, n);
-        const int ramp = fresh ? 0 : rampSamples(band.config, cfg);
+        // Where the coefficients are now: on a design of the way, or on the last one asked for.
+        const BandConfig origin = band.stretches > 0 ? band.heading : band.config;
+        const int ramp = fresh ? 0 : rampSamples(origin, cfg);
+        const int stretches = !fresh && !rest && !band.resting && !band.idle && n == had && n == band.wanted
+            ? glideStretches(origin, cfg, ramp) : 1;
+        band.stretches = 0;
+        if (stretches > 1)
+        {
+            // A move of some length: through the designs of the parameters in
+            // between, so the band on the way is a band and not a blend of two.
+            band.origin = origin;
+            band.config = cfg;
+            band.stretches = stretches;
+            band.stretch = 0;
+            band.stretchLength = std::max(1, ramp / stretches);
+            nextStretch(band);
+            return;
+        }
 
         if (!band.configured) cascade.setNumSections(0);
         for (int s = had; s < count; ++s)
@@ -1401,11 +1465,84 @@ protected:
             else cascade.rampCoeffs(s, rest ? target[s].bypassed() : target[s], ramp);
         }
         band.config = cfg;
+        band.heading = cfg;
         band.wanted = n;
         band.resting = rest;
         band.idle = false;
         band.configured = true;
         settleAnalogBand(band);
+    }
+
+    /**
+     * @brief In how many designs a band goes from one configuration to
+     *        another: one for every quarter of an octave of frequency, every
+     *        12 dB of gain and every octave of Q (linear interpolation of
+     *        the coefficients between two designs that close stays within
+     *        half a decibel of the band of the parameters in between), with
+     *        no stretch shorter than kStretchSamples. 1: straight there.
+     */
+    [[nodiscard]] static int glideStretches(const BandConfig& from, const BandConfig& to, int ramp) noexcept
+    {
+        if (from.type != to.type || from.order != to.order || from.slope != to.slope) return 1;
+        switch (to.type)
+        {
+            case BandType::ConstantTilt:
+            case BandType::LowPassWall:
+            case BandType::HighPassWall: return 1;      // their sections change in number along the way
+            default: break;
+        }
+        const double f0 = std::max(static_cast<double>(from.frequency), 1.0), f1 = std::max(static_cast<double>(to.frequency), 1.0);
+        const double q0 = std::max(static_cast<double>(from.q), 0.025), q1 = std::max(static_cast<double>(to.q), 0.025);
+        const double way = std::max({ 4.0 * std::abs(std::log2(f1 / f0)),
+                                      std::abs(static_cast<double>(to.gain) - static_cast<double>(from.gain)) / 12.0,
+                                      std::abs(std::log2(q1 / q0)) });
+        if (!(way > 1.0)) return 1;
+        const int count = static_cast<int>(std::ceil(std::min(way, static_cast<double>(kMaxStretches))));
+        return std::clamp(std::min(count, ramp / kStretchSamples), 1, kMaxStretches);
+    }
+
+    /** @brief The configuration a share of the way between two: frequency and Q in octaves, gain in decibels. */
+    [[nodiscard]] static BandConfig between(const BandConfig& from, const BandConfig& to, double share) noexcept
+    {
+        BandConfig point = to;
+        const double f0 = std::max(static_cast<double>(from.frequency), 1.0), f1 = std::max(static_cast<double>(to.frequency), 1.0);
+        const double q0 = std::max(static_cast<double>(from.q), 0.025), q1 = std::max(static_cast<double>(to.q), 0.025);
+        point.frequency = static_cast<T>(f0 * std::pow(f1 / f0, share));
+        point.q = static_cast<T>(q0 * std::pow(q1 / q0, share));
+        point.gain = static_cast<T>(static_cast<double>(from.gain) + share * (static_cast<double>(to.gain) - static_cast<double>(from.gain)));
+        return point;
+    }
+
+    /** @brief Starts the next stretch of a glide: designs where it ends and sends the coefficients there. */
+    void nextStretch(AnalogBand& band) noexcept
+    {
+        ++band.stretch;
+        bool last = band.stretch >= band.stretches;
+        BandConfig point = last ? band.config
+                                : between(band.origin, band.config, static_cast<double>(band.stretch) / band.stretches);
+        BiquadCoeffs target[kMaxBandSections];
+        int n = designSections(point, target, kMaxBandSections);
+        if (n != band.wanted && !last)
+        {
+            // A design of the way with other sections: straight to the end.
+            last = true;
+            point = band.config;
+            n = designSections(point, target, kMaxBandSections);
+        }
+        auto& cascade = band.cascade;
+        for (int s = 0; s < std::min(n, cascade.getNumSections()); ++s)
+            cascade.rampCoeffs(s, target[s], band.stretchLength);
+        band.heading = point;
+        band.stretchLeft = band.stretchLength;
+        if (last) band.stretches = 0;       // the cascade lands by itself
+    }
+
+    /** @brief Counts the samples a gliding band has played and starts its next stretch when one ends. */
+    void advanceGlide(AnalogBand& band, int samples) noexcept
+    {
+        if (band.stretches <= 0) return;
+        band.stretchLeft -= samples;
+        if (band.stretchLeft <= 0) nextStretch(band);
     }
 
     /** @brief Whether two configurations give the same sections (the enabled flag is not part of the design). */
@@ -1434,7 +1571,16 @@ protected:
         if (bandAnalog_[static_cast<size_t>(index)] && analog_)
         {
             AnalogBand& band = (*analog_)[static_cast<size_t>(index)];
-            if (!band.idle) band.cascade.processBlock(view);
+            // A glide in stretches is cut where each one ends, whatever the block.
+            const int total = view.getNumSamples();
+            int done = 0;
+            while (done < total)
+            {
+                const int n = band.stretches > 0 ? std::min(total - done, std::max(1, band.stretchLeft)) : total - done;
+                if (!band.idle) band.cascade.processBlock(n == total ? view : view.getSubView(done, n));
+                advanceGlide(band, n);
+                done += n;
+            }
             settleAnalogBand(band);
             return;
         }

@@ -22,6 +22,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -2833,4 +2834,34 @@ DSPARK_TEST(AlgoReverb_float_tracks_double_at_full_modulation)
         signal += reference[i] * reference[i];
     }
     EXPECT_LT(10.0 * std::log10(error / signal), -45.0);
+}
+
+// New: the bucket echo lands on its time. The device's filters and its hold
+// added their own delay to the chain's: an echo of 300 ms arrived half a
+// millisecond late, and each repeat as much again. The chain's clock now
+// runs that much faster. The time is where the echo's weight sits (its first
+// moment, which is the delay of the low frequencies).
+DSPARK_TEST(Delay_bucket_echo_lands_on_its_time)
+{
+    using C = Delay<float>::Character;
+    const size_t n = 96000;
+    for (const float ms : { 100.0f, 300.0f, 600.0f })
+    {
+        const auto echoes = l12Delay(C::Bucket, 0.0f, ms, ms, 0.0, 0.5f, -200.0f, n, true);
+        const double period = static_cast<double>(ms) * 48.0;
+        for (int echo = 1; echo <= 2; ++echo)
+        {
+            const size_t from = static_cast<size_t>((echo - 0.5) * period);
+            const size_t to = std::min(n, static_cast<size_t>((echo + 0.5) * period));
+            double sum = 0.0, at = 0.0;
+            for (size_t i = from; i < to; ++i)
+            {
+                sum += static_cast<double>(echoes[i]);
+                at += static_cast<double>(i) * static_cast<double>(echoes[i]);
+            }
+            const double centre = at / (sum * 48.0);
+            std::printf("  [bucket] %.0f ms: echo %d centred at %.3f ms\n", static_cast<double>(ms), echo, centre);
+            EXPECT_NEAR(centre, echo * static_cast<double>(ms), 0.05 * echo);
+        }
+    }
 }

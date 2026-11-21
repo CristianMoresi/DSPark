@@ -3208,9 +3208,9 @@ DSPARK_TEST(TapeMachine_invalid_inputs_are_ignored)
     dut->prepare(spec(48000.0, 512, -3));
 
     // Wild enums clamp to the last member; sync the twin to the same values.
-    EXPECT_TRUE(dut->getSpeed() == TapeMachine<float>::Speed::IPS_30);
+    EXPECT_TRUE(dut->getSpeed() == TapeMachine<float>::Speed::IPS_3_75);
     EXPECT_TRUE(dut->getStandard() == TapeMachine<float>::Standard::CCIR);
-    twin->setSpeed(TapeMachine<float>::Speed::IPS_30);
+    twin->setSpeed(TapeMachine<float>::Speed::IPS_3_75);
     twin->setStandard(TapeMachine<float>::Standard::CCIR);
 
     EXPECT_NEAR(dut->getDrive(), 6.0f, 1e-6f);
@@ -6486,4 +6486,244 @@ DSPARK_TEST(MultibandSaturation_output_clip_holds_its_ceiling)
     for (size_t i = 4800; i + static_cast<size_t>(late) < quiet.size(); ++i)
         apart = std::max(apart, std::abs(static_cast<double>(clipped[0][i + static_cast<size_t>(late)]) - plain[0][i]));
     EXPECT_LT(apart, 1e-4);
+}
+
+// ============================================================================
+// The tape machine's input, its bias against the top end, the record emphasis
+// trim, the iron's low end, the head by speed and track, rest and block size.
+// ============================================================================
+
+namespace {
+
+// A sum of tones (frequency, amplitude) over a DC offset.
+std::vector<float> m7Tones(const std::vector<std::pair<double, double>>& list, int n, double dc = 0.0)
+{
+    std::vector<float> v(static_cast<size_t>(n), static_cast<float>(dc));
+    for (const auto& tone : list)
+        for (int i = 0; i < n; ++i)
+            v[static_cast<size_t>(i)] += static_cast<float>(tone.second * std::sin(2.0 * 3.14159265358979323846 * tone.first * i / 48000.0));
+    return v;
+}
+
+// The left channel of a machine with a steady transport.
+template <class Setup>
+std::vector<float> m7Tape(Setup&& setup, const std::vector<float>& in)
+{
+    return l10Run([&](Tape10& t) { t.setWowFlutter(0.0f); setup(t); }, in, in).first;
+}
+
+// Gain of a tone through the machine, in dB.
+template <class Setup>
+double m7Gain(Setup&& setup, double hz, double amp, int n = 96000)
+{
+    const std::vector<float> in = m7Tones({ { hz, amp } }, n);
+    return l10Line(m7Tape(setup, in), hz) - l10Line(in, hz);
+}
+
+} // namespace
+
+// New: the input is AC coupled. DC at the input reached the tape and leaned
+// its loop to one side: a second harmonic that no later stage removes (the
+// output coupling only took the DC itself). It no longer reaches it, and the
+// band stays where it was.
+DSPARK_TEST(TapeMachine_input_is_ac_coupled)
+{
+    const int n = 96000;
+    const auto second = [](const std::vector<float>& v) { return l10Line(v, 2000.0) - l10Line(v, 1000.0); };
+    const double clean = second(m7Tape([](Tape10&) {}, m7Tones({ { 1000.0, 0.25 } }, n)));
+    const double offset = second(m7Tape([](Tape10&) {}, m7Tones({ { 1000.0, 0.25 } }, n, 0.1)));
+    std::printf("  [tape] second harmonic of 1 kHz: %.1f dB clean, %.1f dB with DC 0.1 at the input\n", clean, offset);
+    EXPECT_LT(offset, std::max(clean + 3.0, -75.0));
+    EXPECT_NEAR(m7Gain([](Tape10&) {}, 40.0, 0.02), m7Gain([](Tape10&) {}, 1000.0, 0.02), 1.0);
+}
+
+// New: the bias moves the top end both ways. Under the optimum the short
+// wavelengths record more strongly and the top rises; over it they erase
+// themselves and it falls, from the optimum on.
+DSPARK_TEST(TapeMachine_bias_moves_the_top_end_both_ways)
+{
+    const std::vector<float> in = m7Tones({ { 1000.0, 0.02 }, { 10000.0, 0.02 } }, 96000);
+    double last = 1e9, atOptimum = 0.0, low = 0.0, high = 0.0;
+    for (const float bias : { 0.2f, 0.35f, 0.5f, 0.54f, 0.65f, 0.8f })
+    {
+        const std::vector<float> out = m7Tape([=](Tape10& t) { t.setBias(bias); }, in);
+        const double top = l10Line(out, 10000.0) - l10Line(out, 1000.0);
+        std::printf("  [tape] bias %.2f: 10 kHz against 1 kHz %+.2f dB\n", static_cast<double>(bias), top);
+        EXPECT_LT(top, last - 0.05);
+        last = top;
+        if (bias == 0.5f) atOptimum = top;
+        if (bias == 0.2f) low = top;
+        if (bias == 0.8f) high = top;
+    }
+    EXPECT_GT(low, atOptimum + 1.0);
+    EXPECT_LT(high, atOptimum - 1.0);
+}
+
+// New: the record emphasis trim. More emphasis on the record side, taken off
+// by the reproduce side: flat at low level, the top end reaches the tape
+// hotter (a loud tone up there distorts more) and the tape's hiss falls.
+DSPARK_TEST(TapeMachine_record_emphasis_is_flat_at_low_level_and_loads_the_top)
+{
+    const auto with = [](float db) { return [=](Tape10& t) { t.setRecordEmphasis(db); }; };
+    for (const double hz : { 100.0, 1000.0, 10000.0 })
+        EXPECT_NEAR(m7Gain(with(6.0f), hz, 0.01), m7Gain(with(0.0f), hz, 0.01), 0.3);
+    // The third harmonic of a 5 kHz tone at -6 dBFS, against the tone.
+    const auto third = [&](float db) {
+        const std::vector<float> in = m7Tones({ { 5000.0, 0.5 } }, 96000);
+        const std::vector<float> out = m7Tape(with(db), in);
+        return l10Line(out, 15000.0) - l10Line(out, 5000.0);
+    };
+    const double plain = third(0.0f), loaded = third(6.0f), spared = third(-6.0f);
+    std::printf("  [tape] third harmonic of 5 kHz at -6 dBFS: %.1f dB with the trim at 0, %.1f at +6, %.1f at -6\n", plain, loaded, spared);
+    EXPECT_GT(loaded, plain + 0.5);
+    EXPECT_LT(spared, plain - 1.0);
+
+    const std::vector<float> silence(96000, 0.0f);
+    const auto hissTop = [&](float db) {
+        return l10Band(m7Tape([=](Tape10& t) { t.setRecordEmphasis(db); t.setNoise(-50.0f); }, silence), 8000.0, 16000.0);
+    };
+    EXPECT_LT(hissTop(6.0f), hissTop(0.0f) - 3.0);
+
+    Tape10 a;
+    a.setRecordEmphasis(4.0f);
+    a.setRecordEmphasis(std::numeric_limits<float>::quiet_NaN());
+    const auto blob = a.getState();
+    Tape10 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(b.getRecordEmphasis()), 4.0, 1e-6);
+    b.setRecordEmphasis(40.0f);
+    EXPECT_NEAR(static_cast<double>(b.getRecordEmphasis()), 6.0, 1e-6);
+}
+
+// New: the head bump sits where the wavelength meets the head's contact
+// with the tape: it follows the speed (half the speed, half the frequency)
+// and the track format (each has its head).
+DSPARK_TEST(TapeMachine_head_bump_follows_the_speed_and_the_track)
+{
+    using S = Tape10::Speed;
+    using F = Tape10::TrackFormat;
+    const auto lift = [](S speed, F format, double hz) {
+        const auto with = [=](float amount) {
+            return [=](Tape10& t) { t.setSpeed(speed); t.setTrackFormat(format); t.setHeadBump(amount); };
+        };
+        return m7Gain(with(1.0f), hz, 0.008) - m7Gain(with(0.0f), hz, 0.008);
+    };
+    EXPECT_GT(lift(S::IPS_15, F::Half, 90.0), lift(S::IPS_15, F::Half, 45.0) + 0.2);
+    EXPECT_GT(lift(S::IPS_15, F::Half, 90.0), lift(S::IPS_15, F::Half, 180.0) + 0.2);
+    EXPECT_GT(lift(S::IPS_15, F::Full, 72.0), lift(S::IPS_15, F::Full, 112.0) + 0.1);
+    EXPECT_GT(lift(S::IPS_15, F::Quarter, 112.0), lift(S::IPS_15, F::Quarter, 72.0) + 0.1);
+    EXPECT_GT(lift(S::IPS_7_5, F::Half, 45.0), lift(S::IPS_7_5, F::Half, 22.5) + 0.2);
+    EXPECT_GT(lift(S::IPS_3_75, F::Half, 22.5), lift(S::IPS_3_75, F::Half, 45.0) + 0.2);
+}
+
+// New: 3.75 ips. The slower the tape, the shorter the wavelengths and the
+// more of the top the head loses; the reference level stays where it is. The
+// speed comes last in the enumeration, so stored states keep their meaning.
+DSPARK_TEST(TapeMachine_three_and_three_quarter_ips)
+{
+    using S = Tape10::Speed;
+    double last = -1e9;
+    for (const S speed : { S::IPS_3_75, S::IPS_7_5, S::IPS_15, S::IPS_30 })
+    {
+        const double top = m7Gain([=](Tape10& t) { t.setSpeed(speed); t.setLossEffects(1.0f); }, 10000.0, 0.02);
+        std::printf("  [tape] speed %d: 10 kHz at full losses %.2f dB\n", static_cast<int>(speed), top);
+        EXPECT_GT(top, last + 0.5);
+        last = top;
+    }
+    for (const int standard : { 0, 1 })
+        EXPECT_NEAR(m7Gain([=](Tape10& t) { t.setSpeed(S::IPS_3_75); t.setStandard(static_cast<Tape10::Standard>(standard)); }, 1000.0, 0.25),
+                    0.0, 0.5);
+    EXPECT_EQ(static_cast<int>(S::IPS_7_5), 0);
+    EXPECT_EQ(static_cast<int>(S::IPS_30), 2);
+    Tape10 a;
+    a.setSpeed(S::IPS_3_75);
+    const auto blob = a.getState();
+    Tape10 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getSpeed() == S::IPS_3_75);
+}
+
+// New: the output iron loses its low end in a linear way: a first-order
+// high-pass at 20 Hz at the full amount, whatever the level.
+DSPARK_TEST(TapeMachine_output_iron_loses_its_low_end)
+{
+    const auto drop = [](double hz) {
+        return m7Gain([](Tape10& t) { t.setOutputIron(1.0f); }, hz, 0.005, 192000) - m7Gain([](Tape10&) {}, hz, 0.005, 192000);
+    };
+    const double at20 = drop(20.0), at100 = drop(100.0), at1k = drop(1000.0);
+    std::printf("  [tape] the iron at 1 against 0: %.2f dB at 20 Hz, %.2f at 100 Hz, %.2f at 1 kHz\n", at20, at100, at1k);
+    EXPECT_NEAR(at20, -3.0, 0.5);
+    EXPECT_GT(at100, -0.3);
+    EXPECT_NEAR(at1k, 0.0, 0.05);
+}
+
+// New: the machine rests while it is not heard (the mix on the dry side, or
+// the source monitored): the output is the input, late by the latency, to
+// the bit. Asked for again it starts from rest and comes in under the fade:
+// no step, and it ends where a machine that never rested is.
+DSPARK_TEST(TapeMachine_rests_when_it_is_not_heard_and_wakes_without_a_step)
+{
+    const std::vector<float> in = m7Tones({ { 1000.0, 0.25 } }, 96000);
+    const std::vector<float> never = m7Tape([](Tape10&) {}, in);
+    const size_t at = 512 * 60;
+    for (const int way : { 0, 1 })
+    {
+        auto tape = std::make_unique<Tape10>();
+        tape->setWowFlutter(0.0f);
+        if (way == 0) tape->setMix(0.0f);
+        else tape->setMonitor(Tape10::Monitor::Source);
+        tape->prepare(spec(48000.0, 512, 2));
+        std::vector<float> l = in, r = in;
+        for (size_t off = 0; off < l.size(); off += 512)
+        {
+            if (off == at)
+            {
+                if (way == 0) tape->setMix(1.0f);
+                else tape->setMonitor(Tape10::Monitor::PlayHead);
+            }
+            float* p[2] = { l.data() + off, r.data() + off };
+            tape->processBlock(AudioBufferView<float>(p, 2, static_cast<int>(std::min<size_t>(512, l.size() - off))));
+        }
+        const size_t late = static_cast<size_t>(tape->getLatency());
+        double apart = 0.0;
+        for (size_t i = late; i < at; ++i) apart = std::max(apart, std::abs(static_cast<double>(l[i]) - in[i - late]));
+        EXPECT_EQ(apart, 0.0);
+        double resting = 0.0, waking = 0.0, settled = 0.0;
+        for (size_t i = at - 4800; i < at; ++i) resting = std::max(resting, std::abs(static_cast<double>(l[i]) - l[i - 1]));
+        for (size_t i = at; i < at + 4800; ++i) waking = std::max(waking, std::abs(static_cast<double>(l[i]) - l[i - 1]));
+        for (size_t i = l.size() - 4800; i < l.size(); ++i) settled = std::max(settled, std::abs(static_cast<double>(l[i]) - l[i - 1]));
+        std::printf("  [tape] largest step: %.5f at rest, %.5f waking, %.5f settled\n", resting, waking, settled);
+        EXPECT_LT(waking, 1.2 * std::max(resting, settled));
+        EXPECT_NEAR(l10Line(l, 1000.0), l10Line(never, 1000.0), 0.05);
+    }
+}
+
+// New: asked for another block size alone, a prepared machine keeps its
+// memory: the output goes on as if nothing had been asked. The same spec
+// again still starts it from rest.
+DSPARK_TEST(TapeMachine_keeps_its_memory_when_only_the_block_size_changes)
+{
+    const std::vector<float> in = m7Tones({ { 440.0, 0.25 } }, 48000);
+    const auto render = [&](int asked) {
+        auto tape = std::make_unique<Tape10>();
+        tape->prepare(spec(48000.0, 512, 2));
+        std::vector<float> l = in, r = in;
+        for (size_t off = 0; off < l.size(); off += 256)
+        {
+            if (off == 24064 && asked == 1) tape->prepare(spec(48000.0, 256, 2));
+            if (off == 24064 && asked == 2) tape->prepare(spec(48000.0, 512, 2));
+            float* p[2] = { l.data() + off, r.data() + off };
+            tape->processBlock(AudioBufferView<float>(p, 2, static_cast<int>(std::min<size_t>(256, l.size() - off))));
+        }
+        return l;
+    };
+    const std::vector<float> steady = render(0), resized = render(1), again = render(2);
+    double apart = 0.0, restart = 0.0;
+    for (size_t i = 0; i < steady.size(); ++i)
+    {
+        apart = std::max(apart, std::abs(static_cast<double>(steady[i]) - resized[i]));
+        restart = std::max(restart, std::abs(static_cast<double>(steady[i]) - again[i]));
+    }
+    EXPECT_EQ(apart, 0.0);
+    EXPECT_GT(restart, 0.05);
 }

@@ -847,6 +847,7 @@ inline EffectSlot makeSaturation()
     s.addSlider("Comb Loop Freq", 20, 2000, 200, "Hz");
     s.addToggle("Drive Compensation", false);
     s.addChoice("Oversampling Mode", {"Linear phase","Minimum phase"}, 0);
+    s.addToggle("Comb Loop Closing", false);   // 19: the loop closes when the programme stops
     auto shape = std::make_shared<std::array<std::atomic<float>, 4>>();
     (*shape)[0] = 0.0f; (*shape)[1] = 1.0f; (*shape)[2] = 0.0f; (*shape)[3] = 200.0f;
     auto modeWanted  = std::make_shared<std::atomic<int>>(0);
@@ -885,6 +886,7 @@ inline EffectSlot makeSaturation()
             case 16: k[3] = v; p->setCombLoop(p->getCombLoop(), v); break;
             case 17: p->setDriveCompensation(v > 0.5f); break;
             case 18: modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); break;
+            case 19: p->setCombLoopClosing(v > 0.5f); break;
             case 0: p->setAlgorithm(static_cast<typename dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); break;
             case 1: p->setDrive(v); break;
             case 2: p->setMix(v); break;
@@ -937,6 +939,10 @@ inline EffectSlot makeMultibandSaturation()
         s.addToggle((n + "Solo").c_str(), false);
     }
     s.addChoice("Crossover Structure", {"Direct form","Ladder"}, 0);                        // index 26
+    s.addChoice("Crossover Slope", {"6 dB/oct","12 dB/oct","24 dB/oct","36 dB/oct","48 dB/oct"}, 2); // index 27
+    s.addSlider("Mix", 0, 1, 1, "");                                                       // index 28: against the programme as the crossover leaves it
+    s.addToggle("Output Clip", false);                                                      // index 29: an oversampled clipper after the sum
+    s.addSlider("Output Ceiling", -24, 0, 0, "dB");                                         // index 30
     s.prepareFn = [p, modeApplied](auto& sp) {
         p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(modeApplied->load(std::memory_order_relaxed)));
         p->prepare(sp);
@@ -960,6 +966,10 @@ inline EffectSlot makeMultibandSaturation()
         if (i == 4) { for (int b = 0; b < 4; ++b) p->setBandAlgorithm(b, static_cast<dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); return; }
         if (i == 5) { modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); return; }
         if (i == 26) { p->setCrossoverStructure(static_cast<MbSat::Crossover::Structure>(static_cast<int>(v))); return; }
+        if (i == 27) { static constexpr int slopes[] = {6,12,24,36,48}; p->setOrder(slopes[std::clamp(static_cast<int>(v), 0, 4)]); return; }
+        if (i == 28) { p->setMix(v); return; }
+        if (i == 29) { p->setOutputClip(v > 0.5f); return; }
+        if (i == 30) { p->setOutputCeiling(v); return; }
         const int band = (i - 6) / 5, field = (i - 6) % 5;
         switch (field) {
             case 0: p->setBandDrive(band, v); break;
@@ -1709,6 +1719,8 @@ inline EffectSlot makeMultibandCompressor()
     s.addChoice("Crossover", {"Minimum phase","Linear phase"}, 0); // 10
     // Order MUST match CrossoverFilter::Structure (DirectForm=0, Ladder=1).
     s.addChoice("Crossover Structure", {"Direct form","Ladder"}, 0); // 11
+    s.addChoice("Crossover Slope", {"6 dB/oct","12 dB/oct","24 dB/oct","36 dB/oct","48 dB/oct"}, 2); // 12
+    s.addSlider("Mix", 0, 1, 1, "");   // 13: every band against itself as the crossover leaves it
     s.prepareFn = [p](auto& sp) {
         p->prepare(sp);
         p->setNumBands(3);
@@ -1731,6 +1743,8 @@ inline EffectSlot makeMultibandCompressor()
             case 9: for (int b = 0; b < 3; ++b) p->setBandRelease(b, v); break;
             case 10: p->setCrossoverMode(static_cast<typename dspark::CrossoverFilter<float, 12>::FilterMode>(static_cast<int>(v))); break;
             case 11: p->setCrossoverStructure(static_cast<typename dspark::CrossoverFilter<float, 12>::Structure>(static_cast<int>(v))); break;
+            case 12: { static constexpr int slopes[] = {6,12,24,36,48}; p->setOrder(slopes[std::clamp(static_cast<int>(v), 0, 4)]); break; }
+            case 13: p->setMix(v); break;
         }
     };
     s.gainReductionDbFn = [p]() {

@@ -268,6 +268,18 @@ public:
     void setListeningCompensation(T db) noexcept { store(listening_, db, T(-30), T(30)); }
     /** @brief Loudness to decibels with each band's exponent (default off: one exponent). */
     void setLevelCompensation(bool on) noexcept { levelComp_.store(on, std::memory_order_relaxed); }
+    /**
+     * @brief Loudness to decibels with the slope of the loudness curve at
+     *        each band's own level (default off): what a band lacks or has in
+     *        excess is read with that slope, and so is the offset that keeps
+     *        the loudness. Well over the threshold in
+     *        quiet that slope is the band's exponent; near it a band's
+     *        loudness grows faster with its power (the slope is twice the
+     *        exponent 10 dB over the threshold, 1.45 times 20 dB over), and
+     *        a fixed exponent overstates what the band lacks: the ends of a
+     *        quiet programme are asked for less.
+     */
+    void setLocalSlope(bool on) noexcept { localSlope_.store(on, std::memory_order_relaxed); }
     /** @brief The SPL a full-scale sine stands for, 60 to 130 dB (default 100). */
     void setReferenceLevel(T dbSpl) noexcept { store(referenceSpl_, dbSpl, T(60), T(130)); refDirty_.store(true, std::memory_order_release); }
 
@@ -282,6 +294,7 @@ public:
     [[nodiscard]] T getLowFrequency() const noexcept { return loHz_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighFrequency() const noexcept { return hiHz_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool getLevelCompensation() const noexcept { return levelComp_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getLocalSlope() const noexcept { return localSlope_.load(std::memory_order_relaxed); }
     [[nodiscard]] Reference getReference() const noexcept { return reference_.load(std::memory_order_relaxed); }
     [[nodiscard]] Response getResponse() const noexcept { return response_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getResponseTime() const noexcept { return responseMs_.load(std::memory_order_relaxed); }
@@ -346,6 +359,7 @@ public:
         w.write("loHz", static_cast<float>(getLowFrequency()));
         w.write("hiHz", static_cast<float>(getHighFrequency()));
         w.write("levelComp", getLevelCompensation());
+        w.write("localSlope", getLocalSlope());
         w.write("reference", static_cast<int32_t>(getReference()));
         w.write("response", static_cast<int32_t>(getResponse()));
         w.write("responseMs", static_cast<float>(getResponseTime()));
@@ -368,6 +382,7 @@ public:
         setFloor(static_cast<T>(r.read("floor", 30.0f)));
         setFrequencyRange(static_cast<T>(r.read("loHz", 40.0f)), static_cast<T>(r.read("hiHz", 16000.0f)));
         setLevelCompensation(r.read("levelComp", false));
+        setLocalSlope(r.read("localSlope", false));
         setReference(r.read("reference", 0) == 1 ? Reference::EvenPower : Reference::FlatLoudness);
         setResponse(r.read("response", 0) == 1 ? Response::Common : Response::ByBand);
         setResponseTime(static_cast<T>(r.read("responseMs", 60.0f)));
@@ -506,6 +521,7 @@ private:
         }
         warm_ = true;
         const bool evenPower = reference_.load(std::memory_order_relaxed) == Reference::EvenPower;
+        const bool localSlope = localSlope_.load(std::memory_order_relaxed);
         // Loudness in decibels of power, the trend, the two deviations.
         const double tilt = static_cast<double>(tilt_.load(std::memory_order_relaxed));
         const double lo = static_cast<double>(loHz_.load(std::memory_order_relaxed));
@@ -517,11 +533,21 @@ private:
         // level would read as a hole of tens of decibels: it neither shapes
         // the trend nor takes a correction (filling it would raise content
         // nobody hears, the ends of the band first).
-        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, audible {}, weighed {}, present {}, inRange {};
+        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, steep {}, audible {}, weighed {}, present {}, inRange {};
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
             exponent[i] = comp ? bands_.getExponent(b) : kMidExponent;
+            steep[i] = exponent[i];
+            if (localSlope)
+            {
+                // d ln N / d ln P of N = (P + th)^a - th^a at the power this
+                // band's loudness stands for: a far over the threshold, 1 under it.
+                const double a = bands_.getExponent(b), th = bands_.getThreshold(b);
+                const double whole = loud_[i] + std::pow(th, a);              // (P + th)^a
+                const double power = std::pow(whole, 1.0 / a) - th;          // P
+                steep[i] = loud_[i] > 1e-30 && power > 0.0 ? std::clamp(a * power * whole / ((power + th) * loud_[i]), exponent[i], 1.0) : 1.0;
+            }
             level[i] = 10.0 * std::log10(loud_[i] + 1e-12) / exponent[i];
             // Against the even programme, the level is how far this one
             // stands from it in each band.
@@ -614,9 +640,12 @@ private:
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            const double global = tmpC_[i] - meanDev;
-            const double dip = std::min(0.0, level[i] - std::min(below[i], above[i]));
-            const double peak = std::max(0.0, level[i] - std::max(below[i], above[i]));
+            // With the local slope, what a band lacks or has in excess is read with
+            // the slope of its own loudness curve (never more than the exponent says).
+            const double ease = exponent[i] / steep[i];
+            const double global = ease * (tmpC_[i] - meanDev);
+            const double dip = ease * std::min(0.0, level[i] - std::min(below[i], above[i]));
+            const double peak = ease * std::max(0.0, level[i] - std::max(below[i], above[i]));
             // The balance by how present the band is (limited first, so a band
             // half way down to the floor takes half of it), then the local
             // contrast.
@@ -649,8 +678,8 @@ private:
             for (int b = 0; b < kBands; ++b)
             {
                 const auto i = static_cast<size_t>(b);
-                const double raw = corr_[i] + offset * weight[i] * present[i] / exponent[i];
-                const double l = part[i] * std::exp(kPerDb * exponent[i] * std::clamp(raw, -range, range));
+                const double raw = corr_[i] + offset * weight[i] * present[i] / steep[i];
+                const double l = part[i] * std::exp(kPerDb * steep[i] * std::clamp(raw, -range, range));
                 sum += l;
                 if (raw > -range && raw < range) slope += l * kPerDb * weight[i] * present[i];
             }
@@ -685,7 +714,7 @@ private:
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            corr_[i] = std::clamp(corr_[i] + offset * weight[i] * present[i] / exponent[i], -range, range);
+            corr_[i] = std::clamp(corr_[i] + offset * weight[i] * present[i] / steep[i], -range, range);
             gains[i] = static_cast<T>(corr_[i]);
             published_[i].store(gains[i], std::memory_order_relaxed);
         }
@@ -697,7 +726,7 @@ private:
             for (int b = 0; b < kBands; ++b)
             {
                 const auto i = static_cast<size_t>(b);
-                const double l = part[i] * std::exp(kPerDb * exponent[i] * corr_[i]);
+                const double l = part[i] * std::exp(kPerDb * steep[i] * corr_[i]);
                 const double d = l - part[i];
                 if (d > 0.0) raised += d; else lowered += d;
                 after += l;
@@ -728,7 +757,7 @@ private:
 
     std::atomic<T> balance_ { T(0.5) }, fillDips_ { T(0.3) }, trimPeaks_ { T(0.5) }, tilt_ { T(0) };
     std::atomic<T> range_ { T(6) }, knee_ { T(3) }, loHz_ { T(40) }, hiHz_ { T(16000) }, referenceSpl_ { T(100) };
-    std::atomic<bool> levelComp_ { false }, refDirty_ { false };
+    std::atomic<bool> levelComp_ { false }, refDirty_ { false }, localSlope_ { false };
     std::atomic<Reference> reference_ { Reference::FlatLoudness };
     std::atomic<Response> response_ { Response::ByBand };
     std::atomic<T> responseMs_ { T(60) }, listening_ { T(0) };

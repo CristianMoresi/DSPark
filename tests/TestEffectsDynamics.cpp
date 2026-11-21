@@ -8921,3 +8921,958 @@ DSPARK_TEST(DynamicEQ_key_listen_gives_what_a_band_hears)
     EXPECT_EQ(d->getKeyListen(), 0);
     EXPECT_TRUE(d->getState() == blob);
 }
+
+// ============================================================================
+// Compressor: what stands between the ballistics and the gain, and the range
+// ============================================================================
+
+// New: the landing of the release. The gain that is heard takes every deeper
+// reduction at once and comes back behind the ballistics, slower the nearer it
+// is: a release keeps its start and its last decibel takes several times
+// longer, with no bump on the way.
+DSPARK_TEST(Compressor_release_landing_brings_the_last_decibels_back_slowly)
+{
+    using C = Compressor<float>;
+    const auto with = [](float landingMs) {
+        return [=](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(100.0f);
+            c.setReleaseLanding(landingMs);
+        };
+    };
+    // 16 dB over the threshold for a second (12 dB of reduction), then 40 dB lower.
+    Vec x = makeSine(1000.0, 0.2, 48000.0, 48000 * 4);
+    for (size_t i = 48000; i < x.size(); ++i) x[i] *= 0.01f;
+    const auto plain = compTrace(x, with(0.0f)), landed = compTrace(x, with(300.0f));
+    const size_t drop = 48000 / 16;
+    const auto reaches = [&](const std::vector<double>& trace, double depth) {
+        for (size_t i = drop; i < trace.size(); ++i)
+            if (std::abs(trace[i]) <= depth) return static_cast<double>(i - drop) * 16.0 * 1000.0 / 48000.0;
+        return 1e9;
+    };
+    const double plainFirst = reaches(plain, 6.0), landedFirst = reaches(landed, 6.0);
+    const double plainLast = reaches(plain, 0.1) - reaches(plain, 1.0), landedLast = reaches(landed, 0.1) - reaches(landed, 1.0);
+    std::printf("  [landing] from 12 dB of reduction: 6 dB back after %.1f ms plain and %.1f ms with a 300 ms landing; the stretch from 1 dB to 0.1 dB takes %.1f and %.1f ms; held reduction %.3f and %.3f dB\n",
+                plainFirst, landedFirst, plainLast, landedLast, plain[drop - 1], landed[drop - 1]);
+    EXPECT_NEAR(plain[drop - 1], -12.0, 0.1);
+    EXPECT_NEAR(landed[drop - 1], plain[drop - 1], 0.02);              // what is held is the same
+    EXPECT_LT(landedFirst, plainFirst * 1.6);                           // the release starts as it did
+    EXPECT_GT(landedLast, plainLast * 1.5);                             // and lands slowly
+    double bump = 0.0, attack = 0.0;
+    for (size_t i = drop + 1; i < landed.size(); ++i) bump = std::max(bump, landed[i - 1] - landed[i]);
+    for (size_t i = 0; i < drop; ++i) attack = std::max(attack, std::abs(landed[i] - plain[i]));
+    EXPECT_LT(bump, 1e-4);                                              // it only comes back
+    EXPECT_LT(attack, 0.1);                                             // a deeper reduction is taken at once (the onset wobbles 0.06 dB)
+
+    // One sample at a time is the block path; off, it is not there.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C& c) {
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setReleaseLanding(150.0f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setReleaseLanding(0.0f); })), 1e-3);
+
+    // State and wild values.
+    C a;
+    a.setReleaseLanding(250.0f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getReleaseLanding(), 250.0f);
+    b.setReleaseLanding(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(b.getReleaseLanding(), 250.0f);
+    b.setReleaseLanding(1e6f);
+    EXPECT_EQ(b.getReleaseLanding(), 2000.0f);
+    b.setReleaseLanding(-3.0f);
+    EXPECT_EQ(b.getReleaseLanding(), 0.0f);
+}
+
+// New: a lead-lag network in the control path. Of a sudden move of the gain a
+// share arrives at once and the rest with the time constant of the corner;
+// what the gain settles on does not move, and the ripple a fast release
+// leaves on a low tone falls by the depth of the network.
+DSPARK_TEST(Compressor_control_network_applies_a_share_of_a_fast_move_at_once)
+{
+    using C = Compressor<float>;
+    const auto fast = [](float depthDb) {
+        return [=](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setAttack(0.1f);
+            c.setRelease(200.0f);
+            c.setControlNetwork(depthDb, 5.0f);
+        };
+    };
+    Vec step = makeSine(1000.0, 0.002, 48000.0, 48000 * 2);
+    for (size_t i = 48000; i < step.size(); ++i) step[i] *= 100.0f;    // -54 -> -14 dBFS: 12 dB of reduction
+    const auto plain = compTrace(step, fast(0.0f)), half = compTrace(step, fast(6.0206f));
+    const size_t at = 48000 / 16;
+    const size_t soon = at + 6;                                         // 2 ms after the step
+    const double share = half[soon] / plain[soon];
+    std::printf("  [network] 6 dB at 5 Hz: 2 ms after a step the gain is at %.2f dB of %.2f (a share of %.3f); settled %.3f and %.3f dB\n",
+                half[soon], plain[soon], share, half.back(), plain.back());
+    EXPECT_LT(plain[soon], -11.0);                                      // the attack is over (the detector overshoots a step by a decibel)
+    EXPECT_GT(share, 0.49);
+    EXPECT_LT(share, 0.60);                                             // half at once, 6 % of the rest in 2 ms
+    EXPECT_NEAR(half.back(), plain.back(), 0.01);                       // the static curve does not move
+
+    // The ripple of the gain on a 40 Hz tone with a quick release.
+    const auto riding = [](float depthDb) {
+        return [=](C& c) {
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(20.0f);
+            c.setControlNetwork(depthDb, 5.0f);
+        };
+    };
+    const auto ripple = [&](float depthDb, double& mean) {
+        const auto trace = compTrace(makeSine(40.0, 0.5, 48000.0, 96000), riding(depthDb));
+        double lo = 0.0, hi = -100.0, sum = 0.0;
+        const size_t from = trace.size() - 1500;                        // the last half second: 20 periods
+        for (size_t i = from; i < trace.size(); ++i)
+        {
+            lo = std::min(lo, trace[i]);
+            hi = std::max(hi, trace[i]);
+            sum += trace[i];
+        }
+        mean = sum / 1500.0;
+        return hi - lo;
+    };
+    double meanPlain = 0.0, meanHalf = 0.0;
+    const double ripplePlain = ripple(0.0f, meanPlain), rippleHalf = ripple(6.0206f, meanHalf);
+    std::printf("  [network] gain ripple on a 40 Hz tone: %.2f dB plain, %.2f dB through the network; mean %.3f and %.3f dB\n",
+                ripplePlain, rippleHalf, meanPlain, meanHalf);
+    EXPECT_GT(ripplePlain, 1.0);
+    EXPECT_NEAR(rippleHalf / ripplePlain, 0.5, 0.06);
+    EXPECT_NEAR(meanHalf, meanPlain, 0.05);
+
+    // The paths; a feedback loop reads the gain before the network and stays put.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C& c) {
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setControlNetwork(4.0f, 8.0f);
+        c.setReleaseLanding(100.0f);
+        c.setGainSmoothing(3.0f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setControlNetwork(0.0f); })), 1e-3);
+    const auto loop = [](float depthDb) {
+        return [=](C& c) {
+            c.setTopology(C::Topology::FeedBack);
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(100.0f);
+            c.setControlNetwork(depthDb, 5.0f);
+        };
+    };
+    const Vec steady = makeSine(1000.0, 0.4, 48000.0, 48000);
+    EXPECT_NEAR(compTrace(steady, loop(6.0f)).back(), compTrace(steady, loop(0.0f)).back(), 0.05);
+
+    // Switched on while the gain is down, it starts from where the gain is.
+    {
+        auto c = std::make_unique<C>();
+        fast(0.0f)(*c);
+        c->prepare(AudioSpec{ 48000.0, 16, 1 });
+        std::vector<Vec> x { makeSine(1000.0, 0.4, 48000.0, 48000) };
+        int played = 0;
+        double last = 0.0, jump = 0.0;
+        processInBlocks(x, 16, [&](AudioBufferView<float> b) {
+            if (played == 24000) c->setControlNetwork(9.0f, 5.0f);
+            c->processBlock(b);
+            played += b.getNumSamples();
+            const double gr = static_cast<double>(c->getGainReductionDb());
+            if (played > 12000) jump = std::max(jump, std::abs(gr - last));
+            last = gr;
+        });
+        EXPECT_LT(jump, 0.05);
+    }
+
+    // State and wild values.
+    C a;
+    a.setControlNetwork(4.5f, 20.0f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getControlNetworkDepth(), 4.5f);
+    EXPECT_EQ(b.getControlNetworkCorner(), 20.0f);
+    b.setControlNetwork(std::numeric_limits<float>::quiet_NaN(), 50.0f);
+    EXPECT_EQ(b.getControlNetworkDepth(), 4.5f);
+    EXPECT_EQ(b.getControlNetworkCorner(), 20.0f);
+    b.setControlNetwork(90.0f, 5000.0f);
+    EXPECT_EQ(b.getControlNetworkDepth(), 12.0f);
+    EXPECT_EQ(b.getControlNetworkCorner(), 100.0f);
+    b.setControlNetwork(-2.0f, std::numeric_limits<float>::infinity());
+    EXPECT_EQ(b.getControlNetworkDepth(), 0.0f);
+    EXPECT_EQ(b.getControlNetworkCorner(), 100.0f);
+}
+
+// New: a range the gain change meets in a stretch of its own. Under the
+// stretch the target is untouched, over it it is the range exactly, and in it
+// a quadratic joins the two with no corner; the stretch is as wide as the
+// range when the range is small.
+DSPARK_TEST(Compressor_local_range_bends_only_around_the_range)
+{
+    using C = Compressor<float>;
+    // A 1 kHz tone of amplitude 0.5 read by the RMS detector is at -9.03 dB: at 2:1 the
+    // target is half of what that is over the threshold.
+    auto reduction = [](double target, float range, C::RangeShape shape) {
+        return compHeldReduction(0.5, 1.0, [&](C& c) {
+            c.setDetector(C::DetectorType::Rms);
+            c.setRatio(2.0f);
+            c.setThreshold(static_cast<float>(-9.03 - 2.0 * target));
+            c.setRange(range);
+            c.setRangeShape(shape);
+        });
+    };
+    const auto local = C::RangeShape::Local;
+    EXPECT_NEAR(reduction(2.0, 6.0f, local), -2.0, 0.03);       // under the stretch (3 to 9 dB)
+    EXPECT_NEAR(reduction(3.0, 6.0f, local), -3.0, 0.03);       // where it starts
+    EXPECT_NEAR(reduction(3.2, 6.0f, local), -3.1967, 0.03);    // the slope goes on from 1
+    EXPECT_NEAR(reduction(6.0, 6.0f, local), -5.25, 0.03);      // on the range: an eighth of the stretch short
+    EXPECT_NEAR(reduction(8.8, 6.0f, local), -5.9967, 0.03);    // and arrives at 0
+    EXPECT_NEAR(reduction(9.0, 6.0f, local), -6.0, 0.03);       // where it ends
+    EXPECT_NEAR(reduction(25.0, 6.0f, local), -6.0, 0.03);      // far over: the range exactly
+    EXPECT_NEAR(reduction(2.0, 2.0f, local), -1.75, 0.03);      // a range of 2 dB: a stretch of 2 dB
+    EXPECT_NEAR(reduction(0.9, 2.0f, local), -0.9, 0.03);
+    EXPECT_NEAR(reduction(4.0, 2.0f, local), -2.0, 0.03);
+    // The other two shapes are what they were.
+    EXPECT_NEAR(reduction(12.0, 6.0f, C::RangeShape::Asymptotic), -5.912, 0.03);
+    EXPECT_NEAR(reduction(12.0, 6.0f, C::RangeShape::Corner), -6.0, 0.03);
+
+    // The older switch is two of the shapes; the state keeps the third.
+    C c;
+    EXPECT_TRUE(c.getRangeShape() == C::RangeShape::Corner);
+    c.setSoftRange(true);
+    EXPECT_TRUE(c.getRangeShape() == C::RangeShape::Asymptotic);
+    c.setRangeShape(local);
+    EXPECT_TRUE(c.isSoftRange());
+    const auto blob = c.getState();
+    C other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.getRangeShape() == local);
+    EXPECT_TRUE(other.getState() == blob);
+    other.setRangeShape(static_cast<C::RangeShape>(40));
+    EXPECT_TRUE(other.getRangeShape() == local);
+    other.setSoftRange(false);
+    EXPECT_TRUE(other.getRangeShape() == C::RangeShape::Corner);
+
+    // One sample at a time is the block path.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [&](C& k) {
+        k.setThreshold(-30.0f);
+        k.setRatio(4.0f);
+        k.setAttack(2.0f);
+        k.setRelease(60.0f);
+        k.setRange(8.0f);
+        k.setRangeShape(local);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& k) { working(k); k.setRangeShape(C::RangeShape::Corner); })), 1e-3);
+}
+
+// New: a tone that changes with the reduction. The gain acts on a copy of the
+// signal that has passed a nearly flat filter, y = x - (1 - g) F(x): with no
+// reduction the output is the input bit for bit, and with 12 dB of it each
+// tone is where that expression puts it.
+DSPARK_TEST(Compressor_reduction_tone_leans_the_response_with_the_reduction)
+{
+    using C = Compressor<float>;
+    const int n = 96000;
+    const double hz[5] = { 30.0, 200.0, 1000.0, 4000.0, 16000.0 };
+    const Vec key = makeSine(1000.0, 0.2, 48000.0, n);              // 16 dB over the threshold: 12 dB of reduction
+    Vec probes(static_cast<size_t>(n), 0.0f);
+    for (const double f : hz)
+    {
+        const Vec tone = makeSine(f, 0.01, 48000.0, n);
+        for (int i = 0; i < n; ++i) probes[static_cast<size_t>(i)] += tone[static_cast<size_t>(i)];
+    }
+    double reductionDb = 0.0;
+    const auto keyed = [&](float lowDb, float highDb) {
+        C c;
+        c.setDetector(C::DetectorType::Hilbert);
+        c.setThreshold(-30.0f);
+        c.setRatio(4.0f);
+        c.setAttack(1.0f);
+        c.setRelease(100.0f);
+        c.setReductionTone(lowDb, highDb);
+        c.prepare(AudioSpec{ 48000.0, 512, 1 });
+        Vec audio = probes, k = key;
+        float* pa[1]; float* pk[1];
+        for (int off = 0; off < n; off += 512)
+        {
+            const int m = std::min(512, n - off);
+            pa[0] = audio.data() + off;
+            pk[0] = k.data() + off;
+            AudioBufferView<float> va(pa, 1, m), vk(pk, 1, m);
+            c.processBlock(va, vk);
+        }
+        reductionDb = static_cast<double>(c.getGainReductionDb());
+        return audio;
+    };
+    const auto response = [](const BiquadCoeffs& s, double f) {
+        const std::complex<double> z1 = std::polar(1.0, -2.0 * kPiD * f / 48000.0), z2 = z1 * z1;
+        return (s.b0 + s.b1 * z1 + s.b2 * z2) / (1.0 + s.a1 * z1 + s.a2 * z2);
+    };
+    const auto level = [&](const Vec& y, double f) {
+        return toDb(toneAmplitude(y.data() + n - 19200, 19200, f, 48000.0) / 0.01);
+    };
+
+    const Vec plain = keyed(0.0f, 0.0f);
+    EXPECT_NEAR(reductionDb, -12.0, 0.05);
+    for (const double f : hz) EXPECT_NEAR(level(plain, f), reductionDb, 0.02);
+
+    for (int which = 0; which < 2; ++which)
+    {
+        const float lowDb = which == 0 ? 1.5f : -1.0f, highDb = which == 0 ? -1.5f : 1.0f;
+        const Vec y = keyed(lowDb, highDb);
+        const double g = std::pow(10.0, reductionDb / 20.0);
+        const BiquadCoeffs low = BiquadCoeffs::makeLowShelfMatched(48000.0, C::kReductionToneLowHz, static_cast<double>(lowDb));
+        const BiquadCoeffs high = BiquadCoeffs::makeHighShelfMatched(48000.0, C::kReductionToneHighHz, static_cast<double>(highDb));
+        double worst = 0.0, shown[5] = {};
+        for (int i = 0; i < 5; ++i)
+        {
+            const std::complex<double> filter = response(low, hz[i]) * response(high, hz[i]);
+            const double expected = toDb(std::abs(1.0 - (1.0 - g) * filter));
+            shown[i] = level(y, hz[i]);
+            worst = std::max(worst, std::abs(shown[i] - expected));
+        }
+        std::printf("  [tone] %+.1f dB low and %+.1f dB high under %.2f dB of reduction: 30 Hz %.2f dB, 200 Hz %.2f, 1 kHz %.2f, 4 kHz %.2f, 16 kHz %.2f; farthest from y = x - (1 - g) F(x): %.3f dB\n",
+                    static_cast<double>(lowDb), static_cast<double>(highDb), reductionDb,
+                    shown[0], shown[1], shown[2], shown[3], shown[4], worst);
+        EXPECT_LT(worst, 0.05);
+        // Deeper where the filter is over 0 dB and shallower where it is under.
+        if (which == 0) { EXPECT_LT(shown[0], reductionDb - 3.0); EXPECT_GT(shown[4], reductionDb + 2.0); }
+        else            { EXPECT_GT(shown[0], reductionDb + 1.5); EXPECT_LT(shown[4], reductionDb - 2.0); }
+    }
+
+    // No reduction: the input, bit for bit.
+    {
+        C c;
+        c.setThreshold(0.0f);
+        c.setReductionTone(2.0f, -2.0f);
+        c.prepare(AudioSpec{ 48000.0, 512, 2 });
+        const Vec x = compLowOverHigh(24000);
+        std::vector<Vec> v { x, x };
+        processInBlocks(v, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+        EXPECT_TRUE(std::memcmp(v[0].data(), x.data(), sizeof(float) * x.size()) == 0);
+        EXPECT_TRUE(std::memcmp(v[1].data(), x.data(), sizeof(float) * x.size()) == 0);
+    }
+
+    // One sample at a time is the block path; the push-pull element applies the gain its own way.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C& c) {
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setReductionTone(1.0f, -2.0f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setReductionTone(0.0f, 0.0f); })), 1e-3);
+    const auto pair = [](float toneDb) {
+        return [=](C& c) {
+            c.setCharacter(C::Character::Varimu);
+            c.setThreshold(-24.0f);
+            c.setRatio(4.0f);
+            c.setCharacterColor(0.8f);
+            c.setReductionTone(toneDb, toneDb);
+        };
+    };
+    EXPECT_EQ(compFarthest(compRender(burst, pair(2.0f)), compRender(burst, pair(0.0f))), 0.0);
+
+    // State and wild values.
+    C a;
+    a.setReductionTone(1.25f, -0.75f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getReductionToneLow(), 1.25f);
+    EXPECT_EQ(b.getReductionToneHigh(), -0.75f);
+    b.setReductionTone(std::numeric_limits<float>::quiet_NaN(), 40.0f);
+    EXPECT_EQ(b.getReductionToneLow(), 1.25f);
+    EXPECT_EQ(b.getReductionToneHigh(), 3.0f);
+    b.setReductionTone(-40.0f, std::numeric_limits<float>::infinity());
+    EXPECT_EQ(b.getReductionToneLow(), -3.0f);
+    EXPECT_EQ(b.getReductionToneHigh(), 3.0f);
+}
+
+// New: the leak of the control. The moves of the gain, through a high-pass of
+// a few Hz, are added to the output of the element: a thump at each attack
+// and release in proportion to the amount, and nothing under a settled gain.
+DSPARK_TEST(Compressor_control_leak_leaves_a_thump_where_the_gain_moves)
+{
+    using C = Compressor<float>;
+    const int n = 96000;
+    // A tone that comes and goes: 100 ms on, 150 ms off, 16 dB over the threshold.
+    Vec bursts = makeSine(1000.0, 0.2, 48000.0, n);
+    for (int i = 0; i < n; ++i)
+        if ((i % 12000) >= 4800) bursts[static_cast<size_t>(i)] = 0.0f;
+    const auto with = [](float amount) {
+        return [=](C& c) {
+            c.setDetector(C::DetectorType::Hilbert);
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setAttack(1.0f);
+            c.setRelease(50.0f);
+            c.setControlLeak(amount);
+        };
+    };
+    const Vec none = compRender(bursts, with(0.0f)), half = compRender(bursts, with(0.5f)), whole = compRender(bursts, with(1.0f));
+    double sumHalf = 0.0, sumWhole = 0.0, peak = 0.0, apart = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        const double h = static_cast<double>(half[static_cast<size_t>(i)]) - none[static_cast<size_t>(i)];
+        const double w = static_cast<double>(whole[static_cast<size_t>(i)]) - none[static_cast<size_t>(i)];
+        sumHalf += h * h;
+        sumWhole += w * w;
+        peak = std::max(peak, std::abs(w));
+        apart = std::max(apart, std::abs(w - 2.0 * h));
+    }
+    const double doubling = 10.0 * std::log10(sumWhole / sumHalf);
+    std::printf("  [leak] bursts under 12 dB of reduction: what the leak adds peaks at %.4f at an amount of 1 and rises %.2f dB from 0.5 to 1 (farthest from twice: %.1e)\n",
+                peak, doubling, apart);
+    EXPECT_NEAR(doubling, 6.02, 0.05);
+    EXPECT_GT(peak, 0.02);                      // a gain that falls by 0.75 leaks 0.05 of that
+    EXPECT_LT(peak, 0.04);
+
+    // Under a gain that has settled it adds nothing.
+    const Vec held = makeSine(1000.0, 0.2, 48000.0, n);
+    const Vec heldNone = compRender(held, with(0.0f)), heldWhole = compRender(held, with(1.0f));
+    const double settled = compFarthest(heldWhole, heldNone, static_cast<size_t>(n - 9600));
+    std::printf("  [leak] a held tone, last 200 ms: what the leak adds stays under %.1e\n", settled);
+    EXPECT_LT(settled, 1e-6);
+
+    // Switched on while the gain is down, it starts from that gain: no thump.
+    {
+        auto c = std::make_unique<C>();
+        with(0.0f)(*c);
+        c->prepare(AudioSpec{ 48000.0, 512, 1 });
+        std::vector<Vec> x { held };
+        int played = 0;
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) {
+            if (played == 512 * 90) c->setControlLeak(1.0f);
+            c->processBlock(b);
+            played += b.getNumSamples();
+        });
+        EXPECT_LT(compFarthest(x[0], heldNone, static_cast<size_t>(512 * 90)), 1e-4);
+    }
+
+    // One sample at a time is the block path.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C& c) {
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setControlLeak(0.7f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setControlLeak(0.0f); })), 1e-4);
+
+    // State and wild values.
+    C a;
+    a.setControlLeak(0.35f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getControlLeak(), 0.35f);
+    b.setControlLeak(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(b.getControlLeak(), 0.35f);
+    b.setControlLeak(9.0f);
+    EXPECT_EQ(b.getControlLeak(), 1.0f);
+    b.setControlLeak(-9.0f);
+    EXPECT_EQ(b.getControlLeak(), 0.0f);
+}
+
+// New: a detector that reads the two halves of the wave differently. A signal
+// that is not symmetric gets a different reduction from its inverse, the gain
+// moves at the frequency of the signal (a second harmonic that grows with the
+// asymmetry), and a held symmetric tone settles where it did.
+DSPARK_TEST(Compressor_asymmetric_detector_reads_the_two_halves_differently)
+{
+    using C = Compressor<float>;
+    const int n = 96000;
+    // Peaks of +0.3 and -0.6: a fundamental and its second harmonic.
+    Vec lopsided(static_cast<size_t>(n)), inverse(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = 2.0 * kPiD * 100.0 * i / 48000.0;
+        lopsided[static_cast<size_t>(i)] = static_cast<float>(0.4 * std::sin(t) + 0.2 * std::cos(2.0 * t));
+        inverse[static_cast<size_t>(i)] = -lopsided[static_cast<size_t>(i)];
+    }
+    const auto held = [](float asymmetry) {
+        return [=](C& c) {
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setAttack(0.1f);
+            c.setRelease(500.0f);
+            c.setDetectorAsymmetry(asymmetry);
+        };
+    };
+    const auto reduction = [&](const Vec& x, float asymmetry) { return compTrace(x, held(asymmetry)).back(); };
+    const double even = reduction(lopsided, 0.0f) - reduction(inverse, 0.0f);
+    const double toPositive = reduction(lopsided, 0.5f), fromPositive = reduction(inverse, 0.5f);
+    std::printf("  [asymmetry] peaks of +0.3 and -0.6: the reduction of the signal and of its inverse differ by %.3f dB at 0 and by %.2f dB at 0.5 (%.2f and %.2f dB)\n",
+                even, toPositive - fromPositive, toPositive, fromPositive);
+    EXPECT_NEAR(even, 0.0, 0.02);
+    EXPECT_GT(toPositive - fromPositive, 1.5);                  // its larger half is the one read less
+    EXPECT_NEAR(reduction(lopsided, -0.5f), fromPositive, 0.05);    // the sign chooses the half
+    // A symmetric tone settles where it did.
+    const Vec tone = makeSine(1000.0, 0.5, 48000.0, n);
+    EXPECT_NEAR(reduction(tone, 0.5f), reduction(tone, 0.0f), 0.1);
+    EXPECT_NEAR(reduction(tone, -0.9f), reduction(tone, 0.0f), 0.1);
+
+    // The second harmonic of a low tone whose gain rides the wave.
+    const auto riding = [](float asymmetry) {
+        return [=](C& c) {
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setAttack(0.5f);
+            c.setRelease(5.0f);
+            c.setDetectorAsymmetry(asymmetry);
+        };
+    };
+    const Vec low = makeSine(100.0, 0.5, 48000.0, 48000);
+    double second[4] = {}, third[4] = {};
+    const float amounts[4] = { 0.0f, 0.2f, 0.5f, 0.9f };
+    for (int i = 0; i < 4; ++i)
+    {
+        const Vec y = compRender(low, riding(amounts[i]));
+        second[i] = compLineDb(y, 200.0) - compLineDb(y, 100.0);
+        third[i] = compLineDb(y, 300.0) - compLineDb(y, 100.0);
+    }
+    std::printf("  [asymmetry] 100 Hz with a gain that rides the wave, second / third harmonic in dBc at 0, 0.2, 0.5 and 0.9: %.1f / %.1f, %.1f / %.1f, %.1f / %.1f, %.1f / %.1f\n",
+                second[0], third[0], second[1], third[1], second[2], third[2], second[3], third[3]);
+    EXPECT_LT(second[0], -70.0);
+    EXPECT_GT(second[1], second[0] + 20.0);
+    EXPECT_GT(second[2], second[1] + 3.0);
+    EXPECT_GT(second[3], second[2]);
+    for (int i = 1; i < 4; ++i) EXPECT_GT(second[i] - third[i], second[i - 1] - third[i - 1] + 0.5);    // against the third, too
+
+    // A detector that does not rectify reads the key as it is; one sample at a time is the block path.
+    const Vec burst = compLowOverHigh(24000);
+    const auto mean = [](float asymmetry) {
+        return [=](C& c) {
+            c.setDetector(C::DetectorType::Rms);
+            c.setThreshold(-24.0f);
+            c.setRatio(4.0f);
+            c.setDetectorAsymmetry(asymmetry);
+        };
+    };
+    EXPECT_LT(compFarthest(compRender(burst, mean(0.8f)), compRender(burst, mean(0.0f))), 1e-6);
+    const auto working = [](C& c) {
+        c.setThreshold(-24.0f);
+        c.setRatio(4.0f);
+        c.setAttack(2.0f);
+        c.setRelease(60.0f);
+        c.setDetectorAsymmetry(0.6f);
+    };
+    const Vec block = compRender(burst, working);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working)), 1e-6);
+    EXPECT_GT(compFarthest(block, compRender(burst, [&](C& c) { working(c); c.setDetectorAsymmetry(0.0f); })), 1e-3);
+
+    // State and wild values.
+    C a;
+    a.setDetectorAsymmetry(-0.4f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getDetectorAsymmetry(), -0.4f);
+    b.setDetectorAsymmetry(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(b.getDetectorAsymmetry(), -0.4f);
+    b.setDetectorAsymmetry(7.0f);
+    EXPECT_EQ(b.getDetectorAsymmetry(), 1.0f);
+    b.setDetectorAsymmetry(-7.0f);
+    EXPECT_EQ(b.getDetectorAsymmetry(), -1.0f);
+}
+
+// New: Mode::Both. One detector, two curves: what is over the threshold comes
+// down with the ratio and what is under a second, lower threshold comes up
+// with a ratio and a range of its own; between them, nothing. With no rise it
+// is Downward bit for bit, and in a feedback loop it is Downward.
+DSPARK_TEST(Compressor_both_mode_brings_the_loud_down_and_the_quiet_up)
+{
+    using C = Compressor<float>;
+    // The RMS detector reads a tone of amplitude a at 20 log10(a) - 3.01 dB.
+    const auto gainAt = [](double levelDb, C::Mode mode) {
+        return compHeldReduction(std::pow(10.0, (levelDb + 3.0103) / 20.0), 1.0, [&](C& c) {
+            c.setDetector(C::DetectorType::Rms);
+            c.setThreshold(-20.0f);
+            c.setRatio(4.0f);
+            c.setMode(mode);
+            c.setLift(30.0f, 2.0f, 6.0f);           // a lower threshold at -50 dB
+        });
+    };
+    const double levels[10] = { 0.0, -10.0, -20.0, -30.0, -45.0, -50.0, -56.0, -62.0, -70.0, -80.0 };
+    const double wanted[10] = { -15.0, -7.5, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 6.0, 6.0 };
+    double worst = 0.0, shown[10] = {};
+    for (int i = 0; i < 10; ++i)
+    {
+        shown[i] = gainAt(levels[i], C::Mode::Both);
+        worst = std::max(worst, std::abs(shown[i] - wanted[i]));
+    }
+    std::printf("  [both] gain at 0, -10, -20, -30, -45, -50, -56, -62, -70 and -80 dB: %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f dB; farthest from the curve %.3f dB\n",
+                shown[0], shown[1], shown[2], shown[3], shown[4], shown[5], shown[6], shown[7], shown[8], shown[9], worst);
+    EXPECT_LT(worst, 0.1);
+    EXPECT_NEAR(gainAt(-62.0, C::Mode::Downward), 0.0, 0.01);
+
+    // No rise: Downward, bit for bit. In a loop: Downward too.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C::Mode mode, float riseDb, bool loop) {
+        return [=](C& c) {
+            c.setThreshold(-24.0f);
+            c.setRatio(4.0f);
+            c.setAttack(2.0f);
+            c.setRelease(60.0f);
+            c.setMode(mode);
+            c.setLift(20.0f, 3.0f, riseDb);
+            if (loop) c.setTopology(C::Topology::FeedBack);
+        };
+    };
+    EXPECT_EQ(compFarthest(compRender(burst, working(C::Mode::Both, 0.0f, false)),
+                           compRender(burst, working(C::Mode::Downward, 0.0f, false))), 0.0);
+    EXPECT_EQ(compFarthest(compRender(burst, working(C::Mode::Both, 9.0f, true)),
+                           compRender(burst, working(C::Mode::Downward, 9.0f, true))), 0.0);
+    // With a rise it is another signal, and one sample at a time is the block path.
+    Vec quiet = burst;
+    for (auto& s : quiet) s *= 0.02f;
+    const Vec block = compRender(quiet, working(C::Mode::Both, 9.0f, false));
+    EXPECT_GT(compFarthest(block, compRender(quiet, working(C::Mode::Downward, 9.0f, false))), 1e-4);
+    EXPECT_LT(compFarthest(block, compRenderSamples(quiet, working(C::Mode::Both, 9.0f, false))), 1e-6);
+
+    // State and wild values.
+    C a;
+    a.setMode(C::Mode::Both);
+    a.setLift(24.0f, 3.0f, 9.0f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getState() == blob);
+    EXPECT_EQ(b.getLiftBelow(), 24.0f);
+    EXPECT_EQ(b.getLiftRatio(), 3.0f);
+    EXPECT_EQ(b.getLiftRange(), 9.0f);
+    b.setLift(std::numeric_limits<float>::quiet_NaN(), 0.2f, 900.0f);
+    EXPECT_EQ(b.getLiftBelow(), 24.0f);
+    EXPECT_EQ(b.getLiftRatio(), 1.0f);
+    EXPECT_EQ(b.getLiftRange(), 40.0f);
+    b.setLift(900.0f, std::numeric_limits<float>::infinity(), -4.0f);
+    EXPECT_EQ(b.getLiftBelow(), 80.0f);
+    EXPECT_EQ(b.getLiftRatio(), 1.0f);
+    EXPECT_EQ(b.getLiftRange(), 0.0f);
+}
+
+// New: Mode::Leveler. No ratio and no knee: the gain is 1 / (1 + level /
+// threshold), 6 dB at the threshold and harder by itself the louder the
+// input, so the output never passes the threshold; the range bounds it.
+DSPARK_TEST(Compressor_leveler_mode_hardens_by_itself)
+{
+    using C = Compressor<float>;
+    const auto gainAt = [](double levelDb, float ratio, float knee, float range) {
+        return compHeldReduction(std::pow(10.0, (levelDb + 3.0103) / 20.0), 1.0, [&](C& c) {
+            c.setDetector(C::DetectorType::Rms);
+            c.setThreshold(-20.0f);
+            c.setRatio(ratio);
+            c.setKnee(knee);
+            c.setRange(range);
+            c.setMode(C::Mode::Leveler);
+        });
+    };
+    const double levels[6] = { 0.0, -10.0, -20.0, -30.0, -40.0, -60.0 };
+    double worst = 0.0, shown[6] = {};
+    for (int i = 0; i < 6; ++i)
+    {
+        shown[i] = gainAt(levels[i], 4.0f, 0.0f, 100.0f);
+        const double wanted = -20.0 * std::log10(1.0 + std::pow(10.0, (levels[i] + 20.0) / 20.0));
+        worst = std::max(worst, std::abs(shown[i] - wanted));
+        EXPECT_LT(levels[i] + shown[i], -20.0);                 // the output stays under the threshold
+    }
+    std::printf("  [leveler] gain at 0, -10, -20, -30, -40 and -60 dB under a threshold of -20: %.2f %.2f %.2f %.2f %.2f %.3f dB; farthest from 1 / (1 + level / threshold) %.3f dB\n",
+                shown[0], shown[1], shown[2], shown[3], shown[4], shown[5], worst);
+    EXPECT_LT(worst, 0.05);
+    EXPECT_NEAR(shown[2], -6.02, 0.05);
+    EXPECT_NEAR(gainAt(0.0, 20.0f, 12.0f, 100.0f), shown[0], 0.01);     // neither the ratio nor the knee counts
+    EXPECT_NEAR(gainAt(0.0, 4.0f, 0.0f, 6.0f), -6.0, 0.02);             // the range bounds it
+
+    // The static makeup counts its own curve: half of what a signal at full scale loses.
+    {
+        C c;
+        c.setThreshold(-20.0f);
+        c.setMode(C::Mode::Leveler);
+        c.setAutoMakeup(C::AutoMakeupMode::Static);
+        c.prepare(AudioSpec{ 48000.0, 512, 1 });
+        const Vec in = makeSine(1000.0, 0.001, 48000.0, 48000);         // 40 dB under the threshold
+        std::vector<Vec> x { in };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c.processBlock(b); });
+        const double change = toDb(toneAmplitude(x[0].data() + 38400, 9600, 1000.0, 48000.0) / 0.001);
+        // 20.83 dB at full scale: +10.41; the curve itself takes 0.09 at this level.
+        EXPECT_NEAR(change, 10.41 - 0.09, 0.15);
+    }
+
+    // In a loop the curve is the ratio's; one sample at a time is the block path.
+    const Vec burst = compLowOverHigh(24000);
+    const auto working = [](C::Mode mode, bool loop) {
+        return [=](C& c) {
+            c.setThreshold(-24.0f);
+            c.setRatio(4.0f);
+            c.setAttack(2.0f);
+            c.setRelease(60.0f);
+            c.setMode(mode);
+            if (loop) c.setTopology(C::Topology::FeedBack);
+        };
+    };
+    EXPECT_EQ(compFarthest(compRender(burst, working(C::Mode::Leveler, true)),
+                           compRender(burst, working(C::Mode::Downward, true))), 0.0);
+    const Vec block = compRender(burst, working(C::Mode::Leveler, false));
+    EXPECT_GT(compFarthest(block, compRender(burst, working(C::Mode::Downward, false))), 1e-3);
+    EXPECT_LT(compFarthest(block, compRenderSamples(burst, working(C::Mode::Leveler, false))), 1e-6);
+
+    // The state keeps the mode; a mode that is not one is the last.
+    C a;
+    a.setMode(C::Mode::Leveler);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getState() == blob);
+    a.setMode(static_cast<C::Mode>(77));
+    EXPECT_TRUE(a.getState() == blob);
+}
+
+// New: the routes of a pair. The compressor works on the middle and the
+// sides in place of left and right: on both, on one (the other passes
+// untouched and in time), or on one with the gain the other asks for.
+DSPARK_TEST(Compressor_routes_work_on_the_middle_and_the_sides)
+{
+    using C = Compressor<float>;
+    const int n = 48000;
+    const Vec mid = makeSine(1000.0, 0.4, 48000.0, n);              // 12 dB over the threshold: 9 dB of reduction
+    const Vec side = makeSine(300.0, 0.05, 48000.0, n);             // under it
+    const auto pairOf = [&](const Vec& m, const Vec& s) {
+        std::vector<Vec> x { Vec(static_cast<size_t>(n)), Vec(static_cast<size_t>(n)) };
+        for (int i = 0; i < n; ++i)
+        {
+            x[0][static_cast<size_t>(i)] = m[static_cast<size_t>(i)] + s[static_cast<size_t>(i)];
+            x[1][static_cast<size_t>(i)] = m[static_cast<size_t>(i)] - s[static_cast<size_t>(i)];
+        }
+        return x;
+    };
+    const auto partOf = [&](const std::vector<Vec>& x, bool sides) {
+        Vec v(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            v[static_cast<size_t>(i)] = 0.5f * (sides ? x[0][static_cast<size_t>(i)] - x[1][static_cast<size_t>(i)]
+                                                      : x[0][static_cast<size_t>(i)] + x[1][static_cast<size_t>(i)]);
+        return v;
+    };
+    const auto late = [&](const Vec& y, const Vec& x, int by) {
+        double worst = 0.0;
+        for (int i = by; i < n; ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(y[static_cast<size_t>(i)]) - x[static_cast<size_t>(i - by)]));
+        return worst;
+    };
+    const auto base = [](C& c) {
+        c.setDetector(C::DetectorType::Hilbert);
+        c.setThreshold(-20.0f);
+        c.setRatio(4.0f);
+        c.setAttack(1.0f);
+        c.setRelease(100.0f);
+    };
+    const auto run = [&](std::vector<Vec> x, C::Route route, float lookaheadMs, float link, int* latency = nullptr) {
+        auto c = std::make_unique<C>();
+        base(*c);
+        c->setRoute(route);
+        c->setLookahead(lookaheadMs);
+        c->setStereoLink(link);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+        if (latency != nullptr) *latency = c->getLatency();
+        return x;
+    };
+    const auto levelDb = [&](const Vec& v, double hz, double reference) {
+        return toDb(toneAmplitude(v.data() + n - 9600, 9600, hz, 48000.0) / reference);
+    };
+
+    // The middle alone: 9 dB off the middle, and the sides as they came.
+    {
+        const auto y = run(pairOf(mid, side), C::Route::Mid, 0.0f, 1.0f);
+        const double untouched = late(partOf(y, true), side, 0);
+        std::printf("  [routes] the middle alone: the middle changes %.2f dB and the sides come out within %.1e of what went in\n",
+                    levelDb(partOf(y, false), 1000.0, 0.4), untouched);
+        EXPECT_NEAR(levelDb(partOf(y, false), 1000.0, 0.4), -9.03, 0.1);
+        EXPECT_LT(untouched, 1e-7);
+    }
+    // The sides alone, loud this time; and the part that is not treated waits for the other.
+    {
+        const auto y = run(pairOf(side, mid), C::Route::Side, 0.0f, 1.0f);
+        EXPECT_NEAR(levelDb(partOf(y, true), 1000.0, 0.4), -9.03, 0.1);
+        EXPECT_LT(late(partOf(y, false), side, 0), 1e-7);
+        int latency = 0;
+        const auto ahead = run(pairOf(mid, side), C::Route::Mid, 5.0f, 1.0f, &latency);
+        EXPECT_EQ(latency, 240);
+        EXPECT_LT(late(partOf(ahead, true), side, 240), 1e-7);
+        EXPECT_NEAR(levelDb(partOf(ahead, false), 1000.0, 0.4), -9.03, 0.1);
+    }
+    // Both: each with its gain when they are not linked, one gain for the two when they are.
+    {
+        const auto apart = run(pairOf(mid, side), C::Route::MidSide, 0.0f, 0.0f);
+        EXPECT_NEAR(levelDb(partOf(apart, false), 1000.0, 0.4), -9.03, 0.1);
+        EXPECT_NEAR(levelDb(partOf(apart, true), 300.0, 0.05), 0.0, 0.02);
+        const auto linked = run(pairOf(mid, side), C::Route::MidSide, 0.0f, 1.0f);
+        EXPECT_NEAR(levelDb(partOf(linked, true), 300.0, 0.05), -9.03, 0.15);
+    }
+    // Crossed: the middle of the pair asks, and the sides get the gain.
+    {
+        const auto y = run(pairOf(mid, side), C::Route::MidKeysSide, 0.0f, 1.0f);
+        EXPECT_NEAR(levelDb(partOf(y, true), 300.0, 0.05), -9.03, 0.1);
+        EXPECT_LT(late(partOf(y, false), mid, 0), 1e-7);
+        const auto other = run(pairOf(side, mid), C::Route::SideKeysMid, 0.0f, 1.0f);
+        EXPECT_NEAR(levelDb(partOf(other, false), 300.0, 0.05), -9.03, 0.1);
+        EXPECT_LT(late(partOf(other, true), mid, 0), 1e-7);
+        // A middle that comes and goes: the sides follow it down and come back.
+        Vec bursts = mid;
+        for (int i = 0; i < n; ++i)
+            if ((i % 24000) >= 12000) bursts[static_cast<size_t>(i)] = 0.0f;
+        const auto moving = run(pairOf(bursts, side), C::Route::MidKeysSide, 0.0f, 1.0f);
+        const Vec sides = partOf(moving, true);
+        const double during = toDb(toneAmplitude(sides.data() + 24000 + 7200, 4800, 300.0, 48000.0) / 0.05);
+        const double after = toDb(toneAmplitude(sides.data() + 36000 + 7200, 4800, 300.0, 48000.0) / 0.05);
+        std::printf("  [routes] the middle keys the sides: the sides at %.2f dB while the middle sounds and %.2f dB once it has stopped\n", during, after);
+        EXPECT_NEAR(during, -9.03, 0.2);
+        EXPECT_GT(after, -2.5);                                 // 150 to 250 ms into a release of 100 ms
+    }
+    // No reduction: the pair comes back from its middle and its sides as it went.
+    {
+        auto c = std::make_unique<C>();
+        c->setThreshold(0.0f);
+        c->setRoute(C::Route::MidSide);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        const auto in = pairOf(mid, side);
+        auto x = in;
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+        EXPECT_LT(std::max(compFarthest(x[0], in[0]), compFarthest(x[1], in[1])), 1e-7);
+    }
+    // A key given apart is split the same way; listened to, the part that is not treated is left out.
+    {
+        auto c = std::make_unique<C>();
+        base(*c);
+        c->setRoute(C::Route::Mid);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        const Vec quiet = makeSine(1000.0, 0.01, 48000.0, n);
+        auto x = pairOf(quiet, side);
+        std::vector<Vec> key { mid, mid };                          // all middle
+        std::vector<float*> pa(2), pk(2);
+        for (int off = 0; off < n; off += 512)
+        {
+            const int m = std::min(512, n - off);
+            for (size_t ch = 0; ch < 2; ++ch) { pa[ch] = x[ch].data() + off; pk[ch] = key[ch].data() + off; }
+            AudioBufferView<float> va(pa.data(), 2, m), vk(pk.data(), 2, m);
+            c->processBlock(va, vk);
+        }
+        EXPECT_NEAR(levelDb(partOf(x, false), 1000.0, 0.01), -9.03, 0.1);
+        EXPECT_LT(late(partOf(x, true), side, 0), 1e-7);
+
+        auto d = std::make_unique<C>();
+        base(*d);
+        d->setRoute(C::Route::Mid);
+        d->setSidechainListen(true);
+        d->prepare(AudioSpec{ 48000.0, 512, 2 });
+        auto heard = pairOf(mid, side);
+        processInBlocks(heard, 512, [&](AudioBufferView<float> b) { d->processBlock(b); });
+        EXPECT_LT(compFarthest(heard[0], heard[1], 4800), 1e-7);    // the middle of the key, and nothing of the sides
+        EXPECT_GT(toneAmplitude(heard[0].data() + n - 9600, 9600, 1000.0, 48000.0), 0.3);
+    }
+    // Any other width runs as left and right; the state keeps the route.
+    {
+        const auto wide = [&](C::Route route) {
+            auto c = std::make_unique<C>();
+            base(*c);
+            c->setRoute(route);
+            c->prepare(AudioSpec{ 48000.0, 512, 3 });
+            std::vector<Vec> x { mid, side, mid };
+            processInBlocks(x, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+            return x;
+        };
+        const auto a = wide(C::Route::Mid), b = wide(C::Route::Stereo);
+        EXPECT_EQ(std::max({ compFarthest(a[0], b[0]), compFarthest(a[1], b[1]), compFarthest(a[2], b[2]) }), 0.0);
+        C c;
+        c.setRoute(C::Route::SideKeysMid);
+        const auto blob = c.getState();
+        C other;
+        EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+        EXPECT_TRUE(other.getRoute() == C::Route::SideKeysMid);
+        other.setRoute(static_cast<C::Route>(-3));
+        EXPECT_TRUE(other.getRoute() == C::Route::Stereo);
+    }
+}
+
+// The measures of the programme count in the knobs' own times. A reduction
+// held for three release times lengthens the release as much with a release
+// of 50 ms as with one of a second, and the emphasis of the attack overshoots
+// as far with an attack of 2 ms as with one of 20 (the measures had fixed
+// windows: 1.5 s and 30 ms, whatever the knobs said).
+DSPARK_TEST(Compressor_programme_measures_count_in_the_knobs_own_times)
+{
+    using C = Compressor<float>;
+    const auto stretch = [&](float releaseMs) {
+        const double held = 3.0 * static_cast<double>(releaseMs) / 1000.0;
+        const Vec in = compToneThenSilence(1000.0, 0.4, held, held + 12.0 * static_cast<double>(releaseMs) / 1000.0 + 0.5);
+        const auto time = [&](float amount) {
+            const auto trace = compTrace(in, [&](C& c) {
+                c.setDetector(C::DetectorType::Hilbert);
+                c.setThreshold(-20.0f);
+                c.setRatio(4.0f);
+                c.setAttack(1.0f);
+                c.setRelease(releaseMs);
+                c.setProgramRelease(amount);
+            });
+            return compReleaseMs(trace, static_cast<int>(held * 48000.0));
+        };
+        return time(1.0f) / time(0.0f);
+    };
+    const double quick = stretch(50.0f), usual = stretch(100.0f), slow = stretch(1000.0f);
+    std::printf("  [windows] a reduction held for three release times lengthens the release %.3f times at 50 ms, %.3f at 100 ms and %.3f at 1 s\n",
+                quick, usual, slow);
+    EXPECT_GT(usual, 1.05);
+    EXPECT_NEAR(quick / usual, 1.0, 0.1);
+    EXPECT_NEAR(slow / usual, 1.0, 0.1);
+
+    const auto overshoot = [&](float attackMs) {
+        Vec in = makeSine(1000.0, 0.4, 48000.0, 48000 * 2);
+        for (int i = 0; i < 4800; ++i) in[static_cast<size_t>(i)] = 0.0f;
+        const auto deepest = [&](float emphasis) {
+            const auto trace = compTrace(in, [&](C& c) {
+                c.setDetector(C::DetectorType::Hilbert);
+                c.setThreshold(-20.0f);
+                c.setRatio(4.0f);
+                c.setAttack(attackMs);
+                c.setRelease(2000.0f);
+                c.setAttackEmphasis(emphasis);
+            });
+            double d = 0.0;
+            for (double v : trace) d = std::min(d, v);
+            return d;
+        };
+        return deepest(0.0f) - deepest(1.0f);
+    };
+    const double sharp = overshoot(2.0f), broad = overshoot(20.0f);
+    std::printf("  [windows] the emphasis of the attack goes %.2f dB past the plain attack at 2 ms and %.2f dB at 20 ms\n", sharp, broad);
+    EXPECT_GT(sharp, 1.0);
+    EXPECT_NEAR(sharp / broad, 1.0, 0.2);
+}

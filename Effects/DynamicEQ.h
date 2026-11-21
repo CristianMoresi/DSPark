@@ -87,6 +87,16 @@
  * - BandConfig::scope: the band acts on every channel (linked by the
  *   loudest), on the left or the right alone, or on the middle or the sides
  *   of the first pair, and listens to the same part of the sidechain.
+ * - BandConfig::listenLow / listenHigh: a zone of its own for the detector.
+ *   The band then acts where its frequency says and listens between those
+ *   two edges (a high-pass at the low one, a low-pass at the high one, or
+ *   both; with both, a tone in the middle of the zone reads at its level):
+ *   a band at 300 Hz that gives way when the kick sounds at 60, or a
+ *   de-esser that acts on the upper mids and listens to the sibilance.
+ *
+ * Key listen (setKeyListen(), a monitoring control): the output is what one
+ * band's detector hears, late by the latency, with the bands still working
+ * underneath.
  *
  * Threading model (per method; the model is docs/threading.md):
  * - prepare() / reset() / setOversampling() / setLinearPhase() /
@@ -95,6 +105,8 @@
  * - setMixedBands(): any thread; the audio thread changes engine at the next
  *   block and the bands start clean there (may click: choose it before
  *   playback).
+ * - setKeyListen() / setRemovalListen(): any thread; atomic words the audio
+ *   thread reads once per block.
  * - setBand() / setNumBands() / setLookahead(): RT-safe from one control
  *   thread; the audio thread applies them at the next block. Each band is
  *   published through its own seqlock over std::atomic words, so the audio
@@ -111,7 +123,8 @@
  * - getBandGainDb() is an atomic metering read; getLatency() is safe from any
  *   thread once prepared.
  * - One-master designation (Core/Biquad.h, setCoeffsNow()): the embedded
- *   bandFilter_/bandDetector_ Biquads are AUDIO-MODULATED -- the audio thread
+ *   bandFilter_/bandDetector_/bandZone_ Biquads (and the two of the key
+ *   listen) are AUDIO-MODULATED -- the audio thread
  *   writes their coefficients directly via Biquad::setCoeffsNow(), and nothing
  *   ever calls Biquad::setCoeffs() on them. Control parameters arrive only
  *   through this class's own StagedBand seqlock, adopted at processCore entry.
@@ -151,6 +164,7 @@
 #include <memory>
 #include <numbers>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace dspark {
@@ -211,6 +225,8 @@ public:
         Scope scope = Scope::Stereo;   ///< The channels the band acts on and listens to.
         Timing timing    = Timing::Manual;  ///< Program: the times come from the band, and the attack and release fields are not used.
         bool relativeThreshold = false;     ///< The threshold counts from the band's own recent level instead of from full scale.
+        T listenLow      = T(0);            ///< Low edge, in Hz, of the zone the detector listens to; 0: no edge on that side.
+        T listenHigh     = T(0);            ///< High edge of that zone; with both at 0 the detector listens where the band acts.
 
         T aboveRatio     = T(1);
         T aboveAttackMs  = T(5);
@@ -320,6 +336,16 @@ public:
         reset();
         for (int ch = 0; ch < std::min(spec.numChannels, kMaxChannels); ++ch)
             deltaRing_[static_cast<size_t>(ch)].prepare(kRemovalCapacity + std::max(1, spec.maxBlockSize));
+
+        // The key listen: the key a band hears, kept for the longest latency
+        // the mode can have (its lookahead goes up to 10 ms).
+        listenChannels_ = std::min(spec.numChannels, kMaxChannels);
+        listenBlock_ = std::max(1, spec.maxBlockSize);
+        listenReach_ = linear_ ? linear_->latency
+                               : maxLaSamples / runFactor() + 1 + (oversampler_ ? oversampler_->getLatency() : 0);
+        for (int ch = 0; ch < listenChannels_; ++ch)
+            listenRing_[static_cast<size_t>(ch)].prepare(listenReach_ + listenBlock_ + 1);
+        listenHeard_.assign(static_cast<size_t>(listenChannels_) * static_cast<size_t>(listenBlock_), T(0));
         isPrepared_.store(true, std::memory_order_relaxed);
     }
 
@@ -340,13 +366,16 @@ public:
     void processBlock(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
     {
         if (!isPrepared_.load(std::memory_order_relaxed)) return;
-        if (!removalListen_.load(std::memory_order_relaxed))
+        const bool removal = removalListen_.load(std::memory_order_relaxed);
+        const bool keyed = keyListen_.load(std::memory_order_relaxed) >= 0 || listenBand_ >= 0;
+        if (!removal && !keyed)
         {
             processImpl(audio, sidechain);
             return;
         }
-        // Removal listen: the input, late by the latency, minus the output, in
-        // chunks of the prepared block.
+        // The listens, in chunks of the prepared block. Removal: the input,
+        // late by the latency, minus the output. Key: what a band's detector
+        // hears, late by the latency, in place of the output.
         const bool selfKeyed = sidechain.getNumChannels() <= 0 || sidechain.getNumSamples() < audio.getNumSamples()
                             || sidechain.getChannel(0) == audio.getChannel(0);
         const int nCh = std::min(audio.getNumChannels(), kMaxChannels);
@@ -355,19 +384,28 @@ public:
         {
             const int m = std::min(step, audio.getNumSamples() - off);
             auto part = audio.getSubView(off, m);
-            for (int ch = 0; ch < nCh; ++ch)
+            auto key = selfKeyed ? part : sidechain.getSubView(off, m);
+            const bool heard = keyed && hearKey(key, nCh, m);   // before the bands write over the signal
+            if (removal)
             {
-                const T* d = part.getChannel(ch);
-                for (int i = 0; i < m; ++i) deltaRing_[static_cast<size_t>(ch)].push(d[i]);
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    const T* d = part.getChannel(ch);
+                    for (int i = 0; i < m; ++i) deltaRing_[static_cast<size_t>(ch)].push(d[i]);
+                }
             }
             const int late = std::min(getLatency(), kRemovalCapacity);
-            processImpl(part, selfKeyed ? part : sidechain.getSubView(off, m));
-            for (int ch = 0; ch < nCh; ++ch)
+            processImpl(part, key);
+            if (removal)
             {
-                T* d = part.getChannel(ch);
-                const auto& ring = deltaRing_[static_cast<size_t>(ch)];
-                for (int i = 0; i < m; ++i) d[i] = ring.read(late + (m - 1 - i)) - d[i];
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    T* d = part.getChannel(ch);
+                    const auto& ring = deltaRing_[static_cast<size_t>(ch)];
+                    for (int i = 0; i < m; ++i) d[i] = ring.read(late + (m - 1 - i)) - d[i];
+                }
             }
+            if (heard) playKey(part, nCh, m);
         }
     }
 
@@ -379,6 +417,28 @@ public:
     void setRemovalListen(bool on) noexcept { removalListen_.store(on, std::memory_order_relaxed); }
     /** @return Whether the output is what the bands change. */
     [[nodiscard]] bool isRemovalListen() const noexcept { return removalListen_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Key listen: the output is what one band's detector hears.
+     *
+     * The key (the sidechain, or the signal itself) through the detector
+     * filters of the band -- its zone when it has one -- on the channels of
+     * the band's scope: a band of the middle is heard in the centre and one of
+     * the sides with its two channels opposed. It is late by getLatency(), so
+     * it lines up with the processed signal it takes the place of, and it
+     * comes and goes through a 10 ms fade. The bands keep working underneath:
+     * when the listen ends the processing is where it would have been. With
+     * the removal listen on as well, the key is what is heard. A monitoring
+     * control, not in the state. Safe from any thread.
+     *
+     * @param band The band to listen to; negative, or past the last one, for none.
+     */
+    void setKeyListen(int band) noexcept
+    {
+        keyListen_.store(band >= 0 && band < MaxBands ? band : -1, std::memory_order_relaxed);
+    }
+    /** @return The band whose key is the output, or -1 for none. */
+    [[nodiscard]] int getKeyListen() const noexcept { return keyListen_.load(std::memory_order_relaxed); }
 
 private:
     void processImpl(AudioBufferView<T> audio, AudioBufferView<T> sidechain) noexcept
@@ -424,6 +484,131 @@ private:
         }
     }
 
+    /**
+     * @brief Key listen, first half: the key as the listened band's detector
+     *        hears it, into the line that keeps it for the latency.
+     *
+     * Runs at the host rate through two filters of its own, designed like the
+     * band's detector, so the bands are not touched. A change of band waits
+     * for the fade to have closed on the old one.
+     *
+     * @return Whether the line holds something for this chunk (playKey()).
+     */
+    bool hearKey(AudioBufferView<T>& key, int nCh, int m) noexcept
+    {
+        const int wanted = keyListen_.load(std::memory_order_relaxed);
+        if (wanted != listenBand_ && listenWeight_ <= 0.0)
+        {
+            listenBand_ = wanted;
+            listenDesigned_ = false;
+            listenFirst_.reset();
+            listenSecond_.reset();
+            for (int ch = 0; ch < listenChannels_; ++ch) listenRing_[static_cast<size_t>(ch)].reset();
+        }
+        if (listenBand_ < 0 || listenChannels_ <= 0 || m > listenBlock_) return false;
+        listenGoal_ = wanted == listenBand_ ? 1.0 : 0.0;
+
+        // The band as published (a bounded read: a collision keeps the design in use).
+        BandConfig cfg;
+        if (!staged_[static_cast<size_t>(listenBand_)].tryRead(cfg))
+        {
+            if (listenDesigned_) cfg = listenCfg_;
+            else cfg = states_[listenBand_].cfg;
+        }
+        const bool moved = !listenDesigned_ || cfg.frequency != listenCfg_.frequency || cfg.q != listenCfg_.q
+                           || cfg.shape != listenCfg_.shape || cfg.timing != listenCfg_.timing
+                           || cfg.listenLow != listenCfg_.listenLow || cfg.listenHigh != listenCfg_.listenHigh;
+        if (listenDesigned_ && cfg.scope != listenCfg_.scope)
+        {
+            listenFirst_.reset();          // another signal: nothing of the old one rings on
+            listenSecond_.reset();
+        }
+        if (moved)
+        {
+            const DetectorDesign detector = designDetector(cfg, sampleRate_);
+            listenFirst_.setCoeffsNow(detector.first);
+            listenSecond_.setCoeffsNow(detector.second);
+            if (detector.two && !listenTwo_) listenSecond_.reset();
+            listenTwo_ = detector.two;
+        }
+        listenCfg_ = cfg;
+        listenDesigned_ = true;
+
+        const int scCh = key.getNumChannels();
+        const int channels = std::min(nCh, listenChannels_);
+        const auto line = [this](int ch) noexcept {
+            return listenHeard_.data() + static_cast<size_t>(ch) * static_cast<size_t>(listenBlock_);
+        };
+        const auto through = [this, m](const T* one, const T* other, T sign, int slot, T* out) noexcept {
+            for (int i = 0; i < m; ++i)
+            {
+                T x = std::isfinite(one[i]) ? one[i] : T(0);
+                if (other != nullptr) x = (x + sign * (std::isfinite(other[i]) ? other[i] : T(0))) * T(0.5);
+                x = listenFirst_.processSample(x, slot);
+                out[i] = listenTwo_ ? listenSecond_.processSample(x, slot) : x;
+            }
+        };
+        for (int ch = 0; ch < channels; ++ch) std::fill_n(line(ch), m, T(0));
+        if (scCh > 0)
+        {
+            switch (cfg.scope)
+            {
+            case Scope::Stereo:
+                for (int ch = 0; ch < channels; ++ch)
+                    through(key.getChannel(std::min(ch, scCh - 1)), nullptr, T(1), ch, line(ch));
+                break;
+            case Scope::Left:
+                through(key.getChannel(0), nullptr, T(1), 0, line(0));
+                break;
+            case Scope::Right:
+                if (channels >= 2) through(key.getChannel(std::min(1, scCh - 1)), nullptr, T(1), 1, line(1));
+                break;
+            case Scope::Mid:
+                through(key.getChannel(0), scCh >= 2 ? key.getChannel(1) : nullptr, T(1), 0, line(0));
+                if (channels >= 2) std::copy_n(line(0), m, line(1));        // heard in the centre
+                break;
+            case Scope::Side:
+                if (channels >= 2 && scCh >= 2)
+                {
+                    through(key.getChannel(0), key.getChannel(1), T(-1), 0, line(0));
+                    for (int i = 0; i < m; ++i) line(1)[i] = -line(0)[i];   // the sides: opposed
+                }
+                break;
+            }
+        }
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            const T* heard = line(ch);
+            auto& ring = listenRing_[static_cast<size_t>(ch)];
+            for (int i = 0; i < m; ++i) ring.push(heard[i]);
+        }
+        return true;
+    }
+
+    /** @brief Key listen, second half: the key heard takes the place of the output, through its fade. */
+    void playKey(AudioBufferView<T>& out, int nCh, int m) noexcept
+    {
+        const int channels = std::min(nCh, listenChannels_);
+        const int late = std::min(getLatency(), listenReach_);
+        const double step = 1.0 / std::max(1.0, kListenFadeMs * 0.001 * sampleRate_);
+        const double from = listenWeight_, goal = listenGoal_;
+        double weight = from;
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            T* d = out.getChannel(ch);
+            const auto& ring = listenRing_[static_cast<size_t>(ch)];
+            weight = from;
+            for (int i = 0; i < m; ++i)
+            {
+                weight = goal > weight ? std::min(goal, weight + step) : std::max(goal, weight - step);
+                const T heard = ring.read(late + (m - 1 - i));
+                if (weight >= 1.0) d[i] = heard;
+                else if (weight > 0.0) d[i] = static_cast<T>(d[i] + static_cast<T>(weight) * (heard - d[i]));
+            }
+        }
+        listenWeight_ = weight;
+    }
+
 public:
     /**
      * @brief Thread-safe configuration update for a specific band.
@@ -433,8 +618,9 @@ public:
      * detector or the gain ballistics permanently), wild shape enums are
      * clamped (a scope or a timing that is not one keeps the band's own),
      * the gain at rest is held within 24 dB, the knee within 40 dB (any
-     * negative knee is the automatic one), and the range fields are floored
-     * at 0. Configuring a band at or
+     * negative knee is the automatic one), the range fields are floored
+     * at 0, and the edges of the listening zone are floored at 0 and put in
+     * order when both are there. Configuring a band at or
      * beyond the current band count raises the count to band + 1 (it used to
      * leave the band silent until setNumBands()).
      */
@@ -459,6 +645,10 @@ public:
             c.scope = prev.scope;
         if (static_cast<int>(c.timing) < 0 || static_cast<int>(c.timing) > static_cast<int>(Timing::Program))
             c.timing = prev.timing;
+        c.listenLow      = std::max(keep(c.listenLow, prev.listenLow), T(0));
+        c.listenHigh     = std::max(keep(c.listenHigh, prev.listenHigh), T(0));
+        if (c.listenLow > T(0) && c.listenHigh > T(0) && c.listenHigh < c.listenLow)
+            std::swap(c.listenLow, c.listenHigh);
         c.aboveRatio     = keep(c.aboveRatio, prev.aboveRatio);
         c.aboveAttackMs  = keep(c.aboveAttackMs, prev.aboveAttackMs);
         c.aboveReleaseMs = keep(c.aboveReleaseMs, prev.aboveReleaseMs);
@@ -802,6 +992,13 @@ public:
         if (oversamplerSc_) oversamplerSc_->reset();
         refreshCounter_ = 0;
         lastNumBands_ = MaxBands;
+        // The key listen starts over: it fades in again if it is still asked for.
+        listenBand_ = -1;
+        listenWeight_ = 0.0;
+        listenDesigned_ = false;
+        listenFirst_.reset();
+        listenSecond_.reset();
+        for (auto& ring : listenRing_) ring.reset();
     }
 
 
@@ -844,6 +1041,10 @@ public:
             w.write(key, static_cast<int>(c.timing));
             std::snprintf(key, sizeof(key), "b%d.relative", i);
             w.write(key, c.relativeThreshold);
+            std::snprintf(key, sizeof(key), "b%d.listenLo", i);
+            w.write(key, static_cast<float>(c.listenLow));
+            std::snprintf(key, sizeof(key), "b%d.listenHi", i);
+            w.write(key, static_cast<float>(c.listenHigh));
             std::snprintf(key, sizeof(key), "b%d.aRatio", i);
             w.write(key, static_cast<float>(c.aboveRatio));
             std::snprintf(key, sizeof(key), "b%d.aAtk", i);
@@ -898,6 +1099,10 @@ public:
             c.timing = static_cast<Timing>(std::clamp(r.read(key, 0), 0, static_cast<int>(Timing::Program)));
             std::snprintf(key, sizeof(key), "b%d.relative", i);
             c.relativeThreshold = r.read(key, false);
+            std::snprintf(key, sizeof(key), "b%d.listenLo", i);
+            c.listenLow = static_cast<T>(r.read(key, 0.0f));
+            std::snprintf(key, sizeof(key), "b%d.listenHi", i);
+            c.listenHigh = static_cast<T>(r.read(key, 0.0f));
             std::snprintf(key, sizeof(key), "b%d.aRatio", i);
             c.aboveRatio = static_cast<T>(r.read(key, 1.0f));
             std::snprintf(key, sizeof(key), "b%d.aAtk", i);
@@ -954,6 +1159,8 @@ private:
 
     static constexpr double kReferenceFallDb = 2.0;     ///< dB per second the reference level falls.
     static constexpr double kReferenceWatch = 0.5;      ///< Seconds a second reference listens to a new zone.
+    static constexpr double kZoneFloorHz = 10.0;        ///< Lowest edge a listening zone is designed at.
+    static constexpr double kListenFadeMs = 10.0;       ///< The key listen comes and goes in this long.
 
     static constexpr double kKneePerOctave = 3.0;       ///< Automatic knee: dB per (1 + octaves of width), at a range of 12 dB.
     static constexpr double kMixedRampMs = 20.0;        ///< Glide of a mixed band's filters to a new design.
@@ -965,6 +1172,7 @@ private:
         T aboveAtkCoeff = T(0), aboveRelCoeff = T(0);
         T belowAtkCoeff = T(0), belowRelCoeff = T(0);
         T knee = T(0);                      ///< Knee in use (the automatic one resolved).
+        bool zoned = false;                 ///< The detector has a second section: a zone with both edges.
 
         // Program timing: the three followers, in amplitude.
         double fastUp = 1.0, fastDown = 1.0, slowUp = 1.0, slowDown = 1.0, lastDown = 1.0;
@@ -1004,6 +1212,82 @@ private:
     [[nodiscard]] static bool ofThePair(const BandConfig& cfg) noexcept
     {
         return cfg.scope == Scope::Mid || cfg.scope == Scope::Side;
+    }
+
+    /** @brief What a band's detector listens through, and how fast its envelope can move. */
+    struct DetectorDesign
+    {
+        BiquadCoeffs first, second;
+        bool two = false;       ///< The second section runs: a zone with both edges.
+        double unit = 0.0;      ///< Time constant of the detector's envelope, in seconds.
+    };
+
+    /**
+     * @brief Designs the detector of a band at a rate.
+     *
+     * Without a zone it listens where the gain filter acts: a band-pass for a
+     * bell (narrower with program timing, so what sets the gain is the middle
+     * of the band) and the matching half of the spectrum for a shelf. With a
+     * zone (BandConfig::listenLow / listenHigh) it is a high-pass at the low
+     * edge, a low-pass at the high one, or both; with both, the pair is
+     * scaled for a tone in the middle of the zone to read at its level (two
+     * second-order sections an octave apart would read it 1.9 dB low). The
+     * designs match the analog prototype (a bilinear band-pass narrows toward
+     * Nyquist: at 44.1 kHz it hears a band 30 % narrower in octaves than the
+     * one asked for at 10 kHz, so the detector heard less than the band it
+     * moves).
+     */
+    [[nodiscard]] static DetectorDesign designDetector(const BandConfig& cfg, double fs) noexcept
+    {
+        DetectorDesign d;
+        const double top = 0.45 * fs;
+        const double low = static_cast<double>(cfg.listenLow), high = static_cast<double>(cfg.listenHigh);
+        if (low > 0.0 && high > 0.0)
+        {
+            const double lo = std::clamp(low, kZoneFloorHz, top), hi = std::clamp(high, kZoneFloorHz, top);
+            d.first = BiquadCoeffs::makeHighPassMatched(fs, lo, T(0.707));
+            d.second = BiquadCoeffs::makeLowPassMatched(fs, hi, T(0.707));
+            d.two = true;
+            const double middle = std::sqrt(lo * hi);
+            const double there = d.first.getMagnitude(middle, fs) * d.second.getMagnitude(middle, fs);
+            if (there > 1e-3)
+            {
+                d.first.b0 /= there;
+                d.first.b1 /= there;
+                d.first.b2 /= there;
+            }
+            // Two sections on one corner are still a band about that wide.
+            d.unit = 1.0 / (std::numbers::pi * std::max(hi - lo, middle));
+            return d;
+        }
+        if (low > 0.0 || high > 0.0)
+        {
+            const double edge = std::clamp(low > 0.0 ? low : high, kZoneFloorHz, top);
+            d.first = low > 0.0 ? BiquadCoeffs::makeHighPassMatched(fs, edge, T(0.707))
+                                : BiquadCoeffs::makeLowPassMatched(fs, edge, T(0.707));
+            d.unit = 1.0 / (std::numbers::pi * edge);
+            return d;
+        }
+
+        const bool program = cfg.timing == Timing::Program;
+        const T detectorQ = program ? cfg.q * static_cast<T>(kDetectorNarrowing) : cfg.q;
+        const double hz = std::clamp(static_cast<double>(cfg.frequency), 10.0, top);
+        switch (cfg.shape)
+        {
+        case BandShape::Bell:
+            d.first = BiquadCoeffs::makeBandPassMatched(fs, cfg.frequency, detectorQ);
+            d.unit = std::max(static_cast<double>(detectorQ), 0.1) / (std::numbers::pi * hz);
+            break;
+        case BandShape::LowShelf:
+            d.first = BiquadCoeffs::makeLowPassMatched(fs, cfg.frequency, T(0.707));
+            d.unit = 1.0 / (std::numbers::pi * hz);
+            break;
+        case BandShape::HighShelf:
+            d.first = BiquadCoeffs::makeHighPassMatched(fs, cfg.frequency, T(0.707));
+            d.unit = 1.0 / (std::numbers::pi * hz);
+            break;
+        }
+        return d;
     }
 
     /** @brief The factor the bands run at: the linear-phase mode runs at the host rate. */
@@ -1171,6 +1455,13 @@ private:
                     detBand_[static_cast<size_t>(j)] = static_cast<double>(
                         bandDetector_[b].processSample((one + sign * other) * T(0.5), slot));
                 }
+            }
+            if (states_[b].zoned)
+            {
+                // A zone with both edges: the low-pass after the high-pass.
+                for (int j = 0; j < n; ++j)
+                    detBand_[static_cast<size_t>(j)] = static_cast<double>(bandZone_[b].processSample(
+                        static_cast<T>(detBand_[static_cast<size_t>(j)]), slot));
             }
             analytic_[static_cast<size_t>(b * kMaxChannels + slot)].magnitudeBlock(
                 detBand_.data(), detMag_.data(), n);
@@ -1883,6 +2174,7 @@ private:
     void cleanBand(int b) noexcept
     {
         bandDetector_[b].reset();
+        bandZone_[b].reset();
         bandFilter_[b].reset();
         bandLadder_[static_cast<size_t>(b)].reset();
         currentGainDb_[b] = T(0);
@@ -2122,12 +2414,14 @@ private:
         // The zone the band listens to has moved: with a relative threshold,
         // a second reference listens there before it takes over.
         const bool moved = cfg.frequency != old.frequency || cfg.q != old.q || cfg.shape != old.shape
-                           || cfg.timing != old.timing;
+                           || cfg.timing != old.timing
+                           || cfg.listenLow != old.listenLow || cfg.listenHigh != old.listenHigh;
         if (cfg.relativeThreshold && old.relativeThreshold && moved)
         {
             // The detector starts clean there: what it still rings of the old
             // zone is not the level of the new one.
             bandDetector_[b].reset();
+            bandZone_[b].reset();
             for (int ch = 0; ch < kMaxChannels; ++ch)
                 analytic_[static_cast<size_t>(b * kMaxChannels + ch)].reset();
             st.fast = st.slow = st.heard = 0.0;
@@ -2142,31 +2436,16 @@ private:
         st.referenceFall = kReferenceFallDb / fs;
         st.cfg = cfg;
 
-        // Detector listens where the gain filter acts: bandpass for bells,
-        // the corresponding half of the spectrum for shelves. With program
-        // timing the band-pass is narrower than the band, so what sets the
-        // gain is the middle of it. The designs match the analog prototype
-        // (a bilinear band-pass narrows toward Nyquist: at 44.1 kHz it hears
-        // a band 30 % narrower in octaves than the one asked for at 10 kHz,
-        // so the detector heard less than the band it moves).
-        // Direct writes (setCoeffsNow): this runs on the audio thread, which
-        // owns these Biquads (one-master rule, see the threading block), so
-        // even this cold reconfiguration must not self-publish through the
-        // staged channel.
-        const bool program = cfg.timing == Timing::Program;
-        const T detectorQ = program ? cfg.q * static_cast<T>(kDetectorNarrowing) : cfg.q;
-        switch (cfg.shape)
-        {
-        case BandShape::Bell:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeBandPassMatched(fs, cfg.frequency, detectorQ));
-            break;
-        case BandShape::LowShelf:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeLowPassMatched(fs, cfg.frequency, T(0.707)));
-            break;
-        case BandShape::HighShelf:
-            bandDetector_[b].setCoeffsNow(BiquadCoeffs::makeHighPassMatched(fs, cfg.frequency, T(0.707)));
-            break;
-        }
+        // The detector: where the gain filter acts, or the zone the band was
+        // given (designDetector()). Direct writes (setCoeffsNow): this runs on
+        // the audio thread, which owns these Biquads (one-master rule, see the
+        // threading block), so even this cold reconfiguration must not
+        // self-publish through the staged channel.
+        const DetectorDesign detector = designDetector(cfg, fs);
+        bandDetector_[b].setCoeffsNow(detector.first);
+        bandZone_[b].setCoeffsNow(detector.second);
+        if (detector.two && !st.zoned) bandZone_[b].reset();   // it starts from nothing, not from an old zone
+        st.zoned = detector.two;
 
         auto calcCoeff = [fs](T ms) -> T {
             const double tauSec = std::max(static_cast<double>(ms), 0.01) / 1000.0;
@@ -2179,10 +2458,7 @@ private:
         st.belowRelCoeff = calcCoeff(cfg.belowReleaseMs);
 
         // Program timing: the time constant of the detector's envelope is the unit.
-        const double hz = std::clamp(static_cast<double>(cfg.frequency), 10.0, 0.45 * fs);
-        const double unit = cfg.shape == BandShape::Bell
-            ? std::max(static_cast<double>(detectorQ), 0.1) / (std::numbers::pi * hz)
-            : 1.0 / (std::numbers::pi * hz);
+        const double unit = detector.unit;
         const auto pole = [fs](double seconds) noexcept { return 1.0 - std::exp(-1.0 / (fs * seconds)); };
         const double fastFall = std::max(kFastFallUnits * unit, kFastFallFloor);
         st.fastUp = pole(std::max(unit, kFastRiseFloor));
@@ -2256,6 +2532,8 @@ private:
         std::atomic<int>  scope      { static_cast<int>(Scope::Stereo) };
         std::atomic<int>  timing         { static_cast<int>(Timing::Manual) };
         std::atomic<bool> relative       { false };
+        std::atomic<T>    listenLow      { T(0) };
+        std::atomic<T>    listenHigh     { T(0) };
 
         std::atomic<T>    aboveRatio     { T(1) };
         std::atomic<T>    aboveAttackMs  { T(5) };
@@ -2296,6 +2574,8 @@ private:
             scope.store(static_cast<int>(c.scope), std::memory_order_relaxed);
             timing.store(static_cast<int>(c.timing), std::memory_order_relaxed);
             relative.store(c.relativeThreshold, std::memory_order_relaxed);
+            listenLow.store(c.listenLow, std::memory_order_relaxed);
+            listenHigh.store(c.listenHigh, std::memory_order_relaxed);
             aboveRatio.store(c.aboveRatio, std::memory_order_relaxed);
             aboveAttackMs.store(c.aboveAttackMs, std::memory_order_relaxed);
             aboveReleaseMs.store(c.aboveReleaseMs, std::memory_order_relaxed);
@@ -2316,7 +2596,7 @@ private:
         /// more of the block budget on it.
         static constexpr int kSeqlockMaxAttempts = 3;
 
-        /** @brief Relaxed copy of the twenty published words (no ordering of
+        /** @brief Relaxed copy of the published words (no ordering of
          *  its own; the caller's fences and counter checks provide that).
          *
          *  Shared by both readers below so the word list exists exactly once: a
@@ -2334,6 +2614,8 @@ private:
             c.scope      = static_cast<Scope>(scope.load(std::memory_order_relaxed));
             c.timing         = static_cast<Timing>(timing.load(std::memory_order_relaxed));
             c.relativeThreshold = relative.load(std::memory_order_relaxed);
+            c.listenLow      = listenLow.load(std::memory_order_relaxed);
+            c.listenHigh     = listenHigh.load(std::memory_order_relaxed);
             c.aboveRatio     = aboveRatio.load(std::memory_order_relaxed);
             c.aboveAttackMs  = aboveAttackMs.load(std::memory_order_relaxed);
             c.aboveReleaseMs = aboveReleaseMs.load(std::memory_order_relaxed);
@@ -2359,7 +2641,7 @@ private:
          * it is still using and a give-up leaves it intact.
          *
          * An odd counter means the writer is mid-publish: skip the copy
-         * entirely instead of copying twenty words that would be discarded.
+         * entirely instead of copying words that would be discarded.
          *
          * @param out Receives the band configuration if and only if true is returned.
          * @return true if a consistent configuration was adopted; false if the
@@ -2430,6 +2712,7 @@ private:
     // default Biquad<T> is only 8 channels, which would index its per-channel state
     // out of bounds when processing 9..16-channel (surround/immersive) audio.
     std::array<Biquad<T, kMaxChannels>, MaxBands> bandDetector_ {};
+    std::array<Biquad<T, kMaxChannels>, MaxBands> bandZone_ {};   ///< Second section of a detector with a zone of two edges.
     std::array<Biquad<T, kMaxChannels>, MaxBands> bandFilter_ {};
     std::array<NormalizedLadder<T, kMaxChannels>, MaxBands> bandLadder_ {}; ///< The band filters as ladders (setStructure()).
     std::atomic<Structure> structure_ { Structure::DirectForm };            ///< setStructure().
@@ -2469,6 +2752,18 @@ private:
     static constexpr int kRemovalCapacity = 32768; ///< Longest latency the removal listen lines up.
     std::atomic<bool> removalListen_ { false };          ///< The output is what the bands take out.
     std::array<RingBuffer<T>, kMaxChannels> deltaRing_ {};
+
+    // The key listen (audio thread, but for the band asked for).
+    std::atomic<int> keyListen_ { -1 };          ///< setKeyListen(): the band whose key is the output; -1 for none.
+    int listenBand_ = -1;                        ///< The band the listening filters carry.
+    double listenWeight_ = 0.0, listenGoal_ = 0.0;   ///< How much of the output is the key, and where that is going.
+    bool listenDesigned_ = false, listenTwo_ = false;
+    BandConfig listenCfg_ {};                    ///< What those filters were designed from.
+    Biquad<T, kMaxChannels> listenFirst_ {}, listenSecond_ {};
+    std::array<RingBuffer<T>, kMaxChannels> listenRing_ {};   ///< The key heard, kept for the latency.
+    std::vector<T> listenHeard_;                 ///< One prepared block per channel.
+    int listenChannels_ = 0, listenBlock_ = 0, listenReach_ = 0;
+
     bool mixedActive_ = false;                   ///< The engine the audio thread is running.
     std::unique_ptr<MixedEngine> mixedEngine_;
     std::unique_ptr<LinearEngine> linear_;       ///< The linear-phase mode; null when it is off.

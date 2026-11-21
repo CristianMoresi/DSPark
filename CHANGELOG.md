@@ -6,6 +6,15 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `SpectralFocus` (in `Core/SpectralEnvelope.h`): a frame's spectrum read
+  through a window that shortens as frequency rises, from the one transform
+  of the whole window. The complex spectrum is smoothed across frequency
+  with the time origin on the window's peak, which weighs each bin by a
+  stretch of the frame of its own: a tone that starts reaches 10 to 90 % of
+  its power in 1.3 ms at 8 kHz, 5.3 ms at 1 kHz and 13.3 ms at 100 Hz, where
+  a window of 2048 at 48 kHz takes 16 ms at any frequency. The powers are
+  scaled so that a noise reads through it what it reads through the whole
+  window (within 0.27 dB by octaves).
 - `TonalBalance::setQuality(Quality::Render)`: half the hop and the bank
   refined three times at every hop, for a bounce: the bank's response
   misses the corrections asked by 0.055 dB in place of 0.086, at about

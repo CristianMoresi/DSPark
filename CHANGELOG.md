@@ -6,6 +6,20 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- Orders between whole ones. `FilterDesign::bell()`, `lowShelf()`,
+  `highShelf()`, `bandPass()`, `bandStop()` and `allPass()` take a real order
+  (1 to 16), and so does `Equalizer::BandConfig::order`: an order of 2.5 is a
+  filter half way between the second and the third, and the response moves a
+  little with each step of the order (0.015 per twentieth of an order for a
+  bell or a shelf of 12 dB, 0.084 for a band-pass or a band-stop, as the
+  largest change of the complex response between 20 Hz and 20 kHz) with no
+  jump at the whole orders. What defines each kind stays exact on the way:
+  the top of a bell and half its gain at its edges, the plateaus of a shelf
+  and half its gain at the corner, the edges of a band-pass and of a
+  band-stop at -3.01 dB, and an all-pass flat to rounding, turning its phase
+  at the frequency by 90 degrees per order. Whole orders are the filters they
+  were. The state keeps the order as a real number and still writes the
+  whole one, so an older build reads the nearest filter it has.
 - Resonant shelves and a second-order tilt. `AnalogSection::lowShelfQ()` and
   `highShelfQ()` take the Q of the section: above 0.7071 the response rises
   over the plateau before the corner and dips after it (0.78, 4.58 and 9.79 dB

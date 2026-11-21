@@ -44,6 +44,7 @@
 #include "../Core/Biquad.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/DspMath.h"
+#include "../Core/Interpolation.h"
 #include "../Core/Oversampling.h"
 #include "../Core/Smoothers.h"
 #include "../Core/AnalogRandom.h"
@@ -2358,7 +2359,9 @@ public:
      * falls as the curve saturates, so it cannot run away. The delay cannot
      * be shorter than the latency plus 16 samples: getCombLoopFrequency()
      * gives the frequency in effect. While it is on the block is processed
-     * in pieces no longer than the delay.
+     * in pieces no longer than the delay. A new frequency is reached by a
+     * glide of the delay (an octave in a tenth of a second, read between
+     * samples), so the line that recirculates is never cut.
      *
      * @note Thread-Safe. Values that are not finite are ignored.
      * @param amount -0.95 to 0.95; 0, the default, is off.
@@ -2371,6 +2374,22 @@ public:
         if (std::isfinite(hz) && hz > SampleType(0))
             combLoopHz_.store(std::clamp(hz, kMinFeedbackHz, SampleType(20000)), std::memory_order_relaxed);
     }
+
+    /**
+     * @brief Closes the tuned feedback when the programme stops.
+     *
+     * With a loop gain near one the comb rings on long after the input has
+     * gone. With this on, the loop follows the level of what comes in: it
+     * stays as set while there is programme and closes, in a few tens of
+     * milliseconds, once the input has stayed under -70 dBFS; the ringing
+     * ends with the programme. Off by default.
+     *
+     * @note Thread-Safe.
+     */
+    void setCombLoopClosing(bool on) noexcept { combLoopClosing_.store(on, std::memory_order_relaxed); }
+
+    /** @return Whether the tuned feedback closes when the programme stops. */
+    [[nodiscard]] bool getCombLoopClosing() const noexcept { return combLoopClosing_.load(std::memory_order_relaxed); }
 
     /** @brief The amount of the tuned feedback (see setCombLoop()). */
     [[nodiscard]] SampleType getCombLoop() const noexcept { return combLoop_.load(std::memory_order_relaxed); }
@@ -2617,6 +2636,7 @@ public:
         w.write("levelTracking", static_cast<float>(getLevelTracking()));
         w.write("trackingCorner", static_cast<float>(getTrackingCorner()));
         w.write("combLoop", static_cast<float>(getCombLoop()));
+        w.write("combLoopClosing", getCombLoopClosing());
         w.write("combLoopHz", static_cast<float>(combLoopHz_.load(std::memory_order_relaxed)));
         w.write("driveCompensation", driveCompensation_.load(std::memory_order_relaxed));
         return w.blob();
@@ -2659,6 +2679,7 @@ public:
         setTrackingCorner(static_cast<SampleType>(r.read("trackingCorner", 0.0f)));
         setCombLoop(static_cast<SampleType>(r.read("combLoop", 0.0f)),
                     static_cast<SampleType>(r.read("combLoopHz", 200.0f)));
+        setCombLoopClosing(r.read("combLoopClosing", false));
         setDriveCompensation(r.read("driveCompensation", false));
         return true;
     }
@@ -3198,6 +3219,8 @@ protected:
         followDown_ = 1.0 - std::exp(-1.0 / (0.150 * fs));
         dynamicsSmoothRate_ = 1.0 - std::exp(-1.0 / (0.005 * fs));
         noiseHoldSamples_ = static_cast<int>(0.050 * fs);
+        loopGlide_ = std::pow(2.0, 1.0 / (kLoopOctaveSeconds * fs));
+        programFall_ = std::exp(-1.0 / (kLoopCloseSeconds * fs));
         noiseFall_ = 1.0 - std::exp(-1.0 / (0.150 * fs));
     }
 
@@ -3220,6 +3243,9 @@ protected:
         gainTail_ = 0;
         stagesOn_ = false;
         feedingBefore_ = false;
+        loopDelayNow_ = 0.0;
+        programPeak_ = 0.0;
+        loopOpen_ = 1.0;
     }
 
     /**
@@ -3240,13 +3266,22 @@ protected:
         stageLatency_ = getLatency();
         const bool feeding = feedbackTarget_ != 0.0 || feedbackNow_ != 0.0;
         if (feeding && !feedingBefore_) std::fill(feedbackRing_.begin(), feedbackRing_.end(), SampleType(0));
-        feedingBefore_ = feeding;
         feedbackDelay_ = feedbackDelayFor(stageLatency_);
+        // A loop that starts is at its delay at once; one that runs glides to a new one.
+        if (!feedingBefore_ || !(loopDelayNow_ > 0.0)) loopDelayNow_ = static_cast<double>(feedbackDelay_);
+        feedingBefore_ = feeding;
+        closingOn_ = combLoopClosing_.load(std::memory_order_relaxed);
+        if (!closingOn_) loopOpen_ = 1.0;
         feedbackScale_ = SampleType(1) / decibelsToGain(static_cast<SampleType>(driveSmoother_.getTargetValue()));
         const bool moving = dynamicsTarget_ != 0.0 || dynamicsNow_ != 0.0 || gainTail_ > 0;
         stagesOn_ = feeding || moving || noiseGain_ > 0.0
                  || asymmetryTarget_ != 0.0 || asymmetryNow_ != 0.0;
-        return feeding ? feedbackDelay_ : std::numeric_limits<int>::max();
+        if (!feeding) return std::numeric_limits<int>::max();
+        // At rest a piece is as long as the delay; while the delay glides the
+        // read between samples needs its neighbours, so two samples less
+        // than the shortest delay of the way.
+        if (loopDelayNow_ == static_cast<double>(feedbackDelay_)) return feedbackDelay_;
+        return std::max(1, static_cast<int>(std::min(loopDelayNow_, static_cast<double>(feedbackDelay_))) - 2);
     }
 
     /** A value on its way to a target, 20 ms away; it lands on a target of zero. */
@@ -3283,12 +3318,52 @@ protected:
 
             if (feedbackNow_ != 0.0)
             {
-                const auto at = static_cast<size_t>((feedbackPos_ + i - feedbackDelay_) & feedbackMask);
-                for (int ch = 0; ch < nCh; ++ch)
+                // The loop that closes without programme: the level of what
+                // comes in, falling over kLoopCloseSeconds, opens it.
+                SampleType amount = static_cast<SampleType>(feedbackNow_);
+                if (closingOn_)
                 {
-                    if (ch == keepChannel) continue;
-                    const SampleType back = feedbackRing_[static_cast<size_t>(ch) * static_cast<size_t>(feedbackSize_) + at];
-                    buffer.getChannel(ch)[i] -= static_cast<SampleType>(feedbackNow_) * back;
+                    double top = 0.0;
+                    for (int ch = 0; ch < nCh; ++ch)
+                        if (ch != keepChannel)
+                        {
+                            const double level = std::abs(static_cast<double>(buffer.getChannel(ch)[i]));
+                            if (std::isfinite(level)) top = std::max(top, level);
+                        }
+                    programPeak_ = std::max(top, programPeak_ * programFall_);
+                    approach(loopOpen_, programPeak_ > kLoopCloseLevel ? 1.0 : 0.0, stageRate_);
+                    amount = static_cast<SampleType>(feedbackNow_ * loopOpen_);
+                }
+                const double goal = static_cast<double>(feedbackDelay_);
+                if (loopDelayNow_ == goal)
+                {
+                    const auto at = static_cast<size_t>((feedbackPos_ + i - feedbackDelay_) & feedbackMask);
+                    for (int ch = 0; ch < nCh; ++ch)
+                    {
+                        if (ch == keepChannel) continue;
+                        const SampleType back = feedbackRing_[static_cast<size_t>(ch) * static_cast<size_t>(feedbackSize_) + at];
+                        buffer.getChannel(ch)[i] -= amount * back;
+                    }
+                }
+                else
+                {
+                    // The delay glides to its new length by a constant ratio
+                    // per sample and is read between samples (four points).
+                    loopDelayNow_ = loopDelayNow_ < goal ? std::min(goal, loopDelayNow_ * loopGlide_)
+                                                         : std::max(goal, loopDelayNow_ / loopGlide_);
+                    const int whole = static_cast<int>(loopDelayNow_);
+                    const auto part = static_cast<SampleType>(loopDelayNow_ - static_cast<double>(whole));
+                    const int at = feedbackPos_ + i - whole;
+                    for (int ch = 0; ch < nCh; ++ch)
+                    {
+                        if (ch == keepChannel) continue;
+                        const SampleType* line = feedbackRing_.data() + static_cast<size_t>(ch) * static_cast<size_t>(feedbackSize_);
+                        const SampleType back = interpolateHermite(line[static_cast<size_t>((at + 1) & feedbackMask)],
+                                                                   line[static_cast<size_t>(at & feedbackMask)],
+                                                                   line[static_cast<size_t>((at - 1) & feedbackMask)],
+                                                                   line[static_cast<size_t>((at - 2) & feedbackMask)], part);
+                        buffer.getChannel(ch)[i] -= amount * back;
+                    }
                 }
             }
 
@@ -3498,6 +3573,9 @@ protected:
     static constexpr SampleType kNoiseOffDb = SampleType(-120);     ///< Programme noise at or under this is off.
     static constexpr SampleType kMinFeedbackHz = SampleType(20);     ///< Lowest frequency of the tuned feedback.
     static constexpr int kMinFeedbackDelay = 16;                     ///< Shortest feedback line (and piece of a block).
+    static constexpr double kLoopOctaveSeconds = 0.1;                ///< Time the loop's delay takes to glide an octave.
+    static constexpr double kLoopCloseSeconds = 0.02;                ///< Time constant the programme's level falls with, for the loop that closes.
+    static constexpr double kLoopCloseLevel = 3.1622776601683794e-4; ///< -70 dBFS: under it there is no programme.
     static constexpr double kDynamicsReferenceDb = -18.0;            ///< Level the dynamics bring the programme to.
     static constexpr double kDynamicsReachDb = 24.0;                 ///< Most gain the dynamics apply, either way.
     static constexpr double kEvenShare = 0.25;                       ///< Share of the square added at asymmetry 1.
@@ -3522,6 +3600,10 @@ protected:
     double asymmetryNow_ = 0.0, asymmetryTarget_ = 0.0;
     double dynamicsNow_ = 0.0, dynamicsTarget_ = 0.0;
     double feedbackNow_ = 0.0, feedbackTarget_ = 0.0;
+    double loopDelayNow_ = 0.0, loopGlide_ = 1.0;   ///< The loop's delay now, in samples (0: not started), and its glide per sample.
+    double programPeak_ = 0.0, programFall_ = 0.999, loopOpen_ = 1.0;   ///< The loop that closes: the level of the input, its fall, how open the loop is.
+    std::atomic<bool> combLoopClosing_ { false };
+    bool closingOn_ = false;
     double stageRate_ = 0.0, evenRate_ = 0.0, followUp_ = 0.0, followDown_ = 0.0, focusRate_ = 0.0;
     double followPower_ = 0.0, noiseGain_ = 0.0, noisePeak_ = 0.0, noiseFall_ = 0.0;
     double dynamicsGainDb_ = 0.0, dynamicsSmoothRate_ = 0.0;

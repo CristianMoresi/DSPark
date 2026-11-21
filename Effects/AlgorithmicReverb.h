@@ -139,9 +139,11 @@
  *   3 kHz): Room -51 / -50 dB, Chamber -69 / -48 dB, Hall -55 / -44 dB,
  *   Cathedral -54 / -45 dB (line wander alone: Hall -33 dB, Cathedral
  *   -31 dB at 3 kHz); Plate, lusher by design, -29 / -11 dB.
- * - **Smooth size changes.** setSize() glides the line and in-loop allpass
- *   lengths (a short tape-style Doppler) instead of jumping, so it can be
- *   automated.
+ * - **Smooth size changes.** setSize() opens a second read head at the new
+ *   line and in-loop allpass lengths and cross-fades to it at constant
+ *   power over a quarter of a second, so the size can be automated without
+ *   clicks and without the pitch glide of lengths that slide (changes under
+ *   0.2 % of a line's length still slide).
  * - **Spring tanks.** Type::Spring models six springs per side as
  *   dispersive loops (Valimaki, Parker & Abel 2010): stretched-allpass
  *   cascades make every round trip a chirp whose band edge arrives last,
@@ -326,8 +328,8 @@ public:
             shimBuf_.assign(static_cast<size_t>(size), T(0));
             shimMask_ = size - 1;
         }
-        levelUp_ = std::exp(-1.0 / (0.020 * sr));
-        levelDown_ = std::exp(-1.0 / (0.004 * sr));
+        levelRelease_ = std::exp(-1.0 / (0.5 * sr));
+        levelHoldSamples_ = static_cast<int>(std::lround(0.03 * sr));
 
         // Re-derive the sample counts stored at set-time: after a re-prepare
         // at a different rate they would keep the OLD rate's sample count.
@@ -538,7 +540,8 @@ public:
         shimLen_ = { 0.045, 0.045 };
         shimRng_ = 0x51ED27u;
         lastLateMono_ = T(0);
-        levelEnv_ = 0.0;
+        levelGr_ = 0.0;
+        levelHold_ = 0;
         distLp_ = { T(0), T(0) };
         distMix_ = sourceDepth_.load(std::memory_order_relaxed) > T(0) ? T(1) : T(0);
         tail_.reset();
@@ -568,6 +571,7 @@ public:
         ctrlPhase_ = 0;
         rotTick_ = 0;   // the rotation refresh phase restarts with the LFOs
         loopAPGliding_ = false;
+        sizeFade_ = false;
 
         // Parameter glides snap to their targets with the state.
         snapGlides();
@@ -674,8 +678,10 @@ public:
 
     /**
      * @brief Room size (0.01 - 1). Scales the delay lines from 36% to 100%
-     *        of their base lengths. Changes glide smoothly (with a brief
-     *        Doppler, like a tape delay), so the size can be automated.
+     *        of their base lengths. A change cross-fades two read heads, the
+     *        old lengths to the new, over a quarter of a second (no click and
+     *        no glide of pitch; the next change waits for the fade), so the
+     *        size can be automated.
      */
     void setSize(T size) noexcept
     {
@@ -1007,9 +1013,12 @@ public:
     /**
      * @brief Leveling of the tank, 0 to 1 (0, the default, is off): a compressor on the
      *        tank's input (ratio 1 + 3 x amount over -30 dBFS with a 24 dB
-     *        knee; its level rises over 20 ms and falls over 4 ms), its gain
-     *        compensated at -18 dBFS: quiet passages feed the tail as much as
-     *        loud ones. Non-finite values are ignored.
+     *        knee), its gain compensated at -18 dBFS: quiet passages feed the
+     *        tail as much as loud ones. It reads the peak of each sample (as
+     *        the power of a sine with that peak); its reduction deepens at
+     *        once, holds 30 ms and comes back with a time constant of half a
+     *        second, so it neither moves within a cycle of a low note nor
+     *        lets the start of a hit through. Non-finite values are ignored.
      */
     void setTankLeveling(T amount) noexcept
     {
@@ -1073,9 +1082,10 @@ public:
     /**
      * @brief How the line lengths wander: Smooth (the default) is the smooth
      *        random modulation of every line; Segments moves every other line
-     *        in straight segments toward random positions at random speeds
-     *        (each segment 0.5 to 1.5 cycles of the line's rate), with the
-     *        depth held under 2 % of the line's length.
+     *        in segments that alternate sides, toward random positions at
+     *        random speeds (each segment 0.5 to 1.5 cycles of the line's
+     *        rate), rounded by a critically damped follower so the pitch has
+     *        no corners, with the depth held under 2 % of the line's length.
      */
     void setModulationStyle(ModulationStyle style) noexcept
     {
@@ -1087,7 +1097,7 @@ public:
      *        tuned base lengths; Geometric spaces them evenly in log over the
      *        same range (about 6.6 per octave, the lines of the two sides
      *        interleaved half a step apart), then to the nearest prime. The
-     *        lengths glide to the new layout.
+     *        read heads cross-fade to the new layout as on a change of size.
      */
     void setSpaceLayout(SpaceLayout layout) noexcept
     {
@@ -1309,6 +1319,8 @@ protected:
     static constexpr int kRotPairStride = 4;
     static constexpr double kGlideMs       = 60.0;  ///< size-change glide time constant
     static constexpr double kMaxGlideSpeed = 0.04;  ///< max length change per sample (4% Doppler)
+    static constexpr double kSizeFadeOver    = 0.002;  ///< a length change beyond this share cross-fades two read heads
+    static constexpr double kSizeFadeSeconds = 0.25;   ///< the cross-fade of the two read heads
     static constexpr double kSubsonicHz    = 20.0;  ///< wet-output high-pass (2nd order): no room rings below it
     static constexpr T      kMinReadPos    = T(2);
     /// The modulated reads cover the fractional delay [kApLow, kApLow + 1).
@@ -1331,10 +1343,10 @@ protected:
     static constexpr T kOutGain = T(0.25);
     /// The wet signal's level at full mix against the dry one (see
     /// updateDecayParams()): measured on pink noise, the types with a delay
-    /// network land within -1.1 and +1.0 dB of the dry level at their
-    /// presets, the spring with its own constant (its loops disperse).
-    static constexpr double kWetCalibration = 5.25;
-    static constexpr double kWetCalibrationSpring = 2.95;
+    /// network land within 0.7 dB of the dry level at their presets, the
+    /// spring with its own constant (its loops disperse).
+    static constexpr double kWetCalibration = 4.73;
+    static constexpr double kWetCalibrationSpring = 2.85;
 
     // FDN base delay times in ms (at size = 1); lengths are rounded to primes.
     // About 3.7 s of delay in all: the modal density (modes per Hz equals the
@@ -1534,33 +1546,45 @@ protected:
     };
 
     /**
-     * @brief Modulation by segments: a straight move toward a random
-     *        position (in [-1, 1]) at a random speed (each segment 0.5 to 1.5
-     *        cycles of the rate), then the next.
+     * @brief Modulation by segments: a straight move toward the other side,
+     *        a random share (0.3 to 0.95) of the way to its limit, at a random
+     *        speed (each segment 0.5 to 1.5 cycles of the rate), then the
+     *        next; the output follows the segments through a critically
+     *        damped second-order filter (at twice the rate, 0.2 to 20 Hz), so
+     *        the delay and its rate of change are continuous.
      */
     struct SegmentLfo
     {
-        double pos = 0.0, target = 0.0, step = 0.0;
+        double pos = 0.0, vel = 0.0, goal = 0.0, target = 0.0, step = 0.0, side = 1.0;
         uint32_t state = 1;
 
         void prepare(uint32_t seed) noexcept
         {
             state = seed ? seed : 1;
-            pos = target = step = 0.0;
+            pos = vel = goal = target = step = 0.0;
+            side = 1.0;
         }
 
         double next(int stride, double rateHz, double sr) noexcept
         {
             if (step == 0.0)
             {
-                target = 2.0 * random() - 1.0;
+                // Toward the other side, a random share of the way to its limit.
+                target = goal + (side - goal) * (0.3 + 0.65 * random());
+                side = -side;
                 const double seconds = (0.5 + random()) / std::max(rateHz, 0.01);
-                step = std::abs(target - pos) / std::max(1.0, seconds * sr);
+                step = std::abs(target - goal) / std::max(1.0, seconds * sr);
                 if (step == 0.0) step = 1e-9;
             }
             const double move = step * static_cast<double>(stride);
-            if (std::abs(target - pos) <= move) { pos = target; step = 0.0; }
-            else pos += target > pos ? move : -move;
+            if (std::abs(target - goal) <= move) { goal = target; step = 0.0; }
+            else goal += target > goal ? move : -move;
+            // A critically damped follower of the segments: the delay and its
+            // rate of change stay continuous (no step of pitch at a corner).
+            const double dt = static_cast<double>(stride) / sr;
+            const double w = std::min(2.0 * 3.14159265358979323846 * std::clamp(2.0 * rateHz, 0.2, 20.0), 0.5 / dt);
+            vel += (w * w * (goal - pos) - 2.0 * w * vel) * dt;
+            pos += vel * dt;
             return pos;
         }
 
@@ -1658,6 +1682,12 @@ protected:
     // resolves only about 0.001 samples, which is jitter on every modulated read.
     std::array<double, kMaxLines> pos_ {};       ///< current read position
     std::array<double, kMaxLines> posInc_ {};    ///< per-sample ramp
+    // A change of size under way: the second read heads (see beginSizeFade()).
+    std::array<double, kMaxLines> pos2_ {}, posInc2_ {};
+    std::array<T, kMaxLines> apY2_ {}, lenNew_ {};
+    std::array<int, kMaxLines> loopAPFrom_ {}, loopAPTo_ {};
+    double fadeAt_ = 0.0, fadeStep_ = 0.0;       ///< the fade, 0 to 1, and its step per sample
+    bool sizeFade_ = false;
     std::array<T, kMaxLines> apY1_ {};           ///< allpass interpolator state
     std::array<int, kMaxLines> injTap_ {};
     std::array<T, kMaxLines> injGain_ {};        ///< sign / sqrt(lines)
@@ -1823,6 +1853,9 @@ protected:
     std::array<std::array<T, kMaxLines>, 3> jotGoal_ {}, bassGoal_ {};
     std::array<std::array<std::array<T, kMaxLines>, kDecayBands>, 5> dqGoal_ {};
     bool absorbGlide_ = false;
+    /// The loop gains' ramp across a chunk: where they stood and their step per sample.
+    std::array<std::array<T, kMaxLines>, 6> absFrom_ {}, absStep_ {};
+    std::array<std::array<std::array<T, kMaxLines>, kDecayBands>, 5> dqFrom_ {}, dqStep_ {};
     double quietSamples_ = 1e300;    ///< samples since input last entered the tank
     double tankEmptyAfter_ = 0.0;    ///< quiet samples after which the tank is under -120 dB
     std::array<std::array<T, kMaxLines>, kDecayBands> dqB0_ {}, dqB1_ {}, dqB2_ {}, dqA1_ {}, dqA2_ {};
@@ -1830,7 +1863,8 @@ protected:
     std::array<int, kDecayBands> dqList_ {};
     int dqCount_ = 0;
     T holdNow_ = T(0);
-    double levelEnv_ = 0.0, levelUp_ = 0.0, levelDown_ = 0.0;
+    double levelGr_ = 0.0, levelRelease_ = 0.0;   ///< Tank leveling: the reduction (dB) and its release.
+    int levelHold_ = 0, levelHoldSamples_ = 0;      ///< Tank leveling: hold left and its length.
     std::array<T, 2> distLp_ {};
     T distCoeff_ = T(1), distMix_ = T(0);
     std::array<SegmentLfo, kMaxLines> seg_ {};
@@ -2050,21 +2084,37 @@ protected:
         const bool segments = cachedParams_.segments;
         const double sr = spec_.sampleRate;
         const double rate = static_cast<double>(modRate_.load(std::memory_order_relaxed));
+        // A change of size beyond kSizeFadeOver of a line's length opens a
+        // second read head at the new lengths and cross-fades to it (a glide
+        // of the lengths is a glide of pitch); a smaller one glides. While a
+        // fade runs the next change waits.
+        if (!sizeFade_)
+        {
+            T widest = T(0);
+            for (int i = 0; i < n; ++i)
+                widest = std::max(widest, std::abs(static_cast<T>(lenTarget_[i]) - lenCur_[i]) / std::max(lenCur_[i], T(1)));
+            if (widest > static_cast<T>(kSizeFadeOver)) beginSizeFade();
+        }
         for (int i = 0; i < n; ++i)
         {
-            const T diff = static_cast<T>(lenTarget_[i]) - lenCur_[i];
-            lenCur_[i] += std::clamp(diff * glideCoeff_, -maxGlideStep_, maxGlideStep_);
+            if (!sizeFade_)
+            {
+                const T diff = static_cast<T>(lenTarget_[i]) - lenCur_[i];
+                lenCur_[i] += std::clamp(diff * glideCoeff_, -maxGlideStep_, maxGlideStep_);
+            }
             // Segments: every other line, its depth held under 2 % of its length.
-            const T m = segments
-                ? ((i & 1) ? T(0) : static_cast<T>(seg_[i].next(kCtrl, rate * static_cast<double>(lfoRateFactor(i)), sr))
-                                        * std::min(modDepthSamples_, T(0.02) * lenCur_[i]))
-                : lfo_[i].nextStride(kCtrl) * modDepthSamples_;
-            const double target = std::clamp(static_cast<double>(lenCur_[i]) + static_cast<double>(m),
-                                             static_cast<double>(kMinReadPos),
-                                             static_cast<double>(maxReadPos_));
-            posInc_[i] = (target - pos_[i]) * (1.0 / static_cast<double>(kCtrl));
+            const T wander = segments
+                ? ((i & 1) ? T(0) : static_cast<T>(seg_[i].next(kCtrl, rate * static_cast<double>(lfoRateFactor(i)), sr)))
+                : lfo_[i].nextStride(kCtrl);
+            const auto aim = [&](T length) {
+                const T m = wander * (segments ? std::min(modDepthSamples_, T(0.02) * length) : modDepthSamples_);
+                return std::clamp(static_cast<double>(length) + static_cast<double>(m),
+                                  static_cast<double>(kMinReadPos), static_cast<double>(maxReadPos_));
+            };
+            posInc_[i] = (aim(lenCur_[i]) - pos_[i]) * (1.0 / static_cast<double>(kCtrl));
+            if (sizeFade_) posInc2_[i] = (aim(lenNew_[i]) - pos2_[i]) * (1.0 / static_cast<double>(kCtrl));
         }
-        if (loopAPGliding_)
+        if (loopAPGliding_ && !sizeFade_)
         {
             // The in-loop allpasses follow a size change with the lines.
             bool moving = false;
@@ -2081,6 +2131,48 @@ protected:
             }
             loopAPGliding_ = moving;
         }
+    }
+
+    /**
+     * @brief Opens the second read head of every line at the new lengths
+     *        (with the wander the first one carries) and of every in-loop
+     *        allpass at its new length; the two heads then cross-fade at
+     *        constant power over kSizeFadeSeconds (far apart, what they read
+     *        is uncorrelated).
+     */
+    void beginSizeFade() noexcept
+    {
+        for (int i = 0; i < nLines_; ++i)
+        {
+            const auto l = static_cast<std::size_t>(i);
+            lenNew_[l] = static_cast<T>(lenTarget_[l]);
+            pos2_[l] = std::clamp(static_cast<double>(lenNew_[l]) + (pos_[l] - static_cast<double>(lenCur_[l])),
+                                  static_cast<double>(kMinReadPos), static_cast<double>(maxReadPos_));
+            posInc2_[l] = 0.0;
+            apY2_[l] = lines_.at(i, static_cast<int>(pos2_[l] - kApLow) + 1);
+            loopAPFrom_[l] = static_cast<int>(loopAPCur_[l] + T(0.5));
+            loopAPTo_[l] = loopAPLen_[l];
+        }
+        fadeAt_ = 0.0;
+        sizeFade_ = true;
+    }
+
+    /** @brief The fade is over: the second heads become the first. */
+    void endSizeFade() noexcept
+    {
+        bool allpassesMoved = false;
+        for (int i = 0; i < nLines_; ++i)
+        {
+            const auto l = static_cast<std::size_t>(i);
+            pos_[l] = pos2_[l];
+            posInc_[l] = posInc2_[l];
+            apY1_[l] = apY2_[l];
+            lenCur_[l] = lenNew_[l];
+            loopAPCur_[l] = static_cast<T>(loopAPTo_[l]);
+            allpassesMoved = allpassesMoved || loopAPTo_[l] != loopAPLen_[l];
+        }
+        loopAPGliding_ = allpassesMoved;
+        sizeFade_ = false;
     }
 
     /// Unnormalised M-point Sylvester Hadamard transform in place, fully
@@ -2163,6 +2255,20 @@ protected:
             O::store(apY1_.data() + i, y);
             O::store(r.data() + i, y);
         }
+        // A change of size under way: the second head, at the new lengths,
+        // takes over from the first at constant power.
+        const bool fading = sizeFade_;
+        const T fadeNew = fading ? static_cast<T>(std::sin(1.5707963267948966 * fadeAt_)) : T(0);
+        const T fadeOld = fading ? static_cast<T>(std::cos(1.5707963267948966 * fadeAt_)) : T(1);
+        if (fading) [[unlikely]]
+            for (int i = 0; i < N; ++i)
+            {
+                const double p = pos2_[i] += posInc2_[i];
+                const int M = static_cast<int>(p - kApLow);
+                const T y = allpassCoeff(p - static_cast<double>(M)) * (lines_.at(i, M) - apY2_[i]) + lines_.at(i, M + 1);
+                apY2_[i] = y;
+                r[i] = fadeOld * r[i] + fadeNew * y;
+            }
 
         // Absorption of what each line delivers (its own round trip: the
         // in-loop allpass that fed it plus the line): Jot mid/high shelf,
@@ -2230,7 +2336,12 @@ protected:
         }
 
         {
-            if (loopAPGliding_) [[unlikely]]
+            if (fading) [[unlikely]]
+            {
+                for (int i = 0; i < N; ++i)
+                    tmp[i] = fadeOld * loopAP_.at(i, loopAPFrom_[i]) + fadeNew * loopAP_.at(i, loopAPTo_[i]);
+            }
+            else if (loopAPGliding_) [[unlikely]]
             {
                 for (int i = 0; i < N; ++i)
                 {
@@ -2271,6 +2382,14 @@ protected:
             lines_.write(i, x + injGain_[i] * (inGain * ring_[(i >> 1) & 1].at(injLag + injTap_[i]) + extra));
         }
         lines_.advance();
+        if (fading) [[unlikely]] advanceSizeFade();
+    }
+
+    /** @brief One sample of a size fade; at its end the second heads become the first. */
+    void advanceSizeFade() noexcept
+    {
+        fadeAt_ += fadeStep_;
+        if (fadeAt_ >= 1.0) endSizeFade();
     }
 
     /**
@@ -2339,6 +2458,11 @@ protected:
         const T drive[2] = { T(0.75) * raw[0] + T(0.25) * raw[1],
                              T(0.25) * raw[0] + T(0.75) * raw[1] };
 
+        // A change of size under way: a second head at the new lengths takes
+        // over from the first at constant power (see beginSizeFade()).
+        const bool fading = sizeFade_;
+        const T fadeNew = fading ? static_cast<T>(std::sin(1.5707963267948966 * fadeAt_)) : T(0);
+        const T fadeOld = fading ? static_cast<T>(std::cos(1.5707963267948966 * fadeAt_)) : T(1);
         alignas(64) std::array<T, Springs> x;
         for (int s = 0; s < Springs; ++s)
         {
@@ -2348,6 +2472,14 @@ protected:
             const T y = eta * (lines_.at(s, M) - apY1_[s]) + lines_.at(s, M + 1);
             apY1_[s] = y;
             x[s] = y;
+            if (fading) [[unlikely]]
+            {
+                const double p2 = pos2_[s] += posInc2_[s];
+                const int M2 = static_cast<int>(p2 - kApLow);
+                const T y2 = allpassCoeff(p2 - static_cast<double>(M2)) * (lines_.at(s, M2) - apY2_[s]) + lines_.at(s, M2 + 1);
+                apY2_[s] = y2;
+                x[s] = fadeOld * y + fadeNew * y2;
+            }
         }
 
         // Dispersion: y = a (x - y[n-K]) + x[n-K], stage by stage.
@@ -2422,6 +2554,7 @@ protected:
         const T og = kSpringOutGain / std::sqrt(static_cast<T>(Springs / 2));
         lateL += out[0] * og;
         lateR += out[1] * og;
+        if (fading) [[unlikely]] advanceSizeFade();
     }
 
     /// Line count of the active engine: the springs, or the FDN size.
@@ -2527,9 +2660,18 @@ protected:
         // Tail hold: the absorption fades to unity and the input out.
         const T hold0 = holdNow_;
         holdNow_ = glideTo(holdNow_, tailHold_.load(std::memory_order_relaxed) ? T(1) : T(0), gc);
+        // The loop gains move toward their design (and toward unity while
+        // the tail is held) sample by sample across the chunk: a step of
+        // them is a step of every line's output.
         const bool absorbMoved = absorbGlide_;
-        if (absorbMoved) glideAbsorption(gc);
-        if (holdNow_ != hold0 || absorbMoved) applyHoldCoeffs();
+        const bool absorbRamp = holdNow_ != hold0 || absorbMoved;
+        if (absorbRamp)
+        {
+            holdAbsorption();
+            if (absorbMoved) glideAbsorption(gc);
+            applyHoldCoeffs();
+            rampAbsorption(rampStep);
+        }
         {
             // Input entering the tank (for the empty-tank test of updateDecayParams()).
             T peak = T(0);
@@ -2589,14 +2731,22 @@ protected:
             const bool saturate = cachedParams_.tankSat;
             for (int n = 0; n < count; ++n)
             {
-                const double level = std::max(static_cast<double>(raw[0][n]) * raw[0][n],
-                                              static_cast<double>(raw[1][n]) * raw[1][n]);
-                levelEnv_ = level + (level > levelEnv_ ? levelUp_ : levelDown_) * (levelEnv_ - level);
-                const double over = 10.0 * std::log10(levelEnv_ + 1e-30) - kThreshold;
+                const double peak = std::max(static_cast<double>(raw[0][n]) * raw[0][n],
+                                             static_cast<double>(raw[1][n]) * raw[1][n]);
+                const double over = 10.0 * std::log10(0.5 * peak + 1e-30) - kThreshold;
                 const double gr = over <= -0.5 * kKnee ? 0.0
                                 : over >= 0.5 * kKnee ? slope * over
                                 : slope * (over + 0.5 * kKnee) * (over + 0.5 * kKnee) / (2.0 * kKnee);
-                const T g = static_cast<T>(std::pow(10.0, (gr + makeup) / 20.0));
+                // Deeper at once; a crest within 0.01 dB of the reduction held
+                // holds it again; after the hold it comes back slowly.
+                if (gr <= levelGr_ + 0.01)
+                {
+                    levelGr_ = std::min(levelGr_, gr);
+                    levelHold_ = levelHoldSamples_;
+                }
+                else if (levelHold_ > 0) --levelHold_;
+                else levelGr_ = gr + levelRelease_ * (levelGr_ - gr);
+                const T g = static_cast<T>(std::pow(10.0, (levelGr_ + makeup) / 20.0));
                 for (int c = 0; c < 2; ++c)
                 {
                     T x = raw[c][n] * g;
@@ -2691,6 +2841,7 @@ protected:
         {
             if (ctrlPhase_ == 0) controlTick();
             ctrlPhase_ = (ctrlPhase_ + 1) & (kCtrl - 1);
+            if (absorbRamp) stepAbsorption();
 
             // --- Late field ---
             T lateL = T(0), lateR = T(0);
@@ -2728,6 +2879,7 @@ protected:
             outL[n] = yl;
             outR[n] = yr;
         }
+        if (absorbRamp) applyHoldCoeffs();   // the chunk's end, without the ramp's rounding
     }
 
     /**
@@ -2800,6 +2952,57 @@ protected:
                 dqA1_[b][l] = dqBase_[3][b][l] * k;
                 dqA2_[b][l] = dqBase_[4][b][l] * k;
             }
+        }
+    }
+
+    /// The loop gains as they stand, kept for the ramp of a chunk.
+    void holdAbsorption() noexcept
+    {
+        absFrom_[0] = jotB0_; absFrom_[1] = jotB1_; absFrom_[2] = jotA1_;
+        absFrom_[3] = bassB0_; absFrom_[4] = bassB1_; absFrom_[5] = bassA1_;
+        for (int q = 0; q < dqCount_; ++q)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+            dqFrom_[0][b] = dqB0_[b]; dqFrom_[1][b] = dqB1_[b]; dqFrom_[2][b] = dqB2_[b];
+            dqFrom_[3][b] = dqA1_[b]; dqFrom_[4][b] = dqA2_[b];
+        }
+    }
+
+    /// From the gains held to the ones just applied in a chunk: the step per
+    /// sample, with the gains back where the chunk starts.
+    void rampAbsorption(T perSample) noexcept
+    {
+        const auto ramp = [perSample](auto& now, auto& from, auto& step) {
+            for (std::size_t i = 0; i < now.size(); ++i)
+            {
+                step[i] = (now[i] - from[i]) * perSample;
+                now[i] = from[i];
+            }
+        };
+        ramp(jotB0_, absFrom_[0], absStep_[0]); ramp(jotB1_, absFrom_[1], absStep_[1]); ramp(jotA1_, absFrom_[2], absStep_[2]);
+        ramp(bassB0_, absFrom_[3], absStep_[3]); ramp(bassB1_, absFrom_[4], absStep_[4]); ramp(bassA1_, absFrom_[5], absStep_[5]);
+        for (int q = 0; q < dqCount_; ++q)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+            ramp(dqB0_[b], dqFrom_[0][b], dqStep_[0][b]); ramp(dqB1_[b], dqFrom_[1][b], dqStep_[1][b]);
+            ramp(dqB2_[b], dqFrom_[2][b], dqStep_[2][b]); ramp(dqA1_[b], dqFrom_[3][b], dqStep_[3][b]);
+            ramp(dqA2_[b], dqFrom_[4][b], dqStep_[4][b]);
+        }
+    }
+
+    /// One sample of the loop gains' ramp.
+    void stepAbsorption() noexcept
+    {
+        const auto add = [](auto& now, const auto& step) {
+            for (std::size_t i = 0; i < now.size(); ++i) now[i] += step[i];
+        };
+        add(jotB0_, absStep_[0]); add(jotB1_, absStep_[1]); add(jotA1_, absStep_[2]);
+        add(bassB0_, absStep_[3]); add(bassB1_, absStep_[4]); add(bassA1_, absStep_[5]);
+        for (int q = 0; q < dqCount_; ++q)
+        {
+            const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
+            add(dqB0_[b], dqStep_[0][b]); add(dqB1_[b], dqStep_[1][b]); add(dqB2_[b], dqStep_[2][b]);
+            add(dqA1_[b], dqStep_[3][b]); add(dqA2_[b], dqStep_[4][b]);
         }
     }
 
@@ -2982,6 +3185,7 @@ protected:
         for (int k = 0; k < kMaxLines / 2; ++k)
             rotLfo_[k].setRate(rotRate() * rotRateFactor(k), sr);
         glideCoeff_ = static_cast<T>(1.0 - std::exp(-kCtrl / (kGlideMs * sr / 1000.0)));
+        fadeStep_ = 1.0 / (kSizeFadeSeconds * sr);
         maxGlideStep_ = static_cast<T>(kMaxGlideSpeed * kCtrl);
     }
 
@@ -3048,11 +3252,6 @@ protected:
             }
         }
         meanLoopSec_ = loopSum / std::max(1, nLines_) / sr;
-        // The wet signal's energy grows with the decay over the mean round
-        // trip (tau / meanLoop, the same law the early field is matched to):
-        // this gain takes it back, so the wet signal at full mix has the
-        // dry signal's level whatever the type, decay and size.
-        wetLevel_ = static_cast<T>((spring_ ? kWetCalibrationSpring : kWetCalibration) * std::sqrt(meanLoopSec_ * 2.0 * 6.907755278982137 / std::max(0.05, decay)));
         for (int i = 0; i < kMaxLines; ++i)
         {
             const auto l = static_cast<std::size_t>(i);
@@ -3062,6 +3261,12 @@ protected:
         const auto prevList = dqList_;
         const int prevCount = dqCount_;
         designDecayBands(decay, t60H, t60B, Kh, Kb);
+        // The wet signal's energy is that of the tail (the passes round the
+        // tank, band by band as heard) plus that of the early field: this
+        // gain takes both back, so the wet signal at full mix has the dry
+        // signal's level whatever the type, decay, damping and size.
+        wetLevel_ = static_cast<T>((spring_ ? kWetCalibrationSpring : kWetCalibration)
+            / std::sqrt(std::max(1e-6, heardTailEnergy(decay, t60H, t60B, Kh, Kb) + earlyEnergy())));
 
         // With signal in the tank the loop gains glide to the new design (a
         // step of them is a step of every line's output: a click); an empty
@@ -3142,6 +3347,99 @@ protected:
         const double nr = (1.0 + a) + (a - 1.0) * c, ni = -(a - 1.0) * sn;
         const double dr = (1.0 + b) + (b - 1.0) * c, di = -(b - 1.0) * sn;
         return std::sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+    }
+
+    /**
+     * @brief The energy of the tail for a unit of energy injected, as heard.
+     *        At each frequency the first pass leaves each line attenuated by
+     *        that line's own loop gain (the short lines first and louder),
+     *        and what follows is the geometric series of the mean round trip:
+     *        mean(g^2) / (1 - exp(-x)), x = 2 ln(1000) (mean round trip) /
+     *        T60, which tends to T60 / (2 ln(1000) round trip) for a long
+     *        decay. A spring is its own loop and its first pass is heard
+     *        unattenuated: 1 + 1 / (exp(x) - 1). The loop gains are those
+     *        just designed (the absorption, the bass shelf and the decay
+     *        bands); the frequencies weigh as programme is heard (pink,
+     *        through the loudness weighting: the low end out under about
+     *        40 Hz and 4 dB more over 2 kHz).
+     */
+    [[nodiscard]] double heardTailEnergy(double decay, double t60H, double t60B, double Kh, double Kb) const noexcept
+    {
+        const double sr = spec_.sampleRate, kPi = 3.14159265358979323846;
+        constexpr int kPoints = 24;
+        const double top = std::min(16000.0, 0.45 * sr);
+        double sum = 0.0, weight = 0.0;
+        for (int p = 0; p < kPoints; ++p)
+        {
+            const double f = 31.25 * std::pow(top / 31.25, static_cast<double>(p) / (kPoints - 1));
+            const double f2 = f * f, f4 = f2 * f2, hp = f4 / (f4 + 38.0 * 38.0 * 38.0 * 38.0);
+            const double heard = hp * (1.0 + 1.51 * f2 / (f2 + 1700.0 * 1700.0));
+            const double w = 2.0 * kPi * f / sr;
+            double t60 = 0.0, firstPass = 0.0;
+            for (int i = 0; i < nLines_; ++i)
+            {
+                const auto l = static_cast<std::size_t>(i);
+                const double M = spring_
+                    ? static_cast<double>(lenTarget_[l]) + springStages_ * springK_
+                          * (1.0 - static_cast<double>(springA_)) / (1.0 + static_cast<double>(springA_))
+                    : static_cast<double>(lenTarget_[l] + loopAPLen_[l]);
+                const double gM = std::pow(0.001, M / (decay * sr));
+                const double gH = std::min(std::pow(0.001, M / (t60H * sr)), gM);
+                const double gB = std::min(std::pow(0.001, M / (t60B * sr)), 0.9995);
+                const double rh = std::sqrt(gM / gH), rb = std::sqrt(gB / gM);
+                double g = gH * shelfGain(Kh * rh, Kh / rh, w) * shelfGain(Kb * rb, Kb / rb, w);
+                for (int k = 0; k < dqCount_; ++k)
+                {
+                    const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(k)]);
+                    BiquadCoeffs c;
+                    c.b0 = static_cast<double>(dqGoal_[0][b][l]);
+                    c.b1 = static_cast<double>(dqGoal_[1][b][l]);
+                    c.b2 = static_cast<double>(dqGoal_[2][b][l]);
+                    c.a1 = static_cast<double>(dqGoal_[3][b][l]);
+                    c.a2 = static_cast<double>(dqGoal_[4][b][l]);
+                    g *= biquadGain(c, w);
+                }
+                g = std::clamp(g, 1e-9, 0.9999999);
+                t60 += -3.0 * M / (sr * std::log10(g));
+                firstPass += g * g;
+            }
+            t60 /= static_cast<double>(std::max(1, nLines_));
+            firstPass /= static_cast<double>(std::max(1, nLines_));
+            const double x = std::min(2.0 * 6.907755278982137 * meanLoopSec_ / std::max(1e-3, t60), 50.0);
+            sum += heard * (spring_ ? 1.0 + 1.0 / std::expm1(x) : firstPass / -std::expm1(-x));
+            weight += heard;
+        }
+        return sum / weight;
+    }
+
+    /** @brief The early reflections' window of a type, in ms (none: both zero). */
+    static constexpr std::array<double, 2> earlyWindow(Type type) noexcept
+    {
+        switch (type)
+        {
+            case Type::Room:      return { 1.5, 35.0 };
+            case Type::Hall:      return { 5.0, 110.0 };
+            case Type::Chamber:   return { 3.0, 60.0 };
+            case Type::Cathedral: return { 10.0, 160.0 };
+            case Type::Plate:
+            case Type::Spring:    break;
+        }
+        return { 0.0, 0.0 };
+    }
+
+    /**
+     * @brief The energy of the early field in the tail's units: the tail's
+     *        own energy flow over the early window (see generateERTaps()).
+     */
+    [[nodiscard]] double earlyEnergy() const noexcept
+    {
+        const auto window = earlyWindow(erType_);
+        if (!(window[1] > window[0]) || meanLoopSec_ <= 0.0) return 0.0;
+        const double tau = static_cast<double>(decayTime_.load(std::memory_order_relaxed)) / (2.0 * 6.907755278982137);
+        const double tInj = static_cast<double>(erToLateSamples_.load(std::memory_order_relaxed)) / spec_.sampleRate
+                            + kMeanInjectMs * 1e-3;
+        return tau / meanLoopSec_
+             * (std::exp(-(window[0] * 1e-3 - tInj) / tau) - std::exp(-(window[1] * 1e-3 - tInj) / tau));
     }
 
     /** |H(e^jw)| of a biquad. */
@@ -3363,12 +3661,17 @@ protected:
         const int cap = eco_ ? kEcoERTaps : kMaxERTaps;
         switch (type)
         {
-            case Type::Room:      generateERTaps(1.5, 35.0, cap);                break;
-            case Type::Hall:      generateERTaps(5.0, 110.0, cap);               break;
-            case Type::Chamber:   generateERTaps(3.0, 60.0, cap);                break;
-            case Type::Plate:     generateERTaps(0.0, 0.0, 0);                   break;
+            case Type::Room:
+            case Type::Hall:
+            case Type::Chamber:
+            case Type::Cathedral:
+            {
+                const auto window = earlyWindow(type);
+                generateERTaps(window[0], window[1], cap);
+                break;
+            }
+            case Type::Plate:
             case Type::Spring:    generateERTaps(0.0, 0.0, 0);                   break;
-            case Type::Cathedral: generateERTaps(10.0, 160.0, cap);              break;
         }
     }
 

@@ -256,6 +256,19 @@ public:
         return compressors_[safeBand];
     }
 
+    /**
+     * @brief The mix of every band at once, 0 (dry) to 1 (any thread).
+     *
+     * Each band blends with itself as the crossover leaves it, so the sum is
+     * the programme through the crossover's phase blended with the compressed
+     * bands: a mix of one half is as flat as the crossover is. It sets each
+     * band's Compressor::setMix().
+     */
+    void setMix(T amount) noexcept
+    {
+        for (auto& compressor : compressors_) compressor.setMix(amount);
+    }
+
     // -- Convenience per-band setters ----------------------------------------
 
     /**

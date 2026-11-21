@@ -17,6 +17,16 @@
  * difference, so a band with another oversampling factor or antialiasing
  * order does not comb against its neighbours at the crossover.
  *
+ * setMix() blends the sum with the programme as the crossover leaves it (the
+ * bands summed without their curves, as late as the slowest band): the dry
+ * side carries the crossover's phase, so any mix is as flat as the crossover
+ * is, at the splits too. What still differs between the two sides is each
+ * band's own filtering (its Saturation's 20 Hz high-pass and DC filter lead
+ * the phase at the very bottom: 0.14 dB down at 100 Hz at a mix of one
+ * half). setOutputClip() puts an oversampled clipper after the sum, with a
+ * ceiling (setOutputCeiling()): many driven bands can add up to far more
+ * than any one of them.
+ *
  * Level and pan glide over 20 ms; mute and solo fade over 20 ms on a ramp of
  * their own. A band that is not heard (muted, or left out by a solo, once
  * its fade is over) is not computed: its Saturation is skipped and starts
@@ -26,7 +36,8 @@
  *  - prepare() / reset() / setOversampling() / setOversamplingMode() /
  *    setAntialiasing() / getState() / setState(): setup thread only.
  *  - setNumBands() / setCrossoverFrequency() / setOrder() /
- *    setCrossoverMode() / setCrossoverStructure() and the band setters
+ *    setCrossoverMode() / setCrossoverStructure() / setMix() /
+ *    setOutputClip() / setOutputCeiling() and the band setters
  *    (level, pan, mute, solo, and the convenience drive and algorithm
  *    setters): safe from any thread.
  *  - getBandSaturation(): the returned Saturation's parameter setters are
@@ -34,10 +45,11 @@
  *    are setup-thread.
  *  - getLatency() and the getters: safe from any thread.
  *
- * Dependencies: CrossoverFilter.h, Saturation.h, Core/AudioBuffer.h,
- * Core/AudioSpec.h, Core/DspMath.h, Core/StateBlob.h.
+ * Dependencies: Clipper.h, CrossoverFilter.h, Saturation.h,
+ * Core/AudioBuffer.h, Core/AudioSpec.h, Core/DspMath.h, Core/StateBlob.h.
  */
 
+#include "Clipper.h"
 #include "CrossoverFilter.h"
 #include "Saturation.h"
 #include "../Core/AudioBuffer.h"
@@ -101,8 +113,14 @@ public:
             bandBuffers_[static_cast<size_t>(b)].resize(spec.numChannels, spec.maxBlockSize);
             saturation_[static_cast<size_t>(b)]->prepare(spec);
         }
-        padLines_.assign(static_cast<size_t>(MaxBands) * static_cast<size_t>(std::max(spec.numChannels, 1))
+        // One line more than the bands: the dry sum waits for the slowest band too.
+        padLines_.assign(static_cast<size_t>(MaxBands + 1) * static_cast<size_t>(std::max(spec.numChannels, 1))
                          * static_cast<size_t>(kPadSize), T(0));
+        dryBuffer_.resize(spec.numChannels, spec.maxBlockSize);
+        clip_.setMode(Clipper<T>::Mode::Hard);
+        clip_.setOversampling(4);
+        clip_.setCeiling(outputCeilingDb_.load(std::memory_order_relaxed));
+        clip_.prepare(spec);
         fadeStep_ = 1.0 / std::max(1.0, kFadeSeconds * spec.sampleRate);
         reset();
         prepared_.store(true, std::memory_order_relaxed);
@@ -115,6 +133,10 @@ public:
         for (auto& band : saturation_) band->reset();
         std::fill(padLines_.begin(), padLines_.end(), T(0));
         padPos_ = 0;
+        clip_.reset();
+        clipping_ = outputClip_.load(std::memory_order_relaxed);
+        mixNow_ = static_cast<double>(mix_.load(std::memory_order_relaxed));
+        dryRunning_ = mixNow_ < 1.0;
         for (int b = 0; b < MaxBands; ++b)
         {
             BandRamp& ramp = ramps_[static_cast<size_t>(b)];
@@ -216,6 +238,49 @@ public:
         return band >= 0 && band < MaxBands && ramps_[static_cast<size_t>(band)].computed;
     }
 
+    // -- The sum ---------------------------------------------------------------
+
+    /**
+     * @brief Blends the sum of the bands with the programme, 0 (dry) to 1
+     *        (the default: the bands alone; any thread; glides over 20 ms).
+     *
+     * The dry side is the programme as the crossover leaves it (the bands
+     * summed without their curves) and as late as the slowest band, so it
+     * meets the processed bands in the crossover's phase: with no drive a
+     * mix of one half is as flat as the crossover is, at the splits too.
+     * Each band's own filters still act on its side alone: the 20 Hz
+     * high-pass and the DC filter of every Saturation lead the phase at the
+     * bottom (20 degrees at 100 Hz, which is 0.14 dB at a mix of one half;
+     * setPreFilterHpFrequency() and setDcBlocking() of the bands move it).
+     * Each band's own Saturation mix still acts inside its band.
+     */
+    void setMix(T amount) noexcept
+    {
+        if (std::isfinite(amount)) mix_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+    [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief An oversampled clipper after the sum (off by default; any thread).
+     *
+     * Driven bands add up to more than any one of them (six bands at their
+     * ceilings sum to several times full scale). With this on, the sum is
+     * clipped at setOutputCeiling() four times oversampled, and no sample
+     * leaves over the ceiling; under it nothing changes but the latency,
+     * which grows by the clipper's (getLatency() reports it).
+     */
+    void setOutputClip(bool on) noexcept { outputClip_.store(on, std::memory_order_relaxed); }
+    [[nodiscard]] bool getOutputClip() const noexcept { return outputClip_.load(std::memory_order_relaxed); }
+
+    /** @brief Ceiling of the output clipper, -24 to 0 dBFS (default 0; any thread). */
+    void setOutputCeiling(T dB) noexcept
+    {
+        if (!std::isfinite(dB)) return;
+        outputCeilingDb_.store(std::clamp(dB, T(-24), T(0)), std::memory_order_relaxed);
+        clip_.setCeiling(outputCeilingDb_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] T getOutputCeiling() const noexcept { return outputCeilingDb_.load(std::memory_order_relaxed); }
+
     // -- Settings shared by every band (setup thread) ----------------------------
 
     /** @brief The oversampling factor of every band (NOT real-time safe; see Saturation::setOversampling()). */
@@ -238,9 +303,14 @@ public:
      * @brief Latency in samples: the crossover's and the slowest band's.
      *
      * Every band is delayed to the slowest band's latency, so this is the
-     * latency of the sum whatever each band runs with.
+     * latency of the sum whatever each band runs with; the output clipper
+     * adds its own while it is on.
      */
-    [[nodiscard]] int getLatency() const noexcept { return crossover_.getLatency() + slowestBand(crossover_.getNumBands()); }
+    [[nodiscard]] int getLatency() const noexcept
+    {
+        return crossover_.getLatency() + slowestBand(crossover_.getNumBands())
+             + (outputClip_.load(std::memory_order_relaxed) ? clip_.getLatency() : 0);
+    }
 
     // -- State -----------------------------------------------------------------
 
@@ -253,6 +323,9 @@ public:
         w.write("order", crossover_.getOrder());
         w.write("xoverMode", static_cast<int32_t>(crossover_.getFilterMode()));
         w.write("xoverStructure", static_cast<int32_t>(crossover_.getStructure()));
+        w.write("mix", static_cast<float>(getMix()));
+        w.write("outputClip", getOutputClip());
+        w.write("outputCeiling", static_cast<float>(getOutputCeiling()));
         char key[32];
         for (int i = 0; i < n - 1; ++i)
         {
@@ -285,6 +358,9 @@ public:
         setOrder(r.read("order", int32_t(24)));
         setCrossoverMode(static_cast<typename Crossover::FilterMode>(std::clamp(static_cast<int>(r.read("xoverMode", int32_t(0))), 0, 1)));
         setCrossoverStructure(static_cast<typename Crossover::Structure>(std::clamp(static_cast<int>(r.read("xoverStructure", int32_t(0))), 0, 1)));
+        setMix(static_cast<T>(r.read("mix", 1.0f)));
+        setOutputClip(r.read("outputClip", false));
+        setOutputCeiling(static_cast<T>(r.read("outputCeiling", 0.0f)));
         char key[32];
         for (int i = 0; i < n - 1; ++i)
         {
@@ -382,6 +458,36 @@ private:
 
         const bool soloing = anySolo();
         const int slowest = slowestBand(nb);
+
+        // The dry side of the mix: the bands as the crossover leaves them,
+        // summed before their curves, through a line as long as the slowest
+        // band. It runs while the mix is, or is on its way, under one.
+        const double mixTarget = static_cast<double>(mix_.load(std::memory_order_relaxed));
+        const bool dry = mixTarget < 1.0 || mixNow_ < 1.0;
+        if (dry && !dryRunning_) clearPad(MaxBands);
+        dryRunning_ = dry;
+        if (dry)
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* sum = dryBuffer_.getChannel(ch);
+                std::copy_n(views_[0].getChannel(ch), nS, sum);
+                for (int b = 1; b < nb; ++b)
+                {
+                    const T* band = views_[static_cast<size_t>(b)].getChannel(ch);
+                    for (int i = 0; i < nS; ++i) sum[i] += band[i];
+                }
+                T* line = padLines_.data() + (static_cast<size_t>(MaxBands) * static_cast<size_t>(bandBuffers_[0].getNumChannels())
+                                              + static_cast<size_t>(ch)) * static_cast<size_t>(kPadSize);
+                int pos = padPos_;
+                for (int i = 0; i < nS; ++i)
+                {
+                    line[pos] = sum[i];
+                    sum[i] = line[(pos - slowest) & (kPadSize - 1)];
+                    pos = (pos + 1) & (kPadSize - 1);
+                }
+            }
+        }
         for (int ch = 0; ch < nCh; ++ch) std::fill_n(buffer.getChannel(ch), nS, T(0));
 
         for (int b = 0; b < nb; ++b)
@@ -450,6 +556,45 @@ private:
         // Bands past the count (after a change of it) are left as they were.
         padPos_ = (padPos_ + nS) & (kPadSize - 1);
         for (int b = nb; b < MaxBands; ++b) ramps_[static_cast<size_t>(b)].computed = false;
+
+        // The mix, gliding like the levels do.
+        if (dry)
+        {
+            const double step = std::clamp(mixTarget - mixNow_, -fadeStep_, fadeStep_);
+            double mix = mixNow_;
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                const T* d = dryBuffer_.getChannel(ch);
+                T* out = buffer.getChannel(ch);
+                mix = mixNow_;
+                for (int i = 0; i < nS; ++i)
+                {
+                    if (mix != mixTarget)
+                    {
+                        mix += step;
+                        if ((step > 0.0 && mix > mixTarget) || (step < 0.0 && mix < mixTarget)) mix = mixTarget;
+                    }
+                    out[i] = static_cast<T>(static_cast<double>(d[i]) + mix * (static_cast<double>(out[i]) - static_cast<double>(d[i])));
+                }
+            }
+            mixNow_ = mix;
+        }
+
+        // The clipper after the sum, and no sample over its ceiling (its
+        // filters ring a little past it).
+        const bool clip = outputClip_.load(std::memory_order_relaxed);
+        if (clip && !clipping_) clip_.reset();
+        clipping_ = clip;
+        if (clip)
+        {
+            clip_.processBlock(buffer.getSubView(0, nS));
+            const T top = decibelsToGain(outputCeilingDb_.load(std::memory_order_relaxed));
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* out = buffer.getChannel(ch);
+                for (int i = 0; i < nS; ++i) out[i] = std::clamp(out[i], -top, top);
+            }
+        }
     }
 
     void clearPad(int band) noexcept
@@ -466,8 +611,14 @@ private:
     std::array<AudioBufferView<T>, MaxBands> views_ {};
     std::array<BandParams, MaxBands> params_ {};
     std::array<BandRamp, MaxBands> ramps_ {};
-    std::vector<T> padLines_;   ///< Per band and channel, kPadSize samples each.
+    std::vector<T> padLines_;   ///< Per band (and one more for the dry sum) and channel, kPadSize samples each.
     int padPos_ = 0;
+    AudioBuffer<T> dryBuffer_;                      ///< The bands summed before their curves, for the mix.
+    Clipper<T> clip_;                               ///< The clipper after the sum.
+    std::atomic<T> mix_ { T(1) }, outputCeilingDb_ { T(0) };
+    std::atomic<bool> outputClip_ { false };
+    double mixNow_ = 1.0;                           ///< The mix as it glides (audio thread).
+    bool dryRunning_ = false, clipping_ = false;    ///< The dry line and the clipper ran in the last chunk.
     double fadeStep_ = 1.0 / 960.0;
 };
 

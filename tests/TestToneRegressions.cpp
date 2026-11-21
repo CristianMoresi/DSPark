@@ -970,3 +970,94 @@ DSPARK_TEST(Tone_eq_analog_band_glides_through_the_bands_in_between)
     EXPECT_NEAR(hz, 3200.0, 30.0);
     EXPECT_NEAR(gain, 12.0, 0.05);
 }
+
+// New: resonant shelves and a second-order tilt. By its Q a shelf keeps its
+// plateau and its half gain at the corner and rises over the plateau, more
+// the higher the Q; its cut is the inverse of its boost; the digital section
+// follows it. In the equaliser it is an option (a Q above 0.7071 read as
+// 0.7071 otherwise) and the audio follows the curve drawn.
+DSPARK_TEST(Tone_eq_resonant_shelves_and_second_order_tilt)
+{
+    using EQ = Equalizer<float>;
+    const double fs = 48000.0;
+    const FilterDesign::Band band(fs);
+    double last = -1.0, corner = 0.0, plateau = 0.0, inverse = 0.0, digital = 0.0, high = 0.0;
+    for (const double q : { 0.7071067811865476, 1.0, 2.0, 4.0 })
+    {
+        const AnalogSection up = AnalogSection::lowShelfQ(1000.0, 12.0, q), down = AnalogSection::lowShelfQ(1000.0, -12.0, q);
+        const AnalogSection top = AnalogSection::highShelfQ(1000.0, 12.0, q);
+        corner = std::max(corner, std::abs(up.magnitudeDb(1000.0) - 6.0));
+        plateau = std::max({ plateau, std::abs(up.magnitudeDb(1.0) - 12.0), std::abs(up.magnitudeDb(200000.0)) });
+        const BiquadCoeffs d = FilterDesign::digital(up, band);
+        double over = 0.0;
+        for (double f = 20.0; f < 20000.0; f *= std::pow(2.0, 1.0 / 24.0))
+        {
+            over = std::max(over, up.magnitudeDb(f) - 12.0);
+            inverse = std::max(inverse, std::abs(up.magnitudeDb(f) + down.magnitudeDb(f)));
+            // The high shelf is the low one mirrored about the corner.
+            high = std::max(high, std::abs(top.magnitudeDb(f) - up.magnitudeDb(1.0e6 / f)));
+            const double w = 2.0 * kPiT * f / fs;
+            const double c1 = std::cos(w), s1 = std::sin(w), c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
+            const double nr = d.b0 + d.b1 * c1 + d.b2 * c2, ni = d.b1 * s1 + d.b2 * s2;
+            const double dr = 1.0 + d.a1 * c1 + d.a2 * c2, di = d.a1 * s1 + d.a2 * s2;
+            digital = std::max(digital, std::abs(10.0 * std::log10((nr * nr + ni * ni) / (dr * dr + di * di)) - up.magnitudeDb(f)));
+        }
+        std::printf("  [eq] a low shelf of +12 dB at a Q of %.2f rises %.2f dB over its plateau\n", q, over);
+        EXPECT_GT(over, last);
+        last = over;
+    }
+    const AnalogSection tilt = AnalogSection::tiltSecondOrder(1000.0, 12.0), slow = AnalogSection::tilt(1000.0, 12.0);
+    std::printf("  [eq] shelves by their Q: corner within %.1e dB of half the gain, plateaus within %.1e, cut plus boost %.1e, mirrored %.1e, digital within %.2f dB to 20 kHz; tilt of order 2: %.2f, %.2f and %.2f dB at 1 Hz, the pivot and 200 kHz, %.2f dB an octave up (%.2f of order 1)\n",
+                corner, plateau, inverse, high, digital, tilt.magnitudeDb(1.0), tilt.magnitudeDb(1000.0), tilt.magnitudeDb(200000.0),
+                tilt.magnitudeDb(2000.0), slow.magnitudeDb(2000.0));
+    EXPECT_LT(corner, 1e-9);
+    EXPECT_LT(plateau, 1e-3);
+    EXPECT_LT(inverse, 1e-9);
+    EXPECT_LT(high, 1e-9);
+    EXPECT_LT(digital, 0.25);
+    EXPECT_NEAR(tilt.magnitudeDb(1.0), -6.0, 1e-3);
+    EXPECT_NEAR(tilt.magnitudeDb(1000.0), 0.0, 1e-9);
+    EXPECT_NEAR(tilt.magnitudeDb(200000.0), 6.0, 1e-3);
+    EXPECT_GT(tilt.magnitudeDb(2000.0), slow.magnitudeDb(2000.0) + 0.5);
+
+    // In the equaliser: the same curve with the option off, a rise with it on, and the audio on the curve.
+    const auto drawn = [](EQ& eq, float hz) {
+        float m = 0.0f;
+        eq.getMagnitudeForFrequencyArray(&hz, &m, 1);
+        return 20.0 * std::log10(static_cast<double>(m));
+    };
+    auto plain = std::make_unique<EQ>(), wide = std::make_unique<EQ>(), rung = std::make_unique<EQ>();
+    for (EQ* eq : { plain.get(), wide.get(), rung.get() })
+    {
+        EQ::BandConfig cfg;
+        cfg.type = EQ::BandType::LowShelf;
+        cfg.frequency = 1000.0f;
+        cfg.gain = 12.0f;
+        cfg.q = eq == plain.get() ? 0.7071f : 3.0f;
+        eq->setBand(0, cfg);
+    }
+    rung->setResonantShelves(true);
+    for (EQ* eq : { plain.get(), wide.get(), rung.get() }) eq->prepare(spec(fs, 256, 1));
+    double same = 0.0, rise = 0.0;
+    float where = 0.0f;
+    for (float f = 50.0f; f < 16000.0f; f *= 1.0595f)
+    {
+        same = std::max(same, std::abs(drawn(*wide, f) - drawn(*plain, f)));
+        const double over = drawn(*rung, f) - 12.0;
+        if (over > rise) { rise = over; where = f; }
+    }
+    Planar x(1, 48000);
+    fillSine(x, static_cast<double>(where), fs, 0.1f);
+    runBlocks(*rung, x, 256);
+    const double heard = 20.0 * std::log10(toneAmp(x.p[0], 24000, 48000, static_cast<double>(where), fs) / 0.1);
+    std::printf("  [eq] in the equaliser: option off, a Q of 3 within %.1e dB of 0.7071; on, %.2f dB over the plateau at %.0f Hz, heard %.2f dB (drawn %.2f)\n",
+                same, rise, static_cast<double>(where), heard, drawn(*rung, where));
+    EXPECT_LT(same, 1e-4);
+    EXPECT_GT(rise, 1.0);
+    EXPECT_NEAR(heard, drawn(*rung, where), 0.1);
+    EXPECT_TRUE(rung->isResonantShelves());
+    const auto blob = rung->getState();
+    EQ other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(other.isResonantShelves());
+}

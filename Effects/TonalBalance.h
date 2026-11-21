@@ -30,7 +30,11 @@
  * its threshold in quiet, in full from 10 dB over it. In the bands at the
  * ends, where the threshold climbs, a programme's loudness is almost
  * nothing, and read as a level it would be a hole of tens of decibels; an
- * inaudible band neither shapes the trend nor takes a correction.
+ * inaudible band neither shapes the trend nor takes a correction. And a
+ * band far under the programme (setFloor() dB under its loudest band, in
+ * the model's level) is the floor of a recording or the end of the content:
+ * the balance does not give it back, though a dip between two sides that
+ * sound is still filled.
  *
  * From there: a broad trend across the bands (a smoothing in which each band
  * weighs by its audibility), and two deviations per band, the trend against
@@ -107,6 +111,17 @@ class TonalBalance
 {
 public:
     static constexpr int kBands = 72;      ///< Bands of the analysis and of the bank.
+
+    /**
+     * @brief What a balanced programme is (setReference()). FlatLoudness, the
+     *        default: the same loudness in every band of the ear's scale.
+     *        EvenPower: the loudness, band by band, of a programme with the
+     *        same power in every band at this programme's level, read
+     *        through the same model; it already falls where the ear's
+     *        threshold climbs and follows the level (a quiet programme is
+     *        not asked for the low end only a loud one can show).
+     */
+    enum class Reference { FlatLoudness, EvenPower };
     static constexpr int kMaxChannels = 2; ///< Channels processed (more pass through).
 
     /** @brief Allocates for a rate and a layout (an invalid spec is ignored). */
@@ -145,7 +160,7 @@ public:
         frame_.assign(static_cast<size_t>(fft_), 0.0);
         binPower_.assign(static_cast<size_t>(bins_), 0.0);
         binSmooth_.assign(static_cast<size_t>(bins_), 0.0);
-        for (auto* v : { &ll_, &rr_, &lr_, &li_, &loud_, &corr_, &tmpA_, &tmpB_, &tmpC_, &tmpD_ }) v->assign(kBands, 0.0);
+        for (auto* v : { &ll_, &rr_, &lr_, &li_, &loud_, &evenLoud_, &corr_, &tmpA_, &tmpB_, &tmpC_, &tmpD_ }) v->assign(kBands, 0.0);
         for (int b = 0; b < kBands; ++b)
         {
             const double tau = 0.001 * std::clamp(200.0 * std::pow(1000.0 / bands_.getCentre(b), 0.3), 20.0, 2000.0);
@@ -160,7 +175,7 @@ public:
     {
         for (auto& r : ring_) std::fill(r.begin(), r.end(), 0.0);
         for (auto& d : delay_) std::fill(d.begin(), d.end(), T(0));
-        for (auto* v : { &ll_, &rr_, &lr_, &li_, &loud_, &corr_ }) std::fill(v->begin(), v->end(), 0.0);
+        for (auto* v : { &ll_, &rr_, &lr_, &li_, &loud_, &evenLoud_, &corr_ }) std::fill(v->begin(), v->end(), 0.0);
         ringPos_ = delayPos_ = hopCounter_ = hops_ = 0;
         keyFade_ = 0.0;
         warm_ = false;
@@ -169,6 +184,10 @@ public:
         bank_.setGains(zero.data(), 0, 0);
         for (auto& g : published_) g.store(T(0), std::memory_order_relaxed);
         loudnessChange_.store(T(0), std::memory_order_relaxed);
+        raised_.store(T(0), std::memory_order_relaxed);
+        lowered_.store(T(0), std::memory_order_relaxed);
+        total_.store(T(-200), std::memory_order_relaxed);
+        centroidShift_.store(T(0), std::memory_order_relaxed);
     }
 
     // -- Controls ------------------------------------------------------------
@@ -185,6 +204,23 @@ public:
     void setRange(T db) noexcept { store(range_, db, T(0), T(24)); }
     /** @brief Knee of the correction curves, 0.1 to 12 dB (default 3). */
     void setKnee(T db) noexcept { store(knee_, db, T(0.1), T(12)); }
+    /**
+     * @brief Rounds the approach to the range, 0 to 6 dB (0, the default, is
+     *        the hard limit): a correction that grows (a dip that deepens)
+     *        bends into the range through a second knee and settles on it,
+     *        with no corner.
+     */
+    void setRangeKnee(T db) noexcept { store(rangeKnee_, db, T(0), T(6)); }
+    /**
+     * @brief How far under its loudest band (in the model's level) a band may
+     *        lie and still be given back by the balance, 10 to 120 dB
+     *        (default 30). What lies further down is the floor of a recording
+     *        or the end of the content: the balance leaves it where it is,
+     *        and it takes no part in keeping the loudness. The last 10 dB
+     *        over the floor fade in. A dip between two sides that sound is
+     *        filled whatever its depth.
+     */
+    void setFloor(T db) noexcept { store(floor_, db, T(10), T(120)); }
     /** @brief Frequencies the corrections act on, with edges one Bark wide (default 40 Hz to 16 kHz: the ends of the band, where the threshold in quiet climbs, are left alone). */
     void setFrequencyRange(T loHz, T hiHz) noexcept
     {
@@ -192,6 +228,11 @@ public:
         const T lo = std::clamp(std::min(loHz, hiHz), T(10), T(24000));
         loHz_.store(lo, std::memory_order_relaxed);
         hiHz_.store(std::clamp(std::max(loHz, hiHz), lo, T(24000)), std::memory_order_relaxed);
+    }
+    /** @brief The shape the programme is compared against (see Reference; out-of-range values read as FlatLoudness). */
+    void setReference(Reference r) noexcept
+    {
+        reference_.store(r == Reference::EvenPower ? Reference::EvenPower : Reference::FlatLoudness, std::memory_order_relaxed);
     }
     /** @brief Loudness to decibels with each band's exponent (default off: one exponent). */
     void setLevelCompensation(bool on) noexcept { levelComp_.store(on, std::memory_order_relaxed); }
@@ -204,9 +245,12 @@ public:
     [[nodiscard]] T getTilt() const noexcept { return tilt_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRange() const noexcept { return range_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getKnee() const noexcept { return knee_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getRangeKnee() const noexcept { return rangeKnee_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getFloor() const noexcept { return floor_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getLowFrequency() const noexcept { return loHz_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getHighFrequency() const noexcept { return hiHz_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool getLevelCompensation() const noexcept { return levelComp_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Reference getReference() const noexcept { return reference_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getReferenceLevel() const noexcept { return referenceSpl_.load(std::memory_order_relaxed); }
 
     /** @return The latency in samples (the analysis delay plus the bank's). */
@@ -225,6 +269,18 @@ public:
      *         room to make up for it (a readout for any thread).
      */
     [[nodiscard]] T getLoudnessChange() const noexcept { return loudnessChange_.load(std::memory_order_relaxed); }
+    /**
+     * @return The share of the programme's loudness that the bands raised
+     *         have gained (0 or more; 0.1 is a tenth of the total). A readout
+     *         for any thread, like the three below.
+     */
+    [[nodiscard]] T getLoudnessRaised() const noexcept { return raised_.load(std::memory_order_relaxed); }
+    /** @return The share of the programme's loudness that the bands lowered have lost (0 or less). */
+    [[nodiscard]] T getLoudnessLowered() const noexcept { return lowered_.load(std::memory_order_relaxed); }
+    /** @return The programme's total loudness as the model reads it, in dB (10 log10 of the sum of the bands' loudness; -200 in silence). */
+    [[nodiscard]] T getLoudness() const noexcept { return total_.load(std::memory_order_relaxed); }
+    /** @return How far the corrections move the centre of the loudness along the ear's scale, in Bark (positive: brighter). */
+    [[nodiscard]] T getCentroidShift() const noexcept { return centroidShift_.load(std::memory_order_relaxed); }
     /** @return The bank's response at a frequency in dB (audio thread or after processing). */
     [[nodiscard]] double getResponse(double hz) const noexcept { return bank_.responseDb(hz); }
 
@@ -250,9 +306,12 @@ public:
         w.write("tilt", static_cast<float>(getTilt()));
         w.write("range", static_cast<float>(getRange()));
         w.write("knee", static_cast<float>(getKnee()));
+        w.write("rangeKnee", static_cast<float>(getRangeKnee()));
+        w.write("floor", static_cast<float>(getFloor()));
         w.write("loHz", static_cast<float>(getLowFrequency()));
         w.write("hiHz", static_cast<float>(getHighFrequency()));
         w.write("levelComp", getLevelCompensation());
+        w.write("reference", static_cast<int32_t>(getReference()));
         w.write("refSpl", static_cast<float>(getReferenceLevel()));
         return w.blob();
     }
@@ -267,8 +326,11 @@ public:
         setTilt(static_cast<T>(r.read("tilt", 0.0f)));
         setRange(static_cast<T>(r.read("range", 6.0f)));
         setKnee(static_cast<T>(r.read("knee", 3.0f)));
+        setRangeKnee(static_cast<T>(r.read("rangeKnee", 0.0f)));
+        setFloor(static_cast<T>(r.read("floor", 30.0f)));
         setFrequencyRange(static_cast<T>(r.read("loHz", 40.0f)), static_cast<T>(r.read("hiHz", 16000.0f)));
         setLevelCompensation(r.read("levelComp", false));
+        setReference(r.read("reference", 0) == 1 ? Reference::EvenPower : Reference::FlatLoudness);
         setReferenceLevel(static_cast<T>(r.read("refSpl", 100.0f)));
         return true;
     }
@@ -380,13 +442,23 @@ private:
         bands_.specificLoudness(tmpA_.data(), tmpB_.data());
         const bool comp = levelComp_.load(std::memory_order_relaxed);
         constexpr double kMidExponent = 0.23;
+        // The even programme: the same power in every band (the mean of this
+        // programme's), and its loudness through the same model and the same
+        // smoothing in time.
+        double meanPower = 0.0;
+        for (int b = 0; b < kBands; ++b) meanPower += tmpA_[static_cast<size_t>(b)];
+        meanPower /= kBands;
+        for (int b = 0; b < kBands; ++b) tmpD_[static_cast<size_t>(b)] = meanPower;
+        bands_.specificLoudness(tmpD_.data(), tmpC_.data());
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
             const double c = warm_ ? timeCoeff_[i] : 0.0;
             loud_[i] = tmpB_[i] + c * (loud_[i] - tmpB_[i]);
+            evenLoud_[i] = tmpC_[i] + c * (evenLoud_[i] - tmpC_[i]);
         }
         warm_ = true;
+        const bool evenPower = reference_.load(std::memory_order_relaxed) == Reference::EvenPower;
         // Loudness in decibels of power, the trend, the two deviations.
         const double tilt = static_cast<double>(tilt_.load(std::memory_order_relaxed));
         const double lo = static_cast<double>(loHz_.load(std::memory_order_relaxed));
@@ -398,18 +470,35 @@ private:
         // level would read as a hole of tens of decibels: it neither shapes
         // the trend nor takes a correction (filling it would raise content
         // nobody hears, the ends of the band first).
-        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, audible {}, weighed {};
+        std::array<double, kBands> level {}, trend {}, weight {}, exponent {}, audible {}, weighed {}, present {};
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
             exponent[i] = comp ? bands_.getExponent(b) : kMidExponent;
             level[i] = 10.0 * std::log10(loud_[i] + 1e-12) / exponent[i];
+            // Against the even programme, the level is how far this one
+            // stands from it in each band.
+            if (evenPower) level[i] -= 10.0 * std::log10(evenLoud_[i] + 1e-12) / exponent[i];
             const double over = 10.0 * std::log10((tmpA_[i] + 1e-30) / bands_.getThreshold(b));
             audible[i] = std::clamp(over / kAudibleSpan, 0.0, 1.0);
             trend[i] = audible[i] * level[i];
             weighed[i] = audible[i];
             const double z = bands_.getBark(b);
             weight[i] = std::clamp(z - zLo + 0.5, 0.0, 1.0) * std::clamp(zHi - z + 0.5, 0.0, 1.0) * audible[i];
+        }
+        // How far under the programme each band lies: one setFloor() dB under
+        // the loudest audible band (in the model's level) is no part of the
+        // balance to give back (the floor of a recording, what lies past the
+        // end of the content), and it takes neither the balance nor the
+        // offset that keeps the loudness; it counts in full from kMaskedSpan
+        // dB over that. A dip between two sides that sound is still a dip.
+        {
+            const double floorDb = static_cast<double>(floor_.load(std::memory_order_relaxed));
+            double loudest = -1e9;
+            for (int b = 0; b < kBands; ++b)
+                if (audible[static_cast<size_t>(b)] > 0.0) loudest = std::max(loudest, level[static_cast<size_t>(b)]);
+            for (int b = 0; b < kBands; ++b)
+                present[static_cast<size_t>(b)] = std::clamp((level[static_cast<size_t>(b)] - loudest + floorDb) / kMaskedSpan, 0.0, 1.0);
         }
         // The trend across the bands, each weighed by how audible it is (a
         // normalized smoothing: the audible neighbours of a band decide it).
@@ -461,14 +550,29 @@ private:
         const double range = static_cast<double>(range_.load(std::memory_order_relaxed));
         const double knee = static_cast<double>(knee_.load(std::memory_order_relaxed));
         const auto soft = [knee](double d) { return std::copysign(std::sqrt(d * d + knee * knee) - knee, d); };
+        const double rangeKnee = static_cast<double>(rangeKnee_.load(std::memory_order_relaxed));
+        // The limit of the range: hard, or the smaller of the correction and
+        // the range through a hyperbola (set to pass through 0 and to settle
+        // on the range).
+        const double atZero = 0.5 * (range - std::sqrt(range * range + rangeKnee * rangeKnee));
+        const auto limited = [range, rangeKnee, atZero](double c) {
+            if (!(rangeKnee > 0.0)) return std::clamp(c, -range, range);
+            const double a = std::abs(c), past = a - range;
+            const double rounded = 0.5 * (a + range - std::sqrt(past * past + rangeKnee * rangeKnee));
+            return std::copysign((rounded - atZero) * range / (range - atZero), c);
+        };
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
             const double global = tmpC_[i] - meanDev;
             const double dip = std::min(0.0, level[i] - std::min(below[i], above[i]));
             const double peak = std::max(0.0, level[i] - std::max(below[i], above[i]));
-            double c = -balance * soft(global) - trimPeaks * soft(peak) - fillDips * soft(dip);
-            c = std::clamp(c, -range, range) * weight[i];
+            // The balance by how present the band is (limited first, so a band
+            // half way down to the floor takes half of it), then the local
+            // contrast.
+            double c = -balance * soft(global);
+            if (present[i] < 1.0) c = limited(c) * present[i];
+            c = limited(c - trimPeaks * soft(peak) - fillDips * soft(dip)) * weight[i];
             corr_[i] = c;
         }
         // The total loudness stays: every band in range takes the same
@@ -492,10 +596,10 @@ private:
             for (int b = 0; b < kBands; ++b)
             {
                 const auto i = static_cast<size_t>(b);
-                const double raw = corr_[i] + offset * weight[i] / exponent[i];
+                const double raw = corr_[i] + offset * weight[i] * present[i] / exponent[i];
                 const double l = part[i] * std::exp(kPerDb * exponent[i] * std::clamp(raw, -range, range));
                 sum += l;
-                if (raw > -range && raw < range) slope += l * kPerDb * weight[i];
+                if (raw > -range && raw < range) slope += l * kPerDb * weight[i] * present[i];
             }
             return sum;
         };
@@ -528,9 +632,30 @@ private:
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
-            corr_[i] = std::clamp(corr_[i] + offset * weight[i] / exponent[i], -range, range);
+            corr_[i] = std::clamp(corr_[i] + offset * weight[i] * present[i] / exponent[i], -range, range);
             gains[i] = static_cast<T>(corr_[i]);
             published_[i].store(gains[i], std::memory_order_relaxed);
+        }
+        // What the corrections do to the loudness: the share the raised bands
+        // gain, the share the lowered ones lose, the total, and how far its
+        // centre moves along the ear's scale.
+        {
+            double raised = 0.0, lowered = 0.0, after = 0.0, centreBefore = 0.0, centreAfter = 0.0;
+            for (int b = 0; b < kBands; ++b)
+            {
+                const auto i = static_cast<size_t>(b);
+                const double l = part[i] * std::exp(kPerDb * exponent[i] * corr_[i]);
+                const double d = l - part[i];
+                if (d > 0.0) raised += d; else lowered += d;
+                after += l;
+                centreBefore += part[i] * bands_.getBark(b);
+                centreAfter += l * bands_.getBark(b);
+            }
+            const bool sounding = before > 1e-20 && after > 1e-20;
+            raised_.store(static_cast<T>(sounding ? raised / before : 0.0), std::memory_order_relaxed);
+            lowered_.store(static_cast<T>(sounding ? lowered / before : 0.0), std::memory_order_relaxed);
+            total_.store(static_cast<T>(sounding ? 10.0 * std::log10(before) : -200.0), std::memory_order_relaxed);
+            centroidShift_.store(static_cast<T>(sounding ? centreAfter / after - centreBefore / before : 0.0), std::memory_order_relaxed);
         }
         // The bank refines one hop in eight and carries that correction over
         // the others, so its response does not step with a period of eight hops.
@@ -538,6 +663,7 @@ private:
     }
 
     static constexpr double kAudibleSpan = 10.0;  ///< dB over the threshold in quiet from which a band counts in full.
+    static constexpr double kMaskedSpan = 10.0;   ///< dB over the floor from which a band counts in full for the balance.
     static constexpr double kSidePole = 0.9;      ///< Pole of the one-sided averages a dip or a peak is read against.
     static constexpr double kOffsetLimit = 60.0;  ///< Largest loudness offset looked for, in dB.
     static constexpr int kOffsetSteps = 8;        ///< Steps of the search for the loudness offset.
@@ -550,8 +676,10 @@ private:
     std::atomic<T> balance_ { T(0.5) }, fillDips_ { T(0.3) }, trimPeaks_ { T(0.5) }, tilt_ { T(0) };
     std::atomic<T> range_ { T(6) }, knee_ { T(3) }, loHz_ { T(40) }, hiHz_ { T(16000) }, referenceSpl_ { T(100) };
     std::atomic<bool> levelComp_ { false }, refDirty_ { false };
+    std::atomic<Reference> reference_ { Reference::FlatLoudness };
     std::array<std::atomic<T>, kBands> published_ {};
-    std::atomic<T> loudnessChange_ { T(0) };
+    std::atomic<T> loudnessChange_ { T(0) }, raised_ { T(0) }, lowered_ { T(0) }, total_ { T(-200) }, centroidShift_ { T(0) };
+    std::atomic<T> rangeKnee_ { T(0) }, floor_ { T(30) };
 
     std::unique_ptr<FFTReal<double>> transform_;
     AuditoryBands<double> bands_;
@@ -560,7 +688,7 @@ private:
     std::vector<double> window_, frame_, binPower_, binSmooth_;
     std::vector<std::vector<double>> ring_, spectra_;
     std::vector<std::vector<T>> delay_;
-    std::vector<double> ll_, rr_, lr_, li_, loud_, corr_, tmpA_, tmpB_, tmpC_, tmpD_;
+    std::vector<double> ll_, rr_, lr_, li_, loud_, evenLoud_, corr_, tmpA_, tmpB_, tmpC_, tmpD_;
     std::array<double, kBands> timeCoeff_ {};
 };
 

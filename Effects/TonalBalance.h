@@ -132,6 +132,17 @@ public:
      *        (setResponseTime()), so the whole curve moves together.
      */
     enum class Response { ByBand, Common };
+
+    /**
+     * @brief How fine the analysis and the bank run (setQuality(); it
+     *        applies at the next prepare()). Realtime, the default: a hop of
+     *        a sixteenth of the transform, the bank's gains refined one hop
+     *        in eight and carried over the others. Render: half that hop,
+     *        and the bank refined three times at every hop (its response
+     *        lands closer to the corrections asked), at about three times
+     *        the cost. The latency is the same in both.
+     */
+    enum class Quality { Realtime, Render };
     static constexpr int kMaxChannels = 2; ///< Channels processed (more pass through).
 
     /** @brief Allocates for a rate and a layout (an invalid spec is ignored). */
@@ -145,7 +156,12 @@ public:
         const int octaves = static_cast<int>(std::lround(std::log2(std::max(fs_, 8000.0) / 48000.0)));
         fft_ = std::clamp(2048 << std::max(0, octaves), 1024, 16384);
         if (octaves < 0) fft_ = std::max(512, 2048 >> -octaves);
-        hop_ = std::max(16, fft_ / 16);
+        // The render quality halves the hop; the programme waits as long in both.
+        render_ = quality_.load(std::memory_order_relaxed) == Quality::Render
+            || (qualityFollowsRender_.load(std::memory_order_relaxed) && offlineRendering_.load(std::memory_order_relaxed));
+        qualityInUse_.store(render_ ? Quality::Render : Quality::Realtime, std::memory_order_relaxed);
+        const int realtimeHop = std::max(16, fft_ / 16);
+        hop_ = render_ ? std::max(8, realtimeHop / 2) : realtimeHop;
         const int fall = fft_ / 8;
         transform_ = std::make_unique<FFTReal<double>>(static_cast<size_t>(fft_));
         window_.resize(static_cast<size_t>(fft_));
@@ -156,7 +172,7 @@ public:
         powerScale_ = 4.0 / (sw * sw);
         // The programme waits for the analysis: from the window's centre of
         // mass to its end, plus half a hop (the gains glide over a hop).
-        analysisDelay_ = std::max(1, static_cast<int>(std::lround(static_cast<double>(fft_ - 1) - swi / sw + 0.5 * hop_)));
+        analysisDelay_ = std::max(1, static_cast<int>(std::lround(static_cast<double>(fft_ - 1) - swi / sw + 0.5 * realtimeHop)));
         bins_ = fft_ / 2 + 1;
         bands_.prepare(fs_, fft_, kBands, 20.0, std::min(20000.0, 0.45 * fs_));
         bands_.setReferenceSpl(static_cast<double>(referenceSpl_.load(std::memory_order_relaxed)));
@@ -247,6 +263,16 @@ public:
     {
         reference_.store(r == Reference::EvenPower ? Reference::EvenPower : Reference::FlatLoudness, std::memory_order_relaxed);
     }
+    /** @brief Realtime or Render (see Quality; applies at the next prepare()). */
+    void setQuality(Quality q) noexcept { quality_.store(q == Quality::Render ? Quality::Render : Quality::Realtime, std::memory_order_relaxed); }
+    /**
+     * @brief With it on, a prepare() made while the host renders offline
+     *        (setOfflineRendering(true)) takes the Render quality whatever
+     *        setQuality() says (off by default).
+     */
+    void setQualityFollowsRender(bool on) noexcept { qualityFollowsRender_.store(on, std::memory_order_relaxed); }
+    /** @brief Tells the processor whether the host renders offline (read by the next prepare()). */
+    void setOfflineRendering(bool on) noexcept { offlineRendering_.store(on, std::memory_order_relaxed); }
     /** @brief How the analysis follows the programme in time (see Response; out-of-range values read as ByBand). */
     void setResponse(Response r) noexcept
     {
@@ -297,6 +323,10 @@ public:
     [[nodiscard]] bool getLocalSlope() const noexcept { return localSlope_.load(std::memory_order_relaxed); }
     [[nodiscard]] Reference getReference() const noexcept { return reference_.load(std::memory_order_relaxed); }
     [[nodiscard]] Response getResponse() const noexcept { return response_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Quality getQuality() const noexcept { return quality_.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool getQualityFollowsRender() const noexcept { return qualityFollowsRender_.load(std::memory_order_relaxed); }
+    /** @return The quality the last prepare() took. */
+    [[nodiscard]] Quality getQualityInUse() const noexcept { return qualityInUse_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getResponseTime() const noexcept { return responseMs_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getListeningCompensation() const noexcept { return listening_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getReferenceLevel() const noexcept { return referenceSpl_.load(std::memory_order_relaxed); }
@@ -362,6 +392,8 @@ public:
         w.write("localSlope", getLocalSlope());
         w.write("reference", static_cast<int32_t>(getReference()));
         w.write("response", static_cast<int32_t>(getResponse()));
+        w.write("quality", static_cast<int32_t>(getQuality()));
+        w.write("qualityFollowsRender", getQualityFollowsRender());
         w.write("responseMs", static_cast<float>(getResponseTime()));
         w.write("listening", static_cast<float>(getListeningCompensation()));
         w.write("refSpl", static_cast<float>(getReferenceLevel()));
@@ -385,6 +417,8 @@ public:
         setLocalSlope(r.read("localSlope", false));
         setReference(r.read("reference", 0) == 1 ? Reference::EvenPower : Reference::FlatLoudness);
         setResponse(r.read("response", 0) == 1 ? Response::Common : Response::ByBand);
+        setQuality(r.read("quality", 0) == 1 ? Quality::Render : Quality::Realtime);
+        setQualityFollowsRender(r.read("qualityFollowsRender", false));
         setResponseTime(static_cast<T>(r.read("responseMs", 60.0f)));
         setListeningCompensation(static_cast<T>(r.read("listening", 0.0f)));
         setReferenceLevel(static_cast<T>(r.read("refSpl", 100.0f)));
@@ -741,7 +775,7 @@ private:
         }
         // The bank refines one hop in eight and carries that correction over
         // the others, so its response does not step with a period of eight hops.
-        bank_.setGains(gains.data(), hop_, (hops_++ & 7) == 0 ? 1 : GraphicBank<T, 8>::kCarryRefinement);
+        bank_.setGains(gains.data(), hop_, render_ ? 3 : ((hops_++ & 7) == 0 ? 1 : GraphicBank<T, 8>::kCarryRefinement));
     }
 
     static constexpr double kAudibleSpan = 10.0;  ///< dB over the threshold in quiet from which a band counts in full.
@@ -760,6 +794,9 @@ private:
     std::atomic<bool> levelComp_ { false }, refDirty_ { false }, localSlope_ { false };
     std::atomic<Reference> reference_ { Reference::FlatLoudness };
     std::atomic<Response> response_ { Response::ByBand };
+    std::atomic<Quality> quality_ { Quality::Realtime }, qualityInUse_ { Quality::Realtime };
+    std::atomic<bool> qualityFollowsRender_ { false }, offlineRendering_ { false };
+    bool render_ = false;   ///< The quality the last prepare() took (audio thread).
     std::atomic<T> responseMs_ { T(60) }, listening_ { T(0) };
     std::array<std::atomic<T>, kBands> published_ {};
     std::atomic<T> loudnessChange_ { T(0) }, raised_ { T(0) }, lowered_ { T(0) }, total_ { T(-200) }, centroidShift_ { T(0) };

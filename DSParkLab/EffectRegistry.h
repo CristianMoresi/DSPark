@@ -2305,13 +2305,34 @@ inline EffectSlot makeResonanceSuppressor()
     s.addChoice("Sensitivity Band", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 13
     s.addSlider("Sensitivity Freq", 20, 20000, 3000, "Hz", true); // 14
     s.addSlider("Sensitivity Gain", -12, 12, 6, "dB");          // 15
+    s.addSlider("Mix", 0, 1, 1, "");                            // 16
+    s.addSlider("Knee", 0, 12, 0, "dB");                        // 17
+    s.addSlider("Persistence", 0, 500, 0, "ms");                // 18
+    s.addSlider("Quiet Level", -120, 0, -120, "dBFS");          // 19 - at -120: off
+    s.addToggle("Ear Weighting", false);                        // 20
+    s.addChoice("Envelope Passes", {"One","Two"}, 0);           // 21
+    s.addSlider("Width Taper", 0, 2, 0, "");                    // 22 - above 2 kHz
+    s.addToggle("Short Kernel", false);                         // 23
+    s.addSlider("Hear Band Low", 0, 20000, 0, "Hz");            // 24
+    s.addSlider("Hear Band High", 0, 20000, 0, "Hz");           // 25 - 0: all of it
+    auto heardBand = std::make_shared<std::array<float, 2>>(std::array<float, 2>{ 0.0f, 0.0f });
     auto sens = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, sens](int i, float v) {
+    s.setParamFn = [p, sens, heardBand](int i, float v) {
         using KE = dspark::KeyEqualizer<float, 2>;
         switch (i) {
+            case 16: p->setMix(v); break;
+            case 17: p->setKnee(v); break;
+            case 18: p->setPersistence(v); break;
+            case 19: p->setQuietLevel(v <= -119.5f ? -200.0f : v); break;
+            case 20: p->setAuditoryWeighting(v > 0.5f); break;
+            case 21: p->setEnvelopePasses(static_cast<int>(v) + 1); break;
+            case 22: p->setWidthTaper(2000.0f, v); break;
+            case 23: p->setShortKernel(v > 0.5f); break;
+            case 24: (*heardBand)[0] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
+            case 25: (*heardBand)[1] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
             case 0: p->setThreshold(v); break;
             case 1: p->setStrength(v); break;
             case 2: p->setRange(v); break;
@@ -2361,8 +2382,9 @@ inline EffectSlot makeResonanceSuppressor()
     s.activityLabel = "Resonance found";
     s.targetLabel = "Sensitivity";
     s.group("Main", { 0, 1, 2, 3, 4, 5, 6 });
-    s.group("Stereo & Listen", { 7, 8, 9, 10, 11, 12 });
-    s.group("Sensitivity", { 13, 14, 15 });
+    s.group("Stereo & Listen", { 7, 8, 9, 10, 11, 24, 25, 12 });
+    s.group("Sensitivity", { 13, 14, 15, 20 });
+    s.group("Detection", { 16, 17, 18, 19, 21, 22, 23 });
     return s;
 }
 

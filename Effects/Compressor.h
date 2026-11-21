@@ -66,6 +66,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <new>
 #include <numbers>
 #include <vector>
 
@@ -310,11 +312,22 @@ public:
             gainDelay_[ch].prepare(maxLaSamples);
             hilbertDetectors_[ch].reset();
         }
+        keyMonitor_.prepare(sampleRate_, maxLaSamples + kStageKeyRoom);
+        // The windows of HoldMode::EveryPeak (without memory that mode holds as Deepest does).
+        holdWindows_.reset(new (std::nothrow) SlidingDeepest[kMaxChannels]);
+        if (holdWindows_)
+            for (int ch = 0; ch < kMaxChannels; ++ch) holdWindows_[static_cast<size_t>(ch)].configure(holdSamples_);
+        holdWindowFor_ = holdSamples_;
+        // The ramps of LookaheadShape::Ramp, for the channels of the layout.
+        rampCount_ = std::clamp(spec.numChannels, 1, kMaxChannels);
+        lookaheadRamps_.resize(static_cast<size_t>(rampCount_));
+        for (auto& ramp : lookaheadRamps_) ramp.prepare(maxLaSamples);
         
         lookaheadSamples_ = static_cast<int>(fs * std::clamp(
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
         latencySamples_ = std::max(lookaheadSamples_, static_cast<int>(fs * std::clamp(
             maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000)));
+        latencyKept_ = maxLookaheadMs_.load(std::memory_order_relaxed) > T(0);
 
         updateHpfCoefficients();
         scHpfDirty_.store(false, std::memory_order_relaxed);
@@ -611,6 +624,11 @@ public:
         linkLL_ = linkRR_ = linkLR_ = 0.0;
         stageBefore_.reset();
         stageAfter_.reset();
+        keyMonitor_.reset();
+        gainDelayNow_ = -1.0;
+        for (auto& ramp : lookaheadRamps_) ramp.clear();
+        if (holdWindows_)
+            for (int ch = 0; ch < kMaxChannels; ++ch) holdWindows_[static_cast<size_t>(ch)].clear();
         for (int ch = 0; ch < kMaxChannels; ++ch)
         {
             envFastDb_[ch] = 0.0; // 0 dB gain change = neutral
@@ -841,10 +859,11 @@ public:
      *
      * With a maximum above 0 the audio is always that late (getLatency()
      * reports it) and setLookahead() moves inside it: the gain is held back
-     * by the difference, so the lookahead can be automated while the host
-     * keeps one delay compensation. 0 (the default) is the behaviour of
-     * before: the latency is the lookahead. FeedBack runs without lookahead
-     * and without latency either way.
+     * by the difference (which slides to its new value a quarter of a sample
+     * per sample, with no step in the gain), so the lookahead can be
+     * automated while the host keeps one delay compensation. 0 (the default)
+     * is the behaviour of before: the latency is the lookahead. FeedBack runs
+     * without lookahead and without latency either way.
      *
      * @param ms Latency kept for the lookahead, 0 to 10 ms.
      */
@@ -857,6 +876,62 @@ public:
 
     /** @brief The latency kept for the lookahead, in ms (0: none; see setMaxLookahead()). */
     [[nodiscard]] T getMaxLookahead() const noexcept { return maxLookaheadMs_.load(std::memory_order_relaxed); }
+
+    /** @brief How the lookahead brings a reduction in (see setLookaheadShape()). */
+    enum class LookaheadShape
+    {
+        /// The gain runs ahead of the audio by the lookahead with its own
+        /// attack: a fast attack is complete long before the peak arrives
+        /// (the default).
+        Lead,
+        /// The gain reaches each reduction exactly when its peak leaves the
+        /// delay, along an S-shaped ramp as long as the lookahead: the
+        /// deepest gain change of the next lookahead, through two moving
+        /// averages. Nothing is turned down earlier than it must be, and
+        /// the corner of a fast attack is not heard ahead of a transient.
+        /// A reduction also stays for the lookahead after its peak.
+        Ramp
+    };
+
+    /**
+     * @brief Chooses how the lookahead brings a reduction in (Lead by default).
+     *
+     * Feed-forward, with a lookahead above 0; the ramp follows a lookahead
+     * that moves inside a latency kept for it (setMaxLookahead()). The ramp
+     * runs for the channels given to prepare().
+     */
+    void setLookaheadShape(LookaheadShape shape) noexcept
+    {
+        lookaheadShape_.store(clampEnum(shape, LookaheadShape::Ramp), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return How the lookahead brings a reduction in. */
+    [[nodiscard]] LookaheadShape getLookaheadShape() const noexcept { return lookaheadShape_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief In FeedBack, runs the loop on the key ahead of the audio.
+     *
+     * A feedback compressor reads its own output, which leaves no room for
+     * a lookahead or for a key of its own: by default FeedBack (and the
+     * characters that always detect in feedback) runs without lookahead and
+     * ignores an external key. With this on, the loop is closed around the
+     * key instead (the external key when one is given, the programme
+     * otherwise, before any delay): the detector reads that key times the
+     * gain, as it would read the output, and the gain the loop settles on
+     * is applied to the audio. With the programme as the key and no
+     * lookahead that is the same compressor; and the lookahead (with its
+     * latency, its shape and the latency kept for it) and an external key
+     * now act in feedback too. Off by default.
+     */
+    void setFeedbackKeyed(bool on) noexcept
+    {
+        feedbackKeyed_.store(on, std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return Whether a feedback loop runs on the key ahead of the audio. */
+    [[nodiscard]] bool isFeedbackKeyed() const noexcept { return feedbackKeyed_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Makes the threshold count from the key's own recent peak instead of from full scale.
@@ -1143,6 +1218,32 @@ public:
         timeConstantsDirty_.store(true, std::memory_order_release);
     }
 
+    /** @brief What the hold keeps (see setHoldMode()). */
+    enum class HoldMode
+    {
+        /// The hold starts again only when the gain change goes deeper (or
+        /// as deep); when it ends, the target is whatever the curve asks at
+        /// that moment, so a shallower peak inside the hold is not held
+        /// after it (the default).
+        Deepest,
+        /// Every gain change is held for the hold time after it has passed:
+        /// the deepest of a sliding window. On a tone that dies away with a
+        /// hold longer than its period the gain follows the crests in steps
+        /// instead of dropping into the wave between them. The window is
+        /// exact to a 256th of the hold time.
+        EveryPeak
+    };
+
+    /** @brief Chooses what the hold keeps (Deepest by default). */
+    void setHoldMode(HoldMode mode) noexcept
+    {
+        holdMode_.store(clampEnum(mode, HoldMode::EveryPeak), std::memory_order_relaxed);
+        timeConstantsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return What the hold keeps. */
+    [[nodiscard]] HoldMode getHoldMode() const noexcept { return holdMode_.load(std::memory_order_relaxed); }
+
     /**
      * @brief Limits the maximum gain change the compressor may apply.
      *
@@ -1354,9 +1455,12 @@ public:
      * The output of each channel is what its detector hears, after the
      * sidechain high-pass and the equalizer: the programme, the external key
      * or, in FeedBack with a detector that keeps a memory, the compressed
-     * output of the previous sample. It is not delayed by the lookahead, and
-     * the compressor keeps working underneath (the meter still reads). It is
-     * a monitoring switch: it is not part of the state.
+     * output of the previous sample. Through processBlock() it leaves late by
+     * the latency the compressor reports, so the track keeps its place when
+     * the listen is switched, and it is held under full scale (an equalized
+     * key can be far louder than the programme: KeyMonitor). The compressor
+     * keeps working underneath (the meter still reads). It is a monitoring
+     * switch: it is not part of the state.
      */
     void setSidechainListen(bool on) noexcept { scListen_.store(on, std::memory_order_relaxed); }
 
@@ -1416,7 +1520,7 @@ public:
      *
      * The lookahead. Feedback operation (Topology::FeedBack, or the FET
      * character, which always detects in feedback) disables it, so latency
-     * is 0 there. With setPrecision(High), the Peak and TruePeak detectors
+     * is 0 there, unless the loop runs on the key (setFeedbackKeyed()). With setPrecision(High), the Peak and TruePeak detectors
      * read 7 samples late and the audio waits for them, in feed-forward and
      * in the feedback loops that mode covers. A colour stage in place
      * (setCharacterStage()) adds its few samples. The plugin layer re-reads
@@ -1435,7 +1539,7 @@ public:
                              && readsBetweenSamples(detType) && (!feedback || solved)) ? kDetectorDelay : 0;
         const int coloured = (stagePosition_.load(std::memory_order_relaxed) != StagePosition::Off)
                            ? stageBefore_.getLatency() : 0;
-        if (feedback) return reading + coloured;
+        if (feedback && !feedbackKeyed_.load(std::memory_order_relaxed)) return reading + coloured;
         // Derive the lookahead from the published parameter rather than the
         // audio-thread cache: hosts re-read the latency right after a setter,
         // before the next block has consumed the coefficient-update flag.
@@ -1467,6 +1571,7 @@ public:
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
+        w.write("holdMode", static_cast<int32_t>(getHoldMode()));
         w.write("range", static_cast<float>(rangeDb_.load(std::memory_order_relaxed)));
         w.write("detector", static_cast<int32_t>(detectorType_.load(std::memory_order_relaxed)));
         w.write("topology", static_cast<int32_t>(topology_.load(std::memory_order_relaxed)));
@@ -1480,6 +1585,8 @@ public:
         w.write("rmsWindow", static_cast<float>(rmsWindowMsAtomic_.load(std::memory_order_relaxed)));
         w.write("autoThreshold", autoThreshold_.load(std::memory_order_relaxed));
         w.write("maxLookahead", static_cast<float>(maxLookaheadMs_.load(std::memory_order_relaxed)));
+        w.write("lookaheadShape", static_cast<int32_t>(getLookaheadShape()));
+        w.write("feedbackKeyed", isFeedbackKeyed());
         w.write("amount", static_cast<float>(amount_.load(std::memory_order_relaxed)));
         w.write("softRange", softRange_.load(std::memory_order_relaxed));
         w.write("precision", static_cast<int32_t>(precision_.load(std::memory_order_relaxed)));
@@ -1522,6 +1629,7 @@ public:
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setHoldTime(static_cast<T>(r.read("hold", 0.0f)));
+        setHoldMode(static_cast<HoldMode>(r.read("holdMode", 0)));
         setRange(static_cast<T>(r.read("range", 100.0f)));
         setDetector(static_cast<DetectorType>(r.read("detector", 0)));
         setTopology(static_cast<Topology>(r.read("topology", 0)));
@@ -1534,6 +1642,8 @@ public:
         setRmsWindow(static_cast<T>(r.read("rmsWindow", 10.0f)));
         setAutoThreshold(r.read("autoThreshold", false));
         setMaxLookahead(static_cast<T>(r.read("maxLookahead", 0.0f)));
+        setLookaheadShape(static_cast<LookaheadShape>(r.read("lookaheadShape", 0)));
+        setFeedbackKeyed(r.read("feedbackKeyed", false));
         setAmount(static_cast<T>(r.read("amount", 1.0f)));
         setSoftRange(r.read("softRange", false));
         setPrecision(static_cast<Precision>(r.read("precision", 0)));
@@ -1660,10 +1770,25 @@ protected:
         syncProgramState(program_.active);
         const bool keyBalance = program_.active && program_.spectral > 0.0;
 
-        // Lookahead breaks causal logic in Feedback mode, so it is strictly
-        // disabled there.
-        int activeLookahead = (topoEff == Topology::FeedBack) ? 0 : latencySamples_;
+        // A loop that reads its own output has no room for a lookahead: in
+        // FeedBack it is off, unless the loop is closed around the key
+        // (setFeedbackKeyed()).
+        const bool keyedLoop = topoEff == Topology::FeedBack && feedbackKeyed_.load(std::memory_order_relaxed);
+        int activeLookahead = (topoEff == Topology::FeedBack && !keyedLoop) ? 0 : latencySamples_;
         const bool autoThr = autoThreshold_.load(std::memory_order_relaxed);
+        // An external key does not pass the colour stage placed before the
+        // compressor: listened to, it waits for that stage too.
+        // The lookahead as a ramp: its state starts clean when it comes in.
+        const bool ramp = rampShape_ && activeLookahead > 0;
+        if (ramp != rampActive_)
+        {
+            if (ramp)
+                for (auto& r : lookaheadRamps_) r.clear();
+            rampActive_ = ramp;
+        }
+        const bool externalKey = scCh > 0 && nCh > 0 && sidechain.getChannel(0) != audio.getChannel(0);
+        const int stageKeyDelay = (externalKey && stagePosition_.load(std::memory_order_relaxed) == StagePosition::Before)
+                                ? std::min(stageBefore_.getLatency(), kStageKeyRoom) : 0;
 
         // Fully linked channels share one gain computer: every channel reads
         // the same linked level into the same state, so computing it once per
@@ -1718,7 +1843,7 @@ protected:
                                          splitAdaptive, staticMakeup, adaptiveMakeup,
                                          paramsMoving, autoThr, activeLookahead - lookaheadSamples_,
                                          program_.active, keyBalance, keyEqOn, listen, layered, gainSmooth,
-                                         dominantLink };
+                                         dominantLink, activeLookahead + stageKeyDelay, latencyKept_, ramp };
             const ChunkParams constants { thresh, ratio, knee, mkupBase, mixVal,
                                           staticMakeupDb + analyticDb, amount };
             processFeedForward(audio, sidechain, nCh, nS, scCh, ff, constants);
@@ -1731,7 +1856,9 @@ protected:
         const bool points = precise && readsBetweenSamples(detTypeEff);
         const int count = points ? kDetectorPoints : 1;
         const int audioDelay = activeLookahead + (points ? kDetectorDelay : 0);
-        const int gainDelay = feedForward ? activeLookahead - lookaheadSamples_ : 0;
+        const int gainDelay = (feedForward || keyedLoop) ? activeLookahead - lookaheadSamples_ : 0;
+        const bool gainLine = (feedForward || keyedLoop) && latencyKept_;
+        const int listenDelay = audioDelay + stageKeyDelay;
 
         for (int i = 0; i < nS; ++i)
         {
@@ -1764,6 +1891,7 @@ protected:
             T linkedLin[kDetectorPoints] = {};
             T pairLevel[2][kDetectorPoints] = {};
             T heard[kMaxChannels] = {};
+            T loopSource[kMaxChannels] = {};   // a keyed loop: the key before the gain
             double lowSq = 0.0, highSq = 0.0;
             for (int ch = 0; ch < nCh; ++ch)
             {
@@ -1778,6 +1906,15 @@ protected:
                 if (feedForward)
                     detectorIn = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
                                             : audio.getChannel(ch)[i];
+                else if (keyedLoop)
+                {
+                    // The loop around the key: the key itself where the loop
+                    // equation supplies the gain, the key times the last
+                    // gain where the detector keeps a memory.
+                    loopSource[ch] = detectorSafe((scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
+                                                             : audio.getChannel(ch)[i]);
+                    detectorIn = fbImplicit ? loopSource[ch] : fbLastOutput_[ch];
+                }
                 else
                     detectorIn = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
                 detectorIn = detectorSafe(detectorIn);
@@ -1818,6 +1955,8 @@ protected:
                 T top = T(0);
                 if (feedForward)
                     for (int j = 0; j < count; ++j) top = std::max(top, linkedLin[j]);
+                else if (keyedLoop)
+                    for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(loopSource[ch]));
                 else
                     for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(detectorSafe(audio.getChannel(ch)[i])));
                 autoRefDb_[0] = std::max(static_cast<double>(gainToDecibels(top)), autoRefDb_[0] - autoRefFall_);
@@ -1829,6 +1968,8 @@ protected:
             //    domain). What is heard of the gain is held back inside a
             //    latency kept for the lookahead and scaled by the amount; the
             //    loop keeps the whole.
+            const double slide = gainLine ? slideGainDelay(gainDelay) : 0.0;
+            const int rampLength = gainLine ? activeLookahead - static_cast<int>(std::ceil(slide)) : activeLookahead;
             T blockGR = T(0);
             if (shared)
             {
@@ -1838,13 +1979,15 @@ protected:
                                          : gainPath(levelDb[0], 0, cfg, threshNow, ratio, knee);
                 // (0 dB is the common case below threshold: skip the exp.)
                 const T gainLin = (loopGR == T(0)) ? T(1) : decibelsToGain(loopGR);
-                blockGR = heldBack(loopGR, 0, gainDelay);
+                blockGR = heldBack(rampedIn(loopGR, 0, rampLength, ramp), 0, slide, gainLine);
                 if (amount < T(1)) blockGR *= amount;
                 if (gainSmooth) blockGR = smoothedGain(blockGR, 0);
                 const T outLin = (blockGR == loopGR) ? gainLin : decibelsToGain(blockGR);
                 for (int ch = 0; ch < nCh; ++ch)
                     applyGain(audio, ch, i, gainLin, blockGR, audioDelay, charType,
                               colorAmt, makeupLin, mixVal, outLin);
+                if (keyedLoop)
+                    for (int ch = 0; ch < nCh; ++ch) fbLastOutput_[ch] = loopSource[ch] * gainLin;
             }
             else
             {
@@ -1870,21 +2013,26 @@ protected:
                     const T loopGR = precise ? gainPathPrecise(levelDb, count, ch, cfg, threshNow, ratio, knee)
                                              : gainPath(levelDb[0], ch, cfg, threshNow, ratio, knee);
                     const T gainLin = (loopGR == T(0)) ? T(1) : decibelsToGain(loopGR);
-                    T heardGR = heldBack(loopGR, ch, gainDelay);
+                    T heardGR = heldBack(rampedIn(loopGR, ch, rampLength, ramp), ch, slide, gainLine);
                     if (amount < T(1)) heardGR *= amount;
                     if (gainSmooth) heardGR = smoothedGain(heardGR, ch);
                     const T outLin = (heardGR == loopGR) ? gainLin : decibelsToGain(heardGR);
                     applyGain(audio, ch, i, gainLin, heardGR, audioDelay, charType,
                               colorAmt, makeupLin, mixVal, outLin);
+                    if (keyedLoop) fbLastOutput_[ch] = loopSource[ch] * gainLin;
                     if (ch == 0 || heardGR < blockGR)
                         blockGR = heardGR; // Track worst-case GR for metering
                 }
             }
 
             if (keyEqOn) keyEq_.advance(1);
-            // Key listen: what the detectors heard goes out instead.
+            // Key listen: what the detectors heard goes out instead, late by
+            // the latency and under full scale.
             if (listen)
+            {
+                keyMonitor_.processFrame(heard, nCh, listenDelay);
                 for (int ch = 0; ch < nCh; ++ch) audio.getChannel(ch)[i] = heard[ch];
+            }
 
             gainReductionDb_.store(blockGR, std::memory_order_relaxed);
 
@@ -1937,6 +2085,9 @@ protected:
         bool layered;           ///< The character runs its two layers.
         bool gainSmooth;        ///< The gain is smoothed after the ballistics.
         bool dominant;          ///< The pair links to its dominant component.
+        int listenDelay;        ///< Samples the listened key waits: the latency of the audio path.
+        bool gainLine;          ///< A latency is kept for the lookahead: the gain runs through its line.
+        bool ramp;              ///< The lookahead brings the gain in along a ramp.
     };
 
     /** @brief Parameter values of a block whose smoothers are settled. */
@@ -2134,17 +2285,32 @@ protected:
             // What is heard of the gain: held back while the lookahead is
             // shorter than the latency kept for it, and scaled by the amount.
             const bool scaled = ff.paramsMoving || constants.amount < T(1);
-            if (ff.gainDelay > 0 || scaled || ff.gainSmooth)
+            if (ff.gainLine || scaled || ff.gainSmooth || ff.ramp)
             {
+                // The gain line at rest reads a whole delay; while the lookahead
+                // moves its delay slides, and the ramp's length with it.
+                const bool atRest = !ff.gainLine || gainDelayNow_ == static_cast<double>(ff.gainDelay);
+                double slide[kChunk] = {};
+                if (!atRest)
+                    for (int k = 0; k < m; ++k) slide[k] = slideGainDelay(ff.gainDelay);
                 for (int g = 0; g < nGain; ++g)
                 {
                     T* gd = gain[g];
-                    if (ff.gainDelay > 0)
+                    if (ff.ramp)
+                        for (int k = 0; k < m; ++k)
+                            gd[k] = rampedIn(gd[k], g, atRest ? ff.lookahead - ff.gainDelay
+                                                              : ff.lookahead - static_cast<int>(std::ceil(slide[k])), true);
+                    if (ff.gainLine && atRest)
+                    {
+                        auto& line = gainDelay_[static_cast<size_t>(g)];
                         for (int k = 0; k < m; ++k)
                         {
-                            gainDelay_[g].push(gd[k]);
-                            gd[k] = gainDelay_[g].read(ff.gainDelay);
+                            line.push(gd[k]);
+                            gd[k] = line.read(ff.gainDelay);
                         }
+                    }
+                    else if (ff.gainLine)
+                        for (int k = 0; k < m; ++k) gd[k] = heldBack(gd[k], g, slide[k], true);
                     if (scaled)
                         for (int k = 0; k < m; ++k)
                             if (amt[k] < T(1)) gd[k] *= amt[k];
@@ -2216,9 +2382,16 @@ protected:
                 fbLastOutput_[ch] = wet;
             }
 
-            // Key listen: what the detectors heard goes out instead.
+            // Key listen: what the detectors heard goes out instead, late by
+            // the latency and under full scale.
             if (ff.listen)
-                for (int ch = 0; ch < nCh; ++ch) std::copy_n(heard[ch], m, audio.getChannel(ch) + o);
+                for (int k = 0; k < m; ++k)
+                {
+                    T frame[kMaxChannels];
+                    for (int ch = 0; ch < nCh; ++ch) frame[ch] = heard[ch][k];
+                    keyMonitor_.processFrame(frame, nCh, ff.listenDelay);
+                    for (int ch = 0; ch < nCh; ++ch) audio.getChannel(ch)[o + k] = frame[ch];
+                }
         }
         if (nS > 0) gainReductionDb_.store(lastGr, std::memory_order_relaxed);
 
@@ -2248,6 +2421,8 @@ protected:
             gainSmoothA_[ch] = gainSmoothA_[0];
             gainSmoothB_[ch] = gainSmoothB_[0];
         }
+        if (holdEveryPeak_ && holdWindows_ && holdSamples_ > 0)
+            for (int ch = 1; ch < nCh; ++ch) holdWindows_[static_cast<size_t>(ch)] = holdWindows_[0];
     }
 
     /**
@@ -2285,6 +2460,7 @@ protected:
         const T range = rangeDb_.load(std::memory_order_relaxed);
         const bool soft = softRange_.load(std::memory_order_relaxed);
         const int holdN = holdSamples_;
+        SlidingDeepest* const window = holdWindow(ch);
         const bool upward = ff.modeType == Mode::Upward;
 
         // Static curve first: no state, so the frames overlap freely (the
@@ -2312,7 +2488,7 @@ protected:
             for (int k = 0; k < m; ++k)
             {
                 fast = layeredStep(inDb[k], thr[k], rat[k], kn[k], profile, range, holdN, soft,
-                                   held, counter, level, peak);
+                                   held, counter, level, peak, window);
                 out[k] = static_cast<T>(fast);
             }
             layerLevelDb_[ch] = level;
@@ -2325,7 +2501,7 @@ protected:
             T lastWet = fbLastOutput_[ch];
             for (int k = 0; k < m; ++k)
             {
-                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft, window);
                 const double lastOut = std::abs(static_cast<double>(lastWet));
                 const double outputLevel = (lastOut < 1.0) ? lastOut : 1.0;
                 double y;
@@ -2352,7 +2528,7 @@ protected:
             ProgramState state = programState_[ch];
             for (int k = 0; k < m; ++k)
             {
-                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft, window);
                 out[k] = static_cast<T>(programStep(static_cast<double>(tgt), fast, state, balance[k]));
             }
             programState_[ch] = state;
@@ -2361,7 +2537,7 @@ protected:
         {
             for (int k = 0; k < m; ++k)
             {
-                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft);
+                const T tgt = holdAndRange(tgtA[k], range, holdN, held, counter, soft, window);
                 const double y = ff.decoupled
                     ? decoupledStep(static_cast<double>(tgt), hold, fast, decHoldCoeff_)
                     : ballisticsStep(static_cast<double>(tgt), fast, slow, mid, deep, charAttCoeff_, charRelCoeff_);
@@ -2428,7 +2604,7 @@ protected:
                                              rangeDb_.load(std::memory_order_relaxed), holdSamples_,
                                              softRange_.load(std::memory_order_relaxed),
                                              heldGrDb_[ch], holdCounters_[ch],
-                                             layerLevelDb_[ch], layerPeakDb_[ch]);
+                                             layerLevelDb_[ch], layerPeakDb_[ch], holdWindow(ch));
             envFastDb_[ch] = shown;
             return static_cast<T>(shown);
         }
@@ -2683,9 +2859,23 @@ protected:
             lookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000));
         latencySamples_ = std::max(lookaheadSamples_, static_cast<int>(fs * std::clamp(
             maxLookaheadMs_.load(std::memory_order_relaxed), T(0), T(10)) / T(1000)));
+        latencyKept_ = maxLookaheadMs_.load(std::memory_order_relaxed) > T(0);
         autoRefFall_ = kAutoRefFallDb / static_cast<double>(fs);
 
         holdSamples_ = static_cast<int>(fs * holdMs_.load(std::memory_order_relaxed) / T(1000));
+        rampShape_ = lookaheadShape_.load(std::memory_order_relaxed) == LookaheadShape::Ramp;
+        // The hold's windows follow its length and its mode; a change of
+        // either starts the hold again.
+        const bool everyPeak = holdMode_.load(std::memory_order_relaxed) == HoldMode::EveryPeak;
+        if (everyPeak != holdEveryPeak_ || (everyPeak && holdSamples_ != holdWindowFor_))
+        {
+            if (holdWindows_)
+                for (int ch = 0; ch < kMaxChannels; ++ch) holdWindows_[static_cast<size_t>(ch)].configure(holdSamples_);
+            holdWindowFor_ = holdSamples_;
+            holdCounters_.fill(0);
+            heldGrDb_.fill(T(0));
+            holdEveryPeak_ = everyPeak;
+        }
     }
 
     /**
@@ -2697,7 +2887,185 @@ protected:
     [[nodiscard]] T applyHoldAndRange(T targetGR_Db, int ch) noexcept
     {
         return holdAndRange(targetGR_Db, rangeDb_.load(std::memory_order_relaxed), holdSamples_,
-                            heldGrDb_[ch], holdCounters_[ch], softRange_.load(std::memory_order_relaxed));
+                            heldGrDb_[ch], holdCounters_[ch], softRange_.load(std::memory_order_relaxed),
+                            holdWindow(ch));
+    }
+
+    /**
+     * @brief The deepest gain change of a sliding window (HoldMode::EveryPeak).
+     *
+     * The window is cut in at most kBlocks blocks. The deepest value of each
+     * finished block waits in a queue kept in falling order of depth (a
+     * block that a later, deeper one covers is dropped), so the deepest of
+     * the window is the front of the queue or the block in progress. A value
+     * is held for the window and at most one block more.
+     */
+    struct SlidingDeepest
+    {
+        static constexpr int kBlocks = 256;         ///< Blocks the window is cut in, at most.
+        static constexpr int kSlots = 2 * kBlocks;  ///< Room of the queue (a power of two, over kBlocks + 1).
+        std::array<T, kSlots> depth {};
+        std::array<uint32_t, kSlots> block {};
+        int head = 0, count = 0, inBlock = 0, blockLength = 1, blocks = 1;
+        uint32_t index = 0;
+        T current = T(0);
+
+        /** @brief Sets the window in samples and empties it. */
+        void configure(int windowSamples) noexcept
+        {
+            const int w = std::max(1, windowSamples);
+            blockLength = (w + kBlocks - 1) / kBlocks;
+            blocks = (w + blockLength - 1) / blockLength;
+            clear();
+        }
+
+        void clear() noexcept
+        {
+            head = count = inBlock = 0;
+            index = 0;
+            current = T(0);
+        }
+
+        /**
+         * @brief One value in, the deepest of the window out.
+         * @param gr        Gain change in dB (either sign: the deepest is the largest magnitude).
+         * @param perSample Values pushed per sample (the window is in samples).
+         */
+        [[nodiscard]] T push(T gr, int perSample = 1) noexcept
+        {
+            if (inBlock == 0 || std::abs(gr) >= std::abs(current)) current = gr;
+            T deepest = current;
+            if (count > 0 && std::abs(depth[static_cast<size_t>(head)]) > std::abs(deepest)) deepest = depth[static_cast<size_t>(head)];
+            if (++inBlock >= blockLength * perSample)
+            {
+                // The block is done: it covers every queued block that is no deeper.
+                while (count > 0 && std::abs(depth[static_cast<size_t>((head + count - 1) & (kSlots - 1))]) <= std::abs(current)) --count;
+                const auto at = static_cast<size_t>((head + count) & (kSlots - 1));
+                depth[at] = current;
+                block[at] = index;
+                ++count;
+                ++index;
+                inBlock = 0;
+                // A block leaves when the window has passed it.
+                while (count > 0 && index - block[static_cast<size_t>(head)] > static_cast<uint32_t>(blocks))
+                {
+                    head = (head + 1) & (kSlots - 1);
+                    --count;
+                }
+            }
+            return deepest;
+        }
+    };
+
+    /**
+     * @brief The lookahead as a ramp (LookaheadShape::Ramp).
+     *
+     * Each gain change is replaced by the deepest of the last `length` + 1
+     * (an exact sliding window: a queue in falling order of depth), and that
+     * runs through two moving averages whose lengths add up to `length` + 2.
+     * A reduction that the gain computer asks for at one sample is so
+     * reached, exactly, `length` samples later, when that sample leaves the
+     * lookahead's delay, along an S-shaped ramp; and it stays for `length`
+     * samples after the last sample that asked for it. With no gain change
+     * for as long as the window the output is exactly 0 dB.
+     */
+    struct LookaheadRamp
+    {
+        std::vector<T> deepVal, boxA, boxB;   ///< The queue of the sliding window; the histories of the two averages.
+        std::vector<uint32_t> deepPos;        ///< When each queued value came.
+        uint32_t t = 0;                       ///< Values taken so far (wraps).
+        int mask = 0, head = 0, count = 0, length = 0, lenA = 1, lenB = 1, zerosA = 0, zerosB = 0;
+        double sumA = 0.0, sumB = 0.0;
+
+        /** @brief Allocates for a longest ramp. */
+        void prepare(int maxLength)
+        {
+            size_t n = 8;
+            while (n < static_cast<size_t>(std::max(0, maxLength)) + 4) n <<= 1;
+            deepVal.assign(n, T(0));
+            boxA.assign(n, T(0));
+            boxB.assign(n, T(0));
+            deepPos.assign(n, 0u);
+            mask = static_cast<int>(n) - 1;
+            clear();
+        }
+
+        void clear() noexcept
+        {
+            std::fill(deepVal.begin(), deepVal.end(), T(0));
+            std::fill(boxA.begin(), boxA.end(), T(0));
+            std::fill(boxB.begin(), boxB.end(), T(0));
+            t = 0;
+            head = count = length = zerosA = zerosB = 0;
+            lenA = lenB = 1;
+            sumA = sumB = 0.0;
+        }
+
+        /** @brief Moves the ramp's length to `wanted`, a sample at a time (the sums follow, each step in constant time). */
+        void setLength(int wanted) noexcept
+        {
+            wanted = std::clamp(wanted, 0, mask - 3);
+            while (length != wanted)
+            {
+                const int next = length + (wanted > length ? 1 : -1);
+                const int a = (next + 2) / 2, b = next + 2 - a;
+                // The averages hold the last lenA and lenB values (the last one came at t - 1).
+                if (a > lenA) sumA += static_cast<double>(boxA[(t - 1u - static_cast<uint32_t>(lenA)) & static_cast<uint32_t>(mask)]);
+                else if (a < lenA) sumA -= static_cast<double>(boxA[(t - static_cast<uint32_t>(lenA)) & static_cast<uint32_t>(mask)]);
+                if (b > lenB) sumB += static_cast<double>(boxB[(t - 1u - static_cast<uint32_t>(lenB)) & static_cast<uint32_t>(mask)]);
+                else if (b < lenB) sumB -= static_cast<double>(boxB[(t - static_cast<uint32_t>(lenB)) & static_cast<uint32_t>(mask)]);
+                lenA = a;
+                lenB = b;
+                length = next;
+                zerosA = zerosB = 0;
+            }
+        }
+
+        /** @brief One gain change in dB in, the ramped one out. */
+        [[nodiscard]] T process(T gr) noexcept
+        {
+            const auto m = static_cast<uint32_t>(mask);
+            // The deepest of the last length + 1 (the gain changes share a sign: the largest magnitude).
+            const T depth = std::abs(gr);
+            while (count > 0 && std::abs(deepVal[static_cast<size_t>((head + count - 1) & mask)]) <= depth) --count;
+            const auto at = static_cast<size_t>((head + count) & mask);
+            deepVal[at] = gr;
+            deepPos[at] = t;
+            ++count;
+            while (t - deepPos[static_cast<size_t>(head)] > static_cast<uint32_t>(length))
+            {
+                head = (head + 1) & mask;
+                --count;
+            }
+            const T deep = deepVal[static_cast<size_t>(head)];
+            // Two moving averages; a sum that has seen nothing but zeros for its whole length is zero.
+            sumA += static_cast<double>(deep) - static_cast<double>(boxA[(t - static_cast<uint32_t>(lenA)) & m]);
+            boxA[t & m] = deep;
+            zerosA = deep == T(0) ? std::min(zerosA + 1, lenA) : 0;
+            if (zerosA >= lenA) sumA = 0.0;
+            const T mid = static_cast<T>(sumA / lenA);
+            sumB += static_cast<double>(mid) - static_cast<double>(boxB[(t - static_cast<uint32_t>(lenB)) & m]);
+            boxB[t & m] = mid;
+            zerosB = mid == T(0) ? std::min(zerosB + 1, lenB) : 0;
+            if (zerosB >= lenB) sumB = 0.0;
+            ++t;
+            return static_cast<T>(sumB / lenB);
+        }
+    };
+
+    /** @brief A gain change through the lookahead's ramp of its gain computer, or as it came. */
+    [[nodiscard]] T rampedIn(T grDb, int g, int length, bool run) noexcept
+    {
+        if (!run || g >= rampCount_) return grDb;
+        auto& ramp = lookaheadRamps_[static_cast<size_t>(g)];
+        ramp.setLength(length);
+        return ramp.process(grDb);
+    }
+
+    /** @return The window of a gain computer's hold in HoldMode::EveryPeak (nullptr in Deepest). */
+    [[nodiscard]] SlidingDeepest* holdWindow(int ch) const noexcept
+    {
+        return (holdEveryPeak_ && holdWindows_) ? &holdWindows_[static_cast<size_t>(ch)] : nullptr;
     }
 
     /**
@@ -2708,9 +3076,12 @@ protected:
      * @param held        Held gain change (state).
      * @param counter     Remaining hold samples (state).
      * @param soft        True to approach the range without a corner (setSoftRange()).
+     * @param window      The sliding window that holds instead (HoldMode::EveryPeak), or nullptr.
+     * @param perSample   Targets given per sample (the window counts samples).
      */
     [[nodiscard]] static T holdAndRange(T targetGR_Db, T range, int holdSamples,
-                                        T& held, int& counter, bool soft = false) noexcept
+                                        T& held, int& counter, bool soft = false,
+                                        SlidingDeepest* window = nullptr, int perSample = 1) noexcept
     {
         if (soft && range > T(0))
         {
@@ -2723,6 +3094,7 @@ protected:
             targetGR_Db = std::clamp(targetGR_Db, -range, range);
         }
 
+        if (holdSamples > 0 && window != nullptr) return window->push(targetGR_Db, perSample);
         if (holdSamples > 0)
         {
             if (std::abs(targetGR_Db) >= std::abs(held))
@@ -3208,10 +3580,10 @@ protected:
      */
     [[nodiscard]] double layeredStep(T inputDb, T thresh, T ratio, T knee, const CharacterProfile& profile,
                                      T range, int holdN, bool soft, T& held, int& counter,
-                                     double& level, double& peak) const noexcept
+                                     double& level, double& peak, SlidingDeepest* window = nullptr) const noexcept
     {
         const Layers want = layeredCurve(inputDb, thresh, ratio, knee, profile);
-        const T bounded = holdAndRange(want.level + want.peak, range, holdN, held, counter, soft);
+        const T bounded = holdAndRange(want.level + want.peak, range, holdN, held, counter, soft, window);
         const double levelTarget = static_cast<double>(std::max(want.level, bounded));
         const double peakTarget = static_cast<double>(bounded) - levelTarget;
         level = pacedStep(level, levelTarget, layerAttRate_, layerRelRate_,
@@ -4019,12 +4391,30 @@ protected:
 
     /** @brief The gain as it is heard with a latency kept for the lookahead:
      *  older by the difference (see setMaxLookahead()). */
-    [[nodiscard]] T heldBack(T grDb, int g, int delay) noexcept
+    [[nodiscard]] T heldBack(T grDb, int g, double delay, bool run) noexcept
     {
-        if (delay <= 0) return grDb;
+        if (!run) return grDb;
         auto& line = gainDelay_[static_cast<size_t>(g)];
         line.push(grDb);
-        return line.read(delay);
+        const int whole = static_cast<int>(delay);
+        const T part = static_cast<T>(delay - static_cast<double>(whole));
+        const T at = line.read(whole);
+        return part > T(0) ? at + part * (line.read(whole + 1) - at) : at;
+    }
+
+    /**
+     * @brief The delay of the gain line this frame. It slides to its target
+     *        kGainDelaySlide of a sample per sample, so a lookahead that
+     *        moves inside the latency kept for it leaves no step in the gain
+     *        (the first frame after prepare() or reset() starts at the target).
+     */
+    [[nodiscard]] double slideGainDelay(int target) noexcept
+    {
+        const double goal = static_cast<double>(target);
+        if (gainDelayNow_ < 0.0) gainDelayNow_ = goal;
+        else if (gainDelayNow_ != goal)
+            gainDelayNow_ += std::clamp(goal - gainDelayNow_, -kGainDelaySlide, kGainDelaySlide);
+        return gainDelayNow_;
     }
 
     /**
@@ -4103,7 +4493,7 @@ protected:
         {
             targets[j] = static_cast<double>(holdAndRange(
                 computeGain(levelDb[j], thresh, ratio, knee, cfg.charType, cfg.modeType, guardDb),
-                range, holdLength, heldGrDb_[c], holdCounters_[c], soft));
+                range, holdLength, heldGrDb_[c], holdCounters_[c], soft, holdWindow(static_cast<int>(c)), count));
             deepest = (j == 0) ? targets[j] : std::min(deepest, targets[j]);
         }
         // Programme-dependent timing sets the two coefficients once per
@@ -4709,6 +5099,8 @@ protected:
     std::array<T, kMaxChannels> scHpfState_ {};///< HPF y[n-1] state.
     std::array<T, kMaxChannels> scHpfPrev_ {}; ///< HPF x[n-1] state.
     KeyEq keyEq_;                              ///< Equalizer of the key, after the high-pass.
+    KeyMonitor<T, 16> keyMonitor_;             ///< The listened key: late by the latency, under full scale.
+    static constexpr int kStageKeyRoom = 64;   ///< Samples kept for the colour stage's latency in the listened key.
     std::atomic<bool> scListen_ { false };     ///< The key goes out instead of the audio.
     std::atomic<bool> removalListen_ { false };        ///< The output is what the compression takes out.
 
@@ -4738,6 +5130,10 @@ protected:
     int holdSamples_ = 0;
     std::array<int, kMaxChannels> holdCounters_ {};
     std::array<T, kMaxChannels> heldGrDb_ {};
+    std::atomic<HoldMode> holdMode_ { HoldMode::Deepest };
+    std::unique_ptr<SlidingDeepest[]> holdWindows_;  ///< One window per gain computer (HoldMode::EveryPeak).
+    int holdWindowFor_ = -1;                         ///< The hold length the windows are set for.
+    bool holdEveryPeak_ = false;                     ///< The hold mode as the audio thread took it.
 
     // Automatic threshold, lookahead inside a fixed latency, amount, soft range.
     static constexpr double kAutoRefFallDb = 1.0;   ///< dB per second the reference of the automatic threshold falls.
@@ -4748,6 +5144,15 @@ protected:
     std::atomic<T> maxLookaheadMs_ { T(0) };        ///< Latency kept for the lookahead (0: the lookahead itself).
     int latencySamples_ = 0;                        ///< Delay of the audio in feed-forward (audio thread).
     std::array<RingBuffer<T>, kMaxChannels> gainDelay_ {}; ///< Holds the gain back while the lookahead is shorter than the latency.
+    static constexpr double kGainDelaySlide = 0.25;  ///< Samples per sample the gain line's delay moves to a new lookahead.
+    double gainDelayNow_ = -1.0;                     ///< The gain line's delay now, in samples (negative: not started).
+    bool latencyKept_ = false;                       ///< A latency is kept for the lookahead (audio thread).
+    std::atomic<LookaheadShape> lookaheadShape_ { LookaheadShape::Lead };
+    std::atomic<bool> feedbackKeyed_ { false };       ///< A feedback loop runs on the key ahead of the audio.
+    std::vector<LookaheadRamp> lookaheadRamps_;      ///< One ramp per gain computer of the layout (LookaheadShape::Ramp).
+    int rampCount_ = 0;                              ///< Ramps prepared.
+    bool rampShape_ = false;                         ///< The shape as the audio thread took it.
+    bool rampActive_ = false;                        ///< The ramp ran in the last block.
     std::atomic<T> amount_ { T(1) };                ///< Share of the gain change that is applied, in dB.
     SmoothedValue<T> amountSmooth_;                 ///< De-zippered amount.
     std::atomic<bool> softRange_ { false };         ///< The gain change approaches the range without a corner.

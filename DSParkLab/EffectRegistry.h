@@ -875,16 +875,27 @@ inline EffectSlot makeSaturation()
     s.addToggle("Drive Compensation", false);
     s.addChoice("Oversampling Mode", {"Linear phase","Minimum phase"}, 0);
     s.addToggle("Comb Loop Closing", false);   // 19: the loop closes when the programme stops
+    // 20: the band the oversampler's first stage keeps. Order MUST match
+    // dspark::Oversampling<float>::Band (Preset=0, Audible=1).
+    s.addChoice("Oversampling Band", {"Preset","Audible (to 20 kHz)"}, 0);
     auto shape = std::make_shared<std::array<std::atomic<float>, 4>>();
     (*shape)[0] = 0.0f; (*shape)[1] = 1.0f; (*shape)[2] = 0.0f; (*shape)[3] = 200.0f;
     auto modeWanted  = std::make_shared<std::atomic<int>>(0);
     auto modeApplied = std::make_shared<std::atomic<int>>(0);
-    s.prepareFn = [p, osApplied, modeApplied](auto& sp) {
+    auto bandWanted  = std::make_shared<std::atomic<int>>(0);
+    auto bandApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, osApplied, modeApplied, bandApplied](auto& sp) {
         p->setOversampling(osApplied->load(std::memory_order_relaxed));
         p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(modeApplied->load(std::memory_order_relaxed)));
+        p->setOversamplingBand(static_cast<dspark::Saturation<float>::OversamplingBand>(bandApplied->load(std::memory_order_relaxed)));
         p->prepare(sp);
     };
-    s.processFn = [p, osWanted, osApplied, modeWanted, modeApplied](auto b) {
+    s.processFn = [p, osWanted, osApplied, modeWanted, modeApplied, bandWanted, bandApplied](auto b) {
+        const int band = bandWanted->load(std::memory_order_relaxed);
+        if (band != bandApplied->load(std::memory_order_relaxed)) {
+            p->setOversamplingBand(static_cast<dspark::Saturation<float>::OversamplingBand>(band));   // refits the first stage
+            bandApplied->store(band, std::memory_order_relaxed);
+        }
         const int want = osWanted->load(std::memory_order_relaxed);
         if (want != osApplied->load(std::memory_order_relaxed)) {
             p->setOversampling(want);   // reallocates - safe here (audio thread, no concurrent process)
@@ -898,9 +909,10 @@ inline EffectSlot makeSaturation()
         p->process(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, osWanted, shape, modeWanted](int i, float v) {
+    s.setParamFn = [p, osWanted, shape, modeWanted, bandWanted](int i, float v) {
         auto& k = *shape;
         switch(i) {
+            case 20: bandWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
             case 8: case 9: case 10:
                 k[static_cast<size_t>(i - 8)] = v;
                 p->setCurveShape(k[0].load(), k[1].load(), k[2].load());
@@ -928,7 +940,7 @@ inline EffectSlot makeSaturation()
     s.group("Main", { 0, 1, 2, 3, 4, 5, 17 });
     s.group("Curve", { 8, 9, 10, 11, 12 });
     s.group("Tracking & Loop", { 13, 14, 15, 16 });
-    s.group("Oversampling", { 6, 7, 18 });
+    s.group("Oversampling", { 6, 7, 18, 20 });
     return s;
 }
 
@@ -970,11 +982,20 @@ inline EffectSlot makeMultibandSaturation()
     s.addSlider("Mix", 0, 1, 1, "");                                                       // index 28: against the programme as the crossover leaves it
     s.addToggle("Output Clip", false);                                                      // index 29: an oversampled clipper after the sum
     s.addSlider("Output Ceiling", -24, 0, 0, "dB");                                         // index 30
-    s.prepareFn = [p, modeApplied](auto& sp) {
+    s.addChoice("Oversampling Band", {"Preset","Audible (to 20 kHz)"}, 0);                  // index 31: every band's first stage
+    auto bandWanted  = std::make_shared<std::atomic<int>>(0);
+    auto bandApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, modeApplied, bandApplied](auto& sp) {
         p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(modeApplied->load(std::memory_order_relaxed)));
+        p->setOversamplingBand(static_cast<dspark::Saturation<float>::OversamplingBand>(bandApplied->load(std::memory_order_relaxed)));
         p->prepare(sp);
     };
-    s.processFn = [p, modeWanted, modeApplied](auto b) {
+    s.processFn = [p, modeWanted, modeApplied, bandWanted, bandApplied](auto b) {
+        const int band = bandWanted->load(std::memory_order_relaxed);
+        if (band != bandApplied->load(std::memory_order_relaxed)) {
+            p->setOversamplingBand(static_cast<dspark::Saturation<float>::OversamplingBand>(band));
+            bandApplied->store(band, std::memory_order_relaxed);
+        }
         const int mode = modeWanted->load(std::memory_order_relaxed);
         if (mode != modeApplied->load(std::memory_order_relaxed)) {
             p->setOversamplingMode(static_cast<dspark::Saturation<float>::OversamplingMode>(mode));
@@ -983,8 +1004,9 @@ inline EffectSlot makeMultibandSaturation()
         p->processBlock(b);
     };
     s.resetFn = [p]() { p->reset(); };
-    s.setParamFn = [p, splits, bands, modeWanted](int i, float v) {
+    s.setParamFn = [p, splits, bands, modeWanted, bandWanted](int i, float v) {
         auto& k = *splits;
+        if (i == 31) { bandWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); return; }
         const auto placeSplits = [&]() {
             for (int x = 0; x < bands->load() - 1; ++x) p->setCrossoverFrequency(x, k[static_cast<size_t>(x)].load());
         };
@@ -1071,32 +1093,44 @@ inline EffectSlot makeClipper()
     // Linear-phase (default) or minimum-phase oversampling filters; the
     // dry copy of the mix follows the minimum-phase ones (index 8).
     s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0);
+    // The band the oversampler's first stage keeps (index 9). Order MUST
+    // match dspark::Oversampling<float>::Band (Preset=0, Audible=1).
+    s.addChoice("Oversampling Band", {"Preset","Audible (to 20 kHz)"}, 0);
     auto filtWanted  = std::make_shared<std::atomic<int>>(0);
     auto filtApplied = std::make_shared<std::atomic<int>>(0);
-    s.prepareFn = [p, spec, osWanted, osApplied, filtWanted, filtApplied](auto& sp) {
+    auto bandWanted  = std::make_shared<std::atomic<int>>(0);
+    auto bandApplied = std::make_shared<std::atomic<int>>(0);
+    s.prepareFn = [p, spec, osWanted, osApplied, filtWanted, filtApplied, bandWanted, bandApplied](auto& sp) {
         *spec = sp;
         p->setOversampling(osWanted->load(std::memory_order_relaxed));
         p->setOversamplingMode(static_cast<dspark::Clipper<float>::OversamplingMode>(filtWanted->load(std::memory_order_relaxed)));
+        p->setOversamplingBand(static_cast<dspark::Clipper<float>::OversamplingBand>(bandWanted->load(std::memory_order_relaxed)));
         p->prepare(sp);
         osApplied->store(osWanted->load(std::memory_order_relaxed), std::memory_order_relaxed);
         filtApplied->store(filtWanted->load(std::memory_order_relaxed), std::memory_order_relaxed);
+        bandApplied->store(bandWanted->load(std::memory_order_relaxed), std::memory_order_relaxed);
     };
-    s.processFn = [p, spec, osWanted, osApplied, filtWanted, filtApplied](auto b) {
+    s.processFn = [p, spec, osWanted, osApplied, filtWanted, filtApplied, bandWanted, bandApplied](auto b) {
         const int want = osWanted->load(std::memory_order_relaxed);
         const int filt = filtWanted->load(std::memory_order_relaxed);
-        if ((want != osApplied->load(std::memory_order_relaxed) || filt != filtApplied->load(std::memory_order_relaxed))
+        const int band = bandWanted->load(std::memory_order_relaxed);
+        if ((want != osApplied->load(std::memory_order_relaxed) || filt != filtApplied->load(std::memory_order_relaxed)
+             || band != bandApplied->load(std::memory_order_relaxed))
             && spec->sampleRate > 0) {
             p->setOversampling(want);
             p->setOversamplingMode(static_cast<dspark::Clipper<float>::OversamplingMode>(filt));
+            p->setOversamplingBand(static_cast<dspark::Clipper<float>::OversamplingBand>(band));
             p->prepare(*spec);          // rebuilds filters - safe here (audio thread)
             osApplied->store(want, std::memory_order_relaxed);
             filtApplied->store(filt, std::memory_order_relaxed);
+            bandApplied->store(band, std::memory_order_relaxed);
         }
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, osWanted, filtWanted](int i, float v) {
+    s.setParamFn = [p, osWanted, filtWanted, bandWanted](int i, float v) {
         switch(i) {
+            case 9: bandWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
             case 0: p->setMode(static_cast<dspark::Clipper<float>::Mode>(static_cast<int>(v))); break;
             case 1: p->setCeiling(v); break;
             case 2: p->setInputGain(v); break;

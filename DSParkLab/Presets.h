@@ -242,6 +242,9 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Algorithm", 5 }, { "Drive", 8 }, { "Mix", 0.4f }, { "Oversampling", 2 } });
         s->addPreset("Wavefolder", "Folds over the top of the wave. Move Drive.",
             { { "Algorithm", 6 }, { "Drive", 18 }, { "Oversampling", 3 }, { "Drive Compensation", 1 } });
+        s->addPreset("Short oversampling (audible band)",
+            "4x with a first stage that keeps 20 kHz and stops its image: less latency, the same sound under 20 kHz. Switch Oversampling Band to Preset and back: nothing should change to the ear.",
+            { { "Algorithm", 0 }, { "Drive", 14 }, { "Oversampling", 2 }, { "Oversampling Band", 1 }, { "Drive Compensation", 1 } });
         s->addPreset("Curve, hard and uneven", "The curve with three controls: hardness, curvature and asymmetry.",
             { { "Algorithm", 10 }, { "Drive", 12 }, { "Curve Hardness", 0.6f }, { "Curve Asymmetry", 0.4f },
               { "Oversampling", 2 }, { "Drive Compensation", 1 } });
@@ -264,6 +267,9 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Bands", 4 }, { "Algorithm", 5 }, { "B4 Drive", 12 }, { "B4 Level", -3 } });
         s->addPreset("All bands into the output clip", "Every band driven, and a clipper at -1 dB after the sum.",
             { { "Bands", 3 }, { "B1 Drive", 12 }, { "B2 Drive", 12 }, { "B3 Drive", 12 }, { "Output Clip", 1 }, { "Output Ceiling", -1 } });
+        s->addPreset("Short oversampling (audible band)",
+            "Every band's oversampler with a first stage fitted to the rate. Switch Oversampling Band to compare.",
+            { { "Bands", 3 }, { "Algorithm", 0 }, { "B1 Drive", 12 }, { "B2 Drive", 10 }, { "B3 Drive", 8 }, { "Oversampling Band", 1 } });
         s->addPreset("Gentle split, 6 dB/oct", "Wide crossovers: the bands overlap and the split is hardly heard.",
             { { "Bands", 3 }, { "Crossover Slope", 0 }, { "B1 Drive", 10 }, { "B3 Drive", 8 } });
     }
@@ -285,6 +291,9 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Mode", 0 }, { "Input Gain", 9 }, { "Ceiling", -0.5f }, { "Oversampling", 3 }, { "Antialiasing (2nd order)", 1 } });
         s->addPreset("Three stages", "The same total drive spread over three stages.",
             { { "Mode", 3 }, { "Input Gain", 12 }, { "Stages", 3 }, { "Oversampling", 2 } });
+        s->addPreset("Short oversampling (audible band)",
+            "A soft clip at 4x with a first stage that keeps 20 kHz and stops its image. Switch Oversampling Band to compare.",
+            { { "Mode", 1 }, { "Input Gain", 9 }, { "Ceiling", -1 }, { "Oversampling", 2 }, { "Oversampling Band", 1 } });
     }
 
     // --- Analog models ------------------------------------------------------------

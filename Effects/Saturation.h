@@ -1644,6 +1644,9 @@ public:
         MinimumPhase    ///< Elliptic allpass half-bands: a few samples of latency, the dry path through the same filters.
     };
 
+    /** @brief The band the oversampler's first stage keeps (see setOversamplingBand()). */
+    using OversamplingBand = typename Oversampling<SampleType>::Band;
+
     /** @brief Determines how the stereo field is processed. */
     enum class ProcessingMode { Stereo, MidOnly, SideOnly, MidSide };
 
@@ -1753,7 +1756,7 @@ public:
         dryWetMixer_.prepare(spec);
         
         if (oversamplingFactor_ > 1 && !oversampler_)
-            oversampler_ = makeOversampler(oversamplingFactor_, oversamplingMode_);
+            oversampler_ = makeOversampler(oversamplingFactor_, oversamplingMode_, oversamplingBand_);
         if (oversampler_) oversampler_->prepare(spec);
         prepareStages();
 
@@ -1907,13 +1910,14 @@ private:
     /// are only as deep as its first (80 dB): every stage is then made at
     /// least 100 dB deep. At 2x and 4x the folding of the curve itself is
     /// what is left, so the preset stays.
-    [[nodiscard]] static std::unique_ptr<Oversampling<SampleType>> makeOversampler(int factor, OversamplingMode mode)
+    [[nodiscard]] static std::unique_ptr<Oversampling<SampleType>> makeOversampler(int factor, OversamplingMode mode,
+                                                                                   OversamplingBand band)
     {
         using Os = Oversampling<SampleType>;
         return std::make_unique<Os>(factor, Os::Quality::High,
                                     mode == OversamplingMode::MinimumPhase ? Os::Mode::PolyphaseIir
                                                                            : Os::Mode::LinearPhaseFir,
-                                    factor >= 8 ? Os::Depth::Deep : Os::Depth::Preset);
+                                    factor >= 8 ? Os::Depth::Deep : Os::Depth::Preset, band);
     }
 
     /** Aligns the dry path with the wet one: a delay behind linear-phase
@@ -2616,13 +2620,38 @@ public:
     /** @brief The filters of the oversampler (see setOversamplingMode()). */
     [[nodiscard]] OversamplingMode getOversamplingMode() const noexcept { return oversamplingMode_; }
 
+    /**
+     * @brief Chooses the band the oversampler's first stage keeps (NOT
+     *  real-time safe, as setOversampling()).
+     *
+     * Preset, the default, keeps the band up to 0.46 of the host rate at
+     * every rate. Audible keeps it up to 20 kHz and stops everything from
+     * the image of 20 kHz up, to the same depth: the stage is fitted to the
+     * host rate at prepare() and is shorter the higher the rate (see
+     * Oversampling::Band), which is less latency and less work. At 2x the
+     * linear-phase latency goes from 64 samples to 56 at 44.1 kHz, 32 at
+     * 48 kHz and 10 at 96 kHz. What is given up lies over 20 kHz: the wet
+     * path falls there (a 30 kHz tone at 96 kHz comes back at 0.95 of its
+     * level) while a linear-phase dry path does not.
+     */
+    void setOversamplingBand(OversamplingBand band)
+    {
+        band = static_cast<OversamplingBand>(std::clamp(static_cast<int>(band), 0, 1));
+        if (band == oversamplingBand_) return;
+        oversamplingBand_ = band;
+        applyOversampling(oversamplingFactor_);
+    }
+
+    /** @brief The band of the oversampler's first stage (see setOversamplingBand()). */
+    [[nodiscard]] OversamplingBand getOversamplingBand() const noexcept { return oversamplingBand_; }
+
 private:
     void applyOversampling(int factor)
     {
         oversamplingFactor_ = factor;
         if (factor > 1)
         {
-            oversampler_ = makeOversampler(factor, oversamplingMode_);
+            oversampler_ = makeOversampler(factor, oversamplingMode_, oversamplingBand_);
             if (spec_.sampleRate > 0) oversampler_->prepare(spec_);
         }
         else
@@ -2719,6 +2748,7 @@ public:
         w.write("oversampling", oversamplingFactor_);
         w.write("oversamplingAuto", oversamplingAutomatic_);
         w.write("oversamplingMode", static_cast<int32_t>(oversamplingMode_));
+        w.write("oversamplingBand", static_cast<int32_t>(oversamplingBand_));
         w.write("curveHardness", static_cast<float>(getCurveHardness()));
         w.write("curveCurvature", static_cast<float>(getCurveCurvature()));
         w.write("curveAsymmetry", static_cast<float>(getCurveAsymmetry()));
@@ -2761,6 +2791,7 @@ public:
         setOversampling(r.read("oversampling", 1));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
         setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
+        setOversamplingBand(static_cast<OversamplingBand>(r.read("oversamplingBand", 0)));
         setCurveShape(static_cast<SampleType>(r.read("curveHardness", 0.0f)),
                       static_cast<SampleType>(r.read("curveCurvature", 1.0f)),
                       static_cast<SampleType>(r.read("curveAsymmetry", 0.0f)));
@@ -3576,6 +3607,7 @@ protected:
         if (!calibrator_) calibrator_ = std::make_unique<Saturation>();
         calibrator_->oversamplingAutomatic_ = false;
         calibrator_->oversamplingMode_ = oversamplingMode_;
+        calibrator_->oversamplingBand_ = oversamplingBand_;
         calibrator_->applyOversampling(oversamplingFactor_);
         calibrator_->prepare(AudioSpec { spec_.sampleRate, kCalibrationBlock, 1 });
 
@@ -3721,6 +3753,7 @@ protected:
 
     // Minimum-phase oversampling: the dry path through the same filters.
     OversamplingMode oversamplingMode_ = OversamplingMode::LinearPhase;
+    OversamplingBand oversamplingBand_ = OversamplingBand::Preset;   ///< setOversamplingBand() (setup thread).
     OversamplingDryPath<SampleType> dryPath_;
     bool dryThroughFilters_ = false;
 

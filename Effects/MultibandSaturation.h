@@ -35,6 +35,7 @@
  *
  * Threading model:
  *  - prepare() / reset() / setOversampling() / setOversamplingMode() /
+ *    setOversamplingBand() /
  *    setAntialiasing() / getState() / setState(): setup thread only.
  *  - setNumBands() / setCrossoverFrequency() / setOrder() /
  *    setCrossoverMode() / setCrossoverStructure() / setMix() /
@@ -294,6 +295,12 @@ public:
     void setOversamplingMode(typename Saturation<T>::OversamplingMode mode)
     {
         for (auto& band : saturation_) band->setOversamplingMode(mode);
+    }
+    /** @brief The band the first stage of every band's oversampler keeps (NOT
+     *  real-time safe; see Saturation::setOversamplingBand()). */
+    void setOversamplingBand(typename Saturation<T>::OversamplingBand band)
+    {
+        for (auto& each : saturation_) each->setOversamplingBand(band);
     }
     /** @brief The antialiasing order of every band. */
     void setAntialiasing(typename Saturation<T>::Antialiasing mode) noexcept

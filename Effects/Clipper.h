@@ -139,7 +139,8 @@ public:
             oversampler_ = std::make_unique<Oversampling<T>>(
                 osFactor, Oversampling<T>::Quality::High,
                 minimum ? Oversampling<T>::Mode::PolyphaseIir : Oversampling<T>::Mode::LinearPhaseFir,
-                osFactor >= 16 ? Oversampling<T>::Depth::Deep : Oversampling<T>::Depth::Preset);
+                osFactor >= 16 ? Oversampling<T>::Depth::Deep : Oversampling<T>::Depth::Preset,
+                osBand_.load(std::memory_order_relaxed));
             oversampler_->prepare(spec);
         } else {
             oversampler_.reset();
@@ -383,6 +384,30 @@ public:
     /** @brief The oversampler's filters (setOversamplingMode()). */
     [[nodiscard]] OversamplingMode getOversamplingMode() const noexcept { return osMode_.load(std::memory_order_relaxed); }
 
+    /** @brief The band the oversampler's first stage keeps (see setOversamplingBand()). */
+    using OversamplingBand = typename Oversampling<T>::Band;
+
+    /**
+     * @brief Chooses the band the oversampler's first stage keeps (applied by
+     *        the next prepare()).
+     *
+     * Preset, the default, keeps the band up to 0.46 of the host rate at
+     * every rate. Audible keeps it up to 20 kHz and stops everything from
+     * the image of 20 kHz up, to the same depth: the stage is fitted to the
+     * host rate and is shorter the higher the rate (see Oversampling::Band).
+     * At 2x the linear-phase latency goes from 64 samples to 56 at 44.1 kHz,
+     * 32 at 48 kHz and 10 at 96 kHz. What is given up lies over 20 kHz.
+     *
+     * @param band Preset (default) or Audible.
+     */
+    void setOversamplingBand(OversamplingBand band) noexcept
+    {
+        osBand_.store(static_cast<OversamplingBand>(std::clamp(static_cast<int>(band), 0, 1)), std::memory_order_relaxed);
+    }
+
+    /** @brief The band of the oversampler's first stage (setOversamplingBand()). */
+    [[nodiscard]] OversamplingBand getOversamplingBand() const noexcept { return osBand_.load(std::memory_order_relaxed); }
+
     [[nodiscard]] Mode getMode() const noexcept { return mode_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getCeiling() const noexcept { return ceilingDb_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getInputGain() const noexcept { return inputGainDb_.load(std::memory_order_relaxed); }
@@ -431,6 +456,7 @@ public:
         w.write("oversampling", osFactor_.load(std::memory_order_relaxed));
         w.write("oversamplingAuto", osAutomatic_.load(std::memory_order_relaxed));
         w.write("oversamplingMode", static_cast<int32_t>(getOversamplingMode()));
+        w.write("oversamplingBand", static_cast<int32_t>(getOversamplingBand()));
         w.write("antialias", antialias_.load(std::memory_order_relaxed));
         return w.blob();
     }
@@ -450,6 +476,7 @@ public:
         setOversampling(r.read("oversampling", 1));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
         setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
+        setOversamplingBand(static_cast<OversamplingBand>(r.read("oversamplingBand", 0)));
         setAntialiasing(r.read("antialias", false));
         return true;
     }
@@ -837,6 +864,7 @@ protected:
     std::atomic<int> osFactor_ { 1 }; // Default to 1 (off)
     std::atomic<bool> osAutomatic_ { false }; ///< The factor follows the host rate.
     std::atomic<OversamplingMode> osMode_ { OversamplingMode::LinearPhase }; ///< setOversamplingMode().
+    std::atomic<OversamplingBand> osBand_ { OversamplingBand::Preset };      ///< setOversamplingBand().
     OversamplingDryPath<T> dryPath_;          ///< The dry copy through minimum-phase filters.
     bool dryThroughFilters_ = false;          ///< The dry copy crosses the filters (minimum phase).
     static constexpr double kAutomaticInternalRate = 88200.0; ///< Rate the automatic factor reaches.

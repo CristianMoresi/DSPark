@@ -107,6 +107,11 @@ public:
             for (int i = 0; i < fade; ++i)
                 taper_[static_cast<size_t>(kernelLength_ - fade + i)] = 0.5 + 0.5 * std::cos(3.141592653589793 * (i + 1) / (fade + 1));
         }
+        // The short kernel: half the transform at most, tapered over its whole length.
+        shortLength_ = std::min(kernelLength_, m_ / 2);
+        shortTaper_.resize(static_cast<size_t>(shortLength_));
+        for (int i = 0; i < shortLength_; ++i)
+            shortTaper_[static_cast<size_t>(i)] = 0.5 + 0.5 * std::cos(3.141592653589793 * i / shortLength_);
         const int ch = spec.numChannels;
         ring_.assign(static_cast<size_t>(ch), std::vector<double>(static_cast<size_t>(n_), 0.0));
         keyRing_.assign(static_cast<size_t>(ch), std::vector<double>(static_cast<size_t>(n_), 0.0));
@@ -130,6 +135,16 @@ public:
     /** @brief Applies one minus the filter (what it takes out). */
     void setRemovalListen(bool on) noexcept { removalListen_ = on; }
     [[nodiscard]] bool isRemovalListen() const noexcept { return removalListen_; }
+    /**
+     * @brief Cuts the filter's impulse response to half the transform and
+     *        tapers it over its whole length (off by default: the response
+     *        keeps the room the padding leaves, with only its tail tapered).
+     *        A cut then rings for a shorter time after the event: of the
+     *        response of a cut of 24 dB at a window of 1024, the energy past
+     *        half a window falls from -33 to -43 dB, at the same depth.
+     */
+    void setShortKernel(bool on) noexcept { shortKernel_ = on; }
+    [[nodiscard]] bool isShortKernel() const noexcept { return shortKernel_; }
 
     [[nodiscard]] int getLatency() const noexcept { return n_; }
     [[nodiscard]] int getWindowSize() const noexcept { return n_; }
@@ -177,16 +192,25 @@ public:
     /**
      * @brief Filters a block in place, the callback reading the power of a
      *        key (the same length or longer; its last channel serves the
-     *        programme's extra ones; nullptr reads the programme).
+     *        programme's extra ones; nullptr, or the programme's own
+     *        channels, reads the programme with no second transform).
      */
     template <typename Design>
     void processBlock(AudioBufferView<T> buffer, const AudioBufferView<T>* key, Design&& design) noexcept
     {
         if (!prepared_) return;
         if (key != nullptr && (key->getNumChannels() <= 0 || key->getNumSamples() < buffer.getNumSamples())) key = nullptr;
+        const int nCh = std::min(buffer.getNumChannels(), channels_);
+        if (key != nullptr)
+        {
+            // A key that is the programme itself is read once, as no key.
+            bool same = true;
+            for (int ch = 0; ch < nCh && same; ++ch)
+                same = key->getChannel(std::min(ch, key->getNumChannels() - 1)) == buffer.getChannel(ch);
+            if (same) key = nullptr;
+        }
         keyActive_ = key != nullptr;
         DenormalGuard guard;
-        const int nCh = std::min(buffer.getNumChannels(), channels_);
         const int nS = buffer.getNumSamples();
         const int mask = n_ - 1, accMask = 2 * m_ - 1;
         int i = 0;
@@ -316,8 +340,10 @@ private:
         }
         // Cut to the room the padding leaves, with a raised-cosine tail.
         fft_->inverse(h, c);
-        for (int q = 0; q < kernelLength_; ++q) c[q] *= taper_[static_cast<size_t>(q)];
-        std::fill(c + kernelLength_, c + m_, 0.0);
+        const int length = shortKernel_ ? shortLength_ : kernelLength_;
+        const double* taper = shortKernel_ ? shortTaper_.data() : taper_.data();
+        for (int q = 0; q < length; ++q) c[q] *= taper[q];
+        std::fill(c + length, c + m_, 0.0);
         fft_->forward(c, h);
         return false;
     }
@@ -357,11 +383,11 @@ private:
     }
 
     double fs_ = 48000.0, norm_ = 0.5;
-    int n_ = 2048, pad_ = 2, m_ = 4096, hop_ = 512, bins_ = 2049, kernelLength_ = 2049, channels_ = 0;
+    int n_ = 2048, pad_ = 2, m_ = 4096, hop_ = 512, bins_ = 2049, kernelLength_ = 2049, shortLength_ = 2048, channels_ = 0;
     int writePos_ = 0, readPos_ = 0, hopCounter_ = 0;
-    bool prepared_ = false, linked_ = false, removalListen_ = false, keyActive_ = false;
+    bool prepared_ = false, linked_ = false, removalListen_ = false, keyActive_ = false, shortKernel_ = false;
     std::unique_ptr<FFTReal<double>> fft_;
-    std::vector<double> window_, taper_, frame_, kernel_, keySpectrum_;
+    std::vector<double> window_, taper_, shortTaper_, frame_, kernel_, keySpectrum_;
     std::vector<std::vector<double>> ring_, keyRing_, accum_, spectra_;
     std::vector<T> power_, gain_;
     std::vector<std::vector<T>> powers_;

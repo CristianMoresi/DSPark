@@ -6,6 +6,39 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TapeMachine::Speed::IPS_3_75`: 3.75 ips, with 90 us and the low-frequency
+  constant in both standards. The head loses more of the top (at full losses
+  10 kHz is 8.7 dB down, against 4.1 at 7.5 ips, 2.0 at 15 and 1.0 at 30),
+  the head bump sits at half the frequency of 7.5 ips and the reference
+  level stays where it is. The value comes last in the enumeration, so
+  stored states keep their meaning.
+- `TapeMachine::setRecordEmphasis()`, -6 to +6 dB: a high shelf around 4 kHz
+  on the record side and its exact inverse on the reproduce side, as a
+  record equaliser aligned against its reproduce twin. The round trip stays
+  flat at low level (within 0.01 dB); the top end reaches the tape hotter or
+  cooler (the third harmonic of 5 kHz at -6 dBFS: -29.1 dB at 0, -27.9 at
+  +6, -33.1 at -6) and the tape's hiss between 8 and 16 kHz falls 5.4 dB at
+  +6 and rises 5.5 at -6. State key `recordEmphasis`.
+- `TapeMachine::setTrackFormat()` moves the head bump too: it sits where the
+  wavelength meets the length of the head's contact with the tape (the speed
+  over that length), and each format has its head: at 15 ips, 90 Hz with
+  Half (as before), 72 Hz with Full and 112 Hz with Quarter.
+- `TapeMachine::setOutputIron()` also takes the iron's low end, in a linear
+  way: by the same share the output crosses a first-order high-pass at
+  20 Hz (at the full amount 3.0 dB down at 20 Hz, 0.18 at 100 Hz), which
+  removes by structure what DC the even term leaves.
+- `TapeMachine` rests while it is not heard: with the mix settled on the dry
+  side, or the source monitored, the machine does not run (3 ns per stereo
+  frame against 3550 on the same host) and the output is the input, late by
+  the latency, to the bit. Asked for again it starts from rest, runs unheard
+  for its latency and comes in under the fade: no step (the largest between
+  samples, 0.03266 against 0.03265 of the settled tone).
+- `TapeMachine::prepare()` asked for another block size alone (same rate and
+  channels) keeps the machine's memory: the output goes on to the bit, where
+  it used to restart from silence. Any other call starts from rest.
+- `BucketBrigade::delayFor()`: the delay to ask of the chain for the whole
+  device (its two low-passes, its hold, the average over the step) to be
+  late by a given time.
 - `CrossoverFilter::setOrder()` takes 6 and 36 dB per octave as well, in the
   minimum-phase engine (both structures) and in linear phase. 36 is two
   third-order Butterworth filters per branch (6 dB down at the split, 36 dB
@@ -476,7 +509,7 @@ All notable user-facing changes to DSPark are documented here.
   device of 4096 stages, with its filters at 0.3 of the clock, so a longer
   echo is darker (2 kHz is 0.4 dB down at 150 ms, 6.6 dB at 300 ms and 52 dB
   at 600 ms; 4 kHz 0.4 dB down at 50 ms), and its hiss; the feedback goes
-  round the device (echoes at 300.5 and 601.1 ms with a 300 ms delay) and
+  round the device (echoes at 300.0 and 600.0 ms with a 300 ms delay) and
   the clock's images stay 68 dB under a 1 kHz tone at 300 ms.
   `setCharacterNoise()` sets the hiss of both (-84 dBFS by default). A
   stereo frame costs 171 ns with Tape and 80 with Bucket against 53. State
@@ -2779,6 +2812,25 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `TapeMachine`: DC at the input reached the tape and leaned its loop to one
+  side, a second harmonic that no later stage removed (the output coupling
+  only took the DC itself): a 1 kHz tone at -12 dBFS over a DC of 0.1
+  carried it at -44 dB, and at -86 dB over a 0.5 Hz drift of 0.1. The input
+  is now AC coupled, as a machine's line input is (two one-pole high-passes
+  at 4 Hz in series, critically damped): -147 and -98 dB. The low end gives
+  0.34 dB at 20 Hz, 0.15 at 30 and 0.08 at 40; nothing from 60 Hz up.
+- `TapeMachine::setBias()`: under the optimum the top end did not follow the
+  bias (10 kHz against 1 kHz stayed within 0.1 dB from 0.1 to 0.55), and
+  over it the self-erasure came in at once, a step of 1.2 dB at 0.57. Under
+  the optimum the top now rises as the bias falls (10 kHz 2.0 dB up at 0.2
+  and 2.6 at 0.1, a shelf that follows the speed), and over it the top
+  darkens from the optimum on, without a step (0.8 dB down at 0.55). At the
+  optimum, and from 0.6 up, the response is what it was.
+- `Delay` with `Character::Bucket`: the device's filters and its hold added
+  their own delay to the chain's, so an echo of 300 ms sat at 300.49 ms and
+  each repeat as much again. The chain's clock now takes that delay off:
+  the echoes of a 300 ms delay sit at 299.995 and 600.014 ms (100 ms:
+  99.993 and 200.006; 600 ms: 599.994 and 1200.014).
 - `Saturation::setCombLoop()`: a new frequency moved the read point of the
   feedback line at once, by a whole number of samples: a cut in a signal
   that recirculates, a click each time (a tone under a loop of 0.9 taken

@@ -9864,3 +9864,37 @@ DSPARK_TEST(TonalBalance_local_slope_asks_less_of_a_quiet_end)
     EXPECT_TRUE(b.setState(blob.data(), blob.size()));
     EXPECT_TRUE(b.getLocalSlope());
 }
+
+// New: Quality::Render. Half the hop and the bank refined at every hop: its
+// response lands closer to the corrections asked; the latency is the same,
+// and a render the processor is told of takes that quality by itself.
+DSPARK_TEST(TonalBalance_render_quality_lands_closer)
+{
+    const std::vector<float> x = l13Add(l13MixLike(48000 * 3, 91u), 3000.0, 0.15);
+    const auto missed = [&](Tb9::Quality q, int& latency) {
+        const auto tb = m9Balance([=](Tb9& t) { t.setQuality(q); t.setBalance(1.0f); t.setTrimPeaks(1.0f); t.setRange(12.0f); }, x);
+        latency = tb->getLatency();
+        double worst = 0.0;
+        for (int b = 4; b < Tb9::kBands - 4; ++b)
+            worst = std::max(worst, std::abs(tb->getResponse(tb->getBandCentre(b)) - static_cast<double>(tb->getCorrection(b))));
+        return worst;
+    };
+    int latencyRealtime = 0, latencyRender = 0;
+    const double realtime = missed(Tb9::Quality::Realtime, latencyRealtime), render = missed(Tb9::Quality::Render, latencyRender);
+    std::printf("  [balance] the bank misses the corrections asked by %.3f dB in real time and %.3f dB at the render quality\n", realtime, render);
+    EXPECT_LT(render, realtime);
+    EXPECT_EQ(latencyRender, latencyRealtime);
+    Tb9 a;
+    a.setOfflineRendering(true);
+    a.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(a.getQualityInUse() == Tb9::Quality::Realtime);
+    a.setQualityFollowsRender(true);
+    a.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(a.getQualityInUse() == Tb9::Quality::Render);
+    a.setQuality(static_cast<Tb9::Quality>(7));
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getQualityFollowsRender());
+    EXPECT_TRUE(b.getQuality() == Tb9::Quality::Realtime);
+}

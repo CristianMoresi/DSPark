@@ -159,7 +159,9 @@ public:
         BandPass,   ///< Bandpass around frequency.
         Tilt,       ///< Tilt EQ: pivots spectrum around frequency.
         AllPass,      ///< Turns the phase around frequency, 180 degrees per order; the level stays.
-        ConstantTilt,     ///< The same slope across the whole band: gain is in dB per octave (-6 to +6), 0 dB at frequency.
+        ConstantTilt,     ///< The same slope across the whole band: gain is in dB per octave (-6 to +6), 0 dB at frequency. The end
+                          ///< that rises (20 kHz, or 20 Hz for a negative slope) is held to 36 dB: with the pivot far from the
+                          ///< middle of the band the slope is taken down just enough for that end to stop there.
         LowPassWall,  ///< Elliptic cut above frequency: flat to it, 100 dB down a quarter of an octave later.
         HighPassWall  ///< Elliptic cut below frequency.
     };
@@ -1218,6 +1220,7 @@ protected:
     static constexpr double kRampSlowMs = 40.0;    ///< Glide of a small move of a band of the analog response.
     static constexpr double kRampFastMs = 10.0;    ///< Glide of a jump.
     static constexpr double kRestDb = 0.05;        ///< A gain band closer to 0 dB than this leaves the path.
+    static constexpr double kTiltCeilingDb = 36.0; ///< Most a constant tilt lifts its rising end (20 Hz or 20 kHz).
 
     /// One band of the analog response.
     struct AnalogBand
@@ -1281,7 +1284,7 @@ protected:
                 break;
             case BandType::Tilt:         one.add(AnalogSection::tilt(f, g)); break;
             case BandType::AllPass:      return FilterDesign::allPass(f, q, order);
-            case BandType::ConstantTilt:     return FilterDesign::tilt(f, g);
+            case BandType::ConstantTilt:     return FilterDesign::tilt(f, FilterDesign::tiltSlopeWithin(f, g, kTiltCeilingDb));
             case BandType::LowPassWall:  return FilterDesign::ellipticHighCut(f);
             case BandType::HighPassWall: return FilterDesign::ellipticLowCut(f);
         }

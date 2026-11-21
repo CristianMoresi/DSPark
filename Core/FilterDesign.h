@@ -631,6 +631,25 @@ public:
     }
 
     /**
+     * @brief The slope a tilt can have at a pivot without lifting the end
+     *        that rises (20 kHz for a positive slope, 20 Hz for a negative
+     *        one) by more than a ceiling: the slope asked for, or the one that
+     *        lands that end on the ceiling. The end that falls is not limited.
+     *
+     * @param pivotHz          Frequency that keeps its level.
+     * @param slopeDbPerOctave Slope asked for, in dB per octave.
+     * @param ceilingDb        Most the rising end may be lifted, in dB.
+     */
+    [[nodiscard]] static double tiltSlopeWithin(double pivotHz, double slopeDbPerOctave, double ceilingDb) noexcept
+    {
+        if (!std::isfinite(slopeDbPerOctave) || !std::isfinite(pivotHz) || !(ceilingDb > 0.0)) return slopeDbPerOctave;
+        const double pivot = std::clamp(pivotHz, 20.0, 20000.0);
+        const double octaves = slopeDbPerOctave > 0.0 ? std::log2(20000.0 / pivot) : std::log2(pivot / 20.0);
+        const double rise = std::abs(slopeDbPerOctave) * octaves;
+        return rise > ceilingDb ? slopeDbPerOctave * (ceilingDb / rise) : slopeDbPerOctave;
+    }
+
+    /**
      * @brief Elliptic high cut: flat to the corner within the ripple, then a
      *        wall down to the stop level.
      *

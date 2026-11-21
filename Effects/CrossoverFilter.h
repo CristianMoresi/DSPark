@@ -8,8 +8,8 @@
  * @brief Linkwitz-Riley crossover filter for multi-band audio processing.
  *
  * Splits an audio signal into 2-12 frequency bands using Linkwitz-Riley
- * crossover filters. Supports three slope options (LR12, LR24, LR48) and
- * two processing modes: minimum-phase IIR with allpass phase correction,
+ * crossover filters. Supports five slopes (6 dB per octave, LR12, LR24, LR36
+ * and LR48) and two processing modes: minimum-phase IIR with allpass phase correction,
  * and linear-phase FFT-based processing with zero phase distortion.
  * Its processBlock(input, bandOutputs, count) writes separate caller-owned
  * band buffers, rather than replacing input with one band. Non-finite input
@@ -25,8 +25,13 @@
  * point. LR12 additionally bakes a polarity inversion into the high-pass
  * branch of each split (the textbook LR2 convention): odd-numbered bands
  * come out polarity-inverted so the tree sums flat instead of notching
- * at every crossover. The linear-phase path needs neither (zero-phase
- * magnitudes sum to unity by construction).
+ * at every crossover. LR36 (two third-order Butterworth filters per branch)
+ * does the same, with a first-order and a second-order allpass section per
+ * split above. The 6 dB per octave split is a first-order low-pass and its
+ * complement: the two branches add up to the input itself, so its bands sum
+ * to the input (not to an allpass of it) and need no phase correction. The
+ * linear-phase path needs neither (zero-phase magnitudes sum to unity by
+ * construction).
  *
  * The linear-phase FIR has a fixed length of about 85 ms (4096 taps at 44.1
  * and 48 kHz, scaling with the rate), whatever the host block size. Its
@@ -119,7 +124,7 @@ namespace dspark {
 
 /**
  * @class CrossoverFilter
- * @brief Linkwitz-Riley crossover with 2-12 bands, LR12/LR24/LR48.
+ * @brief Linkwitz-Riley crossover with 2-12 bands: 6, 12, 24, 36 or 48 dB per octave.
  *
  * @tparam T      Sample type (float or double).
  * @tparam MaxBands Maximum number of output bands (compile-time, default 12).
@@ -447,10 +452,18 @@ public:
         }
     }
 
-    /** @brief Sets the crossover slope: 12, 24 or 48 (dB/oct). Other values are ignored. */
+    /**
+     * @brief Sets the crossover slope: 6, 12, 24, 36 or 48 (dB/oct). Other values are ignored.
+     *
+     * 12 to 48 are Linkwitz-Riley splits (the bands sum to an allpass of the
+     * input; each branch is 6 dB down at the split). 6 is a first-order
+     * low-pass and its complement (the bands sum to the input itself; each
+     * branch is 3 dB down at the split in the minimum-phase engine and 6 dB
+     * in the linear-phase one).
+     */
     void setOrder(int order) noexcept
     {
-        if (order == 12 || order == 24 || order == 48)
+        if (order == 6 || order == 12 || order == 24 || order == 36 || order == 48)
         {
             order_.store(order, std::memory_order_relaxed);
             dirty_.store(true, std::memory_order_release);
@@ -744,6 +757,55 @@ private:
         // Note: Frequencies are already guaranteed to be sorted by the setter thread.
         switch (order_.load(std::memory_order_relaxed))
         {
+            case 6:
+                // A first-order low-pass and the high-pass on the same pole:
+                // they add up to the input itself (their numerators sum to
+                // the denominator), so no band needs a phase correction.
+                numStagesPerFilter_ = 1;
+                numStagesAllpass_   = 0;
+                for (int s = 0; s < numSplits; ++s)
+                {
+                    double f = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
+                    setSplitSection(s, 0, BiquadCoeffs::makeFirstOrderLowPass(sr, f),
+                                    BiquadCoeffs::makeFirstOrderHighPass(sr, f), ladderRamp);
+                }
+                break;
+
+            case 36:
+                // Two third-order Butterworth filters in series per branch:
+                // a first-order section and a second-order one of Q = 1,
+                // twice. The two branches meet half a turn apart (three
+                // times 180 degrees), as in LR12, so the high branch is
+                // inverted and the pair sums to the allpass of one
+                // third-order filter: a first-order and a second-order
+                // section.
+                numStagesPerFilter_ = 4;
+                numStagesAllpass_   = 2;
+                for (int s = 0; s < numSplits; ++s)
+                {
+                    double f = clampSplitFreq(static_cast<double>(frequencies_[s]), sr);
+                    const auto lp1 = BiquadCoeffs::makeFirstOrderLowPass(sr, f);
+                    const auto hp1 = BiquadCoeffs::makeFirstOrderHighPass(sr, f);
+                    const auto lp2 = BiquadCoeffs::makeLowPass(sr, f, 1.0);
+                    const auto hp2 = BiquadCoeffs::makeHighPass(sr, f, 1.0);
+                    auto hp1Inverted = hp1;
+                    hp1Inverted.b0 = -hp1Inverted.b0;
+                    hp1Inverted.b1 = -hp1Inverted.b1;
+                    hp1Inverted.b2 = -hp1Inverted.b2;
+                    setSplitSection(s, 0, lp1, hp1Inverted, ladderRamp);
+                    setSplitSection(s, 1, lp2, hp2, ladderRamp);
+                    setSplitSection(s, 2, lp1, hp1, ladderRamp);
+                    setSplitSection(s, 3, lp2, hp2, ladderRamp);
+                    const auto ap1 = makeFirstOrderAllPass(sr, f);
+                    const auto ap2 = BiquadCoeffs::makeAllPass(sr, f, 1.0);
+                    for (int b = 0; b < s; ++b)
+                    {
+                        setAllpassSection(b, s, 0, ap1, ladderRamp);
+                        setAllpassSection(b, s, 1, ap2, ladderRamp);
+                    }
+                }
+                break;
+
             case 12:
                 numStagesPerFilter_ = 2;
                 numStagesAllpass_   = 1;
@@ -1085,7 +1147,9 @@ private:
             lpDesignFc_[static_cast<size_t>(sp)] = clampSplitFreq(static_cast<double>(frequencies_[static_cast<size_t>(sp)]), sr);
         switch (order_.load(std::memory_order_relaxed))
         {
+            case 6: lpDesignExpo_ = 1; break;
             case 12: lpDesignExpo_ = 2; break;
+            case 36: lpDesignExpo_ = 6; break;
             case 48: lpDesignExpo_ = 8; break;
             default: lpDesignExpo_ = 4; break;
         }
@@ -1116,9 +1180,14 @@ private:
         for (int k = begin; k < end; ++k)
         {
             const double r = freq[k] * invFc;
-            double rPow = r * r;
-            if constexpr (Expo >= 4) rPow *= rPow;
-            if constexpr (Expo >= 8) rPow *= rPow;
+            double rPow = r;
+            if constexpr (Expo >= 2) rPow = r * r;
+            if constexpr (Expo == 6) rPow *= rPow * rPow;
+            else
+            {
+                if constexpr (Expo >= 4) rPow *= rPow;
+                if constexpr (Expo >= 8) rPow *= rPow;
+            }
             const double lp = 1.0 / (1.0 + rPow);
             const double c = carry[k];
             mag[k] = static_cast<T>(c * lp);
@@ -1152,9 +1221,9 @@ private:
             // high-pass of every split below it (lpCarry_, the running
             // product), like the IIR tree, so the bands telescope to exactly 1
             // (LP + HP = 1 per split). Ideal Linkwitz-Riley
-            // |LP| = 1/(1 + (f/fc)^N) with N = order/6 (2/4/8 -> 12/24/48
-            // dB/oct), matching the IIR path's slope; integer powers by
-            // repeated squaring. The imaginary parts stay zero (set in
+            // |LP| = 1/(1 + (f/fc)^N) with N = order/6 (1/2/4/6/8 ->
+            // 6/12/24/36/48 dB/oct), matching the IIR path's slope; integer
+            // powers by repeated squaring. The imaginary parts stay zero (set in
             // prepare(); the inverse FFT does not write its input).
             const int chunk = (numBins + kLpMagChunks - 1) / kLpMagChunks;
             const int begin = std::min(numBins, lpDesignStep_ * chunk);
@@ -1164,7 +1233,9 @@ private:
             const double fc = lpDesignFc_[static_cast<size_t>(b)];
             switch (lpDesignExpo_)
             {
+                case 1: designBandMagnitudes<1>(fc, begin, end); break;
                 case 2: designBandMagnitudes<2>(fc, begin, end); break;
+                case 6: designBandMagnitudes<6>(fc, begin, end); break;
                 case 8: designBandMagnitudes<8>(fc, begin, end); break;
                 default: designBandMagnitudes<4>(fc, begin, end); break;
             }

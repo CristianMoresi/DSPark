@@ -154,6 +154,38 @@ struct AnalogSection
         return make(A * A, A * std::sqrt(A) * d * w, A * w * w, 1.0, std::sqrt(A) * d * w, A * w * w);
     }
 
+    /**
+     * @brief Second-order low shelf by its Q: gainDb below the corner, half of
+     *        it (in decibels) at the corner whatever the Q. At 0.7071 it is
+     *        lowShelf() at a slope of 1; above, the response rises over the
+     *        plateau before the corner and dips under 0 dB after it, more the
+     *        higher the Q; a cut is the exact inverse of the boost.
+     */
+    [[nodiscard]] static AnalogSection lowShelfQ(double hz, double gainDb, double q) noexcept
+    {
+        const double w = omegaOf(hz), A = std::pow(10.0, gainDb / 40.0), d = 1.0 / std::clamp(q, 0.05, 100.0);
+        return make(A, A * std::sqrt(A) * d * w, A * A * w * w, A, std::sqrt(A) * d * w, w * w);
+    }
+
+    /** @brief Second-order high shelf by its Q: lowShelfQ() mirrored about the corner. */
+    [[nodiscard]] static AnalogSection highShelfQ(double hz, double gainDb, double q) noexcept
+    {
+        const double w = omegaOf(hz), A = std::pow(10.0, gainDb / 40.0), d = 1.0 / std::clamp(q, 0.05, 100.0);
+        return make(A * A, A * std::sqrt(A) * d * w, A * w * w, 1.0, std::sqrt(A) * d * w, A * w * w);
+    }
+
+    /**
+     * @brief Second-order tilt: 0 dB at the pivot, half of gainDb down far
+     *        below it and half of it up far above, 12 dB per octave at most
+     *        on the way; the Q as in lowShelfQ().
+     */
+    [[nodiscard]] static AnalogSection tiltSecondOrder(double hz, double gainDb, double q = 0.7071067811865476) noexcept
+    {
+        // A low shelf of -gainDb with half of gainDb back over the whole band.
+        const double w = omegaOf(hz), A = std::pow(10.0, -gainDb / 40.0), d = 1.0 / std::clamp(q, 0.05, 100.0);
+        return make(1.0, std::sqrt(A) * d * w, A * w * w, A, std::sqrt(A) * d * w, w * w);
+    }
+
     /** @brief First-order low-pass, -3 dB at the corner. */
     [[nodiscard]] static AnalogSection firstOrderLowPass(double hz) noexcept
     {
@@ -505,19 +537,25 @@ public:
      * A Butterworth shelf (S. J. Orfanidis, "High-Order Digital Parametric
      * Equalizer Design", J. Audio Eng. Soc., 2005): it never overshoots, and
      * a cut is the exact inverse of the boost of the same size.
+     *
+     * From order 2 up, q is the Q of the sharpest pair of poles and of
+     * zeros (0.7071: the Butterworth shelf). Above it the response
+     * rises over the plateau before the corner and dips after it;
+     * the plateau, the half gain at the corner and the inverse cut
+     * stay as they are.
      */
-    [[nodiscard]] static AnalogCascade lowShelf(double hz, double gainDb, int order) noexcept
+    [[nodiscard]] static AnalogCascade lowShelf(double hz, double gainDb, int order, double q = kButterworthQ) noexcept
     {
-        AnalogCascade out = shelfPrototype(gainDb, order);
+        AnalogCascade out = shelfPrototype(gainDb, order, q);
         const double omega = omegaOf(hz);
         for (int i = 0; i < out.count; ++i) at(out, i) = scaled(at(out, i), omega);
         return out;
     }
 
     /** @brief High shelf of any order: lowShelf() mirrored about the corner. */
-    [[nodiscard]] static AnalogCascade highShelf(double hz, double gainDb, int order) noexcept
+    [[nodiscard]] static AnalogCascade highShelf(double hz, double gainDb, int order, double q = kButterworthQ) noexcept
     {
-        AnalogCascade out = shelfPrototype(gainDb, order);
+        AnalogCascade out = shelfPrototype(gainDb, order, q);
         const double omega = omegaOf(hz);
         for (int i = 0; i < out.count; ++i) at(out, i) = mirrored(at(out, i), omega);
         return out;
@@ -1304,15 +1342,18 @@ private:
      * @brief Butterworth low shelf with its corner at 1 rad/s: gainDb at DC,
      *        half of it (in decibels) at the corner, 0 dB far above.
      */
-    [[nodiscard]] static AnalogCascade shelfPrototype(double gainDb, int order) noexcept
+    [[nodiscard]] static AnalogCascade shelfPrototype(double gainDb, int order, double q = kButterworthQ) noexcept
     {
         AnalogCascade out;
         const int n = std::clamp(order, 1, kMaxOrder);
         const double db = std::isfinite(gainDb) ? std::clamp(gainDb, -120.0, 120.0) : 0.0;
         const double g = std::pow(10.0, db / (20.0 * n)), beta = std::pow(10.0, -db / (40.0 * n));
+        // The Q acts on the sharpest pair, in its zeros as in its poles: the
+        // gain of the pair at the corner does not depend on its damping.
+        const double sharpest = kButterworthQ / (std::isfinite(q) ? std::clamp(q, 0.05, 100.0) : kButterworthQ);
         for (int i = 0; i < n / 2; ++i)
         {
-            const double s = std::sin(kPi * (2 * i + 1) / (2.0 * n));
+            const double s = std::sin(kPi * (2 * i + 1) / (2.0 * n)) * (i == 0 ? sharpest : 1.0);
             out.add(AnalogSection::make(1.0, 2.0 * g * s * beta, g * g * beta * beta, 1.0, 2.0 * s * beta, beta * beta));
         }
         if (n % 2 == 1) out.add(AnalogSection::make(0.0, 1.0, g * beta, 0.0, 1.0, beta));

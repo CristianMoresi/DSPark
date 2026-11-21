@@ -4351,7 +4351,7 @@ AnalogEq::BandConfig eqBand(AnalogEq::BandType type, double hz, double gain, dou
     cfg.gain = gain;
     cfg.q = q;
     cfg.slope = slope;
-    cfg.order = order;
+    cfg.order = static_cast<float>(order);
     return cfg;
 }
 

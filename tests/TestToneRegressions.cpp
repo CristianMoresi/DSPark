@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -799,7 +800,7 @@ DSPARK_TEST(Tone_eq_linear_phase_change_is_heard_as_soon_with_many_bands)
                     cfg.frequency = b == 0 ? 1000.0f : 60.0f * std::pow(1.42f, static_cast<float>(b));
                     cfg.gain = b == 0 ? gain : (b % 2 == 0 ? 2.0f : -2.0f);
                     cfg.q = 2.0f;
-                    cfg.order = order;
+                    cfg.order = static_cast<float>(order);
                     eq.setBand(b, cfg);
                 }
             };
@@ -1060,4 +1061,140 @@ DSPARK_TEST(Tone_eq_resonant_shelves_and_second_order_tilt)
     EQ other;
     EXPECT_TRUE(other.setState(blob.data(), blob.size()));
     EXPECT_TRUE(other.isResonantShelves());
+}
+
+namespace {
+
+// The response of an analog cascade at a frequency, as a complex number.
+std::complex<double> analogAt(const AnalogCascade& cascade, double hz)
+{
+    const double w = 2.0 * kPiT * hz;
+    std::complex<double> h(1.0, 0.0);
+    for (int i = 0; i < cascade.count; ++i)
+    {
+        const AnalogSection& s = cascade.sections[static_cast<size_t>(i)];
+        h *= std::complex<double>(s.b0 - s.b2 * w * w, s.b1 * w) / std::complex<double>(s.a0 - s.a2 * w * w, s.a1 * w);
+    }
+    return h;
+}
+
+double analogDb(const AnalogCascade& cascade, double hz)
+{
+    return 20.0 * std::log10(std::max(std::abs(analogAt(cascade, hz)), 1e-15));
+}
+
+} // namespace
+
+// New: orders between whole ones. A bell, a shelf, a band-pass, a band-stop
+// and an all-pass take any order from 1: the response moves a little from one
+// order to the next twentieth and nothing jumps at the whole ones, with the
+// gains that define each kind where they were. The all-pass turns its phase
+// at the frequency by 90 degrees per order all the way (its far response has
+// to go round half a turn between two whole orders, so there it moves fast).
+DSPARK_TEST(Tone_eq_orders_between_whole_ones)
+{
+    using EQ = Equalizer<float>;
+    const double hz = 1000.0, q = 2.0;
+    const double low = hz * (std::sqrt(1.0 + 0.25 / (q * q)) - 0.5 / q), high = hz * (std::sqrt(1.0 + 0.25 / (q * q)) + 0.5 / q);
+    std::vector<double> grid;
+    for (double f = 20.0; f < 20000.0; f *= std::pow(2.0, 1.0 / 12.0)) grid.push_back(f);
+    double bellTop = 0.0, bellEdge = 0.0, shelfEnds = 0.0, shelfCorner = 0.0, passEdge = 0.0, stopEdge = 0.0, allFlat = 0.0;
+    double step[5] = {}, seam[5] = {}, turned = 0.0;
+    AnalogCascade before[5];
+    const auto kinds = [&](double order, AnalogCascade* out) {
+        out[0] = FilterDesign::bell(hz, q, 12.0, order);
+        out[1] = FilterDesign::lowShelf(hz, 12.0, order);
+        out[2] = FilterDesign::bandPass(hz, q, order);
+        out[3] = FilterDesign::bandStop(hz, q, order);
+        out[4] = FilterDesign::allPass(hz, 0.7071067811865476, order);
+    };
+    // At each whole order: a millionth of an order to either side is the same filter.
+    for (int whole = 2; whole <= 5; ++whole)
+    {
+        AnalogCascade at[5], under[5], over[5];
+        kinds(static_cast<double>(whole), at);
+        kinds(whole - 1e-6, under);
+        kinds(whole + 1e-6, over);
+        for (int kind = 0; kind < 5; ++kind)
+            for (const double f : grid)
+                seam[kind] = std::max({ seam[kind], std::abs(analogAt(under[kind], f) - analogAt(at[kind], f)),
+                                        std::abs(analogAt(over[kind], f) - analogAt(at[kind], f)) });
+    }
+    for (int i = 0; i <= 100; ++i)
+    {
+        const double order = 1.0 + 0.05 * i;
+        const AnalogCascade now[5] = { FilterDesign::bell(hz, q, 12.0, order), FilterDesign::lowShelf(hz, 12.0, order),
+                                       FilterDesign::bandPass(hz, q, order), FilterDesign::bandStop(hz, q, order),
+                                       FilterDesign::allPass(hz, 0.7071067811865476, order) };
+        bellTop = std::max(bellTop, std::abs(analogDb(now[0], hz) - 12.0));
+        bellEdge = std::max({ bellEdge, std::abs(analogDb(now[0], low) - 6.0), std::abs(analogDb(now[0], high) - 6.0) });
+        shelfEnds = std::max({ shelfEnds, std::abs(analogDb(now[1], 0.01) - 12.0), std::abs(analogDb(now[1], 1.0e7)) });
+        shelfCorner = std::max(shelfCorner, std::abs(analogDb(now[1], hz) - 6.0));
+        passEdge = std::max({ passEdge, std::abs(analogDb(now[2], hz)), std::abs(analogDb(now[2], low) + 3.0103), std::abs(analogDb(now[2], high) + 3.0103) });
+        stopEdge = std::max({ stopEdge, std::abs(analogDb(now[3], low) + 3.0103), std::abs(analogDb(now[3], high) + 3.0103) });
+        for (const double f : grid) allFlat = std::max(allFlat, std::abs(analogDb(now[4], f)));
+        {
+            // The phase at the frequency: 90 degrees back per order.
+            const std::complex<double> wanted = std::polar(1.0, -0.5 * kPiT * order);
+            turned = std::max(turned, std::abs(analogAt(now[4], hz) - wanted));
+        }
+        if (i > 0)
+            for (int kind = 0; kind < 5; ++kind)
+                for (const double f : grid)
+                    step[kind] = std::max(step[kind], std::abs(analogAt(now[kind], f) - analogAt(before[kind], f))
+                                                          / std::max(1.0, std::abs(analogAt(before[kind], f))));
+        for (int kind = 0; kind < 5; ++kind) before[kind] = now[kind];
+    }
+    std::printf("  [eq] orders 1 to 6 by twentieths: bell top within %.1e dB and edges within %.1e of half the gain; shelf plateaus %.1e, corner %.1e; band-pass centre and edges %.3f dB, band-stop edges %.3f; all-pass flat within %.1e and its turn at the frequency within %.1e; largest move per step: bell %.3f, shelf %.3f, band-pass %.3f, band-stop %.3f; at the whole orders: %.1e, %.1e, %.1e, %.1e and %.1e\n",
+                bellTop, bellEdge, shelfEnds, shelfCorner, passEdge, stopEdge, allFlat, turned, step[0], step[1], step[2], step[3],
+                seam[0], seam[1], seam[2], seam[3], seam[4]);
+    EXPECT_LT(bellTop, 1e-6);
+    EXPECT_LT(bellEdge, 1e-6);
+    EXPECT_LT(shelfEnds, 1e-3);
+    EXPECT_LT(shelfCorner, 1e-9);
+    EXPECT_LT(passEdge, 0.05);
+    EXPECT_LT(stopEdge, 0.05);
+    EXPECT_LT(allFlat, 1e-9);
+    for (int kind = 0; kind < 4; ++kind) EXPECT_LT(step[kind], 0.35);
+    for (int kind = 0; kind < 5; ++kind) EXPECT_LT(seam[kind], 1e-3);
+    EXPECT_LT(turned, 1e-9);
+
+    // In the equaliser: a bell of order 2.5 sits on its gains, comes back from a state, and is heard as drawn.
+    auto eq = std::make_unique<EQ>();
+    EQ::BandConfig cfg;
+    cfg.frequency = 1000.0f;
+    cfg.gain = 12.0f;
+    cfg.q = 2.0f;
+    cfg.order = 2.5f;
+    eq->setBand(0, cfg);
+    eq->prepare(spec(48000.0, 256, 1));
+    float at[2] = { 1000.0f, static_cast<float>(low) }, drawn[2] = {};
+    eq->getMagnitudeForFrequencyArray(at, drawn, 2);
+    Planar x(1, 48000);
+    fillSine(x, 1000.0, 48000.0, 0.1f);
+    runBlocks(*eq, x, 256);
+    const double heard = 20.0 * std::log10(toneAmp(x.p[0], 24000, 48000, 1000.0, 48000.0) / 0.1);
+    const auto blob = eq->getState();
+    EQ other;
+    EXPECT_TRUE(other.setState(blob.data(), blob.size()));
+    std::printf("  [eq] a bell of order 2.5: drawn %.3f dB at the centre and %.3f at an edge, heard %.3f; from its state the order is %.2f\n",
+                20.0 * std::log10(static_cast<double>(drawn[0])), 20.0 * std::log10(static_cast<double>(drawn[1])), heard,
+                static_cast<double>(other.getBandConfig(0).order));
+    EXPECT_NEAR(20.0 * std::log10(static_cast<double>(drawn[0])), 12.0, 0.01);
+    EXPECT_NEAR(20.0 * std::log10(static_cast<double>(drawn[1])), 6.0, 0.02);
+    EXPECT_NEAR(heard, 12.0, 0.05);
+    EXPECT_NEAR(static_cast<double>(other.getBandConfig(0).order), 2.5, 1e-6);
+
+    // An all-pass of order 2.5 in the equaliser leaves the level where it was.
+    auto turn = std::make_unique<EQ>();
+    EQ::BandConfig around;
+    around.type = EQ::BandType::AllPass;
+    around.frequency = 1000.0f;
+    around.order = 2.5f;
+    turn->setBand(0, around);
+    turn->prepare(spec(48000.0, 256, 1));
+    Planar y(1, 48000);
+    fillSine(y, 3000.0, 48000.0, 0.1f);
+    runBlocks(*turn, y, 256);
+    EXPECT_NEAR(20.0 * std::log10(toneAmp(y.p[0], 24000, 48000, 3000.0, 48000.0) / 0.1), 0.0, 0.02);
 }

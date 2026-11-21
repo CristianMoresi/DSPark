@@ -60,8 +60,10 @@
  * kernel resolves the low end: at 48 kHz the default realises a 100 Hz,
  * Q 2, +12 dB bell within 0.1 dB of the drawn curve. A band change is
  * designed on the audio thread in bounded slices, one per partition hop
- * (under 1 ms of work each), then crossfaded over one hop: one bell is heard
- * 4 hops after the change (0.17 s at 48 kHz), 8 bells 6 hops (0.26 s). The
+ * (under 1 ms of work each), then crossfaded over one hop. Every band keeps
+ * its magnitude curve on the design grid, so a change costs the curve of the
+ * band that changed and one product of the curves: a bell is heard 4 hops
+ * after the change (0.17 s at 48 kHz) whatever the number of bands. The
  * first LinearPhase block after prepare(), reset() or a switch into the mode
  * completes a pending design at once (a one-off CPU cost of a few ms).
  * Memory: about 2 MB per stereo instance at 48 kHz, proportional to the
@@ -299,6 +301,8 @@ public:
         lpInput_.assign(channels * static_cast<size_t>(2 * part), T(0));
         lpOutput_.assign(channels * static_cast<size_t>(part), T(0));
         lpAccum_.assign(specLen, T(0));
+        lpWarm_.assign(channels * static_cast<size_t>(2 * part), T(0));
+        lpWarmChannels_.assign(channels, nullptr);
         lpBlockTime_.assign(static_cast<size_t>(2 * part), T(0));
         lpBlockTimeOld_.assign(static_cast<size_t>(2 * part), T(0));
 
@@ -313,6 +317,8 @@ public:
                 0.35875 - 0.48829 * std::cos(t) + 0.14128 * std::cos(2.0 * t) - 0.01168 * std::cos(3.0 * t));
         }
         lpMag_.assign(static_cast<size_t>(lpSlots_) * static_cast<size_t>(kernel + 1), T(1));
+        lpBandPower_.assign(static_cast<size_t>(MaxBands) * static_cast<size_t>(kernel + 1), 1.0f);
+        lpBandKept_.fill(false);
         lpPlaced_[0] = lpPlaced_[1] = false;
         lpDesignSpec_.assign(static_cast<size_t>(design + 2), T(0));
         lpDesignTime_.assign(static_cast<size_t>(design), T(0));
@@ -395,6 +401,7 @@ public:
             processLinearPhase(buffer);
             return;
         }
+        if (lpWasActive_) conditionBandsAfterLinearPhase();
         lpWasActive_ = false;
         processMinimumPhase(buffer);
 
@@ -740,7 +747,12 @@ public:
      * Switching modes changes getLatency(): hosts must be notified. The first
      * LinearPhase block after a switch completes any pending kernel design at
      * once; going in or out of PrototypePhase, the bands that change engine
-     * come in through the 20 ms band fade.
+     * come in through the 20 ms band fade. Leaving LinearPhase, the bands (which
+     * have not run since the mode was entered) are cleared and run over the
+     * input the linear-phase engine still holds, one to two partitions of it
+     * (43 to 85 ms with the default kernel): the first block starts from bands
+     * that have heard what came just before it, at the one-off cost of that
+     * many samples.
      *
      * @param mode Filter mode.
      */
@@ -1871,13 +1883,14 @@ protected:
 
     // -- Linear-phase engine ----------------------------------------------------
 
-    enum class LpStage { Idle, Snapshot, Magnitude, Transform, Partition };
+    enum class LpStage { Idle, Snapshot, Magnitude, Combine, Transform, Partition };
 
     static constexpr int kLpMinKernel = 256;
     static constexpr int kLpMaxKernel = 1 << 18;
     static constexpr int kLpPartitionCount = 16;   ///< Partitions per kernel.
     static constexpr int kLpMinPartition = 64;
     static constexpr int kLpBinBudget = 131072;    ///< Stage evaluations per hop (< 1 ms).
+    static constexpr int kLpProductBudget = 1048576;   ///< Products of kept curves per hop (< 1 ms).
     static constexpr int kLpPartitionSlices = 1;   ///< Hops spent on partition FFTs.
     static constexpr int kLpSyncSteps = 16;        ///< Bound of a synchronous design.
 
@@ -1919,8 +1932,12 @@ protected:
      * @brief Runs one bounded slice of a kernel design into the inactive set.
      *
      * Snapshot: pulls every band through its bounded seqlock read (a give-up
-     * retries on the next hop). Magnitude: evaluates the cascade magnitude on
-     * at most kLpBinBudget stage-bins of the design grid. Transform: one inverse FFT,
+     * retries on the next hop) and designs it; a band whose design is the one
+     * its kept curve was made from needs nothing more. Magnitude: evaluates
+     * the curves of the other bands on at most kLpBinBudget stage-bins of the
+     * design grid. Combine: the product of the curves of the bands that act,
+     * at most kLpProductBudget of them per hop (in the Magnitude's hop when
+     * both fit). Transform: one inverse FFT,
      * the shift to the kernel centre and the window. Partition: forward FFTs
      * of 1/kLpPartitionSlices of the partitions. The finished set is swapped
      * in by the caller (crossfaded during processing).
@@ -1953,40 +1970,72 @@ protected:
                         lpStage_ = LpStage::Idle;
                         return;
                     }
-                    lpStageCount_[static_cast<size_t>(b)] = 0;
-                    lpAnalogCount_[static_cast<size_t>(b)] = 0;
-                    lpBandGroup_[static_cast<size_t>(b)] = 0;
+                    const auto at = static_cast<size_t>(b);
+                    lpBandGroup_[at] = 0;
+                    lpBandLive_[at] = false;
+                    lpBandDirty_[at] = false;
                     if (!cfg.enabled) continue;
                     if (lpSlots_ > 1)
                     {
-                        lpBandGroup_[static_cast<size_t>(b)] = static_cast<int>(cfg.scope);
+                        lpBandGroup_[at] = static_cast<int>(cfg.scope);
                     }
                     else if (cfg.scope == Scope::Right || cfg.scope == Scope::Side)
                     {
                         continue;       // a single channel has no right and no sides
                     }
+                    // The band's design, and whether the curve kept for the band is this design's.
+                    BiquadCoeffs stages[5];
+                    AnalogCascade proto;
+                    int stageCount = 0, analogCount = 0;
                     if (usesAnalog(cfg))
                     {
                         // The magnitude of the prototype itself: nothing to shrink.
-                        const AnalogCascade proto = bandPrototype(cfg);
-                        lpAnalogCount_[static_cast<size_t>(b)] = proto.count;
-                        for (int s = 0; s < proto.count; ++s)
-                            lpAnalog_[static_cast<size_t>(b * kMaxBandSections + s)] = proto.sections[static_cast<size_t>(s)];
+                        proto = bandPrototype(cfg);
+                        analogCount = proto.count;
                     }
                     else
                     {
-                        lpStageCount_[static_cast<size_t>(b)] = buildBandStages(cfg, lpStages_.data() + static_cast<size_t>(b) * 5);
+                        stageCount = buildBandStages(cfg, stages);
                     }
+                    BiquadCoeffs* keptStages = lpStages_.data() + at * 5;
+                    AnalogSection* keptProto = lpAnalog_.data() + at * static_cast<size_t>(kMaxBandSections);
+                    bool same = lpBandKept_[at] && stageCount == lpStageCount_[at] && analogCount == lpAnalogCount_[at];
+                    for (int s = 0; same && s < stageCount; ++s)
+                    {
+                        const BiquadCoeffs& p = stages[s];
+                        const BiquadCoeffs& q = keptStages[s];
+                        same = p.b0 == q.b0 && p.b1 == q.b1 && p.b2 == q.b2 && p.a1 == q.a1 && p.a2 == q.a2;
+                    }
+                    for (int s = 0; same && s < analogCount; ++s)
+                    {
+                        const AnalogSection& p = proto.sections[static_cast<size_t>(s)];
+                        const AnalogSection& q = keptProto[s];
+                        same = p.b0 == q.b0 && p.b1 == q.b1 && p.b2 == q.b2 && p.a0 == q.a0 && p.a1 == q.a1 && p.a2 == q.a2;
+                    }
+                    if (!same)
+                    {
+                        for (int s = 0; s < stageCount; ++s) keptStages[s] = stages[s];
+                        for (int s = 0; s < analogCount; ++s) keptProto[s] = proto.sections[static_cast<size_t>(s)];
+                        lpStageCount_[at] = stageCount;
+                        lpAnalogCount_[at] = analogCount;
+                        // A band with no sections has no curve to compute.
+                        lpBandKept_[at] = stageCount + analogCount == 0;
+                        lpBandDirty_[at] = !lpBandKept_[at];
+                    }
+                    lpBandLive_[at] = stageCount + analogCount > 0;
                 }
                 lpDesignBands_ = activeBands;
                 lpDesignStages_ = 0;
-                for (int b = 0; b < activeBands; ++b)
-                    lpDesignStages_ += lpStageCount_[static_cast<size_t>(b)] + lpAnalogCount_[static_cast<size_t>(b)];
+                lpDesignLive_ = 0;
                 lpDesignPlaced_ = false;
                 for (int b = 0; b < activeBands; ++b)
-                    if (lpBandGroup_[static_cast<size_t>(b)] != 0
-                        && lpStageCount_[static_cast<size_t>(b)] + lpAnalogCount_[static_cast<size_t>(b)] > 0)
-                        lpDesignPlaced_ = true;
+                {
+                    const auto at = static_cast<size_t>(b);
+                    if (lpBandDirty_[at]) lpDesignStages_ += lpStageCount_[at] + lpAnalogCount_[at];
+                    if (!lpBandLive_[at]) continue;
+                    ++lpDesignLive_;
+                    if (lpBandGroup_[at] != 0) lpDesignPlaced_ = true;
+                }
                 lpSlot_ = 0;
                 lpStep_ = 0;
                 lpStage_ = LpStage::Magnitude;
@@ -1996,43 +2045,98 @@ protected:
 
             case LpStage::Magnitude:
             {
+                // The curves of the bands whose design changed; the others keep theirs.
+                const int bins = kernel + 1;
+                const int first = lpStep_;
+                int last = bins;
+                if (lpDesignStages_ > 0)
+                {
+                    const int perSlice = pace == DesignPace::Sliced
+                        ? std::max(256, kLpBinBudget / lpDesignStages_ + 1)
+                        : bins;
+                    last = std::min(bins, first + perSlice);
+                    // Bin k sits at w = pi * k / kernel. The unit phasor is rotated
+                    // bin to bin in double (error grows ~1e-16 per step), seeded
+                    // exactly at the slice start.
+                    const double dw = pi<double> / static_cast<double>(kernel);
+                    const double rc = std::cos(dw), rs = std::sin(dw);
+                    double c1 = std::cos(dw * static_cast<double>(first));
+                    double s1 = std::sin(dw * static_cast<double>(first));
+                    for (int k = first; k < last; ++k)
+                    {
+                        const double c2 = 2.0 * c1 * c1 - 1.0;
+                        const double s2 = 2.0 * s1 * c1;
+                        const double omega = dw * static_cast<double>(k) * spec_.sampleRate;
+                        for (int b = 0; b < lpDesignBands_; ++b)
+                        {
+                            const auto at = static_cast<size_t>(b);
+                            if (!lpBandDirty_[at]) continue;
+                            double power = 1.0;
+                            const BiquadCoeffs* st = lpStages_.data() + at * 5;
+                            for (int s = 0; s < lpStageCount_[at]; ++s)
+                            {
+                                const BiquadCoeffs& c = st[s];
+                                const double nRe = c.b0 + c.b1 * c1 + c.b2 * c2;
+                                const double nIm = -(c.b1 * s1 + c.b2 * s2);
+                                const double dRe = 1.0 + c.a1 * c1 + c.a2 * c2;
+                                const double dIm = -(c.a1 * s1 + c.a2 * s2);
+                                const double den = dRe * dRe + dIm * dIm;
+                                power *= (den > 1e-300) ? (nRe * nRe + nIm * nIm) / den : 0.0;
+                            }
+                            const AnalogSection* sections = lpAnalog_.data() + at * static_cast<size_t>(kMaxBandSections);
+                            for (int s = 0; s < lpAnalogCount_[at]; ++s)
+                                power *= sections[s].magnitudeSquared(omega);
+                            // Under -300 dB a band is silent there.
+                            lpBandPower_[at * static_cast<size_t>(bins) + static_cast<size_t>(k)] =
+                                power > 1e-30 ? static_cast<float>(std::min(power, 1e30)) : 0.0f;
+                        }
+                        const double cn = c1 * rc - s1 * rs;
+                        s1 = s1 * rc + c1 * rs;
+                        c1 = cn;
+                    }
+                    if (last < bins)
+                    {
+                        lpStep_ = last;
+                        return;
+                    }
+                    // Whole: from here each curve stands for its band's design.
+                    for (int b = 0; b < lpDesignBands_; ++b)
+                    {
+                        const auto at = static_cast<size_t>(b);
+                        if (!lpBandDirty_[at]) continue;
+                        lpBandDirty_[at] = false;
+                        lpBandKept_[at] = true;
+                    }
+                }
+                lpStep_ = 0;
+                lpStage_ = LpStage::Combine;
+                // The product is cheap: in the same hop when the two fit in its budget.
+                if (pace == DesignPace::Sliced
+                    && static_cast<double>(last - first) * lpDesignStages_ / kLpBinBudget
+                           + static_cast<double>(bins) * lpDesignLive_ / kLpProductBudget > 1.0)
+                    return;
+            }
+                [[fallthrough]];
+
+            case LpStage::Combine:
+            {
+                // The response: the product of the curves of the bands that act.
                 const int bins = kernel + 1;
                 const int perSlice = pace == DesignPace::Sliced
-                    ? std::max(256, kLpBinBudget / std::max(1, lpDesignStages_))
+                    ? std::max(256, kLpProductBudget / std::max(1, lpDesignLive_) + 1)
                     : bins;
                 const int first = lpStep_;
                 const int last = std::min(bins, first + perSlice);
-                // Bin k sits at w = pi * k / kernel. The unit phasor is rotated
-                // bin to bin in double (error grows ~1e-16 per step), seeded
-                // exactly at the slice start.
-                const double dw = pi<double> / static_cast<double>(kernel);
-                const double rc = std::cos(dw), rs = std::sin(dw);
-                double c1 = std::cos(dw * static_cast<double>(first));
-                double s1 = std::sin(dw * static_cast<double>(first));
                 for (int k = first; k < last; ++k)
                 {
-                    const double c2 = 2.0 * c1 * c1 - 1.0;
-                    const double s2 = 2.0 * s1 * c1;
                     // One product per place of the pair (all in the first when no band is placed).
                     double powers[5] = { 1.0, 1.0, 1.0, 1.0, 1.0 };
                     for (int b = 0; b < lpDesignBands_; ++b)
                     {
-                        double& power = powers[lpDesignPlaced_ ? lpBandGroup_[static_cast<size_t>(b)] : 0];
-                        const BiquadCoeffs* st = lpStages_.data() + static_cast<size_t>(b) * 5;
-                        for (int s = 0; s < lpStageCount_[static_cast<size_t>(b)]; ++s)
-                        {
-                            const BiquadCoeffs& c = st[s];
-                            const double nRe = c.b0 + c.b1 * c1 + c.b2 * c2;
-                            const double nIm = -(c.b1 * s1 + c.b2 * s2);
-                            const double dRe = 1.0 + c.a1 * c1 + c.a2 * c2;
-                            const double dIm = -(c.a1 * s1 + c.a2 * s2);
-                            const double den = dRe * dRe + dIm * dIm;
-                            power *= (den > 1e-300) ? (nRe * nRe + nIm * nIm) / den : 0.0;
-                        }
-                        const AnalogSection* proto = lpAnalog_.data() + static_cast<size_t>(b * kMaxBandSections);
-                        const double omega = dw * static_cast<double>(k) * spec_.sampleRate;
-                        for (int s = 0; s < lpAnalogCount_[static_cast<size_t>(b)]; ++s)
-                            power *= proto[s].magnitudeSquared(omega);
+                        const auto at = static_cast<size_t>(b);
+                        if (!lpBandLive_[at]) continue;
+                        powers[lpDesignPlaced_ ? lpBandGroup_[at] : 0] *=
+                            static_cast<double>(lpBandPower_[at * static_cast<size_t>(bins) + static_cast<size_t>(k)]);
                     }
                     if (!lpDesignPlaced_)
                     {
@@ -2052,9 +2156,6 @@ protected:
                         lpMag_[3 * stride + at] = static_cast<T>(both * left * difference);      // left to right
                         if (lpSlots_ > 4) lpMag_[4 * stride + at] = static_cast<T>(both);        // further channels
                     }
-                    const double cn = c1 * rc - s1 * rs;
-                    s1 = s1 * rc + c1 * rs;
-                    c1 = cn;
                 }
                 if (last >= bins) lpStage_ = LpStage::Transform;
                 else lpStep_ = last;
@@ -2121,6 +2222,35 @@ protected:
                 }
                 return;
             }
+        }
+    }
+
+    /**
+     * @brief Leaving LinearPhase: clears the bands and runs them over the
+     *        input the engine still holds (the last whole partition and what
+     *        there is of the current one), in order, so they resume from the
+     *        memory of what came just before and not from that of the stretch
+     *        of audio they last played.
+     */
+    void conditionBandsAfterLinearPhase() noexcept
+    {
+        const int part = lpPartition_;
+        const int held = part + lpFifoPos_;
+        const int channels = std::min(lpChannels_, static_cast<int>(lpWarmChannels_.size()));
+        if (!lpFft_ || part <= 0 || channels <= 0
+            || lpWarm_.size() < static_cast<size_t>(channels) * static_cast<size_t>(2 * part)) return;
+        for (int i = 0; i < MaxBands; ++i) resetBand(i);
+        for (int ch = 0; ch < channels; ++ch)
+            std::copy_n(lpInput_.data() + static_cast<size_t>(ch) * static_cast<size_t>(2 * part), held,
+                        lpWarm_.data() + static_cast<size_t>(ch) * static_cast<size_t>(2 * part));
+        const int step = std::max(1, spec_.maxBlockSize);
+        for (int at = 0; at < held; at += step)
+        {
+            const int n = std::min(step, held - at);
+            for (int ch = 0; ch < channels; ++ch)
+                lpWarmChannels_[static_cast<size_t>(ch)] =
+                    lpWarm_.data() + static_cast<size_t>(ch) * static_cast<size_t>(2 * part) + static_cast<size_t>(at);
+            processMinimumPhase(AudioBufferView<T>(lpWarmChannels_.data(), channels, n));
         }
     }
 
@@ -2485,6 +2615,8 @@ protected:
     std::vector<T> lpFdl_;                        ///< Per channel: partitions x spectrum.
     std::vector<T> lpInput_, lpOutput_;           ///< Per channel FIFOs.
     std::vector<T> lpAccum_, lpBlockTime_, lpBlockTimeOld_;
+    std::vector<T> lpWarm_;                       ///< The held input the bands are run over on leaving the mode.
+    std::vector<T*> lpWarmChannels_;
     int lpFifoPos_ = 0;
     int lpFdlPos_ = 0;
     bool lpSnap_ = true;
@@ -2496,7 +2628,12 @@ protected:
     bool lpRestartPending_ = false;
     bool lpSwapPending_ = false;
     int lpDesignBands_ = 0;
-    int lpDesignStages_ = 0;
+    int lpDesignStages_ = 0;                     ///< Sections of the bands whose curve this design computes.
+    int lpDesignLive_ = 0;                       ///< Bands that act in this design.
+    std::vector<float> lpBandPower_;             ///< Per band: its squared magnitude on the design grid.
+    std::array<bool, MaxBands> lpBandKept_ {};   ///< The band's curve is that of its stored design.
+    std::array<bool, MaxBands> lpBandDirty_ {};  ///< This design computes the band's curve.
+    std::array<bool, MaxBands> lpBandLive_ {};   ///< The band acts in this design.
     std::array<BiquadCoeffs, MaxBands * 5> lpStages_ {};
     std::array<int, MaxBands> lpStageCount_ {};
     std::array<AnalogSection, MaxBands * AnalogCascade::kMaxSections> lpAnalog_ {};   ///< Prototypes of the analog bands.

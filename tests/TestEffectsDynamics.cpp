@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -8695,4 +8696,228 @@ DSPARK_TEST(Compressor_feedback_keyed_takes_a_lookahead_and_an_external_key)
     EXPECT_TRUE(to->setState(blob.data(), blob.size()));
     EXPECT_TRUE(to->isFeedbackKeyed());
     EXPECT_FALSE(std::make_unique<C>()->isFeedbackKeyed());
+}
+
+// New: a zone of its own for the detector of a band. A band at 300 Hz that
+// listens between 50 and 90 Hz leaves a tone at 300 Hz alone and gives way to
+// one in the zone, which it reads at its level in the middle and 3 dB down on
+// an edge (less what the other edge takes and the scale gives back). One edge
+// alone is a half of the spectrum. In both engines, kept by the state and
+// guarded on the way in.
+DSPARK_TEST(DynamicEQ_band_listens_to_a_zone_of_its_own)
+{
+    using DE = DynamicEQ<float>;
+    const int n = 48000;
+    auto gainAt300 = [&](const DE::BandConfig& band, bool mixed, double keyHz, double keyAmplitude) {
+        auto d = dynEqMake(mixed, 1, band);
+        std::vector<Vec> x { makeSine(300.0, 0.01, 48000.0, n) }, key { makeSine(keyHz, keyAmplitude, 48000.0, n) };
+        dynEqRun(*d, x, key);
+        return toDb(toneAmplitude(x[0].data() + n - 9600, 9600, 300.0, 48000.0) / 0.01);
+    };
+
+    const auto plain = dynEqCut(300.0f, 2.0f, -20.0f, 4.0f, 12.0f);
+    auto zone = plain;
+    zone.listenLow = 50.0f; zone.listenHigh = 90.0f;
+    auto above = plain, below = plain;
+    above.listenLow = 2000.0f;
+    below.listenHigh = 100.0f;
+    const double middle = std::sqrt(50.0 * 90.0);
+
+    for (bool mixed : { false, true })
+    {
+        // Where it acts, as before: 14 dB over the threshold at 4:1.
+        EXPECT_NEAR(gainAt300(plain, mixed, 300.0, 0.5), -10.5, 0.25);
+        const double own = gainAt300(zone, mixed, 300.0, 0.5), inZone = gainAt300(zone, mixed, middle, 0.5);
+        const double onEdge = gainAt300(zone, mixed, 50.0, 0.5);
+        const double low = gainAt300(above, mixed, 300.0, 0.5), high = gainAt300(above, mixed, 5000.0, 0.5);
+        const double top = gainAt300(below, mixed, 5000.0, 0.5), bottom = gainAt300(below, mixed, 50.0, 0.5);
+        std::printf("  [zone] %s engine, a band at 300 Hz listening to 50-90 Hz: its own tone %.2f dB, a tone in the middle of the zone %.2f, one on its low edge %.2f; listening above 2 kHz: 300 Hz %.2f, 5 kHz %.2f; below 100 Hz: 5 kHz %.2f, 50 Hz %.2f\n",
+                    mixed ? "mixed" : "default", own, inZone, onEdge, low, high, top, bottom);
+        EXPECT_NEAR(own, 0.0, 0.05);            // 300 Hz reads 18.6 dB lower in the zone: under the threshold
+        EXPECT_NEAR(inZone, -10.48, 0.25);      // read at its level
+        EXPECT_NEAR(onEdge, -9.68, 0.3);        // -3.01 (its edge) - 0.40 (the other) + 2.34 (the scale)
+        EXPECT_NEAR(low, 0.0, 0.05);
+        EXPECT_NEAR(high, -10.40, 0.3);
+        EXPECT_NEAR(top, 0.0, 0.05);
+        EXPECT_NEAR(bottom, -10.29, 0.3);
+    }
+
+    // Program timing takes its times from the zone: the band still lands on the curve.
+    auto timed = zone;
+    timed.timing = DE::Timing::Program;
+    EXPECT_NEAR(gainAt300(timed, false, middle, 0.5), -10.48, 0.3);
+
+    // The state keeps the zone; edges the wrong way round are put in order, what is
+    // not a value keeps the band's own, and an edge below zero is no edge.
+    auto a = dynEqMake(false, 1, zone);
+    const auto blob = a->getState();
+    auto b = std::make_unique<DE>();
+    b->prepare(AudioSpec{ 48000.0, 512, 1 });
+    EXPECT_TRUE(b->setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b->getState() == blob);
+    EXPECT_FALSE(blob == dynEqMake(false, 1, plain)->getState());
+    auto wild = zone;
+    wild.listenLow = 90.0f; wild.listenHigh = 50.0f;
+    a->setBand(0, wild);
+    EXPECT_TRUE(a->getState() == blob);
+    wild.listenLow = std::numeric_limits<float>::quiet_NaN();
+    wild.listenHigh = std::numeric_limits<float>::infinity();
+    a->setBand(0, wild);
+    EXPECT_TRUE(a->getState() == blob);
+    wild = zone;
+    wild.listenLow = -5.0f;
+    auto none = zone;
+    none.listenLow = 0.0f;
+    EXPECT_TRUE(dynEqMake(false, 1, wild)->getState() == dynEqMake(false, 1, none)->getState());
+}
+
+// New: key listen. The output is what one band's detector hears: the key
+// through the band's detector filters (its zone when it has one), late by the
+// latency, on the channels of the band's scope. The bands keep working
+// underneath, so the output is the processed signal again once it ends.
+DSPARK_TEST(DynamicEQ_key_listen_gives_what_a_band_hears)
+{
+    using DE = DynamicEQ<float>;
+    const int n = 48000;
+    Vec in = makeSine(1000.0, 0.3, 48000.0, n);
+    {
+        const Vec low = makeSine(100.0, 0.3, 48000.0, n);
+        for (int i = 0; i < n; ++i) in[static_cast<size_t>(i)] += low[static_cast<size_t>(i)];
+    }
+    const auto band = dynEqCut(1000.0f, 2.0f, -30.0f, 4.0f, 12.0f);
+
+    // What the detector of that band hears.
+    Vec heard(static_cast<size_t>(n));
+    {
+        Biquad<float> detector;
+        detector.setCoeffsNow(BiquadCoeffs::makeBandPassMatched(48000.0, 1000.0f, 2.0f));
+        for (int i = 0; i < n; ++i) heard[static_cast<size_t>(i)] = detector.processSample(in[static_cast<size_t>(i)], 0);
+    }
+    auto apart = [&](const Vec& y, const Vec& reference, int late, int from) {
+        double worst = 0.0;
+        for (int i = std::max(from, late); i < n; ++i)
+            worst = std::max(worst, std::abs(static_cast<double>(y[static_cast<size_t>(i)])
+                                             - static_cast<double>(reference[static_cast<size_t>(i - late)])));
+        return worst;
+    };
+
+    // No latency, a lookahead, and the linear-phase mode: the key, late by each.
+    for (int mode = 0; mode < 3; ++mode)
+    {
+        auto d = mode == 2 ? dynEqLinear(1, band) : dynEqMake(false, 1, band);
+        if (mode == 1) d->setLookahead(5.0f);
+        d->setKeyListen(0);
+        std::vector<Vec> x { in };
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        const int late = d->getLatency();
+        const double off = apart(x[0], heard, late, late + 4800);
+        std::printf("  [key listen] latency %d: the output is the band's key within %.1e; 1 kHz at %.4f of 0.3, 100 Hz at %.4f\n",
+                    late, off, toneAmplitude(x[0].data() + n - 9600, 9600, 1000.0, 48000.0),
+                    toneAmplitude(x[0].data() + n - 9600, 9600, 100.0, 48000.0));
+        if (mode == 0) { EXPECT_EQ(late, 0); }
+        if (mode == 1) { EXPECT_EQ(late, 240); }
+        if (mode == 2) { EXPECT_GT(late, 1000); }
+        EXPECT_LT(off, 1e-5);
+        EXPECT_NEAR(toneAmplitude(x[0].data() + n - 9600, 9600, 1000.0, 48000.0), 0.3, 0.003);
+        EXPECT_LT(toneAmplitude(x[0].data() + n - 9600, 9600, 100.0, 48000.0), 0.02);
+    }
+
+    // It comes in through a fade, and the processing is back, bit for bit, once it has gone.
+    {
+        auto d = dynEqMake(false, 1, band), twin = dynEqMake(false, 1, band);
+        std::vector<Vec> x { in }, y { in };
+        std::vector<float*> px(1), py(1);
+        double jump = 0.0;
+        float before = 0.0f;
+        for (int off = 0; off < n; off += 512)
+        {
+            const int m = std::min(512, n - off);
+            if (off == 512 * 20) d->setKeyListen(0);
+            if (off == 512 * 50) d->setKeyListen(-1);
+            px[0] = x[0].data() + off;
+            py[0] = y[0].data() + off;
+            AudioBufferView<float> vx(px.data(), 1, m), vy(py.data(), 1, m);
+            d->processBlock(vx);
+            twin->processBlock(vy);
+            for (int i = 0; i < m; ++i)
+            {
+                jump = std::max(jump, std::abs(static_cast<double>(px[0][i]) - static_cast<double>(before)));
+                before = px[0][i];
+            }
+        }
+        double listening = 0.0, after = 0.0;
+        for (int i = 512 * 30; i < 512 * 50; ++i)
+            listening = std::max(listening, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+        for (int i = 512 * 54; i < n; ++i)
+            after = std::max(after, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) - y[0][static_cast<size_t>(i)]));
+        // The input moves 0.045 from one sample to the next at most: nothing steps on the way in or out.
+        std::printf("  [key listen] in and out of it: largest move between samples %.4f; apart from the processing %.3f while listening and %.1e after\n",
+                    jump, listening, after);
+        EXPECT_LT(jump, 0.06);
+        EXPECT_GT(listening, 0.1);
+        EXPECT_EQ(after, 0.0);
+    }
+
+    // An external key and the scopes: a band of the sides is heard with its channels
+    // opposed, one of the left on the left alone, and none of the audio is in it.
+    {
+        const Vec audio = makeSine(3000.0, 0.25, 48000.0, n), shared = makeSine(100.0, 0.3, 48000.0, n);
+        const Vec apartTone = makeSine(1000.0, 0.2, 48000.0, n);
+        Vec keyL(static_cast<size_t>(n)), keyR(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            keyL[static_cast<size_t>(i)] = shared[static_cast<size_t>(i)] + apartTone[static_cast<size_t>(i)];
+            keyR[static_cast<size_t>(i)] = shared[static_cast<size_t>(i)] - apartTone[static_cast<size_t>(i)];
+        }
+        auto side = band;
+        side.scope = DE::Scope::Side;
+        auto d = dynEqMake(false, 2, side);
+        d->setKeyListen(0);
+        std::vector<Vec> x { audio, audio }, key { keyL, keyR };
+        dynEqRun(*d, x, key);
+        double sum = 0.0;
+        for (int i = 4800; i < n; ++i)
+            sum = std::max(sum, std::abs(static_cast<double>(x[0][static_cast<size_t>(i)]) + x[1][static_cast<size_t>(i)]));
+        EXPECT_EQ(sum, 0.0);
+        EXPECT_NEAR(toneAmplitude(x[0].data() + n - 9600, 9600, 1000.0, 48000.0), 0.2, 0.002);
+        EXPECT_LT(toneAmplitude(x[0].data() + n - 9600, 9600, 3000.0, 48000.0), 1e-4);
+
+        auto left = band;
+        left.scope = DE::Scope::Left;
+        auto e = dynEqMake(false, 2, left);
+        e->setKeyListen(0);
+        std::vector<Vec> z { audio, audio };
+        dynEqRun(*e, z, key);
+        double right = 0.0;
+        for (int i = 4800; i < n; ++i) right = std::max(right, std::abs(static_cast<double>(z[1][static_cast<size_t>(i)])));
+        EXPECT_EQ(right, 0.0);
+        EXPECT_NEAR(toneAmplitude(z[0].data() + n - 9600, 9600, 1000.0, 48000.0), 0.2, 0.002);
+    }
+
+    // A band with a zone: what is heard is the zone, at the level it is read at.
+    {
+        auto zone = band;
+        zone.listenLow = 50.0f; zone.listenHigh = 90.0f;
+        auto d = dynEqMake(false, 1, zone);
+        d->setKeyListen(0);
+        const double middle = std::sqrt(50.0 * 90.0);
+        std::vector<Vec> x { makeSine(middle, 0.3, 48000.0, n) };
+        const Vec distant = makeSine(1000.0, 0.3, 48000.0, n);
+        for (int i = 0; i < n; ++i) x[0][static_cast<size_t>(i)] += distant[static_cast<size_t>(i)];
+        processInBlocks(x, 512, [&](AudioBufferView<float> v) { d->processBlock(v); });
+        EXPECT_NEAR(toneAmplitude(x[0].data() + n - 19200, 19200, middle, 48000.0), 0.3, 0.006);
+        EXPECT_LT(toneAmplitude(x[0].data() + n - 19200, 19200, 1000.0, 48000.0), 0.3 * 0.012);
+    }
+
+    // The control: a band that is not one is no listen, and it is not part of the state.
+    auto d = dynEqMake(false, 1, band);
+    const auto blob = d->getState();
+    EXPECT_EQ(d->getKeyListen(), -1);
+    d->setKeyListen(99);
+    EXPECT_EQ(d->getKeyListen(), -1);
+    d->setKeyListen(-7);
+    EXPECT_EQ(d->getKeyListen(), -1);
+    d->setKeyListen(0);
+    EXPECT_EQ(d->getKeyListen(), 0);
+    EXPECT_TRUE(d->getState() == blob);
 }

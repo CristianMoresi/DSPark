@@ -8703,6 +8703,77 @@ DSPARK_TEST(SpectralDynamicEQ_cells_resolve_close_tones)
     EXPECT_GT(quiet, -1.0);
 }
 
+// New: a band edited at work keeps what it was doing where it was doing it.
+// With a tone settled at the centre of a bell, the bell is moved a third of
+// an octave up: at the next frames the reduction is still at the tone, and
+// the bell's new centre, where nothing loud is, is not reduced (the cells'
+// actions used to stay with their index: the full reduction moved to the new
+// centre and the tone's cell started from nothing).
+DSPARK_TEST(SpectralDynamicEQ_an_edited_band_keeps_its_action_by_frequency)
+{
+    using S = SpectralDynamicEQ<float>;
+    const auto pointOf = [](double hz) {
+        return static_cast<int>(std::lround((S::kDisplayPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+    };
+    const size_t n = 48000 * 3, tail = 1024;
+    const std::vector<float> all = l13Add(l13Noise(n + tail, 0.003f, 11u), 2000.0, 0.3);
+    const std::vector<float> head(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(n));
+    const std::vector<float> rest(all.begin() + static_cast<std::ptrdiff_t>(n), all.end());
+    auto eq = std::make_unique<S>();
+    S::Band b;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 2.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    eq->setBand(0, b);
+    eq->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*eq, head, head);
+    const double before = eq->getDisplayGain(pointOf(2000.0));
+    b.frequency = 2520.0f;
+    eq->setBand(0, b);
+    (void)l13Run(*eq, rest, rest);
+    const double atTone = eq->getDisplayGain(pointOf(2000.0)), atCentre = eq->getDisplayGain(pointOf(2520.0));
+    std::cout << "  [spectral dynamic eq] before the move " << before << " dB at the tone; after: " << atTone
+              << " dB at the tone, " << atCentre << " dB at the new centre\n";
+    EXPECT_LT(before, -9.0);
+    EXPECT_LT(atTone, -3.0);
+    EXPECT_GT(atCentre, -3.0);
+}
+
+// New: a cell also looks half a cell into its neighbours, so a partial that
+// crosses a border belongs to both cells instead of changing hands. A tone
+// with a slow vibrato of 300 cents either way across the borders of a bell
+// of 8 cells keeps its reduction from one 10 ms window to the next within
+// 0.6 dB (1.6 dB with cells that did not overlap).
+DSPARK_TEST(SpectralDynamicEQ_overlapping_cells_hold_a_moving_partial)
+{
+    using S = SpectralDynamicEQ<float>;
+    const size_t n = 48000 * 5;
+    std::vector<float> in(n);
+    double ph = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double cents = 300.0 * std::sin(2.0 * 3.14159265358979323846 * 0.5 * static_cast<double>(i) / 48000.0);
+        ph += 2.0 * 3.14159265358979323846 * 2000.0 * std::pow(2.0, cents / 1200.0) / 48000.0;
+        in[i] = static_cast<float>(0.25 * std::sin(ph));
+    }
+    auto eq = std::make_unique<S>();
+    S::Band b;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 1.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 8;
+    eq->setBand(0, b);
+    eq->prepare(spec(48000.0, 256, 2));
+    const auto out = l13Run(*eq, in, in);
+    const auto lat = static_cast<size_t>(eq->getLatency());
+    double last = 0.0, step = 0.0;
+    bool first = true;
+    for (size_t w = 96000; w + 480 + lat <= n; w += 480)
+    {
+        const double level = l13RmsDb(out.first, w + lat, w + lat + 480) - l13RmsDb(in, w, w + 480);
+        if (!first) step = std::max(step, std::abs(level - last));
+        last = level;
+        first = false;
+    }
+    std::cout << "  [spectral dynamic eq] largest step of the reduction between 10 ms windows " << step << " dB\n";
+    EXPECT_LT(step, 0.6);
+}
+
 // New: the options of the denoiser. The delta is the complement of the
 // output; smoothing and release still reduce the learned noise; the filter
 // mode reduces it about as the STFT does, with the same latency.

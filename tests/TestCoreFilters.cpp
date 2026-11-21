@@ -4860,3 +4860,32 @@ DSPARK_TEST(GraphicBank_meets_the_asked_gains)
     const double gainDb = 10.0 * std::log10(s / 24000.0 / (0.01 * 0.5));
     EXPECT_NEAR(gainDb, bank.responseDb(hz), 0.1);
 }
+
+// New: the slope a tilt may have without lifting the end that rises past a
+// ceiling. With the pivot in the middle of the band every slope stays as
+// set; with the pivot at one end the slope comes down just enough for the
+// other end to stop at the ceiling (a pivot at 20 Hz and +6 dB per octave
+// would lift 20 kHz by 60 dB); the end that falls is never limited.
+DSPARK_TEST(FilterDesign_tilt_slope_stays_within_a_ceiling)
+{
+    EXPECT_EQ(FilterDesign::tiltSlopeWithin(632.0, 6.0, 36.0), 6.0);
+    EXPECT_EQ(FilterDesign::tiltSlopeWithin(632.0, -6.0, 36.0), -6.0);
+    EXPECT_NEAR(FilterDesign::tiltSlopeWithin(20.0, 6.0, 36.0), 36.0 / std::log2(1000.0), 1e-9);
+    EXPECT_EQ(FilterDesign::tiltSlopeWithin(20.0, -6.0, 36.0), -6.0);
+    EXPECT_EQ(FilterDesign::tiltSlopeWithin(20000.0, 6.0, 36.0), 6.0);
+    for (const double pivot : { 20.0, 60.0, 250.0, 4000.0, 12000.0, 20000.0 })
+        for (const double slope : { -6.0, -3.0, 3.0, 6.0 })
+        {
+            const double within = FilterDesign::tiltSlopeWithin(pivot, slope, 36.0);
+            EXPECT_TRUE(within * slope > 0.0 && std::abs(within) <= std::abs(slope));
+            const AnalogCascade c = FilterDesign::tilt(pivot, within);
+            double top = -300.0;
+            for (int k = 0; k <= 300; ++k) top = std::max(top, c.magnitudeDb(20.0 * std::pow(1000.0, k / 300.0)));
+            EXPECT_LT(top, 36.3);
+            const double octaves = slope > 0.0 ? std::log2(20000.0 / pivot) : std::log2(pivot / 20.0);
+            if (std::abs(slope) * octaves <= 36.0) EXPECT_EQ(within, slope);
+        }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(FilterDesign::tiltSlopeWithin(1000.0, nan, 36.0)));
+    EXPECT_EQ(FilterDesign::tiltSlopeWithin(20.0, 6.0, 0.0), 6.0);
+}

@@ -8225,3 +8225,105 @@ DSPARK_TEST(Limiter_high_precision_latency_ceiling_paths_and_state)
         EXPECT_TRUE(b.getPrecision() == Limiter<float>::Precision::Standard);
     }
 }
+
+namespace {
+
+// A stereo tone through a processor in blocks of 256, with a hook per block.
+template <class P, class Hook>
+std::vector<float> m3Run(P& p, double hz, double fs, size_t n, double amp, Hook&& hook)
+{
+    std::vector<float> l(n), r(n);
+    for (size_t i = 0; i < n; ++i)
+        l[i] = r[i] = static_cast<float>(amp * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / fs));
+    for (size_t off = 0; off < n; off += 256)
+    {
+        hook(off);
+        float* ch[2] = { l.data() + off, r.data() + off };
+        p.processBlock(AudioBufferView<float>(ch, 2, static_cast<int>(std::min<size_t>(256, n - off))));
+    }
+    return l;
+}
+
+double m3RmsDb(const std::vector<float>& v, size_t from, size_t to)
+{
+    double s = 0.0;
+    for (size_t i = from; i < to; ++i) s += static_cast<double>(v[i]) * v[i];
+    return 10.0 * std::log10(s / static_cast<double>(to - from) + 1e-30);
+}
+
+} // namespace
+
+// New: the detectors of the de-esser and of the dynamic equalizer keep the
+// width of the band they move up to the top of the audio band. Their
+// band-pass is matched to the analog one: a tone half an octave under a
+// 10 kHz band and one half an octave over it, at the same level, read the
+// same at 44.1 kHz (the bilinear band-pass narrows toward Nyquist: the
+// de-esser read 5.2 and 3.2 dB of reduction, the equalizer 4.2 and 2.7).
+DSPARK_TEST(DeEsser_and_DynamicEQ_detectors_keep_their_width_near_the_top)
+{
+    const double fs = 44100.0, centre = 10000.0, edges[2] = { centre / std::sqrt(2.0), centre * std::sqrt(2.0) };
+    double reduction[2] = { 0.0, 0.0 }, gain[2] = { 0.0, 0.0 };
+    for (int k = 0; k < 2; ++k)
+    {
+        auto d = std::make_unique<DeEsser<float>>();
+        d->setFrequency(static_cast<float>(centre));
+        d->setBandwidth(1.0f);
+        d->setThreshold(-30.0f);
+        d->setReduction(12.0f);
+        d->prepare(spec(fs, 256, 2));
+        (void)m3Run(*d, edges[k], fs, 44100, 0.1, [](size_t) {});
+        reduction[k] = static_cast<double>(d->getGainReductionDb());
+
+        auto e = std::make_unique<DynamicEQ<float>>();
+        e->prepare(spec(fs, 256, 2));
+        DynamicEQ<float>::BandConfig c;
+        c.frequency = static_cast<float>(centre);
+        c.q = 1.4142f;
+        c.threshold = -30.0f;
+        c.aboveRatio = 4.0f;
+        c.aboveRangeDb = 12.0f;
+        e->setBand(0, c);
+        (void)m3Run(*e, edges[k], fs, 44100, 0.1, [](size_t) {});
+        gain[k] = static_cast<double>(e->getBandGainDb(0));
+    }
+    std::cout << "  [band detectors] de-esser " << reduction[0] << " / " << reduction[1] << " dB, dynamic eq "
+              << gain[0] << " / " << gain[1] << " dB\n";
+    EXPECT_GT(std::abs(reduction[0]), 5.0);
+    EXPECT_NEAR(reduction[0], reduction[1], 0.5);
+    EXPECT_LT(gain[0], -4.0);
+    EXPECT_NEAR(gain[0], gain[1], 0.5);
+}
+
+// New: the range of a mixed band changed while the band is at work. The
+// weight of the band's end follows the 20 ms glide of its filter, so a tone
+// held 6 dB down goes to 18 dB down without rising on the way (the weight
+// used to jump to the new range while the filter was still at the old one:
+// the tone came up 2.5 dB first).
+DSPARK_TEST(DynamicEQ_mixed_band_follows_a_change_of_range_without_a_bump)
+{
+    const double fs = 48000.0;
+    auto e = std::make_unique<DynamicEQ<float>>();
+    e->setMixedBands(true);
+    e->prepare(spec(fs, 256, 2));
+    DynamicEQ<float>::BandConfig c;
+    c.frequency = 1000.0f;
+    c.q = 1.0f;
+    c.threshold = -50.0f;
+    c.aboveRatio = 20.0f;
+    c.aboveRangeDb = 6.0f;
+    e->setBand(0, c);
+    const size_t n = 96000, at = 48000 / 256 * 256;
+    const auto out = m3Run(*e, 1000.0, fs, n, 0.3, [&](size_t off) {
+        if (off == at) { c.aboveRangeDb = 18.0f; e->setBand(0, c); }
+    });
+    const double in = 20.0 * std::log10(0.3 / std::sqrt(2.0));
+    const double before = m3RmsDb(out, at - 4800, at) - in;
+    double highest = -300.0;
+    for (size_t w = at; w + 48 <= at + 4800; w += 48) highest = std::max(highest, m3RmsDb(out, w, w + 48) - in);
+    const double settled = m3RmsDb(out, n - 4800, n) - in;
+    std::cout << "  [mixed band range] before " << before << " dB, highest on the way " << highest << " dB, settled "
+              << settled << " dB\n";
+    EXPECT_NEAR(before, -6.0, 0.3);
+    EXPECT_NEAR(settled, -18.0, 0.3);
+    EXPECT_LT(highest, before + 0.5);
+}

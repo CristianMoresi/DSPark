@@ -32,6 +32,9 @@
  * the path). sync(), isActive(), processSample(), advance() and reset() on
  * the audio thread.
  *
+ * KeyMonitor is what goes out when the key is listened to: the key late by
+ * the processor's latency and held under full scale.
+ *
  * Dependencies: Biquad.h, BiquadCascade.h, DspMath.h, FilterDesign.h,
  *               StateBlob.h.
  */
@@ -418,6 +421,95 @@ private:
     bool settled_ = false;                     ///< The first settings after prepare() are taken at once.
     bool active_ = false;
     bool leavingAny_ = false;
+};
+
+/**
+ * @class KeyMonitor
+ * @brief The key of a dynamics processor as it is listened to: late by the
+ *        processor's latency and held under full scale.
+ *
+ * A processor that plays its key instead of its output, so that the
+ * sidechain can be tuned by ear, should leave the track where it is: the
+ * key goes out late by the latency the processor reports, and switching the
+ * listen on does not move it against the rest of the mix. An equalized key
+ * can also be far louder than the programme (a bell of +24 dB on a full
+ * mix): the monitor keeps it under a ceiling with one gain for all the
+ * channels, which falls at once when a peak comes and returns over
+ * kReleaseSeconds. Under the ceiling and with no delay the key goes out as
+ * it came, to the bit.
+ *
+ * Threading: prepare() on the setup thread (it allocates and never throws:
+ * without memory the key is not delayed); the rest on the audio thread.
+ *
+ * @tparam T           Sample type (float or double).
+ * @tparam MaxChannels Largest number of key channels.
+ */
+template <FloatType T, int MaxChannels = 16>
+class KeyMonitor
+{
+public:
+    static constexpr double kCeiling = 1.0;          ///< Largest sample that goes out.
+    static constexpr double kReleaseSeconds = 0.1;   ///< Time constant of the gain's return.
+
+    /**
+     * @brief Sets the rate and the longest delay (allocates).
+     * @param sampleRate      Rate in hertz (invalid values leave the monitor as it was).
+     * @param maxDelaySamples Longest delay the key will be given.
+     */
+    void prepare(double sampleRate, int maxDelaySamples) noexcept
+    {
+        if (!std::isfinite(sampleRate) || !(sampleRate > 0.0)) return;
+        release_ = std::exp(-1.0 / (kReleaseSeconds * sampleRate));
+        int n = 1;
+        while (n < std::max(1, maxDelaySamples) + 1 && n < (1 << 24)) n <<= 1;
+        lines_.reset(new (std::nothrow) T[static_cast<size_t>(n) * static_cast<size_t>(MaxChannels)]);
+        size_ = lines_ ? n : 0;
+        reset();
+    }
+
+    /** @brief Clears the delay and lets the gain go. */
+    void reset() noexcept
+    {
+        if (lines_) std::fill_n(lines_.get(), static_cast<size_t>(size_) * static_cast<size_t>(MaxChannels), T(0));
+        pos_ = 0;
+        peak_ = 0.0;
+    }
+
+    /**
+     * @brief One frame: the key of every channel goes in and comes out late
+     *        and under the ceiling.
+     * @param frame    The key of each channel, replaced in place.
+     * @param channels Channels in the frame (those over MaxChannels are left alone).
+     * @param delay    Samples the key is held back (up to the delay given to prepare()).
+     */
+    void processFrame(T* frame, int channels, int delay) noexcept
+    {
+        const int nCh = std::min(channels, MaxChannels);
+        double top = 0.0;
+        if (size_ > 0)
+        {
+            const int d = std::clamp(delay, 0, size_ - 1);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* line = lines_.get() + static_cast<size_t>(ch) * static_cast<size_t>(size_);
+                line[pos_] = frame[ch];
+                frame[ch] = line[(pos_ - d) & (size_ - 1)];
+            }
+            pos_ = (pos_ + 1) & (size_ - 1);
+        }
+        for (int ch = 0; ch < nCh; ++ch) top = std::max(top, std::abs(static_cast<double>(frame[ch])));
+        peak_ = std::max(top, peak_ * release_);
+        if (peak_ > kCeiling)
+        {
+            const T gain = static_cast<T>(kCeiling / peak_);
+            for (int ch = 0; ch < nCh; ++ch) frame[ch] *= gain;
+        }
+    }
+
+private:
+    std::unique_ptr<T[]> lines_;
+    int size_ = 0, pos_ = 0;
+    double release_ = 0.999, peak_ = 0.0;
 };
 
 } // namespace dspark

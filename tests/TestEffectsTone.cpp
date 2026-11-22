@@ -6422,10 +6422,9 @@ DSPARK_TEST(MultibandSaturation_mix_keeps_the_phase_of_the_crossover)
         const double source = std::pow(10.0, sat8Line(in, hz) / 20.0);
         const double dry = amplitude(0.0f), half = amplitude(0.5f), wet = amplitude(1.0f);
         EXPECT_NEAR(dry / source, 1.0, 0.005);                 // the dry side: the flat sum of the crossover
-        // It meets the bands in phase. Under the lowest split the bands' own
-        // filters (each Saturation's 20 Hz high-pass and its DC filter) lead
-        // the dry side a little: 20 degrees at 100 Hz, 0.14 dB at this mix.
-        EXPECT_NEAR(half, 0.5 * (dry + wet), (hz < 200.0 ? 0.02 : 0.003) * source);
+        // It meets the bands in phase, under the lowest split as well (each
+        // band's dry side leads as that band's high-passes do).
+        EXPECT_NEAR(half, 0.5 * (dry + wet), 0.003 * source);
     }
     // A driven band under a mix of one half: half way, in amplitude, between the dry and the wet.
     const Sat8Vec in = sat8Sine(1000.0, 0.25, 24000);
@@ -6726,4 +6725,175 @@ DSPARK_TEST(TapeMachine_keeps_its_memory_when_only_the_block_size_changes)
     }
     EXPECT_EQ(apart, 0.0);
     EXPECT_GT(restart, 0.05);
+}
+
+namespace {
+
+// How far a mix of one half falls short of the mean of the two levels, in dB,
+// the three renders taken alike (the last 4800 samples, hz a multiple of 10).
+template <class Render>
+double mixShortDb(Render&& render, double hz)
+{
+    const auto amplitude = [&](float mix) { return std::pow(10.0, sat8Line(render(mix, hz), hz) / 20.0); };
+    const double dry = amplitude(0.0f), wet = amplitude(1.0f);
+    return 20.0 * std::log10(amplitude(0.5f) / (0.5 * (dry + wet)));
+}
+
+// The largest step between two samples of a low tone as the mix goes to each
+// end and back, over the largest step of the tone itself.
+template <class P>
+double mixTurnStep()
+{
+    const size_t n = 512 * 190;
+    auto p = std::make_unique<P>();
+    if constexpr (requires { p->setWowFlutter(0.0f); }) p->setWowFlutter(0.0f);
+    p->setMix(0.0f);
+    p->prepare(spec(48000.0, 512, 2));
+    const Sat8Vec in = sat8Sine(50.0, 0.1, static_cast<int>(n));
+    Sat8Vec l = in, r = in;
+    for (size_t off = 0; off < n; off += 512)
+    {
+        if (off == 512 * 40) p->setMix(0.5f);
+        if (off == 512 * 80) p->setMix(1.0f);
+        if (off == 512 * 110) p->setMix(0.5f);
+        if (off == 512 * 140) p->setMix(0.0f);
+        float* ch[2] = { l.data() + off, r.data() + off };
+        p->processBlock(AudioBufferView<float>(ch, 2, 512));
+    }
+    double moving = 0.0, still = 0.0;
+    for (size_t i = 512 * 30; i < n; ++i) moving = std::max(moving, std::abs(static_cast<double>(l[i]) - l[i - 1]));
+    for (size_t i = 1; i < n; ++i) still = std::max(still, std::abs(static_cast<double>(in[i]) - in[i - 1]));
+    return moving / still;
+}
+
+} // namespace
+
+// Defect: the wet side of the mix led the dry one by the phase of the 20 Hz
+// high-pass and of the DC filter, so a half mix lost 4.6 dB at 20 Hz and
+// 1.9 dB at 30 Hz that neither side loses.
+DSPARK_TEST(Saturation_half_mix_keeps_the_bottom)
+{
+    for (const int way : { 0, 1, 2, 3, 4 })
+    {
+        const auto render = [way](float mix, double hz) {
+            return sat8Run(sat8Sine(hz, 0.02, 72000), [&](Sat8& s) {
+                if (way == 1) s.setOversamplingMode(Sat8::OversamplingMode::MinimumPhase);
+                if (way == 2) s.setAntialiasing(Sat8::Antialiasing::SecondOrder);
+                if (way == 3) s.setPreFilterHpFrequency(80.0f);
+                if (way == 4) s.setDcBlocking(false);
+                s.setMix(mix);
+            });
+        };
+        double worst = 0.0;
+        for (const double hz : { 20.0, 30.0, 50.0, 80.0, 100.0, 1000.0 }) worst = std::min(worst, mixShortDb(render, hz));
+        std::printf("  [mix] saturation, setting %d: a half mix is short of the mean by %.3f dB at most\n", way, -worst);
+        EXPECT_GT(worst, -0.25);
+    }
+}
+
+// The other side of the same fix: at a mix of zero the dry side keeps its
+// phase, and the output is the input to the bit.
+DSPARK_TEST(Saturation_zero_mix_is_the_input_to_the_bit)
+{
+    const Sat8Vec in = sat8Pink(24000, -18.0, 11u);
+    const Sat8Vec out = sat8Run(in, [](Sat8& s) { s.setOversampling(1); s.setMix(0.0f); });
+    EXPECT_TRUE(out == in);
+    const Sat8Vec whole = sat8Run(in, [](Sat8& s) { s.setMix(0.5f); }, 512);
+    const Sat8Vec cut = sat8Run(in, [](Sat8& s) { s.setMix(0.5f); }, 64);
+    double apart = 0.0;
+    for (size_t i = 0; i < in.size(); ++i) apart = std::max(apart, std::abs(static_cast<double>(whole[i]) - cut[i]));
+    EXPECT_LT(apart, 1e-6);
+}
+
+// Defect: Delta, the difference the saturation makes, took the dry side
+// without the wet side's filters: a quiet tone that the curve leaves as it is
+// came through at -2.9 dB at 50 Hz and -29 dB at 1 kHz.
+DSPARK_TEST(Saturation_delta_leaves_out_what_the_curve_leaves_alone)
+{
+    for (const double hz : { 30.0, 50.0, 100.0, 1000.0 })
+    {
+        const Sat8Vec out = sat8Run(sat8Sine(hz, 0.003, 96000), [](Sat8& s) { s.setOutputMode(Sat8::OutputMode::Delta); });
+        const double left = sat8Line(out, hz) - 20.0 * std::log10(0.003);
+        std::printf("  [delta] %.0f Hz: the tone itself is left at %.1f dB\n", hz, left);
+        EXPECT_LT(left, -55.0);
+    }
+}
+
+// Defect: the dry side of MultibandSaturation::setMix() crossed neither the
+// bands' high-passes nor their minimum-phase oversampling: a half mix lost
+// 1.9 dB at 30 Hz, and 12.7 dB at 19 kHz with minimum-phase filters.
+DSPARK_TEST(MultibandSaturation_half_mix_keeps_the_bottom_and_the_top)
+{
+    for (const int way : { 0, 1, 2 })
+    {
+        const auto render = [way](float mix, double hz) {
+            const Sat8Vec in = sat8Sine(hz, 0.02, 72000);
+            return mbRun(in, in, [&](MbSat& m) {
+                if (way >= 1) m.setOversamplingMode(Saturation<float>::OversamplingMode::MinimumPhase);
+                if (way == 2) m.getBandSaturation(1).setOversampling(4);
+                m.setMix(mix);
+            })[0];
+        };
+        double worst = 0.0;
+        for (const double hz : { 20.0, 30.0, 50.0, 1000.0, 15000.0, 19000.0 }) worst = std::min(worst, mixShortDb(render, hz));
+        std::printf("  [mix] multiband, setting %d: a half mix is short of the mean by %.3f dB at most\n", way, -worst);
+        EXPECT_GT(worst, -0.25);
+    }
+}
+
+// The dry side holds every band whatever the mix of the sum does with it: a
+// muted band is in it at full, and at zero it is the sum of the crossover.
+DSPARK_TEST(MultibandSaturation_dry_side_holds_a_muted_band)
+{
+    const Sat8Vec in = sat8Sine(10000.0, 0.02, 24000);
+    const auto at = [&](float mix) {
+        return sat8Line(mbRun(in, in, [mix](MbSat& m) { m.setNumBands(2); m.setCrossoverFrequency(0, 1000.0f); m.setBandMute(1, true); m.setMix(mix); })[0], 10000.0);
+    };
+    const double source = sat8Line(in, 10000.0);
+    EXPECT_NEAR(at(0.0f), source, 0.05);
+    EXPECT_NEAR(at(0.5f), source - 6.0206, 0.1);
+}
+
+// Defect: the machine's two high-passes led the wet side: a half mix lost
+// 6.0 dB at 20 Hz and 1.0 dB at 50 Hz that neither side loses.
+DSPARK_TEST(TapeMachine_half_mix_keeps_the_bottom)
+{
+    for (const int way : { 0, 1, 2 })
+    {
+        const auto render = [way](float mix, double hz) {
+            const Sat8Vec in = sat8Sine(hz, 0.03, 72000);
+            return l10Run([&](Tape10& t) {
+                t.setWowFlutter(0.0f);
+                if (way == 1) t.setOversamplingMode(Tape10::OversamplingMode::MinimumPhase);
+                if (way == 2) t.setOutputIron(1.0f);
+                t.setMix(mix);
+            }, in, in).first;
+        };
+        double worst = 0.0;
+        for (const double hz : { 20.0, 30.0, 50.0, 100.0, 1000.0 }) worst = std::min(worst, mixShortDb(render, hz));
+        std::printf("  [mix] tape, setting %d: a half mix is short of the mean by %.3f dB at most\n", way, -worst);
+        EXPECT_GT(worst, way == 2 ? -0.35 : -0.25);
+    }
+    // Monitoring the source is the source, whatever the mix.
+    const Sat8Vec in = sat8Pink(24000, -18.0, 13u);
+    auto tape = std::make_unique<Tape10>();
+    tape->setMix(0.5f);
+    tape->setMonitor(Tape10::Monitor::Source);
+    tape->prepare(spec(48000.0, 512, 2));
+    const Sat8Vec out = l10Render(*tape, in, in).first;
+    const size_t late = static_cast<size_t>(tape->getLatency());
+    double apart = 0.0;
+    for (size_t i = late; i < out.size(); ++i) apart = std::max(apart, std::abs(static_cast<double>(out[i]) - in[i - late]));
+    EXPECT_EQ(apart, 0.0);
+}
+
+// The phase of the dry side comes and goes in 20 ms: no step as the mix
+// reaches either end or leaves it.
+DSPARK_TEST(Mix_phase_of_the_dry_side_turns_without_a_step)
+{
+    const double saturation = mixTurnStep<Sat8>(), multiband = mixTurnStep<MbSat>(), tape = mixTurnStep<Tape10>();
+    std::printf("  [mix] the largest step over the tone's: %.3f / %.3f / %.3f\n", saturation, multiband, tape);
+    EXPECT_LT(saturation, 1.5);
+    EXPECT_LT(multiband, 1.5);
+    EXPECT_LT(tape, 1.8);
 }

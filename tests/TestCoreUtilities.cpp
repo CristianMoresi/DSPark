@@ -2494,3 +2494,40 @@ DSPARK_TEST(OversamplingDryPath_adds_in_phase_with_the_engine)
         EXPECT_TRUE(untouched);
     }
 }
+
+// The all-pass on the dry side of a mix: unit gain at every frequency, the
+// lead of two one-pole high-passes at its corner, the input to the bit when
+// it is faded out, and no state left behind by a value that is not finite.
+DSPARK_TEST(DryPhase_leads_without_touching_the_level)
+{
+    detail::DryPhase lead;
+    lead.prepare(48000.0, 1);
+    lead.setCorner(24.0);
+    lead.aim(false);
+    lead.land();
+    for (int i = 0; i < 480; ++i)
+    {
+        const float x = static_cast<float>(0.3 * std::sin(0.01 * i));
+        EXPECT_EQ(lead.processSample(0, x, lead.advance()), x);
+    }
+    lead.aim(true);
+    lead.land();
+    for (const double hz : { 10.0, 20.0, 30.0, 100.0, 1000.0, 10000.0 })
+    {
+        lead.reset();
+        const double w = 2.0 * 3.14159265358979323846 * hz / 48000.0;
+        double re = 0.0, im = 0.0;
+        for (int i = 0; i < 96000; ++i)
+        {
+            const double y = lead.processSample(0, std::sin(w * i), lead.advance());
+            if (i >= 48000) { re += y * std::sin(w * i); im += y * std::cos(w * i); }
+        }
+        re /= 24000.0;
+        im /= 24000.0;
+        EXPECT_NEAR(std::sqrt(re * re + im * im), 1.0, 1e-3);
+        EXPECT_NEAR(std::atan2(im, re), 2.0 * std::atan(std::tan(3.14159265358979323846 * 24.0 / 48000.0) / std::tan(0.5 * w)), 1e-3);
+    }
+    const double bad = lead.processSample(0, std::numeric_limits<double>::infinity(), lead.advance());
+    EXPECT_FALSE(std::isnan(bad));
+    EXPECT_TRUE(std::isfinite(lead.processSample(0, 0.1, lead.advance())));
+}

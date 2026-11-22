@@ -2239,7 +2239,7 @@ public:
     /**
      * @brief Sets the output signal path.
      * @note Thread-Safe. 
-     * @param m The output mode (Normal, WetOnly, Delta). Delta mode outputs ONLY the generated harmonics.
+     * @param m The output mode (Normal, WetOnly, Delta). Delta is the wet side less the dry one, both through the same high-passes: what the curve changes.
      */
     void setOutputMode(OutputMode m)        { pushParam([&](auto& p){ p.outputMode = m; }); }
 

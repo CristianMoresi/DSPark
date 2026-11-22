@@ -60,6 +60,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 
 namespace dspark {
 
@@ -320,6 +321,83 @@ public:
             u = y;
         }
         return u;
+    }
+
+    /**
+     * @brief As processSample(), leaving some sections out for this call.
+     *
+     * A section whose bit is set in `skip` (bit s for section s) is not
+     * computed for this sample: what reaches it goes on to the next section
+     * and its own memory for the channel stays as it was. A cascade whose
+     * sections act on some channels only (an equalizer with bands for the
+     * middle or for the sides of a pair) passes each channel the mask of the
+     * sections that are not for it, the same mask on every sample.
+     *
+     * @pre channel in [0, MaxChannels); MaxSections of 64 at most.
+     * @param input   Input sample.
+     * @param channel Channel index.
+     * @param skip    Sections to leave out, one bit each.
+     * @return Output of the last enabled section that was not left out.
+     */
+    [[nodiscard]] double processSample(double input, int channel, std::uint64_t skip) noexcept
+    {
+        static_assert(MaxSections <= 64, "the mask has one bit per section");
+        assert(channel >= 0 && channel < MaxChannels && "Channel index out of bounds");
+        auto& nodes = node_[static_cast<size_t>(channel)];
+        double u = input;
+        double u1 = nodes[0].h1, u2 = nodes[0].h2;
+        nodes[0].h2 = nodes[0].h1;
+        nodes[0].h1 = input;
+        for (int k = 0; k < numActive_; ++k)
+        {
+            const auto s = static_cast<size_t>(active_[static_cast<size_t>(k)]);
+            if ((skip & (std::uint64_t { 1 } << s)) != 0) continue;
+            const BiquadCoeffs& c = current_[s];
+            auto& out = nodes[s + 1];
+            const double p = (c.b1 * u1 + c.b2 * u2) - c.a2 * out.h2;
+            const double y = (p + c.b0 * u) - c.a1 * out.h1;
+            u1 = out.h1;
+            u2 = out.h2;
+            out.h2 = out.h1;
+            out.h1 = y;
+            u = y;
+        }
+        return u;
+    }
+
+    /**
+     * @brief Rewrites the memory of a pair of channels as its middle and its
+     *        sides, or back.
+     *
+     * The memory of the cascade is signal. A caller that has been giving the
+     * cascade the two channels of a pair and goes on to give it, in the same
+     * two channels, their half sum and their half difference can take the
+     * memory with it: every node of the first channel becomes the half sum
+     * of the two and every node of the second their half difference, and the
+     * sections carry on as if they had been fed that way all along (exact
+     * for the sections that run both channels, which share their
+     * coefficients). The way back is the sum and the difference.
+     *
+     * @param first  Channel that holds the left, or the middle.
+     * @param second Channel that holds the right, or the sides.
+     * @param back   False: left and right become middle and sides. True: the
+     *               other way.
+     */
+    void turnPairMemory(int first, int second, bool back) noexcept
+    {
+        if (first < 0 || second < 0 || first >= MaxChannels || second >= MaxChannels || first == second) return;
+        auto& a = node_[static_cast<size_t>(first)];
+        auto& b = node_[static_cast<size_t>(second)];
+        const double scale = back ? 1.0 : 0.5;
+        for (size_t n = 0; n < a.size(); ++n)
+        {
+            const double sum1 = a[n].h1 + b[n].h1, difference1 = a[n].h1 - b[n].h1;
+            const double sum2 = a[n].h2 + b[n].h2, difference2 = a[n].h2 - b[n].h2;
+            a[n].h1 = scale * sum1;
+            b[n].h1 = scale * difference1;
+            a[n].h2 = scale * sum2;
+            b[n].h2 = scale * difference2;
+        }
     }
 
     /**

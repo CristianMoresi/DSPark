@@ -73,7 +73,9 @@
  *   setMonitor(): the tape, the track width, the operating level and the
  *   monitored head, as on a machine being aligned.
  *
- * The dry path of the mix control is delay-compensated to getLatency(). The
+ * The dry path of the mix control is delay-compensated to getLatency() and,
+ * between the two ends of the mix, takes the phase (not the magnitude) of
+ * the machine's high-passes, so a partial mix keeps its bottom. The
  * mix ramps at no more than full scale per 20 ms, like the other saturators:
  * the wet stream is aligned to the dry, but at high drive the timbral
  * difference a step would jump across is not small.
@@ -115,6 +117,7 @@
  * delay), so hosts get correct PDC.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
+ * Core/DryWetMixer.h,
  * Core/FilterDesign.h, Core/NormalizedLadder.h, Core/TapeTransport.h, Core/SimdOps.h,
  * Core/AudioSpec.h, Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h,
  * Core/StateBlob.h.
@@ -124,6 +127,7 @@
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/DryWetMixer.h"
 #include "../Core/DspMath.h"
 #include "../Core/FilterDesign.h"
 #include "../Core/Hysteresis.h"
@@ -348,7 +352,7 @@ public:
         // (real machines roll off there; also blocks remanence DC).
         outHp_.assign(static_cast<size_t>(numChannels_), {});
         {
-            const auto hc = BiquadCoeffs::makeHighPass(sampleRate_, 24.0, 0.707);
+            const auto hc = BiquadCoeffs::makeHighPass(sampleRate_, kOutputCouplingHz, 0.707);
             for (auto& h : outHp_)
                 h = PeakSection { hc.b0, hc.b1, hc.b2, hc.a1, hc.a2, 0.0, 0.0 };
         }
@@ -412,6 +416,9 @@ public:
         dryRing_.assign(static_cast<size_t>(numChannels_),
                         std::vector<T>(static_cast<size_t>(drySize_), T(0)));
         dryPos_ = 0;
+        for (auto* lead : { &dryInputLead_, &dryOutputLead_, &dryIronLead_ }) lead->prepare(sampleRate_, numChannels_);
+        dryInputLead_.setCorner(kInputCouplingHz);
+        dryOutputLead_.setCorner(detail::DryPhase::kButterworthShare * kOutputCouplingHz);
 
         // The first calibration runs here, on the setup thread; later
         // parameter changes calibrate incrementally inside processBlock().
@@ -449,6 +456,12 @@ public:
         delayPos_ = 0;
         dryPos_ = 0;
         currentMix_ = mix_.load(std::memory_order_relaxed); // no fade-in on start
+        aimDryPhase(currentMix_);
+        for (auto* lead : { &dryInputLead_, &dryOutputLead_, &dryIronLead_ })
+        {
+            lead->reset();
+            lead->land();
+        }
         biasPhase_ = 0;
         modPhaseWow_ = 0.0;
         modPhaseFlut_ = 0.0;
@@ -969,6 +982,7 @@ private:
         const bool xtActive = xt_.active();
         const bool trActive = tr_.active();
         const bool monitorMoving = monitorRamp_.now != 1.0 || monitorRamp_.target != 1.0;
+        aimDryPhase(mixTarget);
         const double humStep = (mains_.load(std::memory_order_relaxed) == 1 ? 60.0 : 50.0) / sampleRate_;
 
         // 1. Dry snapshot for the latency-compensated mix (through the
@@ -997,12 +1011,12 @@ private:
         // dry ring keeps its place and a pending calibration goes on.
         if ((mixTarget == T(0) && mixStart == T(0)) || (monitorRamp_.now == 0.0 && monitorRamp_.target == 0.0))
         {
-            for (int ch = 0; ch < nCh; ++ch)
+            for (int i = 0; i < nS; ++i)
             {
-                T* d = buffer.getChannel(ch);
-                const auto& dry = dryRing_[static_cast<size_t>(ch)];
-                for (int i = 0; i < nS; ++i)
-                    d[i] = dry[static_cast<size_t>((dryPos_ + i - dryDelay_) & (drySize_ - 1))];
+                const double inTurn = dryInputLead_.advance(), outTurn = dryOutputLead_.advance(), ironTurn = dryIronLead_.advance();
+                const int at = (dryPos_ + i - dryDelay_) & (drySize_ - 1);
+                for (int ch = 0; ch < nCh; ++ch)
+                    buffer.getChannel(ch)[i] = turnDry(ch, dryRing_[static_cast<size_t>(ch)][static_cast<size_t>(at)], inTurn, outTurn, ironTurn);
             }
             dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
             if (calActive_) stepCalibration(nS * osFactor_);
@@ -1316,12 +1330,16 @@ private:
             // heard, and the mix and the monitor wait for it.
             const double monitor = i < warm ? 0.0 : (monitorMoving ? monitorRamp_.next() : 1.0);
             const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(std::max(0, i + 1 - warm)));
+            const double inTurn = dryInputLead_.advance(), outTurn = dryOutputLead_.advance(), ironTurn = dryIronLead_.advance();
+            const bool wetAlone = mixVal == T(1) && monitor == 1.0;
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* d = buffer.getChannel(ch);
                 const auto& dry = dryRing_[static_cast<size_t>(ch)];
                 const int dryIdx = (dryPos_ + i - dryDelay_) & (drySize_ - 1);
-                const T drySample = dry[static_cast<size_t>(dryIdx)];
+                const T rawDry = dry[static_cast<size_t>(dryIdx)];
+                const T turned = turnDry(ch, rawDry, inTurn, outTurn, ironTurn);
+                const T drySample = wetAlone ? rawDry : turned;
                 T w = static_cast<T>(wet_[static_cast<size_t>(ch)]);
                 if (monitor != 1.0)
                     w = static_cast<T>(static_cast<double>(drySample)
@@ -1334,6 +1352,29 @@ private:
         }
         dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
         currentMix_ = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(nS - warm));
+    }
+
+    /**
+     * @brief Where the phase of the dry side goes: that of the high-passes
+     *        while the machine is mixed in, none where the dry side is the output.
+     */
+    void aimDryPhase(T mixTarget) noexcept
+    {
+        const bool turn = mixTarget > T(0) && monitor_.load(std::memory_order_relaxed) != 2;
+        const double iron = static_cast<double>(outputIron_.load(std::memory_order_relaxed));
+        dryInputLead_.aim(turn);
+        dryOutputLead_.aim(turn);
+        // The iron takes off a share of a one-pole low-pass: an all-pass at
+        // half that share of its corner leads by as much.
+        dryIronLead_.setCorner(0.5 * kIronCornerHz * std::max(iron, 0.05));
+        dryIronLead_.aim(turn && iron >= 0.05);
+    }
+
+    /** @brief A sample of the dry side through the phase of the high-passes. */
+    [[nodiscard]] T turnDry(int channel, T x, double inTurn, double outTurn, double ironTurn) noexcept
+    {
+        return dryIronLead_.processSample(channel,
+            dryOutputLead_.processSample(channel, dryInputLead_.processSample(channel, x, inTurn), outTurn), ironTurn);
     }
 
     /** @brief A linear ramp towards a target, at a step fixed when it is aimed. */
@@ -2061,6 +2102,7 @@ private:
     static constexpr double kAsymmetryShare = 0.15;        ///< Even term at full asymmetry.
     static constexpr double kTransformerCornerHz = 60.0;
     static constexpr double kInputCouplingHz = 4.0;      ///< Corner of the AC-coupled input.
+    static constexpr double kOutputCouplingHz = 24.0;    ///< Corner of the AC-coupled playback amplifier.
     static constexpr double kIronCornerHz = 20.0;        ///< Corner of the iron's low end at the full amount.
     static constexpr double kUnderBiasLiftDb = 4.5;      ///< Top-end lift with no bias at all.
     static constexpr double kUnderBiasCentreHz = 6000.0; ///< Its centre at 15 ips.
@@ -2082,6 +2124,7 @@ private:
     OversamplingMode osMode_ = OversamplingMode::LinearPhase; ///< setOversamplingMode() (setup thread).
     OversamplingDryPath<T> dryPath_; ///< The dry copy through minimum-phase filters.
     AudioBuffer<T> dryScratch_;      ///< The dry block on its way through dryPath_.
+    detail::DryPhase dryInputLead_, dryOutputLead_, dryIronLead_; ///< The phase of the high-passes on the dry side.
     bool dryThroughFilters_ = false; ///< The dry copy crosses the filters (minimum phase).
     int dryDelay_ = 0;               ///< Delay of the dry ring: what the filters do not bring.
     static constexpr double kAutomaticInternalRate = 176400.0; ///< Rate the automatic factor reaches.

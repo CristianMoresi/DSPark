@@ -463,12 +463,17 @@ public:
         // The wet signal's equalizer.
         if (postEq_.sync())
         {
-            for (int ch = 0; ch < nCh; ++ch)
+            // A frame at a time: the coefficients of a band on the move
+            // advance by samples, whatever the size of the host's block.
+            for (int i = 0; i < nS; ++i)
             {
-                T* d = buffer.getChannel(ch);
-                for (int i = 0; i < nS; ++i) d[i] = postEq_.processSample(d[i], ch);
+                for (int ch = 0; ch < nCh; ++ch)
+                {
+                    T* d = buffer.getChannel(ch);
+                    d[i] = postEq_.processSample(d[i], ch);
+                }
+                postEq_.advance(1);
             }
-            postEq_.advance(nS);
         }
 
         mixer_.mixWet(buffer, mix_.load(std::memory_order_relaxed));

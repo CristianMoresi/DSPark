@@ -8463,7 +8463,7 @@ DSPARK_TEST(TonalBalance_trims_a_peak_and_keeps_the_loudness)
     tb->prepare(spec(48000.0, 256, 2));
     const auto out = l13Run(*tb, peaked, peaked);
     int at3k = 0;
-    for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+    for (int b = 0; b < tb->getNumBands(); ++b)
         if (std::abs(tb->getBandCentre(b) - 3000.0) < std::abs(tb->getBandCentre(at3k) - 3000.0)) at3k = b;
     EXPECT_LT(static_cast<double>(tb->getCorrection(at3k)), -1.0);
     const int lat = tb->getLatency();
@@ -8516,7 +8516,7 @@ DSPARK_TEST(TonalBalance_leaves_the_ends_alone)
             tb->prepare(spec(48000.0, 256, 2));
             (void)l13Run(*tb, x, x);
             double lowEnd = 0.0, highEnd = 0.0;
-            for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+            for (int b = 0; b < tb->getNumBands(); ++b)
             {
                 const double hz = tb->getBandCentre(b), c = static_cast<double>(tb->getCorrection(b));
                 if (hz < 60.0) lowEnd = std::max(lowEnd, std::abs(c));
@@ -8545,7 +8545,7 @@ DSPARK_TEST(TonalBalance_tilt_tilts_the_curve)
         tb->prepare(spec(48000.0, 256, 2));
         (void)l13Run(*tb, x, x);
         int lo = 0, hi = 0;
-        for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+        for (int b = 0; b < tb->getNumBands(); ++b)
         {
             if (std::abs(std::log(tb->getBandCentre(b) / 200.0)) < std::abs(std::log(tb->getBandCentre(lo) / 200.0))) lo = b;
             if (std::abs(std::log(tb->getBandCentre(b) / 5000.0)) < std::abs(std::log(tb->getBandCentre(hi) / 5000.0))) hi = b;
@@ -9079,15 +9079,15 @@ DSPARK_TEST(TonalBalance_reads_a_delayed_channel_as_one_source)
         tb->setBalance(0.0f); tb->setFillDips(1.0f); tb->setTrimPeaks(1.0f); tb->setRange(12.0f);
         tb->prepare(spec(48000.0, 256, 2));
         (void)l13Run(*tb, left, right);
-        std::array<double, TonalBalance<float>::kBands> c {};
-        for (int b = 0; b < TonalBalance<float>::kBands; ++b) c[static_cast<size_t>(b)] = static_cast<double>(tb->getCorrection(b));
+        std::array<double, TonalBalance<float>::kMaxBands> c {};
+        for (int b = 0; b < tb->getNumBands(); ++b) c[static_cast<size_t>(b)] = static_cast<double>(tb->getCorrection(b));
         return c;
     };
     const auto equal = corrections(left), delayed = corrections(late);
     auto probe = std::make_unique<TonalBalance<float>>();
     probe->prepare(spec(48000.0, 256, 2));
     double worst = 0.0;
-    for (int b = 0; b < TonalBalance<float>::kBands; ++b)
+    for (int b = 0; b < probe->getNumBands(); ++b)
     {
         const double hz = probe->getBandCentre(b);
         if (hz < 100.0 || hz > 2000.0) continue;                           // where a band is narrower than the comb
@@ -9126,7 +9126,7 @@ DSPARK_TEST(TonalBalance_keeps_the_loudness_within_a_narrow_range)
             if (off < n / 2) continue;
             worst = std::max(worst, std::abs(static_cast<double>(tb->getLoudnessChange())));
         }
-        for (int b = 0; b < TonalBalance<float>::kBands; ++b) deepest = std::max(deepest, std::abs(static_cast<double>(tb->getCorrection(b))));
+        for (int b = 0; b < tb->getNumBands(); ++b) deepest = std::max(deepest, std::abs(static_cast<double>(tb->getCorrection(b))));
         std::printf("  [loudness] %.0f Hz to %.0f Hz, range %.0f dB: total loudness moved %.4f dB at most; largest correction %.2f dB\n",
                     static_cast<double>(c.lo), static_cast<double>(c.hi), static_cast<double>(c.range), worst, deepest);
         EXPECT_LT(worst, 0.002);
@@ -9583,7 +9583,7 @@ DSPARK_TEST(TonalBalance_range_knee_rounds_the_limit)
     {
         Tb9 probe;
         probe.prepare(spec(48000.0, 256, 2));
-        for (int b = 1; b < Tb9::kBands; ++b)
+        for (int b = 1; b < probe.getNumBands(); ++b)
             if (std::abs(probe.getBandCentre(b) - 2000.0) < std::abs(probe.getBandCentre(band) - 2000.0)) band = b;
     }
     const auto sweep = [&](float knee, double& bend, double& top) {
@@ -9639,14 +9639,17 @@ DSPARK_TEST(TonalBalance_leaves_an_even_programme_alone_at_any_level)
     const size_t n = 48000 * 3;
     // Eight tones of random frequency and phase in each band, the same power in every band.
     Tb9 probe;
+    probe.setDetail(Tb9::Detail::Auditory);
     probe.prepare(spec(48000.0, 256, 2));
+    const int barkBands = probe.getNumBands();
+    const double innerLo = probe.getBandCentre(6) * 0.999999, innerHi = probe.getBandCentre(barkBands - 7) * 1.000001;
     std::vector<float> even(n, 0.0f);
     uint32_t seed = 77u;
     const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return static_cast<double>(seed >> 8) / 16777216.0; };
-    for (int b = 0; b < Tb9::kBands; ++b)
+    for (int b = 0; b < barkBands; ++b)
     {
         const double lo = b > 0 ? std::sqrt(probe.getBandCentre(b - 1) * probe.getBandCentre(b)) : probe.getBandCentre(0) * 0.9;
-        const double hi = b + 1 < Tb9::kBands ? std::sqrt(probe.getBandCentre(b) * probe.getBandCentre(b + 1)) : probe.getBandCentre(b) * 1.05;
+        const double hi = b + 1 < barkBands ? std::sqrt(probe.getBandCentre(b) * probe.getBandCentre(b + 1)) : probe.getBandCentre(b) * 1.05;
         for (int t = 0; t < 8; ++t)
         {
             const double hz = lo + (hi - lo) * next(), phase = 6.283185307179586 * next();
@@ -9657,18 +9660,23 @@ DSPARK_TEST(TonalBalance_leaves_an_even_programme_alone_at_any_level)
     double rms = 0.0;
     for (float x : even) rms += static_cast<double>(x) * x;
     rms = std::sqrt(rms / static_cast<double>(n));
+    for (const bool detail : { false, true })
     for (const double dbfs : { -50.0, -30.0, -10.0 })
     {
         const float gain = static_cast<float>(std::pow(10.0, dbfs / 20.0) / rms);
         std::vector<float> x = even;
         for (auto& s : x) s *= gain;
-        const auto tb = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setFrequencyRange(20.0f, 20000.0f); t.setReference(Tb9::Reference::EvenPower); }, x);
+        const auto tb = m9Balance([detail](Tb9& t) {
+            t.setBalance(1.0f); t.setFrequencyRange(20.0f, 20000.0f); t.setReference(Tb9::Reference::EvenPower);
+            t.setDetail(detail ? Tb9::Detail::Fine : Tb9::Detail::Auditory);
+            if (detail) { t.setFillDips(0.0f); t.setTrimPeaks(0.0f); }
+        }, x);
         double worst = 0.0, inner = 0.0;
-        for (int b = 0; b < Tb9::kBands; ++b)
+        for (int b = 0; b < tb->getNumBands(); ++b)
         {
             const double c = std::abs(static_cast<double>(tb->getCorrection(b)));
             worst = std::max(worst, c);
-            if (b >= 6 && b < Tb9::kBands - 6) inner = std::max(inner, c);
+            if (tb->getBandCentre(b) >= innerLo && tb->getBandCentre(b) <= innerHi) inner = std::max(inner, c);
         }
         std::printf("  [balance] the same power in every band at %.0f dBFS: the largest correction %.2f dB (%.2f away from the ends)\n", dbfs, worst, inner);
         EXPECT_LT(worst, 0.5);
@@ -9714,7 +9722,7 @@ DSPARK_TEST(TonalBalance_does_not_raise_what_is_masked)
     const auto raisedOver8k = [&](float floorDb) {
         const auto tb = m9Balance([=](Tb9& t) { t.setBalance(1.0f); t.setFillDips(1.0f); t.setFloor(floorDb); }, x);
         double top = 0.0;
-        for (int b = 0; b < Tb9::kBands; ++b)
+        for (int b = 0; b < tb->getNumBands(); ++b)
             if (tb->getBandCentre(b) > 8000.0) top = std::max(top, static_cast<double>(tb->getCorrection(b)));
         return top;
     };
@@ -9748,7 +9756,7 @@ DSPARK_TEST(TonalBalance_listening_compensation_raises_the_ends)
     };
     const auto at = [](const Tb9& t, double hz) {
         int band = 0;
-        for (int b = 1; b < Tb9::kBands; ++b)
+        for (int b = 1; b < t.getNumBands(); ++b)
             if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
         return static_cast<double>(t.getCorrection(band));
     };
@@ -9790,7 +9798,7 @@ DSPARK_TEST(TonalBalance_common_response_moves_the_bands_together)
     }
     const auto bandAt = [](const Tb9& t, double hz) {
         int band = 0;
-        for (int b = 1; b < Tb9::kBands; ++b)
+        for (int b = 1; b < t.getNumBands(); ++b)
             if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
         return band;
     };
@@ -9835,7 +9843,7 @@ DSPARK_TEST(TonalBalance_local_slope_asks_less_of_a_quiet_end)
     for (auto& s : quiet) s *= 0.01f;
     const auto at = [](const Tb9& t, double hz) {
         int band = 0;
-        for (int b = 1; b < Tb9::kBands; ++b)
+        for (int b = 1; b < t.getNumBands(); ++b)
             if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
         return static_cast<double>(t.getCorrection(band));
     };
@@ -9875,7 +9883,7 @@ DSPARK_TEST(TonalBalance_render_quality_lands_closer)
         const auto tb = m9Balance([=](Tb9& t) { t.setQuality(q); t.setBalance(1.0f); t.setTrimPeaks(1.0f); t.setRange(12.0f); }, x);
         latency = tb->getLatency();
         double worst = 0.0;
-        for (int b = 4; b < Tb9::kBands - 4; ++b)
+        for (int b = 4; b < tb->getNumBands() - 4; ++b)
             worst = std::max(worst, std::abs(tb->getResponse(tb->getBandCentre(b)) - static_cast<double>(tb->getCorrection(b))));
         return worst;
     };
@@ -9909,7 +9917,7 @@ DSPARK_TEST(TonalBalance_time_focus_reads_the_top_sooner)
     const auto plain = m9Balance([](Tb9& t) { t.setBalance(1.0f); }, steady);
     const auto focused = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setTimeFocus(true); }, steady);
     double apart = 0.0;
-    for (int b = 4; b < Tb9::kBands - 4; ++b)
+    for (int b = 4; b < plain->getNumBands() - 4; ++b)
         apart = std::max(apart, std::abs(static_cast<double>(plain->getCorrection(b)) - static_cast<double>(focused->getCorrection(b))));
 
     const size_t n = 48000 * 4, turn = 48000 * 2;
@@ -9927,7 +9935,7 @@ DSPARK_TEST(TonalBalance_time_focus_reads_the_top_sooner)
         tb->setTimeFocus(focus);
         tb->prepare(spec(48000.0, 64, 2));
         int band = 0;
-        for (int b = 1; b < Tb9::kBands; ++b)
+        for (int b = 1; b < tb->getNumBands(); ++b)
             if (std::abs(tb->getBandCentre(b) - 8000.0) < std::abs(tb->getBandCentre(band) - 8000.0)) band = b;
         std::vector<float> l = x, r = x;
         std::vector<double> track;
@@ -10099,4 +10107,367 @@ DSPARK_TEST(SpectralDynamicEQ_time_focus_reads_the_top_through_a_shorter_window)
     S b;
     EXPECT_TRUE(b.setState(blob.data(), blob.size()));
     EXPECT_TRUE(b.getTimeFocus());
+}
+
+// ----------------------------------------------------------------------------
+// TonalBalance: detail in the low end
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// A programme whose low end has a shape: pinkish noise with a lump at 45 Hz,
+// a hole at 70 Hz and a lump at 120 Hz (bells of +9, -9 and +9 dB).
+std::vector<float> tbShapedLows(size_t n, uint32_t seed)
+{
+    std::vector<float> v = l13Pinkish(n, seed);
+    const BiquadCoeffs bells[3] = { BiquadCoeffs::makePeak(48000.0, 45.0, 3.0, 9.0),
+                                    BiquadCoeffs::makePeak(48000.0, 70.0, 4.0, -9.0),
+                                    BiquadCoeffs::makePeak(48000.0, 120.0, 2.5, 9.0) };
+    for (const BiquadCoeffs& c : bells)
+    {
+        double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+        for (float& s : v)
+        {
+            const double x = static_cast<double>(s);
+            const double y = c.b0 * x + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+            x2 = x1; x1 = x; y2 = y1; y1 = y;
+            s = static_cast<float>(y);
+        }
+    }
+    return v;
+}
+
+// The correction of the band nearest a frequency.
+double tbCorrectionAt(const TonalBalance<float>& tb, double hz)
+{
+    int at = 0;
+    for (int b = 0; b < tb.getNumBands(); ++b)
+        if (std::abs(std::log(tb.getBandCentre(b) / hz)) < std::abs(std::log(tb.getBandCentre(at) / hz))) at = b;
+    return static_cast<double>(tb.getCorrection(at));
+}
+
+} // namespace
+
+// The bands of each detail: how many, and how wide in the low end. A third of
+// a critical band is some 30 Hz there whatever the frequency; with Fine no
+// band is wider than a sixth of an octave and with Finest than a twelfth.
+// The latency does not depend on it.
+DSPARK_TEST(TonalBalance_detail_lays_more_bands_in_the_low_end)
+{
+    using TB = TonalBalance<float>;
+    struct Case { TB::Detail detail; int bands; double widestOctaves; int under100; };
+    const Case cases[] = { { TB::Detail::Auditory, 72, 1.0, 3 }, { TB::Detail::Fine, 87, 1.0 / 6.0, 14 },
+                           { TB::Detail::Finest, 122, 1.0 / 12.0, 28 } };
+    int latency = -1;
+    for (const auto& c : cases)
+    {
+        auto tb = std::make_unique<TB>();
+        tb->setDetail(c.detail);
+        tb->prepare(spec(48000.0, 256, 2));
+        EXPECT_TRUE(tb->getDetailInUse() == c.detail);
+        const int bands = tb->getNumBands();
+        double widest = 0.0;
+        int low = 0;
+        for (int b = 1; b < bands; ++b)
+        {
+            widest = std::max(widest, std::log2(tb->getBandCentre(b) / tb->getBandCentre(b - 1)));
+            EXPECT_GT(tb->getBandCentre(b), tb->getBandCentre(b - 1));
+        }
+        for (int b = 0; b < bands; ++b)
+            if (tb->getBandCentre(b) < 100.0) ++low;
+        std::printf("  [tb detail] %d: %d bands, %d of them under 100 Hz, the widest step %.4f of an octave, from %.1f to %.1f Hz, latency %d\n",
+                    static_cast<int>(c.detail), bands, low, widest, tb->getBandCentre(0), tb->getBandCentre(bands - 1), tb->getLatency());
+        EXPECT_NEAR(bands, c.bands, 2);
+        EXPECT_NEAR(tb->getBandCentre(0), 20.0, 1e-6);
+        EXPECT_NEAR(tb->getBandCentre(bands - 1), 20000.0, 1e-3);
+        if (c.detail != TB::Detail::Auditory) EXPECT_LT(widest, c.widestOctaves * 1.02);
+        EXPECT_NEAR(low, c.under100, 1);
+        if (latency < 0) latency = tb->getLatency();
+        EXPECT_EQ(tb->getLatency(), latency);
+    }
+    // The default is Fine, and a value out of range reads as it.
+    TB fresh;
+    EXPECT_TRUE(fresh.getDetail() == TB::Detail::Fine);
+    fresh.setDetail(static_cast<TB::Detail>(9));
+    EXPECT_TRUE(fresh.getDetail() == TB::Detail::Fine);
+    fresh.setContrastKnee(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(fresh.getContrastKnee(), 1.5f, 0.0f);
+}
+
+// A low end with a lump at 45 Hz, a hole at 70 Hz and a lump at 120 Hz. On
+// the ear's scale the three fall in neighbouring bands 30 Hz wide read
+// through a transform that cannot tell them apart, and the correction is one
+// broad cut. With the detail the hole is cut less than the lumps (or
+// raised), in the corrections and in what the bank plays.
+DSPARK_TEST(TonalBalance_follows_the_shape_of_the_low_end)
+{
+    using TB = TonalBalance<float>;
+    const size_t n = 48000 * 8;
+    const std::vector<float> programme = tbShapedLows(n, 7u);
+    double contrast[3] = {};
+    int at = 0;
+    for (const auto detail : { TB::Detail::Auditory, TB::Detail::Fine, TB::Detail::Finest })
+    {
+        auto tb = std::make_unique<TB>();
+        tb->setDetail(detail);
+        tb->setFrequencyRange(20.0f, 16000.0f);
+        tb->prepare(spec(48000.0, 256, 2));
+        (void)l13Run(*tb, programme, programme);
+        const double c45 = tbCorrectionAt(*tb, 45.0), c70 = tbCorrectionAt(*tb, 70.0), c120 = tbCorrectionAt(*tb, 120.0);
+        const double r45 = tb->getResponse(45.0), r70 = tb->getResponse(70.0), r120 = tb->getResponse(120.0);
+        std::printf("  [tb lows] detail %d: corrections at 45 / 70 / 120 Hz %.2f / %.2f / %.2f dB; the bank plays %.2f / %.2f / %.2f dB; loudness change %.3f dB\n",
+                    static_cast<int>(detail), c45, c70, c120, r45, r70, r120, static_cast<double>(tb->getLoudnessChange()));
+        std::printf("  [tb lows] detail %d curve:", static_cast<int>(detail));
+        for (int b = 0; b < tb->getNumBands() && tb->getBandCentre(b) < 400.0; ++b)
+            std::printf(" %.0f:%.1f", tb->getBandCentre(b), static_cast<double>(tb->getCorrection(b)));
+        std::printf("\n");
+        contrast[at++] = r70 - 0.5 * (r45 + r120);
+        EXPECT_NEAR(static_cast<double>(tb->getLoudnessChange()), 0.0, 0.2);
+    }
+    // How much less the hole is cut than the two lumps around it.
+    std::printf("  [tb lows] the hole against the lumps, in what the bank plays: %.2f dB auditory, %.2f fine, %.2f finest\n",
+                contrast[0], contrast[1], contrast[2]);
+    EXPECT_GT(contrast[1], contrast[0] + 1.0);
+    EXPECT_GT(contrast[2], contrast[0] + 1.0);
+
+    // With every correction at full and no knee, the shape comes back nearly whole.
+    auto full = std::make_unique<TB>();
+    full->setFrequencyRange(20.0f, 16000.0f);
+    full->setBalance(0.0f); full->setFillDips(1.0f); full->setTrimPeaks(1.0f); full->setContrastKnee(0.1f); full->setRange(12.0f);
+    full->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*full, programme, programme);
+    std::printf("  [tb lows] dips and peaks at full, fine: the bank plays %.2f / %.2f / %.2f dB at 45 / 70 / 120 Hz\n",
+                full->getResponse(45.0), full->getResponse(70.0), full->getResponse(120.0));
+    EXPECT_GT(full->getResponse(70.0) - 0.5 * (full->getResponse(45.0) + full->getResponse(120.0)), 4.0);
+}
+
+// The detail does not change what the ear's model says of a programme with
+// no shape: pinkish noise takes the same broad correction with the three
+// details (the bands of the low end are narrower, the loudness they stand
+// for is that of the third of a Bark around each), and a programme at rest
+// stays at rest.
+DSPARK_TEST(TonalBalance_detail_keeps_the_broad_balance)
+{
+    using TB = TonalBalance<float>;
+    const size_t n = 48000 * 6;
+    const std::vector<float> programme = l13Pinkish(n, 11u);
+    const double probes[] = { 60.0, 150.0, 400.0, 1000.0, 3000.0, 8000.0 };
+    double seen[3][6] = {};
+    int at = 0;
+    for (const auto detail : { TB::Detail::Auditory, TB::Detail::Fine, TB::Detail::Finest })
+    {
+        auto tb = std::make_unique<TB>();
+        tb->setDetail(detail);
+        tb->setFillDips(0.0f); tb->setTrimPeaks(0.0f);
+        tb->prepare(spec(48000.0, 256, 2));
+        (void)l13Run(*tb, programme, programme);
+        std::printf("  [tb broad] detail %d:", static_cast<int>(detail));
+        for (int k = 0; k < 6; ++k)
+        {
+            seen[at][k] = tb->getResponse(probes[k]);
+            std::printf(" %.0f Hz %.2f dB", probes[k], seen[at][k]);
+        }
+        std::printf("; loudness %.2f dB, change %.3f dB\n", static_cast<double>(tb->getLoudness()), static_cast<double>(tb->getLoudnessChange()));
+        ++at;
+    }
+    for (int k = 0; k < 6; ++k)
+    {
+        EXPECT_NEAR(seen[1][k], seen[0][k], 1.0);
+        EXPECT_NEAR(seen[2][k], seen[0][k], 1.0);
+    }
+    // Silence in, nothing asked.
+    auto tb = std::make_unique<TB>();
+    tb->prepare(spec(48000.0, 256, 2));
+    (void)l13Run(*tb, std::vector<float>(48000, 0.0f), std::vector<float>(48000, 0.0f));
+    double worst = 0.0;
+    for (int b = 0; b < tb->getNumBands(); ++b) worst = std::max(worst, std::abs(static_cast<double>(tb->getCorrection(b))));
+    EXPECT_LT(worst, 1e-6);
+}
+
+namespace {
+
+// What was played at a frequency, in dB over what went in: the ratio of the
+// average power within a twelfth of an octave of it, output against the input
+// late by the latency, over the last half of the programme.
+double tbPlayedDb(const std::vector<float>& in, const std::vector<float>& out, int latency, double hz)
+{
+    constexpr int size = 16384;
+    FFTReal<double> fft(static_cast<size_t>(size));
+    std::vector<double> a(static_cast<size_t>(size)), b(static_cast<size_t>(size));
+    std::vector<double> sa(static_cast<size_t>(size + 2)), sb(static_cast<size_t>(size + 2));
+    const double binHz = 48000.0 / size, edge = std::pow(2.0, 1.0 / 24.0);
+    const int lo = static_cast<int>(hz / edge / binHz), hi = static_cast<int>(hz * edge / binHz) + 1;
+    double went = 0.0, came = 0.0;
+    for (size_t at = in.size() / 2; at + size <= out.size(); at += size / 2)
+    {
+        for (int i = 0; i < size; ++i)
+        {
+            const size_t k = static_cast<size_t>(i);
+            const double w = 0.5 - 0.5 * std::cos(2.0 * 3.14159265358979323846 * i / size);
+            a[k] = w * in[at + k - static_cast<size_t>(latency)];
+            b[k] = w * out[at + k];
+        }
+        fft.forward(a.data(), sa.data());
+        fft.forward(b.data(), sb.data());
+        for (int k = lo; k <= hi; ++k)
+        {
+            const size_t re = static_cast<size_t>(2 * k), im = re + 1;
+            went += sa[re] * sa[re] + sa[im] * sa[im];
+            came += sb[re] * sb[re] + sb[im] * sb[im];
+        }
+    }
+    return 10.0 * std::log10(came / went);
+}
+
+} // namespace
+
+// Defect: with everything at its default, a low end with lumps at 45 and
+// 120 Hz and a hole at 70 Hz took one broad cut, the hole as deep as the
+// lumps. Read in the audio that comes out, not in the curve that is drawn.
+DSPARK_TEST(TonalBalance_does_not_play_one_broad_cut_over_a_shaped_low_end)
+{
+    const size_t n = 48000 * 10;
+    const std::vector<float> in = tbShapedLows(n, 7u);
+    auto tb = std::make_unique<TonalBalance<float>>();
+    tb->prepare(spec(48000.0, 256, 2));
+    const std::vector<float> out = l13Run(*tb, in, in).first;
+    const double at45 = tbPlayedDb(in, out, tb->getLatency(), 45.0);
+    const double at70 = tbPlayedDb(in, out, tb->getLatency(), 70.0);
+    const double at120 = tbPlayedDb(in, out, tb->getLatency(), 120.0);
+    std::printf("  [tb audio] played at 45 / 70 / 120 Hz: %.2f / %.2f / %.2f dB; the hole over the lumps %.2f dB\n",
+                at45, at70, at120, at70 - 0.5 * (at45 + at120));
+    EXPECT_GT(at70 - at45, 1.0);
+    EXPECT_GT(at70 - at120, 1.0);
+}
+
+// The other side of the fix: a low end with nothing in it to fix is left
+// alone. Pink noise is even per octave, which is what the long look reads
+// against: with the balance off, neither detail follows its ripple.
+DSPARK_TEST(TonalBalance_detail_leaves_pink_noise_alone)
+{
+    const size_t n = 48000 * 8;
+    std::vector<float> pink = l13Noise(n, 1.0f, 17u);
+    double b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0, b4 = 0.0;
+    for (float& s : pink)
+    {
+        const double w = static_cast<double>(s);
+        b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.969 * b2 + w * 0.153852;
+        b3 = 0.8665 * b3 + w * 0.3104856; b4 = 0.55 * b4 + w * 0.5329522;
+        s = static_cast<float>(0.04 * (b0 + b1 + b2 + b3 + b4 + w * 0.5362));
+    }
+    for (const auto detail : { Tb9::Detail::Fine, Tb9::Detail::Finest })
+    {
+        const auto tb = m9Balance([detail](Tb9& t) { t.setBalance(0.0f); t.setDetail(detail); }, pink);
+        double worst = 0.0, at = 0.0;
+        for (int b = 0; b < tb->getNumBands(); ++b)
+        {
+            const double hz = tb->getBandCentre(b), c = std::abs(static_cast<double>(tb->getCorrection(b)));
+            if (hz < 1000.0 && c > worst) { worst = c; at = hz; }
+        }
+        std::printf("  [tb pink] detail %d: the largest correction under 1 kHz is %.2f dB, at %.0f Hz\n", static_cast<int>(detail), worst, at);
+        EXPECT_LT(worst, 0.6);
+    }
+}
+
+// The long look runs at a fraction of whatever rate the host has: every rate
+// prepares and stays finite, and from 44.1 to 192 kHz the hole of the low end
+// is cut less than its lumps, in mono and in stereo.
+DSPARK_TEST(TonalBalance_detail_works_at_every_rate)
+{
+    for (const double rate : { 8000.0, 22050.0, 44100.0, 88200.0, 96000.0, 192000.0 })
+        for (const int channels : { 1, 2 })
+        {
+            const size_t n = static_cast<size_t>(rate * 6.0);
+            std::vector<float> x = l13Pinkish(n, 23u);
+            const BiquadCoeffs bells[3] = { BiquadCoeffs::makePeak(rate, 45.0, 3.0, 12.0),
+                                            BiquadCoeffs::makePeak(rate, 70.0, 4.0, -12.0),
+                                            BiquadCoeffs::makePeak(rate, 120.0, 2.5, 12.0) };
+            for (const BiquadCoeffs& c : bells)
+            {
+                double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+                for (float& s : x)
+                {
+                    const double in = static_cast<double>(s);
+                    const double y = c.b0 * in + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+                    x2 = x1; x1 = in; y2 = y1; y1 = y;
+                    s = static_cast<float>(y);
+                }
+            }
+            auto tb = std::make_unique<TonalBalance<float>>();
+            tb->setBalance(0.0f);
+            tb->setFrequencyRange(20.0f, 16000.0f);
+            tb->prepare(spec(rate, 256, channels));
+            std::vector<float> other = x;
+            bool finite = true;
+            for (size_t off = 0; off < n; off += 256)
+            {
+                float* ch[2] = { x.data() + off, other.data() + off };
+                const int m = static_cast<int>(std::min<size_t>(256, n - off));
+                tb->processBlock(AudioBufferView<float>(ch, channels, m));
+                for (int i = 0; i < m; ++i) finite = finite && std::isfinite(ch[0][i]);
+            }
+            const double hole = tb->getResponse(70.0) - 0.5 * (tb->getResponse(45.0) + tb->getResponse(120.0));
+            std::printf("  [tb rates] %.0f Hz, %d channel(s): %d bands, the hole over the lumps %.2f dB\n", rate, channels, tb->getNumBands(), hole);
+            EXPECT_TRUE(finite);
+            EXPECT_GT(tb->getNumBands(), 2);
+            EXPECT_TRUE(tb->getNumBands() <= TonalBalance<float>::kMaxBands);
+            if (rate >= 44100.0) EXPECT_GT(hole, 0.8);
+        }
+}
+
+// The long look is fed by hops, never by the host's blocks: the output does
+// not depend on how the programme is cut.
+DSPARK_TEST(TonalBalance_detail_does_not_depend_on_the_block_size)
+{
+    const std::vector<float> in = tbShapedLows(48000 * 2, 29u);
+    const auto render = [&in](int block) {
+        auto tb = std::make_unique<TonalBalance<float>>();
+        tb->prepare(spec(48000.0, 512, 2));
+        return l13Run(*tb, in, in, block).first;
+    };
+    const std::vector<float> whole = render(512), cut = render(37);
+    double apart = 0.0;
+    for (size_t i = 0; i < whole.size(); ++i) apart = std::max(apart, std::abs(static_cast<double>(whole[i]) - cut[i]));
+    std::printf("  [tb blocks] blocks of 512 and of 37 stand %.2e apart\n", apart);
+    EXPECT_LT(apart, 1e-6);
+}
+
+// Defect: the wet equalizer moved its ramps once per block, after it, so a
+// band on the move was held for the whole block and stepped at its end: the
+// glide of a setting depended on the host's block.
+DSPARK_TEST(AlgoReverb_wet_equalizer_glides_the_same_at_any_block_size)
+{
+    const size_t n = 1024 * 80, turn = 1024 * 47;
+    const std::vector<float> in = l11Noise(n, 0.3f, 13u);
+    const auto render = [&](size_t block, bool change) {
+        auto r = std::make_unique<ARevF>();
+        r->prepare(spec(48000.0, 1024, 2));
+        r->setType(ARevF::Type::Hall);
+        r->setMix(1.0f);
+        KeyEqualizer<float, 2>::Band band;
+        band.shape = KeyEqualizer<float, 2>::Shape::Bell;
+        band.frequency = 1000.0f;
+        band.q = 1.0f;
+        band.gainDb = 18.0f;
+        r->setPostEqBand(0, band);
+        auto w = makeBuffer(2, 64);
+        r->processBlock(w.view());
+        std::vector<float> left = in, right = in;
+        for (size_t off = 0; off < n; off += block)
+        {
+            if (change && off == turn) { band.gainDb = -18.0f; r->setPostEqBand(0, band); }
+            float* p[2] = { left.data() + off, right.data() + off };
+            r->processBlock(AudioBufferView<float>(p, 2, static_cast<int>(block)));
+        }
+        return left;
+    };
+    const auto apart = [&](bool change) {
+        const std::vector<float> fine = render(64, change), coarse = render(1024, change);
+        double worst = 0.0;
+        for (size_t i = turn; i < n; ++i) worst = std::max(worst, std::abs(static_cast<double>(fine[i]) - coarse[i]));
+        return worst;
+    };
+    const double still = apart(false), moving = apart(true);
+    std::printf("  [wet eq] blocks of 64 and 1024 stand %.2e apart with the band still and %.2e with it on the move\n", still, moving);
+    EXPECT_LT(moving, 2.0 * still + 1e-5);
 }

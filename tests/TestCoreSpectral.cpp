@@ -3315,3 +3315,78 @@ DSPARK_TEST(SpectralFilter_time_focus_gives_the_design_a_shorter_window_at_the_t
     EXPECT_LT(apart, 0.4);
     EXPECT_LT(between[1], between[0]);
 }
+
+// More bands in the low end, and the same bands over a second spectrum. The
+// layout starts from the 72 bands uniform in Bark and lets none be wider
+// than a sixth of an octave: the octave rules in the low end and the Bark
+// layout from where its bands are the narrower ones. A band stands for a
+// stretch of the Bark axis, and the stretches add up to the whole of it. A
+// spectrum of even density reads the same through a transform at the full
+// rate and through a longer one at an eighth of it.
+DSPARK_TEST(AuditoryBands_detailed_layout_and_a_second_spectrum)
+{
+    AuditoryBands<double> plain, fine, finest, slow;
+    plain.prepare(48000.0, 2048, 72, 20.0, 20000.0);
+    fine.prepareDetailed(48000.0, 2048, 72, 20.0, 20000.0, 6.0);
+    finest.prepareDetailed(48000.0, 2048, 72, 20.0, 20000.0, 12.0);
+    EXPECT_TRUE(plain.isUniform());
+    EXPECT_FALSE(fine.isUniform());
+    std::printf("  [bands] %d uniform in Bark, %d with a sixth of an octave, %d with a twelfth\n",
+                plain.getNumBands(), fine.getNumBands(), finest.getNumBands());
+    EXPECT_EQ(plain.getNumBands(), 72);
+    EXPECT_EQ(fine.getNumBands(), 87);
+    EXPECT_EQ(finest.getNumBands(), 122);
+
+    const double span = AuditoryScale::hzToBark(20000.0) - AuditoryScale::hzToBark(20.0);
+    for (const auto* bands : { &plain, &fine, &finest })
+    {
+        double total = 0.0;
+        for (int b = 0; b < bands->getNumBands(); ++b) total += bands->getWidthBark(b);
+        EXPECT_NEAR(total, span, 1e-9);
+        EXPECT_NEAR(bands->getCentre(0), 20.0, 1e-9);
+        EXPECT_NEAR(bands->getCentre(bands->getNumBands() - 1), 20000.0, 1e-6);
+    }
+    // Where each rule holds, and where they meet.
+    double meet = 0.0;
+    for (int b = 1; b < fine.getNumBands(); ++b)
+    {
+        const double step = std::log2(fine.getCentre(b) / fine.getCentre(b - 1));
+        EXPECT_LT(step, 1.0 / 6.0 * 1.01);
+        const double inBark = fine.getBark(b) - fine.getBark(b - 1);
+        EXPECT_LT(inBark, plain.getSpacing() * 1.01);
+        if (meet == 0.0 && step < 0.98 / 6.0) meet = fine.getCentre(b);   // the first step the Bark layout rules
+    }
+    std::printf("  [bands] the octave rules up to %.0f Hz\n", meet);
+    EXPECT_GT(meet, 200.0);
+    EXPECT_LT(meet, 400.0);
+
+    // An even density through the two transforms.
+    slow.prepareLike(fine, 6000.0, 2048);
+    EXPECT_EQ(slow.getNumBands(), fine.getNumBands());
+    std::vector<double> fast(1025, 48000.0 / 2048.0), slowBins(1025, 6000.0 / 2048.0);
+    std::vector<double> a(static_cast<size_t>(fine.getNumBands())), b2(static_cast<size_t>(fine.getNumBands()));
+    fine.bandPowers(fast.data(), a.data());
+    slow.bandPowers(slowBins.data(), b2.data());
+    double worst = 0.0;
+    for (int b = 0; b < fine.getNumBands(); ++b)
+    {
+        const double hz = fine.getCentre(b);
+        if (hz < 30.0 || hz > 2000.0) continue;
+        worst = std::max(worst, std::abs(a[static_cast<size_t>(b)] / b2[static_cast<size_t>(b)] - 1.0));
+    }
+    std::printf("  [bands] an even density through the two transforms: %.4f apart at most, 30 Hz to 2 kHz\n", worst);
+    EXPECT_LT(worst, 0.05);
+
+    // A tone of 70 Hz: the long transform puts it in its band; the short one cannot.
+    std::vector<double> line(1025, 0.0);
+    line[static_cast<size_t>(std::lround(70.0 / (6000.0 / 2048.0)))] = 1.0;
+    slow.bandPowers(line.data(), b2.data());
+    int top = 0;
+    for (int b = 0; b < slow.getNumBands(); ++b)
+        if (b2[static_cast<size_t>(b)] > b2[static_cast<size_t>(top)]) top = b;
+    EXPECT_NEAR(slow.getCentre(top), 70.0, 5.0);
+
+    // The total loudness is the integral over Bark whatever the layout.
+    std::vector<double> flat(static_cast<size_t>(fine.getNumBands()), 2.0), flatPlain(72, 2.0);
+    EXPECT_NEAR(fine.totalLoudness(flat.data()), plain.totalLoudness(flatPlain.data()), 1e-9);
+}

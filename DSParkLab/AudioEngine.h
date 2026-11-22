@@ -473,7 +473,10 @@ private:
         spec_ = { fileSampleRate_, kBlockSize, 2 };
         workBuffer_.resize(spec_.numChannels, kBlockSize);
 
-        spectrum_.prepare(fileSampleRate_, 4096);
+        // 3 Hz between bins at 48 kHz: 50 Hz and 70 Hz are two things on the
+        // display. Such a frame comes six times a second, so it is smoothed less.
+        spectrum_.prepare(fileSampleRate_, 16384);
+        spectrum_.setSmoothing(0.5f);
         meter_.prepare(spec_);
         meter_.setAttackMs(5.0f);
         meter_.setReleaseMs(100.0f);

@@ -568,7 +568,7 @@ private:
         const float* spec = engine.getSpectrumDb();
         if (bins <= 1 || !spec) return;
         const float bottom = p0.y + h;
-        float prevX = 0, prevY = 0;
+        float prevX = 0, prevY = 0, loudest = bottom;
         bool have = false;
         for (int k = 1; k < bins; ++k)
         {
@@ -576,14 +576,18 @@ private:
             if (f < kFMin || f > kFMax) continue;
             const float x = freqToX(f, p0.x, w);
             const float y = dbToYspec(spec[k], p0.y, h);
-            if (have && x - prevX >= 0.5f)
+            if (!have) { prevX = x; prevY = y; have = true; continue; }
+            // Where several bins share a pixel the loudest is drawn: one bin
+            // in each would leave a line between two of them undrawn.
+            loudest = std::min(loudest, y);
+            if (x - prevX >= 0.5f)
             {
-                dl->AddQuadFilled(ImVec2(prevX, prevY), ImVec2(x, y), ImVec2(x, bottom), ImVec2(prevX, bottom),
+                dl->AddQuadFilled(ImVec2(prevX, prevY), ImVec2(x, loudest), ImVec2(x, bottom), ImVec2(prevX, bottom),
                                   IM_COL32(55, 120, 190, 50));
-                dl->AddLine(ImVec2(prevX, prevY), ImVec2(x, y), IM_COL32(85, 160, 230, 140), 1.3f);
-                prevX = x; prevY = y;
+                dl->AddLine(ImVec2(prevX, prevY), ImVec2(x, loudest), IM_COL32(85, 160, 230, 140), 1.3f);
+                prevX = x; prevY = loudest;
+                loudest = bottom;
             }
-            else if (!have) { prevX = x; prevY = y; have = true; }
         }
     }
 

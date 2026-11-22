@@ -2295,30 +2295,42 @@ inline EffectSlot makeTonalBalance()
     s.addChoice("Response", {"By Band","Common"}, 0);          // 14 - order MUST match TonalBalance::Response
     s.addSlider("Response Time", 10, 2000, 60, "ms", true);    // 15
     s.addToggle("Local Slope", false);                         // 16
-    s.addChoice("Quality (on reload)", {"Realtime","Render"}, 0); // 17 - order MUST match TonalBalance::Quality
+    s.addChoice("Quality", {"Realtime","Render"}, 0); // 17 - order MUST match TonalBalance::Quality
     s.addToggle("Time Focus", false);                          // 18
+    s.addSlider("Contrast Knee", 0.1f, 12, 1.5f, "dB");           // 19 - the knee of dips and peaks
+    s.addChoice("Detail", {"Auditory (72 bands)","Fine (1/6 oct lows)","Finest (1/12 oct lows)"}, 1); // 20 - order MUST match TonalBalance::Detail
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
     // The band centres exist once the processor is prepared; the display
-    // reads them from this copy (taken where prepare() runs).
+    // reads them from this copy (taken where prepare() runs), and how many
+    // there are (the detail decides it).
     using TB = dspark::TonalBalance<float>;
-    auto centres = std::make_shared<std::array<double, TB::kBands>>();
+    // Atomic, because a change of Detail lays the bands out again on the
+    // audio thread while the display reads them.
+    auto centres = std::make_shared<std::array<std::atomic<double>, TB::kMaxBands>>();
+    auto bandCount = std::make_shared<std::atomic<int>>(0);
     auto ready = std::make_shared<std::atomic<bool>>(false);
-    s.prepareFn = [p, centres, ready](auto& sp) {
+    auto spec = std::make_shared<dspark::AudioSpec>();
+    const auto layOut = [p, centres, bandCount, ready](const dspark::AudioSpec& sp) {
+        ready->store(false, std::memory_order_release);
         p->prepare(sp);
-        for (int b = 0; b < TB::kBands; ++b) (*centres)[static_cast<std::size_t>(b)] = std::log(std::max(1.0, p->getBandCentre(b)));
+        const int bands = p->getNumBands();
+        for (int b = 0; b < bands; ++b) (*centres)[static_cast<std::size_t>(b)].store(std::log(std::max(1.0, p->getBandCentre(b))), std::memory_order_relaxed);
+        bandCount->store(bands, std::memory_order_relaxed);
         ready->store(true, std::memory_order_release);
     };
+    s.prepareFn = [layOut, spec](auto& sp) { *spec = sp; layOut(sp); };
     // Live: the correction of each band now (any thread), drawn between the
     // band centres. Behind it: the reference shape the trend is pulled to.
-    s.magnitudeFn = [p, centres, ready](const float* f, float* mdb, int n, double, const float*) {
-        if (!ready->load(std::memory_order_acquire)) { std::fill(mdb, mdb + n, 0.0f); return; }
+    s.magnitudeFn = [p, centres, bandCount, ready](const float* f, float* mdb, int n, double, const float*) {
+        const int bands = bandCount->load(std::memory_order_relaxed);
+        if (!ready->load(std::memory_order_acquire) || bands < 2) { std::fill(mdb, mdb + n, 0.0f); return; }
         const auto& c = *centres;
         int j = 0;
         for (int i = 0; i < n; ++i)
         {
             const double lf = std::log(std::max(1.0f, f[i]));
-            while (j < TB::kBands - 2 && lf > c[static_cast<std::size_t>(j + 1)]) ++j;
-            const double span = c[static_cast<std::size_t>(j + 1)] - c[static_cast<std::size_t>(j)];
+            while (j < bands - 2 && lf > c[static_cast<std::size_t>(j + 1)]) ++j;
+            const double span = c[static_cast<std::size_t>(j + 1)].load(std::memory_order_relaxed) - c[static_cast<std::size_t>(j)].load(std::memory_order_relaxed);
             const double t = span > 0.0 ? std::clamp((lf - c[static_cast<std::size_t>(j)]) / span, 0.0, 1.0) : 0.0;
             const double a = p->getCorrection(j), b = p->getCorrection(j + 1);
             mdb[i] = static_cast<float>(a + t * (b - a));
@@ -2330,7 +2342,13 @@ inline EffectSlot makeTonalBalance()
     s.liveLabel = "Correction now";
     s.targetLabel = "Reference tilt";
     s.displayRangeDb = 12.0f;
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    // Quality and Detail take a prepare(): made here, where nothing processes
+    // beside it, when what is asked is not what runs.
+    s.processFn = [p, layOut, spec](auto b) {
+        if (spec->sampleRate > 0 && (p->getQuality() != p->getQualityInUse() || p->getDetail() != p->getDetailInUse()))
+            layOut(*spec);
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, range](int i, float v) {
         switch (i) {
@@ -2353,6 +2371,8 @@ inline EffectSlot makeTonalBalance()
             case 16: p->setLocalSlope(v > 0.5f); break;
             case 17: p->setQuality(static_cast<dspark::TonalBalance<float>::Quality>(static_cast<int>(v))); break;
             case 18: p->setTimeFocus(v > 0.5f); break;
+            case 19: p->setContrastKnee(v); break;
+            case 20: p->setDetail(static_cast<dspark::TonalBalance<float>::Detail>(static_cast<int>(v))); break;
         }
     };
     return s;
@@ -2376,7 +2396,7 @@ inline EffectSlot makeResonanceSuppressor()
     s.addSlider("Side Weight", 0, 2, 1, "");                    // 9
     s.addToggle("Hear Removed", false);                         // 10
     s.addToggle("Hear Focus", false);                           // 11
-    s.addChoice("Quality (on reload)", {"Realtime","Offline"}, 0); // 12
+    s.addChoice("Quality", {"Realtime","Offline"}, 0); // 12
     s.addChoice("Sensitivity Band", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 13
     s.addSlider("Sensitivity Freq", 20, 20000, 3000, "Hz", true); // 14
     s.addSlider("Sensitivity Gain", -12, 12, 6, "dB");          // 15
@@ -2393,8 +2413,13 @@ inline EffectSlot makeResonanceSuppressor()
     s.addToggle("Time Focus", false);                           // 26
     auto heardBand = std::make_shared<std::array<float, 2>>(std::array<float, 2>{ 0.0f, 0.0f });
     auto sens = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
-    s.prepareFn = [p](auto& sp) { p->prepare(sp); };
-    s.processFn = [p](auto b) { p->processBlock(b); };
+    auto spec = std::make_shared<dspark::AudioSpec>();
+    s.prepareFn = [p, spec](auto& sp) { *spec = sp; p->prepare(sp); };
+    // Quality takes a prepare(): made here, where nothing processes beside it.
+    s.processFn = [p, spec](auto b) {
+        if (spec->sampleRate > 0 && p->getQuality() != p->getQualityInUse()) p->prepare(*spec);
+        p->processBlock(b);
+    };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, sens, heardBand](int i, float v) {
         using KE = dspark::KeyEqualizer<float, 2>;

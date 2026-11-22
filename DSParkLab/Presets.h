@@ -493,6 +493,12 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
         s->addPreset("Even power as the reference", "The reference is a programme with the same power in every band.",
             { { "Balance", 0.8f }, { "Reference", 1 } });
         s->addPreset("Towards a brighter balance", "The target leans 1.5 dB per octave to the top.", { { "Balance", 0.6f }, { "Tilt", 1.5f } });
+        s->addPreset("Low end in detail", "Dips and peaks at full with a small knee: the curve follows the lumps and the holes of the low end. Switch Detail to Auditory to hear how it was.",
+            { { "Balance", 0.5f }, { "Fill Dips", 1 }, { "Trim Peaks", 1 }, { "Contrast Knee", 1 }, { "Range", 9 }, { "Low Freq", 20 }, { "Detail", 1 } });
+        s->addPreset("Only the detail", "No broad balance: only what stands out of its two sides is trimmed and what falls under them filled. Move Contrast Knee.",
+            { { "Balance", 0 }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Range", 9 }, { "Low Freq", 20 }, { "Detail", 1 } });
+        s->addPreset("Finest low end", "A twelfth of an octave in the low end. Switch Detail to Fine to compare.",
+            { { "Balance", 0.5f }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Low Freq", 20 }, { "Detail", 2 } });
         s->addPreset("One curve for all, time focus", "A common response instead of one per band, and a shorter window at the top.",
             { { "Balance", 0.8f }, { "Response", 1 }, { "Time Focus", 1 } });
     }

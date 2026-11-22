@@ -6,6 +6,13 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TapeMachine::setBiasShape(BiasShape::FourLevel)` (setup thread; off by
+  default): the gain of the tape no longer rises with the level before it
+  saturates. The two-level carrier lifts 10 kHz by up to 3.2 dB at the
+  nominal bias and the loud parts by up to 9.9 dB at full bias; with four
+  levels the gain holds and then falls at any bias. It is another sound
+  (1 kHz at 0 dBFS leaves 1.9 dB lower), it runs at no less than 352.8 kHz
+  (8x at 48 kHz) and costs about twice as much. State key `biasShape`.
 - `TonalBalance::setDetail()` (`Auditory`, `Fine` by default, `Finest`;
   applied at the next `prepare()`), `setContrastKnee()` and `getNumBands()`.
   `getCorrection()` and `getBandCentre()` now index the bands of the bank
@@ -3076,7 +3083,8 @@ All notable user-facing changes to DSPark are documented here.
   4.6 dB at 20 Hz in the two saturations and 6.0 dB in the tape (1.9 and
   3.0 dB at 30 Hz). Between the two ends the dry side now takes that phase
   through all-passes that keep its level: 0.11 dB short at most from 20 Hz
-  up at the defaults. A mix of zero is still the input.
+  up at the defaults. A mix of zero is still the input. With the mix under
+  one the two saturations cost up to a third more.
 - `MultibandSaturation::setMix()` with minimum-phase oversampling: the dry
   side did not cross the bands' filters and a half mix lost 12.7 dB at
   19 kHz (now 0.04 dB or less). With the mix under one a muted band is

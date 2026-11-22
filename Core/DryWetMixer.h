@@ -27,7 +27,8 @@
  * setup state and belong to the setup thread. Moves are setup-time only.
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, and the C++20 standard-library
- * `algorithm`, `atomic`, and `cmath` headers.
+ * `algorithm`, `array`, `atomic`, `cmath`, `cstddef`, `numbers` and `vector`
+ * headers.
  *
  * @code
  * dspark::DryWetMixer<float> mixer;
@@ -49,8 +50,12 @@
 #include "AudioSpec.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <numbers>
+#include <vector>
 
 // DSPARK_RESTRICT is normally provided by SimdOps.h (pulled in via AudioBuffer.h).
 // Guard against redefinition so this header stays self-contained if included alone.
@@ -391,5 +396,130 @@ private:
 
     static constexpr double kMinRampSeconds = 0.02;
 };
+
+namespace detail {
+
+/**
+ * @class DryPhase
+ * @brief Gives the dry side of a mix the phase that a high-pass leaves in
+ *        the wet side, and none of its magnitude.
+ *
+ * A first-order all-pass that leads: two one-pole high-passes at its corner
+ * turn the phase exactly as much, and a second-order Butterworth high-pass
+ * within a few degrees of it with the corner at kButterworthShare of its
+ * own. A wet side behind such a filter and a dry side without it are a
+ * quarter of a turn or more apart at the bottom, and their mix loses there
+ * what neither side loses by itself.
+ *
+ * It fades in and out over 20 ms (aim()). Faded out it returns its input to
+ * the bit, and it goes on following it, so that it starts from where the
+ * programme is.
+ *
+ * Processing thread, except prepare() (setup thread; allocates).
+ */
+class DryPhase
+{
+public:
+    /** The corner for a second-order Butterworth high-pass, over that of the filter. */
+    static constexpr double kButterworthShare = 0.8;
+
+    /**
+     * @brief Sizes the state (allocates).
+     * @param sampleRate The rate it runs at.
+     * @param channels   The channels it keeps.
+     */
+    void prepare(double sampleRate, int channels)
+    {
+        sampleRate_ = sampleRate;
+        step_ = 1.0 / std::max(1.0, sampleRate * 0.02);
+        state_.assign(static_cast<std::size_t>(std::max(channels, 0)), {});
+        corner_ = -1.0;
+    }
+
+    /** @brief Clears the memory (the amount stays). */
+    void reset() noexcept { std::fill(state_.begin(), state_.end(), std::array<double, 2> {}); }
+
+    /**
+     * @brief Moves the corner (a tangent, when it changes).
+     * @param hz The corner in hertz.
+     */
+    void setCorner(double hz) noexcept
+    {
+        if (hz == corner_) return;
+        corner_ = hz;
+        const double t = std::tan(std::numbers::pi * std::clamp(hz / sampleRate_, 0.0, 0.45));
+        pole_ = (1.0 - t) / (1.0 + t);
+    }
+
+    /**
+     * @brief Where the amount goes.
+     * @param on Whether the dry side is turned.
+     */
+    void aim(bool on) noexcept { target_ = on ? 1.0 : 0.0; }
+
+    /** @brief Puts the amount where it goes, without the fade. */
+    void land() noexcept { amount_ = target_; }
+
+    /** @brief Moves the amount by a frame and returns it. */
+    [[nodiscard]] double advance() noexcept
+    {
+        if (amount_ != target_)
+            amount_ = (amount_ < target_) ? std::min(target_, amount_ + step_) : std::max(target_, amount_ - step_);
+        return amount_;
+    }
+
+    /**
+     * @brief A sample of a channel, with the amount that advance() returned.
+     * @param channel The channel (one that was not prepared passes).
+     * @param x       The dry sample.
+     * @param amount  The amount of this frame.
+     */
+    template <typename T>
+    [[nodiscard]] T processSample(int channel, T x, double amount) noexcept
+    {
+        if (channel < 0 || static_cast<std::size_t>(channel) >= state_.size()) return x;
+        auto& s = state_[static_cast<std::size_t>(channel)];
+        const double in = static_cast<double>(x);
+        double y = pole_ * (in + s[1]) - s[0];
+        if (!std::isfinite(y))
+        {
+            s = {};
+            return x;
+        }
+        if (std::abs(y) < 1e-30) y = 0.0;
+        s[0] = in;
+        s[1] = y;
+        if (amount == 0.0) return x;
+        return static_cast<T>(amount == 1.0 ? y : in + amount * (y - in));
+    }
+
+    /**
+     * @brief A stretch of a buffer, in place.
+     * @param buffer The dry side.
+     */
+    template <typename T>
+    void process(AudioBufferView<T> buffer) noexcept
+    {
+        const int channels = std::min(buffer.getNumChannels(), static_cast<int>(state_.size()));
+        const int samples = buffer.getNumSamples();
+        for (int i = 0; i < samples; ++i)
+        {
+            const double amount = advance();
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                T* data = buffer.getChannel(ch);
+                data[i] = processSample(ch, data[i], amount);
+            }
+        }
+    }
+
+private:
+    std::vector<std::array<double, 2>> state_;   ///< Per channel: the last input and the last output.
+    double sampleRate_ = 48000.0, step_ = 1.0 / 960.0;
+    double corner_ = -1.0, pole_ = 0.0;
+    double amount_ = 0.0, target_ = 0.0;
+};
+
+} // namespace detail
 
 } // namespace dspark

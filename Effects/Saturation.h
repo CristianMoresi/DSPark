@@ -1591,6 +1591,9 @@ public:
 // Saturation - Public API
 // ============================================================================
 
+template <FloatType T, int MaxBands>
+class MultibandSaturation;
+
 /**
  * @class Saturation
  * @brief Professional multi-algorithm saturation processor with analog simulation.
@@ -1737,7 +1740,12 @@ public:
         // channel range so it covers every channel the pipeline touches, not
         // just the first eight.
         dcBlocker_.setOrder(2);
-        dcBlocker_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, 5.0);
+        dcBlocker_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, kDcCornerHz);
+        dryDc_.setOrder(2);
+        dryDc_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, kDcCornerHz);
+        dryPre_.reset();
+        dryPreLead_.prepare(spec.sampleRate, std::min(spec.numChannels, 8));   // as many as the pre-filter reaches
+        dryDcLead_.prepare(spec.sampleRate, spec.numChannels);
         
         lastPreHpFreq_    = -1.0f;
         lastPostTiltFreq_ = -1.0f;
@@ -1819,6 +1827,8 @@ public:
         postFilter_.reset();
         dcBlocker_.reset();
         dryWetMixer_.reset();
+        dryRunning_ = false;
+        dryHoldSamples_ = 0;
         if (oversampler_) oversampler_->reset();
 
         driveSmoother_.skip();
@@ -1859,7 +1869,20 @@ public:
      * 
      * @param buffer Mutable view of the audio data. Will be modified in-place.
      */
-    void processBlock(AudioBufferView<SampleType> buffer) noexcept
+    void processBlock(AudioBufferView<SampleType> buffer) noexcept { processPieces(buffer, nullptr, false); }
+
+private:
+    // MultibandSaturation takes the dry side of each band from here: it is
+    // already as late as the band, behind its filters and in its phase.
+    template <FloatType, int> friend class MultibandSaturation;
+
+    /**
+     * @brief processBlock(), giving the dry side of the mix as well when asked.
+     * @param buffer  The audio, in place.
+     * @param dryOut  Takes the dry side when not null (the same size).
+     * @param dryTurn With dryOut: whether the caller hears it mixed, and so in the phase of the wet side.
+     */
+    void processPieces(AudioBufferView<SampleType> buffer, const AudioBufferView<SampleType>* dryOut, bool dryTurn) noexcept
     {
         if (!prepared_) return;
         handleParameterChanges();
@@ -1872,10 +1895,12 @@ public:
         maybeCalibrate(total);
         const int maxBlock = std::min(std::max(1, spec_.maxBlockSize), syncStages());
         for (int off = 0; off < total; off += maxBlock)
-            processChunk(buffer.getSubView(off, std::min(maxBlock, total - off)));
+        {
+            const int n = std::min(maxBlock, total - off);
+            processChunk(buffer.getSubView(off, n), dryOut, off, dryTurn);
+        }
     }
 
-private:
     /// The oversampler of a factor. From 8x the curves leave harmonics across
     /// the whole oversampled band at close to their full level (the
     /// wavefolder above the tone's own), and the High preset's later stages
@@ -1902,8 +1927,43 @@ private:
         dryWetMixer_.setLatencyCompensation((oversampled && !dryThroughFilters_) ? oversampler_->getLatency() : 0);
     }
 
-    void processChunk(AudioBufferView<SampleType> buffer) noexcept
+    /**
+     * Whether the dry side is worked on in this chunk, and how. Full wet and
+     * settled it is heard by nobody: it is then left alone. A mix of zero is
+     * the input, so there its phase is left alone too.
+     */
+    bool aimDryPhase(int samples, bool asked, bool askedTurn) noexcept
     {
+        const float mix = mixSmoother_.getTargetValue();
+        const bool normal = outputMode_ == OutputMode::Normal;
+        const bool delta = outputMode_ == OutputMode::Delta;
+        const bool heard = asked || delta || adaptiveBlend_.load(std::memory_order_relaxed) || (normal && mix < 1.0f);
+        if (heard) dryHoldSamples_ = static_cast<int>(spec_.sampleRate * kDryHoldSeconds);
+        const bool run = heard || dryHoldSamples_ > 0;
+        if (!heard) dryHoldSamples_ = std::max(0, dryHoldSamples_ - samples);
+
+        const bool turn = (!normal || mix > 0.0f) && (!asked || askedTurn);
+        dryPreLead_.aim(turn);
+        dryDcLead_.aim(turn && dcBlockingEnabled_);
+        dryDcLead_.setCorner(detail::DryPhase::kButterworthShare * kDcCornerHz);
+        if (run && (!dryRunning_ || delta != dryExact_))
+        {
+            dryPreLead_.reset();
+            dryDcLead_.reset();
+            dryPreLead_.land();
+            dryDcLead_.land();
+            dryPre_.reset();
+            dryDc_.reset();
+        }
+        dryRunning_ = run;
+        dryExact_ = delta;
+        return run;
+    }
+
+    void processChunk(AudioBufferView<SampleType> buffer, const AudioBufferView<SampleType>* dryOut = nullptr,
+                      int dryOffset = 0, bool dryTurn = false) noexcept
+    {
+        const bool dryWork = aimDryPhase(buffer.getNumSamples(), dryOut != nullptr, dryTurn);
         // Second-order antialiasing delays the wet path by whole base
         // samples (two at 2x, one otherwise; inside the algorithms and
         // padded after them); the dry capture and the untouched M/S
@@ -1946,18 +2006,15 @@ private:
             }
             auto dryView = dryAligned_.toView().getSubView(0, nS);
             if (dryThroughFilters_) dryPath_.process(dryView);
-            dryWetMixer_.pushDry(dryView);
         }
-        else if (dryThroughFilters_)
+        else if (dryThroughFilters_ || dryWork)
         {
-            const int nCh = std::min({buffer.getNumChannels(), dryAligned_.getNumChannels(), kMaxCh});
+            const int nCh = std::min(buffer.getNumChannels(), dryAligned_.getNumChannels());
             const int nS = std::min(buffer.getNumSamples(), dryAligned_.getNumSamples());
             for (int ch = 0; ch < nCh; ++ch)
                 std::memcpy(dryAligned_.getChannel(ch), buffer.getChannel(ch),
                             static_cast<std::size_t>(nS) * sizeof(SampleType));
-            auto dryView = dryAligned_.toView().getSubView(0, nS);
-            dryPath_.process(dryView);
-            dryWetMixer_.pushDry(dryView);
+            if (dryThroughFilters_) dryPath_.process(dryAligned_.toView().getSubView(0, nS));
         }
         else
         {
@@ -1979,11 +2036,39 @@ private:
                 {
                     auto c = BiquadCoeffs::makeHighPass(spec_.sampleRate, static_cast<double>(curFreq));
                     preFilter_.setCoeffs(c);
+                    dryPre_.setCoeffs(c);
                     lastPreHpFreq_ = curFreq;
                 }
                 auto subView = buffer.getSubView(i, chunk);
                 preFilter_.processBlock(subView);
+                if (dryWork)
+                {
+                    auto drySub = dryAligned_.toView().getSubView(i, chunk);
+                    if (dryExact_)
+                    {
+                        // Delta is what the curve adds: the dry copy crosses
+                        // the very filters the wet side does.
+                        dryPre_.processBlock(drySub);
+                        continue;
+                    }
+                    dryPreLead_.setCorner(detail::DryPhase::kButterworthShare * static_cast<double>(curFreq));
+                    dryPreLead_.process(drySub);
+                    dryDcLead_.process(drySub);
+                }
             }
+        }
+        if (second || dryThroughFilters_ || dryWork)
+        {
+            auto dryView = dryAligned_.toView().getSubView(0, std::min(buffer.getNumSamples(), dryAligned_.getNumSamples()));
+            if (dryWork && dryExact_ && dcBlockingEnabled_) dryDc_.processBlock(dryView);
+            dryWetMixer_.pushDry(dryView);
+        }
+        if (dryOut != nullptr)
+        {
+            const int channels = std::min({ buffer.getNumChannels(), dryOut->getNumChannels(), dryWetMixer_.getDryNumChannels() });
+            const int samples = std::min(buffer.getNumSamples(), dryWetMixer_.getDryCapturedSamples());
+            for (int ch = 0; ch < channels; ++ch)
+                std::copy_n(dryWetMixer_.getDryChannel(ch), samples, dryOut->getChannel(ch) + dryOffset);
         }
 
         const bool isMidSide = (procMode_ == ProcessingMode::MidOnly || procMode_ == ProcessingMode::SideOnly || procMode_ == ProcessingMode::MidSide) && buffer.getNumChannels() == 2;
@@ -2119,6 +2204,12 @@ public:
 
     /**
      * @brief Sets the global Dry/Wet blend.
+     *
+     * Between the two ends the dry side takes the phase of the wet side's
+     * high-passes (setPreFilterHpFrequency(), setDcBlocking()) and keeps
+     * its own level, so a partial mix is the mean of the two levels at the
+     * bottom as well. At zero the output is the input (late by the latency).
+     *
      * @note Thread-Safe. Smoothed internally over 20ms.
      * @param mix01 Mix ratio. Range: [0.0 (fully dry), 1.0 (fully wet)].
      */
@@ -3665,6 +3756,16 @@ protected:
     // error above ~96 kHz and sources the very offset it is here to remove).
     DCBlocker<SampleType> dcBlocker_;
     DryWetMixer<SampleType> dryWetMixer_;
+
+    // The dry side of the mix (audio thread): the phase of the two
+    // high-passes, or the filters themselves for the Delta output.
+    static constexpr double kDcCornerHz = 5.0;
+    static constexpr double kDryHoldSeconds = 0.05;   ///< It is kept up this long after the mix has gone full wet.
+    detail::DryPhase dryPreLead_, dryDcLead_;
+    Biquad<SampleType> dryPre_;
+    DCBlocker<SampleType> dryDc_;
+    bool dryRunning_ = false, dryExact_ = false;
+    int dryHoldSamples_ = 0;
 
     AnalogRandom::Generator<SampleType> leftDrift_, rightDrift_;
 

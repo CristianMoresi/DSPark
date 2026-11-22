@@ -20,17 +20,18 @@
  * setMix() blends the sum with the programme as the crossover leaves it (the
  * bands summed without their curves, as late as the slowest band): the dry
  * side carries the crossover's phase, so any mix is as flat as the crossover
- * is, at the splits too. What still differs between the two sides is each
- * band's own filtering (its Saturation's 20 Hz high-pass and DC filter lead
- * the phase at the very bottom: 0.14 dB down at 100 Hz at a mix of one
- * half). setOutputClip() puts an oversampled clipper after the sum, with a
+ * is, at the splits too. Each band of the dry side is the dry side of that
+ * band's Saturation: through the same oversampling filters when they are
+ * minimum phase, and in the phase of its high-passes while the mix is
+ * between its ends. setOutputClip() puts an oversampled clipper after the sum, with a
  * ceiling (setOutputCeiling()): many driven bands can add up to far more
  * than any one of them.
  *
  * Level and pan glide over 20 ms; mute and solo fade over 20 ms on a ramp of
  * their own. A band that is not heard (muted, or left out by a solo, once
- * its fade is over) is not computed: its Saturation is skipped and starts
- * from silence when the band is heard again, under its fade in.
+ * its fade is over) is not computed unless the mix needs its dry side: its
+ * Saturation is skipped and starts from silence when the band is heard
+ * again, under its fade in.
  *
  * Threading model:
  *  - prepare() / reset() / setOversampling() / setOversamplingMode() /
@@ -113,10 +114,11 @@ public:
             bandBuffers_[static_cast<size_t>(b)].resize(spec.numChannels, spec.maxBlockSize);
             saturation_[static_cast<size_t>(b)]->prepare(spec);
         }
-        // One line more than the bands: the dry sum waits for the slowest band too.
-        padLines_.assign(static_cast<size_t>(MaxBands + 1) * static_cast<size_t>(std::max(spec.numChannels, 1))
+        // Two lines a band: its dry side waits for the slowest band too.
+        padLines_.assign(static_cast<size_t>(2 * MaxBands) * static_cast<size_t>(std::max(spec.numChannels, 1))
                          * static_cast<size_t>(kPadSize), T(0));
         dryBuffer_.resize(spec.numChannels, spec.maxBlockSize);
+        bandDry_.resize(spec.numChannels, spec.maxBlockSize);
         clip_.setMode(Clipper<T>::Mode::Hard);
         clip_.setOversampling(4);
         clip_.setCeiling(outputCeilingDb_.load(std::memory_order_relaxed));
@@ -248,10 +250,10 @@ public:
      * summed without their curves) and as late as the slowest band, so it
      * meets the processed bands in the crossover's phase: with no drive a
      * mix of one half is as flat as the crossover is, at the splits too.
-     * Each band's own filters still act on its side alone: the 20 Hz
-     * high-pass and the DC filter of every Saturation lead the phase at the
-     * bottom (20 degrees at 100 Hz, which is 0.14 dB at a mix of one half;
-     * setPreFilterHpFrequency() and setDcBlocking() of the bands move it).
+     * Each band's dry side crosses what that band's does: the filters of
+     * minimum-phase oversampling, and between the two ends the phase (not
+     * the magnitude) of its Saturation's high-passes, so a mix of one half
+     * is the mean of the two levels at the bottom and at the top as well.
      * Each band's own Saturation mix still acts inside its band.
      */
     void setMix(T amount) noexcept
@@ -459,35 +461,17 @@ private:
         const bool soloing = anySolo();
         const int slowest = slowestBand(nb);
 
-        // The dry side of the mix: the bands as the crossover leaves them,
-        // summed before their curves, through a line as long as the slowest
-        // band. It runs while the mix is, or is on its way, under one.
+        // The dry side of the mix: the dry side of each band, waiting for the
+        // slowest band as the band itself does, summed without level, pan or
+        // mute. It runs while the mix is, or is on its way, under one.
         const double mixTarget = static_cast<double>(mix_.load(std::memory_order_relaxed));
         const bool dry = mixTarget < 1.0 || mixNow_ < 1.0;
-        if (dry && !dryRunning_) clearPad(MaxBands);
+        if (dry && !dryRunning_)
+            for (int b = 0; b < MaxBands; ++b) clearPad(MaxBands + b);
         dryRunning_ = dry;
+        auto dryBand = bandDry_.toView().getSubView(0, nS);
         if (dry)
-        {
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T* sum = dryBuffer_.getChannel(ch);
-                std::copy_n(views_[0].getChannel(ch), nS, sum);
-                for (int b = 1; b < nb; ++b)
-                {
-                    const T* band = views_[static_cast<size_t>(b)].getChannel(ch);
-                    for (int i = 0; i < nS; ++i) sum[i] += band[i];
-                }
-                T* line = padLines_.data() + (static_cast<size_t>(MaxBands) * static_cast<size_t>(bandBuffers_[0].getNumChannels())
-                                              + static_cast<size_t>(ch)) * static_cast<size_t>(kPadSize);
-                int pos = padPos_;
-                for (int i = 0; i < nS; ++i)
-                {
-                    line[pos] = sum[i];
-                    sum[i] = line[(pos - slowest) & (kPadSize - 1)];
-                    pos = (pos + 1) & (kPadSize - 1);
-                }
-            }
-        }
+            for (int ch = 0; ch < nCh; ++ch) std::fill_n(dryBuffer_.getChannel(ch), nS, T(0));
         for (int ch = 0; ch < nCh; ++ch) std::fill_n(buffer.getChannel(ch), nS, T(0));
 
         for (int b = 0; b < nb; ++b)
@@ -495,9 +479,10 @@ private:
             BandRamp& ramp = ramps_[static_cast<size_t>(b)];
             const Targets t = targets(b, soloing);
 
-            // A band that is not heard, and has faded out, is not computed.
+            // A band that is not heard, and has faded out, is not computed,
+            // unless the mix wants its dry side.
             const bool silent = t.heard == 0.0 && ramp.heard == 0.0;
-            if (silent)
+            if (silent && !dry)
             {
                 ramp.computed = false;
                 ramp.left = t.left;
@@ -513,8 +498,10 @@ private:
                 ramp.computed = true;
             }
             auto view = views_[static_cast<size_t>(b)];
-            sat.processBlock(view);
+            if (dry) sat.processPieces(view, &dryBand, mixTarget > 0.0);
+            else sat.processBlock(view);
             const int pad = slowest - sat.getLatency();
+            if (dry) addDryBand(b, nCh, nS, pad);
 
             const double heardStep = std::clamp(t.heard - ramp.heard, -fadeStep_, fadeStep_);
             const bool fading = ramp.heard != t.heard;
@@ -597,6 +584,25 @@ private:
         }
     }
 
+    /** Adds the dry side of a band, as late as the slowest band. */
+    void addDryBand(int band, int channels, int samples, int pad) noexcept
+    {
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            const T* in = bandDry_.getChannel(ch);
+            T* sum = dryBuffer_.getChannel(ch);
+            T* line = padLines_.data() + (static_cast<size_t>(MaxBands + band) * static_cast<size_t>(bandBuffers_[0].getNumChannels())
+                                          + static_cast<size_t>(ch)) * static_cast<size_t>(kPadSize);
+            int pos = padPos_;
+            for (int i = 0; i < samples; ++i)
+            {
+                line[pos] = in[i];
+                sum[i] += line[(pos - pad) & (kPadSize - 1)];
+                pos = (pos + 1) & (kPadSize - 1);
+            }
+        }
+    }
+
     void clearPad(int band) noexcept
     {
         const size_t per = static_cast<size_t>(bandBuffers_[0].getNumChannels()) * static_cast<size_t>(kPadSize);
@@ -611,9 +617,9 @@ private:
     std::array<AudioBufferView<T>, MaxBands> views_ {};
     std::array<BandParams, MaxBands> params_ {};
     std::array<BandRamp, MaxBands> ramps_ {};
-    std::vector<T> padLines_;   ///< Per band (and one more for the dry sum) and channel, kPadSize samples each.
+    std::vector<T> padLines_;   ///< Per band (then per band's dry side) and channel, kPadSize samples each.
     int padPos_ = 0;
-    AudioBuffer<T> dryBuffer_;                      ///< The bands summed before their curves, for the mix.
+    AudioBuffer<T> dryBuffer_, bandDry_;            ///< The dry side of the mix, and that of the band at hand.
     Clipper<T> clip_;                               ///< The clipper after the sum.
     std::atomic<T> mix_ { T(1) }, outputCeilingDb_ { T(0) };
     std::atomic<bool> outputClip_ { false };

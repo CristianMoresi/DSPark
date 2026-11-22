@@ -1940,8 +1940,11 @@ inline EffectSlot makeTapeMachine()
     s.addToggle("Auto Oversampling", false);                               // 23
     s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0); // 24
     s.addSlider("Record Emphasis", -6, 6, 0, "dB");                         // 25
-    // setAutomaticOversampling() is a setup call (it re-prepares): the UI
-    // records the wish and the audio thread applies it between blocks.
+    s.addChoice("Bias Shape", {"Two Level","Four Level"}, 0);               // 26
+    auto shapeWanted = std::make_shared<std::atomic<int>>(0);
+    // setAutomaticOversampling() and setBiasShape() are setup calls (they
+    // re-prepare): the UI records the wish and the audio thread applies it
+    // between blocks.
     auto autoWanted  = std::make_shared<std::atomic<int>>(0);
     auto autoApplied = std::make_shared<std::atomic<int>>(0);
     auto hum = std::make_shared<std::atomic<float>>(-120.0f);
@@ -1949,7 +1952,8 @@ inline EffectSlot makeTapeMachine()
     auto align = std::make_shared<std::array<std::atomic<float>, 2>>();
     auto filtWanted  = std::make_shared<std::atomic<int>>(0);
     auto filtApplied = std::make_shared<std::atomic<int>>(0);
-    s.prepareFn = [p, autoWanted, autoApplied, filtWanted, filtApplied](auto& sp) {
+    s.prepareFn = [p, autoWanted, autoApplied, filtWanted, filtApplied, shapeWanted](auto& sp) {
+        p->setBiasShape(static_cast<dspark::TapeMachine<float>::BiasShape>(shapeWanted->load(std::memory_order_relaxed)));
         const int want = autoWanted->load(std::memory_order_relaxed);
         p->setAutomaticOversampling(want != 0);
         autoApplied->store(want, std::memory_order_relaxed);
@@ -1958,7 +1962,8 @@ inline EffectSlot makeTapeMachine()
         filtApplied->store(filt, std::memory_order_relaxed);
         p->prepare(sp);
     };
-    s.processFn = [p, autoWanted, autoApplied, filtWanted, filtApplied](auto b) {
+    s.processFn = [p, autoWanted, autoApplied, filtWanted, filtApplied, shapeWanted](auto b) {
+        p->setBiasShape(static_cast<dspark::TapeMachine<float>::BiasShape>(shapeWanted->load(std::memory_order_relaxed))); // returns at once when it is the one in use
         const int want = autoWanted->load(std::memory_order_relaxed);
         if (want != autoApplied->load(std::memory_order_relaxed)) {
             p->setAutomaticOversampling(want != 0);   // setup call - safe here (audio thread)
@@ -1973,7 +1978,7 @@ inline EffectSlot makeTapeMachine()
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, autoWanted, filtWanted, hum, mains, align](int i, float v) {
+    s.setParamFn = [p, autoWanted, filtWanted, hum, mains, align, shapeWanted](int i, float v) {
         using TM = dspark::TapeMachine<float>;
         switch (i) {
             case 0: p->setDrive(v); break;
@@ -2002,9 +2007,10 @@ inline EffectSlot makeTapeMachine()
             case 23: autoWanted->store(v > 0.5f ? 1 : 0, std::memory_order_relaxed); break;
             case 24: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
             case 25: p->setRecordEmphasis(v); break;
+            case 26: shapeWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
         }
     };
-    s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7 });
+    s.group("Main", { 0, 1, 26, 2, 3, 4, 5, 6, 7 });
     s.group("Machine", { 8, 15, 16, 19, 20, 21, 22 });
     s.group("Noise & Colour", { 9, 10, 11, 12, 13, 14 });
     s.group("Alignment", { 17, 18, 25, 23, 24 });

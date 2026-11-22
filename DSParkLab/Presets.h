@@ -308,6 +308,10 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Record Emphasis", 4 }, { "Drive", 6 } });
         s->addPreset("Speed transport", "The wow and flutter as changes of the tape's speed (Transport: Speed).",
             { { "Transport", 1 }, { "Wow/Flutter", 0.6f }, { "Drive", 4 } });
+        s->addPreset("Four-level bias", "The loud parts are no longer lifted before they saturate. Switch Bias Shape to Two Level to compare.",
+            { { "Bias Shape", 1 }, { "Drive", 6 } });
+        s->addPreset("Four-level bias, over-biased", "Where the lift was largest (bias at 0.9). Switch Bias Shape to Two Level to compare.",
+            { { "Bias Shape", 1 }, { "Bias", 0.9f }, { "Drive", 6 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Tube Preamp"))

@@ -6897,3 +6897,106 @@ DSPARK_TEST(Mix_phase_of_the_dry_side_turns_without_a_step)
     EXPECT_LT(multiband, 1.5);
     EXPECT_LT(tape, 1.8);
 }
+
+// Defect of the two-level carrier, kept as the default sound: the gain rises
+// with the level before it saturates (3.2 dB at the nominal bias, 9.9 at
+// full). With four levels it never rises, at any bias or formulation.
+DSPARK_TEST(TapeMachine_four_level_bias_never_lifts_the_loud_parts)
+{
+    struct Case { float bias; int formulation; };
+    double quietest = 0.0, at0 = 0.0, classic0 = 0.0;
+    for (const Case c : { Case { 0.0f, 0 }, Case { 0.25f, 0 }, Case { 0.5f, 0 }, Case { 0.75f, 0 }, Case { 0.9f, 0 },
+                          Case { 1.0f, 0 }, Case { 0.5f, 1 }, Case { 0.5f, 2 } })
+    {
+        double rise = 0.0;
+        for (const double hz : { 1000.0, 10000.0 })
+        {
+            double last = 0.0;
+            for (const double db : { -40.0, -18.0, -12.0, -6.0, 0.0, 6.0 })
+            {
+                const double amp = std::pow(10.0, db / 20.0);
+                const Sat8Vec in = sat8Sine(hz, amp, 24000);
+                const double gain = sat8Line(l10Run([&](Tape10& t) {
+                    t.setBiasShape(Tape10::BiasShape::FourLevel);
+                    t.setWowFlutter(0.0f);
+                    t.setBias(c.bias);
+                    t.setFormulation(static_cast<Tape10::Formulation>(c.formulation));
+                }, in, in).first, hz) - db;
+                if (db > -40.0) rise = std::max(rise, gain - last);
+                last = gain;
+                if (hz == 1000.0 && c.bias == 0.5f && c.formulation == 0)
+                {
+                    if (db == -40.0) quietest = gain;
+                    if (db == 0.0)
+                    {
+                        at0 = gain;
+                        classic0 = sat8Line(l10Run([](Tape10& t) { t.setWowFlutter(0.0f); }, in, in).first, hz) - db;
+                    }
+                }
+            }
+        }
+        std::printf("  [bias shape] bias %.2f, formulation %d: the gain rises by %.3f dB at most from a level to the next\n",
+                    static_cast<double>(c.bias), c.formulation, rise);
+        EXPECT_LT(rise, 0.05);
+    }
+    std::printf("  [bias shape] 1 kHz: %.2f dB quiet, %.2f dB at full scale (two levels: %.2f)\n", quietest, at0, classic0);
+    EXPECT_NEAR(quietest, 0.0, 0.5);
+    EXPECT_LT(at0, quietest - 0.3);
+}
+
+// The reason for its higher internal rate: the four levels must not buy the
+// gain with inharmonic products of the top.
+DSPARK_TEST(TapeMachine_four_level_bias_keeps_the_top_as_clean)
+{
+    for (const double hz : { 10100.0, 13150.0, 15050.0, 19250.0 })
+    {
+        const Sat8Vec in = sat8Sine(hz, 0.5, 24000);
+        const auto worst = [&](Tape10::BiasShape shape) {
+            const Sat8Vec out = l10Run([shape](Tape10& t) { t.setWowFlutter(0.0f); t.setBiasShape(shape); }, in, in).first;
+            double most = -300.0;
+            for (double f = 50.0; f < 19000.0; f += 50.0)
+            {
+                const double order = std::round(f / hz);
+                if (std::abs(f - order * hz) < 1.0) continue;
+                most = std::max(most, sat8Line(out, f));
+            }
+            return most - sat8Line(out, hz);
+        };
+        const double two = worst(Tape10::BiasShape::TwoLevel), four = worst(Tape10::BiasShape::FourLevel);
+        std::printf("  [bias shape] inharmonic of %.0f Hz at -6 dBFS: %.1f dBc with two levels, %.1f with four\n", hz, two, four);
+        EXPECT_LT(four, two + 1.0);
+    }
+}
+
+// The floor of the factor and what is saved: the factor asked for comes back
+// with two levels, and the latency reported is the real one at each rate.
+DSPARK_TEST(TapeMachine_bias_shape_sets_the_least_rate_and_is_saved)
+{
+    for (const auto& [rate, factor] : { std::pair { 44100.0, 8 }, std::pair { 48000.0, 8 }, std::pair { 96000.0, 4 }, std::pair { 192000.0, 2 } })
+    {
+        auto tape = std::make_unique<Tape10>();
+        tape->setWowFlutter(0.0f);
+        tape->setOversampling(2);
+        tape->prepare(spec(rate, 512, 2));
+        EXPECT_EQ(tape->getOversamplingFactor(), 2);
+        tape->setBiasShape(Tape10::BiasShape::FourLevel);
+        EXPECT_EQ(tape->getOversamplingFactor(), factor);
+
+        Sat8Vec in(8192, 0.0f);
+        in[512] = 0.05f;
+        const Sat8Vec out = l10Render(*tape, in, in).first;
+        size_t peak = 0;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (std::abs(out[i]) > std::abs(out[peak])) peak = i;
+        EXPECT_NEAR(static_cast<double>(peak), 512.0 + tape->getLatency(), 1.0);
+
+        const auto blob = tape->getState();
+        auto other = std::make_unique<Tape10>();
+        EXPECT_TRUE(other->setState(blob.data(), blob.size()));
+        EXPECT_TRUE(other->getBiasShape() == Tape10::BiasShape::FourLevel);
+        other->prepare(spec(rate, 512, 2));
+        EXPECT_EQ(other->getLatency(), tape->getLatency());
+        other->setBiasShape(Tape10::BiasShape::TwoLevel);
+        EXPECT_EQ(other->getOversamplingFactor(), 2);
+    }
+}

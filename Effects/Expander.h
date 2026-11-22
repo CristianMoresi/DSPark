@@ -264,8 +264,11 @@ public:
      *
      * Six bands (cuts from 6 to 48 dB per octave, bells, shelves, a tilt)
      * shape what the detector weighs, after the sidechain high-pass, on the
-     * programme or on the external key, and never on the audio. A change
-     * glides over 20 ms; a band that is Off costs nothing.
+     * programme or on the external key, and never on the audio. A band that
+     * keeps its form glides to a new setting over 20 ms and a change of
+     * shape crosses over the same time; a band that is Off costs nothing.
+     * The detector reads the loudest channel of the key, each one shaped by
+     * every band: a band's placement on the middle or the sides is not used.
      *
      * @param band     Band index in [0, KeyEq::kBands); others are ignored.
      * @param settings Shape, frequency, gain, q and slope of the band.

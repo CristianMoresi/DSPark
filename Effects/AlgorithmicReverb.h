@@ -463,15 +463,16 @@ public:
         // The wet signal's equalizer.
         if (postEq_.sync())
         {
-            // A frame at a time: the coefficients of a band on the move
-            // advance by samples, whatever the size of the host's block.
+            // A frame at a time, advanced by samples: a band on the middle
+            // or on the sides takes both channels at once, and the
+            // coefficients of a band on the move do not depend on the size
+            // of the host's block.
             for (int i = 0; i < nS; ++i)
             {
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    T* d = buffer.getChannel(ch);
-                    d[i] = postEq_.processSample(d[i], ch);
-                }
+                T frame[2] = {};
+                for (int ch = 0; ch < nCh; ++ch) frame[ch] = buffer.getChannel(ch)[i];
+                postEq_.processFrame(frame, nCh);
+                for (int ch = 0; ch < nCh; ++ch) buffer.getChannel(ch)[i] = frame[ch];
                 postEq_.advance(1);
             }
         }
@@ -501,8 +502,10 @@ public:
         processChunk(&input, &input, &outL, &outR, 1);
         if (postEq_.sync())
         {
-            outL = postEq_.processSample(outL, 0);
-            outR = postEq_.processSample(outR, 1);
+            T frame[2] = { outL, outR };
+            postEq_.processFrame(frame, 2);
+            outL = frame[0];
+            outR = frame[1];
             postEq_.advance(1);
         }
         return { outL, outR };
@@ -1079,7 +1082,14 @@ public:
         widthLaw_.store(std::clamp(static_cast<int>(law), 0, 1), std::memory_order_relaxed);
     }
 
-    /** @brief One band of the wet signal's equalizer (KeyEqualizer bands; 20 ms ramps). */
+    /**
+     * @brief One band of the wet signal's equalizer (KeyEqualizer bands).
+     *
+     * A band that keeps its form glides to a new setting over 20 ms, designed
+     * again on the way; a change of shape crosses to a second bank of
+     * filters over the same time. A band can sit on both channels of the wet
+     * pair, on its middle or on its sides (Band::placement).
+     */
     void setPostEqBand(int index, const typename KeyEqualizer<T, 2>::Band& band) noexcept { postEq_.setBand(index, band); }
     /** @return The settings of a band of the wet signal's equalizer. */
     [[nodiscard]] typename KeyEqualizer<T, 2>::Band getPostEqBand(int index) const noexcept { return postEq_.getBand(index); }

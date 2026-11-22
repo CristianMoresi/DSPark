@@ -1722,6 +1722,8 @@ public:
     using KeyBand = typename KeyEq::Band;
     /** @brief What a band of the key equalizer does. */
     using KeyShape = typename KeyEq::Shape;
+    /** @brief The part of a two-channel key a band of the key equalizer acts on. */
+    using KeyPlacement = typename KeyEq::Placement;
     /** @brief Bands of the key equalizer. */
     static constexpr int kKeyBands = KeyEq::kBands;
 
@@ -1732,13 +1734,23 @@ public:
      * high-pass: low and high cuts from 6 to 48 dB per octave, bells,
      * shelves and a tilt, each designed from its analog curve. They act on
      * whatever the detector reads (the programme, the external key or, in
-     * FeedBack, the compressed output) and never on the audio. A change
-     * glides over 20 ms; a band that is Off costs nothing. The timing that
+     * FeedBack, the compressed output) and never on the audio. A band that
+     * keeps its form glides to a new setting over 20 ms, designed again on
+     * the way; a change of shape crosses to a second bank of filters over
+     * the same time; a band that is Off costs nothing. The timing that
      * follows the spectral balance (setSpectralTiming()) and the analytic
      * makeup read the key before the equalizer.
      *
+     * With a two-channel key a band can sit on both channels, on the middle
+     * of the pair or on its sides (KeyBand::placement): a low cut on the
+     * middle keeps a centred kick from moving the gain while what is wide
+     * still does. The placement is that of the pair the detector reads, so
+     * under a route that already works on the middle and the sides
+     * (setRoute()) leave the bands on both. processSample() has the key one
+     * channel at a time and takes every band on every channel.
+     *
      * @param band     Band index in [0, kKeyBands); others are ignored.
-     * @param settings Shape, frequency, gain, q and slope of the band.
+     * @param settings Shape, frequency, gain, q, slope and placement of the band.
      */
     void setSidechainBand(int band, const KeyBand& settings) noexcept { keyEq_.setBand(band, settings); }
 
@@ -2260,7 +2272,10 @@ protected:
         const bool feedForward = topoEff == Topology::FeedForward;
         const bool element = profile.colour == Colour::PushPull
                           && (colorAmt > T(0) || colorSmooth_.isSmoothing());
-        if (feedForward && !precise && !element && !sampleWise)
+        // A band of the key's equalizer on the middle or on the sides of a
+        // pair takes the key a frame at a time.
+        const bool keyFrames = keyEqOn && nCh == 2 && keyEq_.isPlaced();
+        if (feedForward && !precise && !element && !sampleWise && !keyFrames)
         {
             const FeedForwardConfig ff { detTypeEff, charType, modeType, autoMkup, sLink,
                                          activeLookahead, scHpf, shared, decoupled,
@@ -2318,19 +2333,19 @@ protected:
             T heard[kMaxChannels] = {};
             T loopSource[kMaxChannels] = {};   // a keyed loop: the key before the gain
             double lowSq = 0.0, highSq = 0.0;
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                // The sidechain filter must process whatever the detector
-                // consumes. In feed-forward that is the key (the audio when
-                // the sidechain buffer lacks channels). In FeedBack it is the
-                // compressed output (the external key is ignored): the
-                // previous sample on the explicit path, or the channel's own
-                // current input on the semi-implicit path (the loop equation
-                // supplies the gain).
-                T detectorIn;
+            // What the detector of a channel reads, before the key's equalizer.
+            // The sidechain filter must process whatever the detector
+            // consumes. In feed-forward that is the key (the audio when
+            // the sidechain buffer lacks channels). In FeedBack it is the
+            // compressed output (the external key is ignored): the
+            // previous sample on the explicit path, or the channel's own
+            // current input on the semi-implicit path (the loop equation
+            // supplies the gain).
+            const auto keyOf = [&](int ch) noexcept -> T {
+                T source;
                 if (feedForward)
-                    detectorIn = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
-                                            : audio.getChannel(ch)[i];
+                    source = (scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
+                                        : audio.getChannel(ch)[i];
                 else if (keyedLoop)
                 {
                     // The loop around the key: the key itself where the loop
@@ -2338,14 +2353,32 @@ protected:
                     // gain where the detector keeps a memory.
                     loopSource[ch] = detectorSafe((scCh > 0) ? sidechain.getChannel(std::min(ch, scCh - 1))[i]
                                                              : audio.getChannel(ch)[i]);
-                    detectorIn = fbImplicit ? loopSource[ch] : fbLastOutput_[ch];
+                    source = fbImplicit ? loopSource[ch] : fbLastOutput_[ch];
                 }
                 else
-                    detectorIn = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
-                detectorIn = detectorSafe(detectorIn);
-                if (keyBalance) balanceBands(detectorIn, ch, lowSq, highSq);
-                if (scHpf) detectorIn = applySidechainHPF(detectorIn, ch);
-                if (keyEqOn) detectorIn = keyEq_.processSample(detectorIn, ch);
+                    source = fbImplicit ? audio.getChannel(ch)[i] : fbLastOutput_[ch];
+                source = detectorSafe(source);
+                if (keyBalance) balanceBands(source, ch, lowSq, highSq);
+                if (scHpf) source = applySidechainHPF(source, ch);
+                return source;
+            };
+            T keyPair[2] = {};
+            if (keyFrames)
+            {
+                keyPair[0] = keyOf(0);
+                keyPair[1] = keyOf(1);
+                keyEq_.processFrame(keyPair, 2);
+            }
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T detectorIn;
+                if (keyFrames)
+                    detectorIn = keyPair[ch];
+                else
+                {
+                    detectorIn = keyOf(ch);
+                    if (keyEqOn) detectorIn = keyEq_.processSample(detectorIn, ch);
+                }
                 heard[ch] = detectorIn;
                 if (lopsided) detectorIn = asymmetric(detectorIn, ch);
 

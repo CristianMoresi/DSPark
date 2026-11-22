@@ -116,6 +116,12 @@
  * reflects the active factor (oversampler group delay + loss FIR + transport
  * delay), so hosts get correct PDC.
  *
+ * **The carrier and the gain.** Two sign levels are a dither with two
+ * peaks, and the gain of such a loop rises with the level before it
+ * saturates: 2.8 dB at 1 kHz and 3.2 dB at 10 kHz at the nominal bias, up to
+ * 9.9 dB at full bias. setBiasShape(BiasShape::FourLevel) takes that away
+ * at twice the internal rate and about twice the cost; see it.
+ *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
  * Core/DryWetMixer.h,
  * Core/FilterDesign.h, Core/NormalizedLadder.h, Core/TapeTransport.h, Core/SimdOps.h,
@@ -268,7 +274,8 @@ public:
         numChannels_ = spec.numChannels;
         maxBlock_ = std::max(spec.maxBlockSize, 1);
         if (osAutomatic_)
-            osFactor_ = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate);
+            osRequested_ = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate);
+        osFactor_ = factorInUse(spec.sampleRate);
 
         // The hysteresis core runs at the active oversampling factor (4x
         // default) so the quarter-internal-rate AC bias carrier and its
@@ -519,9 +526,10 @@ public:
     void setOversampling(int factor)
     {
         if (factor < 1 || factor > 16 || (factor & (factor - 1)) != 0) return;
-        if (factor == osFactor_ && !osAutomatic_) return;
+        if (factor == osRequested_ && !osAutomatic_) return;
         osAutomatic_ = false;
-        osFactor_ = factor;
+        osRequested_ = factor;
+        osFactor_ = factorInUse(sampleRate_);
         if (prepared_.load(std::memory_order_relaxed))
             prepare(spec_);
     }
@@ -549,6 +557,43 @@ public:
 
     /** @brief Whether the factor follows the host rate (setAutomaticOversampling()). */
     [[nodiscard]] bool isOversamplingAutomatic() const noexcept { return osAutomatic_; }
+
+    /** @brief The levels of the bias carrier (see setBiasShape()). */
+    enum class BiasShape
+    {
+        TwoLevel, ///< Every sample at plus or minus the amplitude (default).
+        FourLevel ///< An inner and an outer level of each sign: the gain only falls with the level.
+    };
+
+    /**
+     * @brief Chooses the levels of the bias carrier (SETUP THREAD ONLY, as
+     *  setOversampling(): an active instance is prepared again).
+     *
+     * TwoLevel, the default, is the sound the machine has had: its gain
+     * rises with the level before it saturates (3.2 dB at the nominal bias,
+     * up to 9.9 dB at full bias).
+     *
+     * With FourLevel the gain holds and then falls, at any bias, as a tape
+     * compresses. It is another sound, quieter when driven: 1 kHz at 0 dBFS
+     * leaves 1.9 dB lower. The four levels need twice the headroom over the
+     * audio band, so the core then runs at no less than 352.8 kHz whatever
+     * setOversampling() asked: 8x at 44.1 and 48 kHz, about twice the cost
+     * and a latency of its own (getOversamplingFactor(), getLatency()).
+     *
+     * @param shape TwoLevel (default) or FourLevel.
+     */
+    void setBiasShape(BiasShape shape)
+    {
+        const bool four = shape == BiasShape::FourLevel;
+        if (four == fourLevel_) return;
+        fourLevel_ = four;
+        osFactor_ = factorInUse(sampleRate_);
+        if (prepared_.load(std::memory_order_relaxed))
+            prepare(spec_);
+    }
+
+    /** @brief The levels of the bias carrier (setBiasShape()). */
+    [[nodiscard]] BiasShape getBiasShape() const noexcept { return fourLevel_ ? BiasShape::FourLevel : BiasShape::TwoLevel; }
 
     /** @brief How the oversampler filters (see setOversamplingMode()). */
     enum class OversamplingMode
@@ -580,7 +625,7 @@ public:
     /** @brief The oversampler's filters (setOversamplingMode()). */
     [[nodiscard]] OversamplingMode getOversamplingMode() const noexcept { return osMode_; }
 
-    /** @brief Active oversampling factor (1 = off, 4 = default). */
+    /** @brief Active oversampling factor (1 = off, 4 = default; see setBiasShape()). */
     [[nodiscard]] int getOversamplingFactor() const noexcept { return osFactor_; }
 
     /** @brief Tape speed (changes EQ time constants, losses and head bump).
@@ -859,7 +904,8 @@ public:
         w.write("wowFlutter", static_cast<float>(wowFlutter_.load(std::memory_order_relaxed)));
         w.write("noise", static_cast<float>(noiseDb_.load(std::memory_order_relaxed)));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
-        w.write("oversampling", osFactor_);
+        w.write("oversampling", osRequested_);
+        w.write("biasShape", fourLevel_ ? 1 : 0);
         w.write("oversamplingAuto", osAutomatic_);
         w.write("oversamplingMode", static_cast<int32_t>(osMode_));
         w.write("transport", transport_.load(std::memory_order_relaxed));
@@ -910,6 +956,7 @@ public:
         // Default 4 = the historical fixed factor (older blobs restore 4x).
         setOversampling(r.read("oversampling", 4));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
+        setBiasShape(r.read("biasShape", 0) == 1 ? BiasShape::FourLevel : BiasShape::TwoLevel);
         setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
         return true;
     }
@@ -1143,7 +1190,7 @@ private:
                         xs += asym.next() * kAsymmetryShare * (square - mean);
                     }
                     const double x = inScale * xs;
-                    const double c = B * kBiasTable[static_cast<size_t>(phase)];
+                    const double c = carrier(B, biasNominal_, phase);
                     phase = (phase + 1) & 7;
                     const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
                     const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
@@ -1375,6 +1422,25 @@ private:
     {
         return dryIronLead_.processSample(channel,
             dryOutputLead_.processSample(channel, dryInputLead_.processSample(channel, x, inTurn), outTurn), ironTurn);
+    }
+
+    /** @brief The factor in use: the one asked for, or the least the four levels need. */
+    [[nodiscard]] int factorInUse(double rate) const noexcept
+    {
+        return fourLevel_ ? std::max(osRequested_, Oversampling<T>::factorForRate(rate, kFourLevelInternalRate)) : osRequested_;
+    }
+
+    /**
+     * @brief The carrier at one of its eight phases.
+     * @param amplitude The amplitude of the bias in use.
+     * @param nominal   The optimum of the material: over it the inner level stays.
+     * @param phase     The phase, 0 to 7.
+     */
+    [[nodiscard]] double carrier(double amplitude, double nominal, int phase) const noexcept
+    {
+        const double sign = kBiasTable[static_cast<size_t>(phase)];
+        if (!fourLevel_) return amplitude * sign;
+        return sign * ((phase & 1) ? kOuterLevel * amplitude : kInnerLevel * std::min(amplitude, nominal));
     }
 
     /** @brief A linear ramp towards a target, at a step fixed when it is aimed. */
@@ -1668,6 +1734,8 @@ private:
         calReq_.form = fp;
         const double biasB = std::min(6.0, 3.0 * std::pow(9.0, bias - 0.5));
         calReq_.biasAmp = biasB * 2.2e4 * (fp.k / 2.7e4);
+        biasNominal_ = 3.0 * 2.2e4 * (fp.k / 2.7e4);
+        calReq_.biasNominal = biasNominal_;
         if (biasB > 3.0)
         {
             // Gentle self-erasure (corner gliding 22 kHz -> ~12.8 kHz at full
@@ -2018,7 +2086,7 @@ private:
             const int i = calI_;
             const double s = std::sin(calW_ * i);
             const double x = calRun_.hScale * calRun_.calAmp * s;
-            const double c = calRun_.biasAmp * kBiasTable[static_cast<size_t>(i & 7)];
+            const double c = carrier(calRun_.biasAmp, calRun_.biasNominal, i & 7);
             const double m = 0.5
                 * (static_cast<double>(calib_.processSample(static_cast<T>(x + c)))
                  + static_cast<double>(calib2_.processSample(static_cast<T>(x - c))));
@@ -2119,6 +2187,11 @@ private:
     std::atomic<bool> prepared_ { false };
     int latency_ = 0;
     int drySize_ = 1;
+    int osRequested_ = 4;            ///< The factor asked for (setOversampling(), the automatic one).
+    bool fourLevel_ = false;         ///< The levels of the bias carrier (setBiasShape(); setup thread).
+    double biasNominal_ = 3.0 * 2.2e4; ///< The bias at the optimum of the material.
+    static constexpr double kFourLevelInternalRate = 352800.0;
+    static constexpr double kInnerLevel = 0.2, kOuterLevel = 0.6; ///< Of the bias amplitude, inner level up to the optimum.
     int osFactor_ = 4;               ///< Oversampling factor (setup thread; 1 = off, 4 default).
     bool osAutomatic_ = false;       ///< The factor follows the host rate (setAutomaticOversampling()).
     OversamplingMode osMode_ = OversamplingMode::LinearPhase; ///< setOversamplingMode() (setup thread).
@@ -2194,7 +2267,7 @@ private:
 
     struct CalibrationRequest
     {
-        double hScale = 1.0, biasAmp = 3.0 * 2.2e4, calAmp = 0.25, drive = 1.0;
+        double hScale = 1.0, biasAmp = 3.0 * 2.2e4, biasNominal = 3.0 * 2.2e4, calAmp = 0.25, drive = 1.0;
         FormulationParams form { 3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17, 0.0 };
     };
     CalibrationRequest calReq_, calRun_;

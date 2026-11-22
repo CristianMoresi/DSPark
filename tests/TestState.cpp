@@ -86,6 +86,7 @@ DSPARK_TEST(State_roundtrip_dynamics)
         Compressor<float>::KeyBand band;
         band.shape = Compressor<float>::KeyShape::HighShelf;
         band.frequency = 3200.0f; band.gainDb = -4.5f; band.q = 1.3f; band.slope = 6.0f;
+        band.placement = Compressor<float>::KeyPlacement::Side;
         c.setSidechainBand(4, band);
         c.setGainSmoothing(7.5f);
         c.setOptoCell(Compressor<float>::OptoCell::ThreeStage);

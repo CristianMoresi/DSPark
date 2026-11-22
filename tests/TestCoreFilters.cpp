@@ -27,6 +27,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -4993,4 +4994,333 @@ DSPARK_TEST(GraphicBank_flushes_a_sample_that_is_not_a_number)
     for (size_t i = 0; i < l1.size(); ++i)
         apart = std::max({ apart, std::abs(static_cast<double>(l1[i]) - l2[i]), std::abs(static_cast<double>(r1[i]) - r2[i]) });
     EXPECT_EQ(apart, 0.0);
+}
+
+// ----------------------------------------------------------------------------
+// KeyEqualizer: bands on the move, changes of form, and the middle and the sides
+// ----------------------------------------------------------------------------
+
+// A band that keeps its form moves through real designs: stopped half way
+// through a sweep of three octaves, a narrow bell is the narrow bell of the
+// frequency half way (on a logarithmic scale), not a mixture of the two ends.
+DSPARK_TEST(KeyEqualizer_a_band_on_the_move_is_a_real_design_all_the_way)
+{
+    using Shape = KeyEq2::Shape;
+    const auto at = [](const KeyEq2::Band& band) {
+        auto eq = std::make_unique<KeyEq2>();
+        eq->prepare(48000.0);
+        eq->setBand(0, band);
+        (void)eq->sync();
+        return eq;
+    };
+
+    auto eq = at(keyEqBand(Shape::Bell, 250.0f, 12.0f, 8.0f, 12.0f));
+    EXPECT_EQ(eq->getStretch(), 32);
+    eq->setBand(0, keyEqBand(Shape::Bell, 2000.0f, 12.0f, 8.0f, 12.0f));
+    EXPECT_TRUE(eq->sync());
+    // Half of the 20 ms, in whole stretches: time stops when advance() does.
+    for (int k = 0; k < 15; ++k) eq->advance(32);
+
+    const double middle = 250.0 * std::sqrt(8.0);
+    auto reference = at(keyEqBand(Shape::Bell, static_cast<float>(middle), 12.0f, 8.0f, 12.0f));
+    double worst = 0.0;
+    for (double hz : { 250.0, 500.0, 650.0, middle, 770.0, 1000.0, 2000.0 })
+    {
+        const double moving = keyEqToneDb(*eq, hz), still = keyEqToneDb(*reference, hz);
+        std::printf("  [key eq] half way, %7.1f Hz: %6.2f dB on the move, %6.2f dB the design there\n", hz, moving, still);
+        worst = std::max(worst, std::abs(moving - still));
+    }
+    EXPECT_LT(worst, 0.05);
+    EXPECT_NEAR(keyEqToneDb(*eq, middle), 12.0, 0.1);
+
+    // Between two designs the coefficients are on the line from one to the
+    // next, a thirtieth of the way apart: still the bell, a little off.
+    eq->advance(16);
+    auto between = at(keyEqBand(Shape::Bell, static_cast<float>(250.0 * std::pow(8.0, 0.5 + 16.0 / 960.0)), 12.0f, 8.0f, 12.0f));
+    double off = 0.0;
+    for (double hz : { 650.0, middle, 770.0 })
+        off = std::max(off, std::abs(keyEqToneDb(*eq, hz) - keyEqToneDb(*between, hz)));
+    std::printf("  [key eq] between two designs: %.3f dB from the design there\n", off);
+    EXPECT_LT(off, 1.0);
+
+    // It lands on the setting asked for, and stays.
+    for (int k = 0; k < 40; ++k) eq->advance(32);
+    auto end = at(keyEqBand(Shape::Bell, 2000.0f, 12.0f, 8.0f, 12.0f));
+    for (double hz : { 1000.0, 2000.0, 4000.0 })
+        EXPECT_NEAR(keyEqToneDb(*eq, hz), keyEqToneDb(*end, hz), 1e-6);
+
+    // Gain, q and slope move the same way: a cut gliding from 100 Hz to
+    // 1.6 kHz is, half way, the cut at 400 Hz.
+    auto cut = at(keyEqBand(Shape::LowCut, 100.0f, 0.0f, 0.7071f, 24.0f));
+    cut->setBand(0, keyEqBand(Shape::LowCut, 1600.0f, 0.0f, 0.7071f, 24.0f));
+    EXPECT_TRUE(cut->sync());
+    for (int k = 0; k < 15; ++k) cut->advance(32);
+    EXPECT_NEAR(keyEqToneDb(*cut, 400.0), -3.01, 0.15);
+    EXPECT_NEAR(keyEqToneDb(*cut, 100.0), -48.16, 0.6);
+
+    // A new setting in the middle of the way starts from where the band is.
+    auto turn = at(keyEqBand(Shape::Bell, 250.0f, 12.0f, 8.0f, 12.0f));
+    turn->setBand(0, keyEqBand(Shape::Bell, 2000.0f, 12.0f, 8.0f, 12.0f));
+    (void)turn->sync();
+    for (int k = 0; k < 15; ++k) turn->advance(32);
+    turn->setBand(0, keyEqBand(Shape::Bell, static_cast<float>(middle), 0.5f, 8.0f, 12.0f));
+    (void)turn->sync();
+    EXPECT_NEAR(keyEqToneDb(*turn, middle), 12.0, 0.5);          // still where it was
+    for (int k = 0; k < 15; ++k) turn->advance(32);
+    EXPECT_NEAR(keyEqToneDb(*turn, middle), 6.25, 0.1);          // half way down in decibels
+    for (int k = 0; k < 20; ++k) turn->advance(32);
+    EXPECT_NEAR(keyEqToneDb(*turn, middle), 0.5, 0.05);
+}
+
+// A change of form crosses two banks: under a steady tone the level goes
+// from one settled value to the other without rising over the larger of the
+// two and without a step, whatever the two shapes are; a band that comes in
+// under a signal brings no click of its own.
+DSPARK_TEST(KeyEqualizer_a_change_of_form_crosses_two_banks_without_a_step)
+{
+    using Shape = KeyEq2::Shape;
+    const auto tone = [](int i) {
+        return static_cast<float>(0.2 * std::sin(2.0 * 3.14159265358979323846 * 1000.0 * i / 48000.0));
+    };
+    struct Case { const char* name; KeyEq2::Band from, to; };
+    const Case cases[] = {
+        { "bell to low shelf", keyEqBand(Shape::Bell, 1000.0f, 12.0f, 1.0f, 12.0f), keyEqBand(Shape::LowShelf, 4000.0f, 6.0f, 0.7071f, 12.0f) },
+        { "bell to steep cut", keyEqBand(Shape::Bell, 1000.0f, 9.0f, 4.0f, 12.0f), keyEqBand(Shape::HighCut, 8000.0f, 0.0f, 0.7071f, 48.0f) },
+        { "shelf to tilt", keyEqBand(Shape::HighShelf, 300.0f, -9.0f, 0.7071f, 12.0f), keyEqBand(Shape::Tilt, 1000.0f, 0.0f, 0.7071f, 3.0f) },
+        { "cut to nothing", keyEqBand(Shape::LowCut, 500.0f, 0.0f, 0.7071f, 12.0f), keyEqBand(Shape::Off, 500.0f, 0.0f, 0.7071f, 12.0f) },
+        { "nothing to a bell", keyEqBand(Shape::Off, 500.0f, 0.0f, 0.7071f, 12.0f), keyEqBand(Shape::Bell, 1000.0f, -12.0f, 2.0f, 12.0f) },
+    };
+    for (const auto& c : cases)
+    {
+        auto eq = std::make_unique<KeyEq2>();
+        eq->prepare(48000.0);
+        eq->setBand(0, c.from);
+        (void)eq->sync();
+        int at = 0;
+        float last = 0.0f;
+        // Peak of each cycle of the tone (48 samples) and the largest step between two samples.
+        const auto run = [&](int cycles, double& low, double& high, double& step) {
+            low = 1e9; high = 0.0; step = 0.0;
+            for (int k = 0; k < cycles; ++k)
+            {
+                double peak = 0.0;
+                for (int i = 0; i < 48; ++i, ++at)
+                {
+                    const float y = eq->processSample(tone(at), 0);
+                    eq->advance(1);
+                    step = std::max(step, static_cast<double>(std::abs(y - last)));
+                    peak = std::max(peak, static_cast<double>(std::abs(y)));
+                    last = y;
+                }
+                low = std::min(low, peak);
+                high = std::max(high, peak);
+            }
+        };
+        double low = 0.0, high = 0.0, step = 0.0;
+        run(100, low, high, step);
+        run(10, low, high, step);
+        const double before = high, beforeStep = step;
+        eq->setBand(0, c.to);
+        (void)eq->sync();
+        double crossLow = 0.0, crossHigh = 0.0, crossStep = 0.0;
+        run(40, crossLow, crossHigh, crossStep);
+        run(100, low, high, step);
+        run(10, low, high, step);
+        const double after = high, afterStep = step;
+        std::printf("  [key eq] %-18s %6.2f dB to %6.2f dB; on the way %6.2f to %6.2f dB; largest step %.5f (%.5f and %.5f settled)\n",
+                    c.name, 20.0 * std::log10(before / 0.2), 20.0 * std::log10(after / 0.2),
+                    20.0 * std::log10(crossLow / 0.2), 20.0 * std::log10(crossHigh / 0.2),
+                    crossStep, beforeStep, afterStep);
+        // Two tones of the same frequency that are not in phase add to less
+        // than either: the level can dip under the smaller by what the phase
+        // between the two filters takes, never rise over the larger.
+        EXPECT_GT(crossLow, std::min(before, after) * 0.9);
+        EXPECT_LT(crossHigh, std::max(before, after) * 1.015);
+        EXPECT_LT(crossStep, std::max(beforeStep, afterStep) * 1.03);
+    }
+
+    // Settings that arrive during a crossing wait for it and are taken then.
+    auto eq = std::make_unique<KeyEq2>();
+    eq->prepare(48000.0);
+    eq->setBand(0, keyEqBand(Shape::Bell, 1000.0f, 12.0f, 1.0f, 12.0f));
+    (void)eq->sync();
+    eq->setBand(0, keyEqBand(Shape::LowCut, 4000.0f, 0.0f, 0.7071f, 24.0f));
+    (void)eq->sync();
+    eq->advance(200);
+    eq->setBand(0, keyEqBand(Shape::Bell, 1000.0f, -6.0f, 1.0f, 12.0f));
+    EXPECT_TRUE(eq->sync());
+    eq->advance(800);                 // the first crossing ends here
+    EXPECT_TRUE(eq->sync());          // and the bell that waited starts its own
+    for (int k = 0; k < 40; ++k) eq->advance(32);
+    EXPECT_NEAR(keyEqToneDb(*eq, 1000.0), -6.0, 0.1);
+
+    // reset() in the middle of a crossing leaves the set that was coming in.
+    eq->setBand(0, keyEqBand(Shape::HighShelf, 500.0f, 6.0f, 0.7071f, 12.0f));
+    (void)eq->sync();
+    eq->advance(100);
+    eq->reset();
+    EXPECT_NEAR(keyEqToneDb(*eq, 8000.0), 6.0, 0.3);
+}
+
+// A band on the middle or on the sides of a pair: the other part goes through
+// untouched, to the bit where it carries nothing of the band's own part; one
+// channel alone is its own middle; and the placement travels in the state.
+DSPARK_TEST(KeyEqualizer_bands_sit_on_the_middle_or_on_the_sides)
+{
+    using Shape = KeyEq2::Shape;
+    using Place = KeyEq2::Placement;
+    const auto with = [](Shape shape, float hz, float gainDb, Place place) {
+        auto eq = std::make_unique<KeyEq2>();
+        eq->prepare(48000.0);
+        auto band = keyEqBand(shape, hz, gainDb, 1.0f, 24.0f);
+        band.placement = place;
+        eq->setBand(0, band);
+        (void)eq->sync();
+        return eq;
+    };
+    const auto tone = [](int i, double hz) {
+        return static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * hz * i / 48000.0));
+    };
+
+    // A band on the sides and a key that is the same in both channels: to the bit.
+    {
+        auto eq = with(Shape::Bell, 1000.0f, 12.0f, Place::Side);
+        EXPECT_TRUE(eq->isActive());
+        EXPECT_TRUE(eq->isPlaced());
+        bool same = true;
+        for (int i = 0; i < 4800; ++i)
+        {
+            const float x = tone(i, 1000.0);
+            float frame[2] = { x, x };
+            eq->processFrame(frame, 2);
+            same = same && frame[0] == x && frame[1] == x;
+            eq->advance(1);
+        }
+        EXPECT_TRUE(same);
+    }
+    // A cut on the middle and a key that is only sides: to the bit.
+    {
+        auto eq = with(Shape::LowCut, 4000.0f, 0.0f, Place::Mid);
+        bool same = true;
+        for (int i = 0; i < 4800; ++i)
+        {
+            const float x = tone(i, 1000.0);
+            float frame[2] = { x, -x };
+            eq->processFrame(frame, 2);
+            same = same && frame[0] == x && frame[1] == -x;
+            eq->advance(1);
+        }
+        EXPECT_TRUE(same);
+    }
+    // Each part gets its band: the middle of a pair through a bell on the
+    // middle is the bell of the middle, and its sides are what they were.
+    {
+        auto placed = with(Shape::Bell, 1000.0f, 9.0f, Place::Mid);
+        auto plain = with(Shape::Bell, 1000.0f, 9.0f, Place::Stereo);
+        EXPECT_FALSE(plain->isPlaced());
+        double midOff = 0.0, sideOff = 0.0, sidesPlain = 0.0;
+        for (int i = 0; i < 9600; ++i)
+        {
+            const float l = tone(i, 1000.0), r = 0.6f * tone(i + 7, 1700.0);
+            float frame[2] = { l, r };
+            placed->processFrame(frame, 2);
+            const float shapedMid = plain->processSample(0.5f * (l + r), 0);
+            const float shapedSide = plain->processSample(0.5f * (l - r), 1);
+            midOff = std::max(midOff, static_cast<double>(std::abs(0.5f * (frame[0] + frame[1]) - shapedMid)));
+            sideOff = std::max(sideOff, static_cast<double>(std::abs(0.5f * (frame[0] - frame[1]) - 0.5f * (l - r))));
+            sidesPlain = std::max(sidesPlain, static_cast<double>(std::abs(shapedSide - 0.5f * (l - r))));
+        }
+        std::printf("  [key eq] a bell on the middle: middle %.2e from the bell of the middle, sides %.2e from what they were\n", midOff, sideOff);
+        EXPECT_LT(midOff, 1e-6);
+        EXPECT_LT(sideOff, 1e-6);
+        EXPECT_GT(sidesPlain, 0.01);          // on both channels the sides would have been shaped
+    }
+    // One channel alone is its own middle and has no sides.
+    {
+        auto side = with(Shape::Bell, 1000.0f, 12.0f, Place::Side);
+        auto mid = with(Shape::Bell, 1000.0f, 12.0f, Place::Mid);
+        bool untouched = true;
+        double peak = 0.0;
+        for (int i = 0; i < 9600; ++i)
+        {
+            const float x = tone(i, 1000.0);
+            float a = x, b = x;
+            side->processFrame(&a, 1);
+            mid->processFrame(&b, 1);
+            untouched = untouched && a == x;
+            if (i > 4800) peak = std::max(peak, static_cast<double>(std::abs(b)));
+        }
+        EXPECT_TRUE(untouched);
+        EXPECT_NEAR(20.0 * std::log10(peak / 0.25), 12.0, 0.1);
+        // A caller with one channel at a time gets every band.
+        EXPECT_NEAR(keyEqToneDb(*side, 1000.0), 12.0, 0.1);
+    }
+    // The curve of each part, and the state.
+    {
+        auto eq = std::make_unique<KeyEq2>();
+        eq->prepare(48000.0);
+        auto a = keyEqBand(Shape::Bell, 500.0f, 6.0f, 6.0f, 12.0f);
+        auto b = keyEqBand(Shape::Bell, 2000.0f, -9.0f, 6.0f, 12.0f);  b.placement = Place::Mid;
+        auto c = keyEqBand(Shape::Bell, 8000.0f, 4.0f, 6.0f, 12.0f);   c.placement = Place::Side;
+        eq->setBand(0, a); eq->setBand(1, b); eq->setBand(2, c);
+        const auto every = eq->getResponse(), middle = eq->getResponse(Place::Mid), sides = eq->getResponse(Place::Side);
+        EXPECT_EQ(every.count, 3);
+        EXPECT_EQ(middle.count, 2);
+        EXPECT_EQ(sides.count, 2);
+        EXPECT_NEAR(every.magnitudeDb(500.0), 6.0, 0.2);
+        EXPECT_NEAR(middle.magnitudeDb(2000.0), -9.0, 0.2);      // the band on the middle
+        EXPECT_NEAR(sides.magnitudeDb(2000.0), 0.0, 0.2);        // is not in the sides' curve
+        EXPECT_NEAR(sides.magnitudeDb(8000.0), 4.0, 0.2);
+        EXPECT_NEAR(middle.magnitudeDb(8000.0), 0.0, 0.2);
+        EXPECT_NEAR(middle.magnitudeDb(500.0), 6.0, 0.2);        // the band on both is in the two
+        EXPECT_NEAR(sides.magnitudeDb(500.0), 6.0, 0.2);
+
+        StateWriter w(stateId("TEST"), 1);
+        eq->writeState(w, "key");
+        const auto blob = w.blob();
+        StateReader r(blob.data(), blob.size());
+        auto other = std::make_unique<KeyEq2>();
+        other->readState(r, "key");
+        EXPECT_TRUE(other->getBand(0).placement == Place::Stereo);
+        EXPECT_TRUE(other->getBand(1).placement == Place::Mid);
+        EXPECT_TRUE(other->getBand(2).placement == Place::Side);
+        // A state written before there was a placement: both channels.
+        StateWriter old(stateId("TEST"), 1);
+        old.write("key1.shape", static_cast<int32_t>(Shape::Bell));
+        old.write("key1.gain", 3.0f);
+        const auto oldBlob = old.blob();
+        StateReader oldReader(oldBlob.data(), oldBlob.size());
+        other->readState(oldReader, "key");
+        EXPECT_TRUE(other->getBand(1).shape == Shape::Bell);
+        EXPECT_TRUE(other->getBand(1).placement == Place::Stereo);
+        // A placement out of range is brought into it.
+        auto wild = a;
+        wild.placement = static_cast<Place>(9);
+        eq->setBand(3, wild);
+        EXPECT_TRUE(eq->getBand(3).placement == Place::Side);
+    }
+    // Moving a band from both channels to the sides is a change of form: it
+    // crosses, and a key that is the same in both channels comes out whole.
+    {
+        auto eq = with(Shape::Bell, 1000.0f, 12.0f, Place::Stereo);
+        auto band = keyEqBand(Shape::Bell, 1000.0f, 12.0f, 1.0f, 24.0f);
+        band.placement = Place::Side;
+        double early = 0.0, late = 0.0, step = 0.0;
+        float last = 0.0f;
+        for (int i = 0; i < 9600; ++i)
+        {
+            if (i == 4800) { eq->setBand(0, band); (void)eq->sync(); }
+            const float x = tone(i, 1000.0);
+            float frame[2] = { x, x };
+            eq->processFrame(frame, 2);
+            eq->advance(1);
+            if (i >= 4700 && i < 4800) early = std::max(early, static_cast<double>(std::abs(frame[0])));
+            if (i >= 9500) late = std::max(late, static_cast<double>(std::abs(frame[0])));
+            if (i >= 4700) step = std::max(step, static_cast<double>(std::abs(frame[0] - last)));
+            last = frame[0];
+        }
+        EXPECT_NEAR(20.0 * std::log10(early / 0.25), 12.0, 0.1);
+        EXPECT_NEAR(20.0 * std::log10(late / 0.25), 0.0, 0.01);
+        EXPECT_LT(step, 0.14);        // the step of the tone 12 dB up is 0.13
+    }
 }

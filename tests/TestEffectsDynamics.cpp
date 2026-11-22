@@ -9876,3 +9876,71 @@ DSPARK_TEST(Compressor_programme_measures_count_in_the_knobs_own_times)
     EXPECT_GT(sharp, 1.0);
     EXPECT_NEAR(sharp / broad, 1.0, 0.2);
 }
+
+// A band of the key's equalizer on the middle or on the sides of a pair. A
+// low cut on the middle takes a centred low tone out of what the detector
+// weighs and one on the sides leaves it there; for a tone that is only sides
+// it is the other way round. On both channels it takes either.
+DSPARK_TEST(Compressor_key_bands_sit_on_the_middle_or_on_the_sides)
+{
+    using C = Compressor<float>;
+    const int n = 24000;
+    const auto reduction = [&](bool wide, int place, int block) {
+        auto c = std::make_unique<C>();
+        c->setThreshold(-20.0f);
+        c->setRatio(4.0f);
+        c->setAttack(5.0f);
+        c->setRelease(100.0f);
+        if (place >= 0)
+        {
+            C::KeyBand cut;
+            cut.shape = C::KeyShape::LowCut;
+            cut.frequency = 500.0f;
+            cut.slope = 24.0f;
+            cut.placement = static_cast<C::KeyPlacement>(place);
+            c->setSidechainBand(0, cut);
+        }
+        c->prepare(AudioSpec{ 48000.0, block, 2 });
+        std::vector<Vec> x(2, Vec(static_cast<size_t>(n)));
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = static_cast<float>(0.5 * std::sin(2.0 * kPiD * 60.0 * i / 48000.0));
+            x[0][static_cast<size_t>(i)] = v;
+            x[1][static_cast<size_t>(i)] = wide ? -v : v;
+        }
+        double deepest = 0.0;
+        int at = 0;
+        processInBlocks(x, block, [&](AudioBufferView<float> b) {
+            c->processBlock(b);
+            at += b.getNumSamples();
+            if (at > n - 4800) deepest = std::min(deepest, static_cast<double>(c->getGainReductionDb()));
+        });
+        return deepest;
+    };
+    const int stereo = static_cast<int>(C::KeyPlacement::Stereo), mid = static_cast<int>(C::KeyPlacement::Mid),
+              side = static_cast<int>(C::KeyPlacement::Side);
+
+    const double centred = reduction(false, -1, 512), wideTone = reduction(true, -1, 512);
+    std::printf("  [key place] no band: centred %.3f dB, wide %.3f dB\n", centred, wideTone);
+    EXPECT_LT(centred, -5.0);
+    EXPECT_NEAR(wideTone, centred, 0.01);
+
+    const double centredStereo = reduction(false, stereo, 512), centredMid = reduction(false, mid, 512),
+                 centredSide = reduction(false, side, 512);
+    const double wideStereo = reduction(true, stereo, 512), wideMid = reduction(true, mid, 512),
+                 wideSide = reduction(true, side, 512);
+    std::printf("  [key place] centred tone: cut on both %.3f, on the middle %.3f, on the sides %.3f dB\n",
+                centredStereo, centredMid, centredSide);
+    std::printf("  [key place] wide tone:    cut on both %.3f, on the middle %.3f, on the sides %.3f dB\n",
+                wideStereo, wideMid, wideSide);
+    EXPECT_GT(centredStereo, -0.05);
+    EXPECT_GT(centredMid, -0.05);
+    EXPECT_NEAR(centredSide, centred, 0.01);
+    EXPECT_GT(wideStereo, -0.05);
+    EXPECT_NEAR(wideMid, wideTone, 0.01);
+    EXPECT_GT(wideSide, -0.05);
+
+    // The size of the block is not in it.
+    EXPECT_NEAR(reduction(true, mid, 37), wideMid, 0.01);
+    EXPECT_NEAR(reduction(false, side, 1), centredSide, 0.01);
+}

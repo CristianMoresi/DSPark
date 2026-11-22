@@ -277,8 +277,7 @@ All notable user-facing changes to DSPark are documented here.
 - `MultibandSaturation::setMix()`: the sum of the bands against the programme
   as the crossover leaves it (the bands summed before their curves, as late
   as the slowest band), so any mix is as flat as the crossover, at the
-  splits too (each band's own 20 Hz high-pass and DC filter still lead the
-  phase at the bottom: 0.14 dB at 100 Hz at a mix of one half).
+  splits too.
   `MultibandCompressor::setMix()` sets the mix of every band, which is the
   same thing there. State key `mix`.
 - `MultibandSaturation::setOutputClip()` and `setOutputCeiling()`: a clipper
@@ -3071,6 +3070,20 @@ All notable user-facing changes to DSPark are documented here.
   per block of the host, so its glide stepped and the output depended on the
   block size (0.34 of full scale between blocks of 64 and of 1024 as a band
   went from +18 to -18 dB; now none).
+- `Saturation`, `MultibandSaturation`, `TapeMachine`: a partial mix lost its
+  bottom. The high-passes of the wet side lead the phase, the dry side had
+  none, and a mix of one half fell short of the mean of the two levels by
+  4.6 dB at 20 Hz in the two saturations and 6.0 dB in the tape (1.9 and
+  3.0 dB at 30 Hz). Between the two ends the dry side now takes that phase
+  through all-passes that keep its level: 0.11 dB short at most from 20 Hz
+  up at the defaults. A mix of zero is still the input.
+- `MultibandSaturation::setMix()` with minimum-phase oversampling: the dry
+  side did not cross the bands' filters and a half mix lost 12.7 dB at
+  19 kHz (now 0.04 dB or less). With the mix under one a muted band is
+  computed, for its dry side.
+- `Saturation` in `OutputMode::Delta`: the dry side did not cross the
+  high-passes of the wet side, so a quiet tone that the curve leaves alone
+  came through at -2.9 dB at 50 Hz and -29 dB at 1 kHz (now -115 and -95 dB).
 - DSParkLab: the spectrum resolves 3 Hz in place of 12, and the Quality and
   Detail controls of the spectral effects take effect when they are moved
   (they waited for a reload, which put them back at their defaults).

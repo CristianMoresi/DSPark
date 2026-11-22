@@ -58,6 +58,15 @@
  * own loudness exponent (the low end, whose loudness grows faster with
  * level, moves less in decibels for the same change of loudness).
  *
+ * In the low end those 72 bands are 30 Hz wide and the transform cannot tell
+ * 50 Hz from 70 Hz, which is enough for loudness and too coarse to see a
+ * hole between two lumps. So under 500 Hz (fading out by 1 kHz) the local
+ * contrast comes from a second look (setDetail(), Fine by default): a third
+ * of a second of the programme at a fraction of the rate, in bands a sixth
+ * of an octave wide, each read as power per octave against the half octave
+ * on either side of it. The balance, the audibility and the total loudness
+ * go by the 72 bands whatever the detail.
+ *
  * The gains drive a GraphicBank (a bell per band, a shelf at each end,
  * their gains solved by least squares so the bank's response is the one
  * asked for) whose sections glide over each hop; the bank refines its
@@ -74,8 +83,8 @@
  * atomic publications, safe from any thread. Non-finite values are ignored.
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, AuditoryBands.h, DenormalGuard.h,
- * DspMath.h, FFT.h, GraphicBank.h, SpectralEnvelope.h, StateBlob.h,
- * WindowFunctions.h.
+ * DspMath.h, FFT.h, GraphicBank.h, Oversampling.h, SpectralEnvelope.h,
+ * StateBlob.h, WindowFunctions.h.
  */
 
 #include "../Core/AudioBuffer.h"
@@ -85,6 +94,7 @@
 #include "../Core/DspMath.h"
 #include "../Core/FFT.h"
 #include "../Core/GraphicBank.h"
+#include "../Core/Oversampling.h"
 #include "../Core/SpectralEnvelope.h"
 #include "../Core/StateBlob.h"
 #include "../Core/WindowFunctions.h"
@@ -110,7 +120,23 @@ template <FloatType T>
 class TonalBalance
 {
 public:
-    static constexpr int kBands = 72;      ///< Bands of the analysis and of the bank.
+    static constexpr int kBands = 72;      ///< Bands of the loudness model.
+    static constexpr int kMaxBands = 128;  ///< Most bands of the bank (getNumBands() says how many run).
+
+    /**
+     * @brief How finely the low end is read and played (setDetail(); it
+     *        applies at the next prepare()).
+     *
+     * - Auditory: the 72 bands of the model alone, for analysis and bank.
+     * - Fine (default): no band of the bank wider than a sixth of an octave
+     *   (87 bands), and the dips and peaks under 500 Hz read by the long
+     *   look in those bands.
+     * - Finest: the same with a twelfth of an octave (122 bands).
+     *
+     * The long look hears the low end about 0.2 s late and follows it over
+     * a second or so; the latency of the processor does not change.
+     */
+    enum class Detail { Auditory, Fine, Finest };
 
     /**
      * @brief What a balanced programme is (setReference()). FlatLoudness, the
@@ -179,9 +205,28 @@ public:
         envelope_.prepare(bins_, 1.0 / 6.0);
         focus_.prepare(window_.data(), fft_, fft_, 1.0 / 6.0);
         for (auto* v : { &focusRe_[0], &focusRe_[1], &focusIm_[0], &focusIm_[1] }) v->assign(static_cast<size_t>(bins_), 0.0);
-        std::array<double, kBands> centres {};
-        for (int b = 0; b < kBands; ++b) centres[static_cast<size_t>(b)] = bands_.getCentre(b);
-        bank_.prepare(fs_, centres.data(), kBands, channels_);
+        const Detail detail = detail_.load(std::memory_order_relaxed);
+        detailInUse_.store(detail, std::memory_order_relaxed);
+        detailed_ = detail != Detail::Auditory;
+        const double top = std::min(20000.0, 0.45 * fs_);
+        if (detailed_) out_.prepareDetailed(fs_, fft_, kBands, 20.0, top, detail == Detail::Finest ? 12.0 : 6.0);
+        else out_.prepare(fs_, fft_, kBands, 20.0, top);
+        out_.setReferenceSpl(static_cast<double>(referenceSpl_.load(std::memory_order_relaxed)));
+        nb_ = std::min(out_.getNumBands(), kMaxBands);
+        numBands_.store(nb_, std::memory_order_relaxed);
+        // The bank: bells a critical band wide, or three bands wide where the
+        // bands are closer together than a third of a critical band.
+        std::array<double, kMaxBands> centres {}, widths {};
+        for (int j = 0; j < nb_; ++j) centres[static_cast<size_t>(j)] = out_.getCentre(j);
+        for (int j = 0; j < nb_; ++j)
+        {
+            const auto u = static_cast<size_t>(j);
+            const double spacing = j == 0 ? centres[1] - centres[0]
+                                 : (j == nb_ - 1 ? centres[u] - centres[u - 1] : 0.5 * (centres[u + 1] - centres[u - 1]));
+            widths[u] = std::min(AuditoryScale::criticalBandwidth(centres[u]), kBellBands * spacing);
+        }
+        bank_.prepare(fs_, centres.data(), nb_, channels_, 1.0, detailed_ ? widths.data() : nullptr);
+        prepareDetail();
         ring_.assign(static_cast<size_t>(channels_), std::vector<double>(static_cast<size_t>(fft_), 0.0));
         spectra_.assign(static_cast<size_t>(channels_), std::vector<double>(static_cast<size_t>(fft_ + 2), 0.0));
         delay_.assign(static_cast<size_t>(channels_), std::vector<T>(static_cast<size_t>(analysisDelay_), T(0)));
@@ -211,7 +256,8 @@ public:
         keyFade_ = 0.0;
         warm_ = false;
         bank_.reset();
-        std::array<T, kBands> zero {};
+        resetDetail();
+        std::array<T, kMaxBands> zero {};
         bank_.setGains(zero.data(), 0, 0);
         for (auto& g : published_) g.store(T(0), std::memory_order_relaxed);
         loudnessChange_.store(T(0), std::memory_order_relaxed);
@@ -235,6 +281,18 @@ public:
     void setRange(T db) noexcept { store(range_, db, T(0), T(24)); }
     /** @brief Knee of the correction curves, 0.1 to 12 dB (default 3). */
     void setKnee(T db) noexcept { store(knee_, db, T(0.1), T(12)); }
+    /**
+     * @brief Knee of the dips and peaks the long look reads in the low end,
+     *        0.1 to 12 dB (default 1.5; setKnee() keeps the rest): smaller
+     *        and the ripple of a noisy programme is followed, larger and
+     *        only what stands well out is touched.
+     */
+    void setContrastKnee(T db) noexcept { store(contrastKnee_, db, T(0.1), T(12)); }
+    /** @brief How finely the low end is read (see Detail; applies at the next prepare(); out-of-range values read as Fine). */
+    void setDetail(Detail d) noexcept
+    {
+        detail_.store(d == Detail::Auditory || d == Detail::Finest ? d : Detail::Fine, std::memory_order_relaxed);
+    }
     /**
      * @brief Rounds the approach to the range, 0 to 6 dB (0, the default, is
      *        the hard limit): a correction that grows (a dip that deepens)
@@ -329,6 +387,12 @@ public:
     [[nodiscard]] T getTilt() const noexcept { return tilt_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRange() const noexcept { return range_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getKnee() const noexcept { return knee_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getContrastKnee() const noexcept { return contrastKnee_.load(std::memory_order_relaxed); }
+    [[nodiscard]] Detail getDetail() const noexcept { return detail_.load(std::memory_order_relaxed); }
+    /** @return The detail the last prepare() took. */
+    [[nodiscard]] Detail getDetailInUse() const noexcept { return detailInUse_.load(std::memory_order_relaxed); }
+    /** @return How many bands getBandCentre() and getCorrection() have (after prepare(): 72, 87 or 122 at 44.1 kHz and over). */
+    [[nodiscard]] int getNumBands() const noexcept { return numBands_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRangeKnee() const noexcept { return rangeKnee_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getFloor() const noexcept { return floor_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getLowFrequency() const noexcept { return loHz_.load(std::memory_order_relaxed); }
@@ -349,11 +413,11 @@ public:
     /** @return The latency in samples (the analysis delay plus the bank's). */
     [[nodiscard]] int getLatency() const noexcept { return analysisDelay_ + bank_.getLatency(); }
     /** @return A band's centre in hertz. */
-    [[nodiscard]] double getBandCentre(int band) const noexcept { return bands_.getCentre(band); }
+    [[nodiscard]] double getBandCentre(int band) const noexcept { return out_.getCentre(band); }
     /** @return The correction of a band in dB (a readout for any thread). */
     [[nodiscard]] T getCorrection(int band) const noexcept
     {
-        return published_[static_cast<size_t>(std::clamp(band, 0, kBands - 1))].load(std::memory_order_relaxed);
+        return published_[static_cast<size_t>(std::clamp(band, 0, kMaxBands - 1))].load(std::memory_order_relaxed);
     }
     /**
      * @return The change of the programme's total loudness the corrections
@@ -399,6 +463,8 @@ public:
         w.write("tilt", static_cast<float>(getTilt()));
         w.write("range", static_cast<float>(getRange()));
         w.write("knee", static_cast<float>(getKnee()));
+        w.write("contrastKnee", static_cast<float>(getContrastKnee()));
+        w.write("detail", static_cast<int32_t>(getDetail()));
         w.write("rangeKnee", static_cast<float>(getRangeKnee()));
         w.write("floor", static_cast<float>(getFloor()));
         w.write("loHz", static_cast<float>(getLowFrequency()));
@@ -426,6 +492,8 @@ public:
         setTilt(static_cast<T>(r.read("tilt", 0.0f)));
         setRange(static_cast<T>(r.read("range", 6.0f)));
         setKnee(static_cast<T>(r.read("knee", 3.0f)));
+        setContrastKnee(static_cast<T>(r.read("contrastKnee", 1.5f)));
+        setDetail(static_cast<Detail>(r.read("detail", 1)));
         setRangeKnee(static_cast<T>(r.read("rangeKnee", 0.0f)));
         setFloor(static_cast<T>(r.read("floor", 30.0f)));
         setFrequencyRange(static_cast<T>(r.read("loHz", 40.0f)), static_cast<T>(r.read("hiHz", 16000.0f)));
@@ -453,7 +521,11 @@ private:
         if (!prepared_) return;
         DenormalGuard guard;
         if (refDirty_.exchange(false, std::memory_order_acquire))
-            bands_.setReferenceSpl(static_cast<double>(referenceSpl_.load(std::memory_order_relaxed)));
+        {
+            const double spl = static_cast<double>(referenceSpl_.load(std::memory_order_relaxed));
+            bands_.setReferenceSpl(spl);
+            out_.setReferenceSpl(spl);
+        }
         const int nCh = std::min(buffer.getNumChannels(), channels_);
         const int nS = buffer.getNumSamples();
         if (nCh <= 0) return;
@@ -495,6 +567,7 @@ private:
             if (hopCounter_ >= hop_)
             {
                 hopCounter_ = 0;
+                if (detailed_) feedLongLook(nCh);
                 analyse(nCh);
             }
             i += chunk;
@@ -710,6 +783,7 @@ private:
         // the range through a hyperbola (set to pass through 0 and to settle
         // on the range).
         const double atZero = 0.5 * (range - std::sqrt(range * range + rangeKnee * rangeKnee));
+        if (detailed_) readDetail(fillDips, trimPeaks, range, lo, hi);
         const auto limited = [range, rangeKnee, atZero](double c) {
             if (!(rangeKnee > 0.0)) return std::clamp(c, -range, range);
             const double a = std::abs(c), past = a - range;
@@ -730,7 +804,11 @@ private:
             // contrast.
             double c = -balance * soft(global);
             if (present[i] < 1.0) c = limited(c) * present[i];
-            c = limited(c - trimPeaks * soft(peak) - fillDips * soft(dip)) * weight[i];
+            if (detailed_)
+                c = std::clamp(limited(c - modelShare_[i] * (trimPeaks * soft(peak) + fillDips * soft(dip))) * weight[i]
+                               + detailMean_[i], -range, range);
+            else
+                c = limited(c - trimPeaks * soft(peak) - fillDips * soft(dip)) * weight[i];
             // The listening level: a fixed contour, whatever the programme.
             if (listening != 0.0)
                 c = std::clamp(c + listening * (1.0 - midExponent / bands_.getExponent(b)) * inRange[i], -range, range);
@@ -789,14 +867,28 @@ private:
             change /= kPerDb;
         }
         loudnessChange_.store(static_cast<T>(change), std::memory_order_relaxed);
-        std::array<T, kBands> gains {};
+        std::array<T, kMaxBands> gains {};
         for (int b = 0; b < kBands; ++b)
         {
             const auto i = static_cast<size_t>(b);
             corr_[i] = std::clamp(corr_[i] + offset * weight[i] * present[i] / steep[i], -range, range);
             gains[i] = static_cast<T>(corr_[i]);
-            published_[i].store(gains[i], std::memory_order_relaxed);
         }
+        if (detailed_)
+        {
+            // Each band of the bank: the model's correction there, less the
+            // share of it that was the detail's mean, plus the detail itself.
+            for (int j = 0; j < nb_; ++j)
+            {
+                const auto u = static_cast<size_t>(j);
+                const auto under = static_cast<size_t>(modelBand_[u]);
+                const double first = corr_[under] - detailMean_[under];
+                const double second = corr_[under + 1] - detailMean_[under + 1];
+                gains[u] = static_cast<T>(std::clamp(first + modelPart_[u] * (second - first) + detailGain_[u], -range, range));
+            }
+        }
+        for (int j = 0; j < nb_; ++j)
+            published_[static_cast<size_t>(j)].store(gains[static_cast<size_t>(j)], std::memory_order_relaxed);
         // What the corrections do to the loudness: the share the raised bands
         // gain, the share the lowered ones lose, the total, and how far its
         // centre moves along the ear's scale.
@@ -823,6 +915,215 @@ private:
         bank_.setGains(gains.data(), hop_, render_ ? 3 : ((hops_++ & 7) == 0 ? 1 : GraphicBank<T, 8>::kCarryRefinement));
     }
 
+    // -- The low end through a long look (Detail::Fine and Finest) --------------
+
+    /**
+     * @brief Sets up the long look (the programme near 6 kHz at any host
+     *        rate, a third of a second of it under a Hann window) and the
+     *        maps between its bands and those of the model.
+     */
+    void prepareDetail()
+    {
+        decimator_.reset();
+        longTransform_.reset();
+        detailBands_ = 0;
+        modelShare_.fill(1.0);
+        if (!detailed_) return;
+
+        longFactor_ = 1;
+        while (longFactor_ < 16 && fs_ / (2.0 * longFactor_) >= kLongLookRate && hop_ % (2 * longFactor_) == 0) longFactor_ *= 2;
+        const double rate = fs_ / static_cast<double>(longFactor_);
+        longFft_ = 1024;
+        while (longFft_ < 16384 && 1.5 * longFft_ < kLongLookSeconds * rate) longFft_ *= 2;
+        longBins_ = longFft_ / 2 + 1;
+        longEvery_ = render_ ? 8 : 4;
+        longTransform_ = std::make_unique<FFTReal<double>>(static_cast<size_t>(longFft_));
+        longWindow_.resize(static_cast<size_t>(longFft_));
+        WindowFunctions<double>::hann(longWindow_.data(), longFft_, true);
+        // On the scale of the model: a band's power is the true one times
+        // the noise bandwidth of the main window, in bins.
+        double squaresLong = 0.0, squaresMain = 0.0, sumMain = 0.0;
+        for (const double w : longWindow_) squaresLong += w * w;
+        for (const double w : window_) { squaresMain += w * w; sumMain += w; }
+        longScale_ = 4.0 / (static_cast<double>(longFft_) * squaresLong)
+                   * static_cast<double>(fft_) * squaresMain / (sumMain * sumMain);
+        long_.prepareLike(out_, rate, longFft_);
+        using Decimator = Oversampling<double, kMaxChannels>;
+        decimator_ = std::make_unique<Decimator>(longFactor_, Decimator::Quality::Medium);
+        const int chunk = hop_ / longFactor_;
+        decimator_->prepare(AudioSpec { rate, chunk, channels_ });
+        longRing_.assign(static_cast<size_t>(channels_), std::vector<double>(static_cast<size_t>(longFft_), 0.0));
+        longChunk_.assign(static_cast<size_t>(channels_), std::vector<double>(static_cast<size_t>(chunk), 0.0));
+        longFrame_.assign(static_cast<size_t>(longFft_), 0.0);
+        longSpectrum_.assign(static_cast<size_t>(longFft_ + 2), 0.0);
+        longBinPower_.assign(static_cast<size_t>(longBins_), 0.0);
+        longBandPower_.assign(static_cast<size_t>(out_.getNumBands()), 0.0);
+
+        // How much of the local contrast at a frequency is the detail's: all
+        // of it under kDetailHz, none an octave over it.
+        const double highest = std::min(2.0 * kDetailHz, 0.4 * rate);
+        const auto shareAt = [highest](double hz) {
+            return hz < highest ? std::clamp(1.0 - std::log2(hz / kDetailHz), 0.0, 1.0) : 0.0;
+        };
+        for (int b = 0; b < kBands; ++b) modelShare_[static_cast<size_t>(b)] = 1.0 - shareAt(bands_.getCentre(b));
+
+        const double step = static_cast<double>(longEvery_ * hop_) / fs_;
+        for (int j = 0; j < nb_; ++j)
+        {
+            const auto u = static_cast<size_t>(j);
+            const double hz = out_.getCentre(j);
+            const double position = (out_.getBark(j) - bands_.getBark(0)) / bands_.getSpacing();
+            const int under = std::clamp(static_cast<int>(std::floor(position)), 0, kBands - 2);
+            modelBand_[u] = under;
+            modelPart_[u] = std::clamp(position - under, 0.0, 1.0);
+            modelNearest_[u] = std::clamp(static_cast<int>(std::lround(position)), 0, kBands - 1);
+            detailShare_[u] = shareAt(hz);
+            // A band more than the reach past the hand-over still stands on
+            // one side of the ones before it.
+            if (hz < 0.4 * rate && hz < 4.0 * kDetailHz) detailBands_ = j + 1;
+            const double below = j > 0 ? std::log2(hz / out_.getCentre(j - 1)) : std::log2(out_.getCentre(1) / hz);
+            const double above = j + 1 < nb_ ? std::log2(out_.getCentre(j + 1) / hz) : below;
+            perOctave_[u] = 2.0 / (below + above);
+            sidePole_[u] = std::exp(-below / kSideOctaves);
+            perThirdBark_[u] = bands_.getSpacing() / std::max(out_.getWidthBark(j), 1e-9);
+            // Few bins fall in a band of the lowest octaves: it takes longer to settle.
+            const double tau = std::clamp(1.5 * std::sqrt(100.0 / hz), 0.4, 2.0);
+            longCoeff_[u] = std::exp(-step / tau);
+        }
+        detailGlide_ = std::exp(-static_cast<double>(hop_) / (kDetailGlideSeconds * fs_));
+    }
+
+    void resetDetail() noexcept
+    {
+        for (auto& r : longRing_) std::fill(r.begin(), r.end(), 0.0);
+        if (decimator_) decimator_->reset();
+        longPos_ = longCount_ = longPhase_ = 0;
+        longWarm_ = false;
+        longPower_.fill(0.0);
+        detailGain_.fill(0.0);
+        detailMean_.fill(0.0);
+    }
+
+    /** @brief The hop that has just come in goes into the long look, which is taken one hop in longEvery_. */
+    void feedLongLook(int nCh) noexcept
+    {
+        const int chunk = hop_ / longFactor_;
+        auto fast = decimator_->getHighRateBlock(chunk);
+        double* slow[kMaxChannels] {};
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const auto& r = ring_[static_cast<size_t>(ch)];
+            double* d = fast.getChannel(ch);
+            for (int k = 0; k < hop_; ++k) d[k] = r[static_cast<size_t>((ringPos_ - hop_ + k) & (fft_ - 1))];
+            slow[ch] = longChunk_[static_cast<size_t>(ch)].data();
+        }
+        decimator_->downsample(AudioBufferView<double>(slow, nCh, chunk));
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            auto& r = longRing_[static_cast<size_t>(ch)];
+            for (int k = 0; k < chunk; ++k) r[static_cast<size_t>((longPos_ + k) & (longFft_ - 1))] = slow[ch][k];
+        }
+        longPos_ = (longPos_ + chunk) & (longFft_ - 1);
+        longCount_ = std::min(longCount_ + chunk, longFft_);
+        if (++longPhase_ < longEvery_) return;
+        longPhase_ = 0;
+        if (longCount_ < longFft_) return;
+
+        std::fill(longBinPower_.begin(), longBinPower_.end(), 0.0);
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const auto& r = longRing_[static_cast<size_t>(ch)];
+            for (int k = 0; k < longFft_; ++k)
+                longFrame_[static_cast<size_t>(k)] = r[static_cast<size_t>((longPos_ + k) & (longFft_ - 1))] * longWindow_[static_cast<size_t>(k)];
+            longTransform_->forward(longFrame_.data(), longSpectrum_.data());
+            for (int k = 0; k < longBins_; ++k)
+            {
+                const double re = longSpectrum_[static_cast<size_t>(2 * k)], im = longSpectrum_[static_cast<size_t>(2 * k + 1)];
+                longBinPower_[static_cast<size_t>(k)] += longScale_ * (re * re + im * im) / nCh;
+            }
+        }
+        long_.bandPowers(longBinPower_.data(), longBandPower_.data());
+        for (int j = 0; j < detailBands_; ++j)
+        {
+            const auto u = static_cast<size_t>(j);
+            const double keep = longWarm_ ? longCoeff_[u] : 0.0;
+            longPower_[u] = longBandPower_[u] + keep * (longPower_[u] - longBandPower_[u]);
+        }
+        longWarm_ = true;
+    }
+
+    /**
+     * @brief The dips and peaks of the low end: each band's power per octave
+     *        against the audible bands on either side of it (one-pole
+     *        averages of half an octave that leave the band out), and the
+     *        mean of what they ask over each band of the model.
+     */
+    void readDetail(double fillDips, double trimPeaks, double range, double lo, double hi) noexcept
+    {
+        std::array<double, kMaxBands> db {}, heard {}, lowerSide {}, upperSide {};
+        const int n = longWarm_ ? detailBands_ : 0;
+        for (int j = 0; j < n; ++j)
+        {
+            const auto u = static_cast<size_t>(j);
+            db[u] = 10.0 * std::log10(perOctave_[u] * longPower_[u] + 1e-30);
+            const double over = 10.0 * std::log10((perThirdBark_[u] * longPower_[u] + 1e-30) / out_.getThreshold(j));
+            heard[u] = std::clamp(over / kAudibleSpan, 0.0, 1.0);
+        }
+        double num = 0.0, den = 0.0;
+        for (int j = 0; j < n; ++j)
+        {
+            const auto u = static_cast<size_t>(j);
+            lowerSide[u] = den > 1e-9 ? num / den : db[u];
+            const double pole = j + 1 < n ? sidePole_[u + 1] : 0.0;
+            num = pole * (num + heard[u] * db[u]);
+            den = pole * (den + heard[u]);
+        }
+        num = 0.0; den = 0.0;
+        for (int j = n - 1; j >= 0; --j)
+        {
+            const auto u = static_cast<size_t>(j);
+            upperSide[u] = den > 1e-9 ? num / den : db[u];
+            num = sidePole_[u] * (num + heard[u] * db[u]);
+            den = sidePole_[u] * (den + heard[u]);
+        }
+        const double k = static_cast<double>(contrastKnee_.load(std::memory_order_relaxed));
+        const auto bend = [k](double d) { return std::copysign(std::sqrt(d * d + k * k) - k, d); };
+        std::array<double, kBands> sum {}, count {};
+        for (int j = 0; j < nb_; ++j)
+        {
+            const auto u = static_cast<size_t>(j);
+            double asked = 0.0;
+            if (j < n && detailShare_[u] > 0.0)
+            {
+                const double dip = std::max(-kDipLimit, std::min(0.0, db[u] - std::min(lowerSide[u], upperSide[u])));
+                const double peak = std::max(0.0, db[u] - std::max(lowerSide[u], upperSide[u]));
+                // The edges of the range are a third of an octave wide here
+                // (one Bark would reach from 40 Hz to 90 Hz).
+                const double hz = out_.getCentre(j);
+                const double inside = std::clamp(3.0 * std::log2(hz / lo) + 0.5, 0.0, 1.0)
+                                    * std::clamp(3.0 * std::log2(hi / hz) + 0.5, 0.0, 1.0);
+                asked = detailShare_[u] * inside * heard[u]
+                      * std::clamp(-trimPeaks * bend(peak) - fillDips * bend(dip), -range, range);
+            }
+            detailGain_[u] = asked + detailGlide_ * (detailGain_[u] - asked);
+            const auto closest = static_cast<size_t>(modelNearest_[u]);
+            sum[closest] += detailGain_[u];
+            count[closest] += 1.0;
+        }
+        for (int b = 0; b < kBands; ++b)
+        {
+            const auto i = static_cast<size_t>(b);
+            detailMean_[i] = count[i] > 0.0 ? sum[i] / count[i] : 0.0;
+        }
+    }
+
+    static constexpr double kBellBands = 3.0;          ///< Width of a bell of the bank in bands, where that is under a critical band.
+    static constexpr double kLongLookSeconds = 0.34;   ///< Length of the long look.
+    static constexpr double kLongLookRate = 5000.0;    ///< Lowest rate the long look runs at.
+    static constexpr double kDetailHz = 500.0;         ///< Under it the local contrast is the long look's; an octave over it, the model's.
+    static constexpr double kSideOctaves = 0.5;        ///< Reach of the two sides a band is read against in the low end.
+    static constexpr double kDipLimit = 18.0;          ///< Deepest dip the long look reads: past it a band is empty rather than low.
+    static constexpr double kDetailGlideSeconds = 0.1; ///< Glide of what the detail asks.
     static constexpr double kAudibleSpan = 10.0;  ///< dB over the threshold in quiet from which a band counts in full.
     static constexpr double kMaskedSpan = 10.0;   ///< dB over the floor from which a band counts in full for the balance.
     static constexpr double kSidePole = 0.9;      ///< Pole of the one-sided averages a dip or a peak is read against.
@@ -843,7 +1144,7 @@ private:
     std::atomic<bool> qualityFollowsRender_ { false }, offlineRendering_ { false };
     bool render_ = false;   ///< The quality the last prepare() took (audio thread).
     std::atomic<T> responseMs_ { T(60) }, listening_ { T(0) };
-    std::array<std::atomic<T>, kBands> published_ {};
+    std::array<std::atomic<T>, kMaxBands> published_ {};
     std::atomic<T> loudnessChange_ { T(0) }, raised_ { T(0) }, lowered_ { T(0) }, total_ { T(-200) }, centroidShift_ { T(0) };
     std::atomic<T> rangeKnee_ { T(0) }, floor_ { T(30) };
 
@@ -859,6 +1160,24 @@ private:
     std::vector<std::vector<T>> delay_;
     std::vector<double> ll_, rr_, lr_, li_, loud_, evenLoud_, corr_, tmpA_, tmpB_, tmpC_, tmpD_;
     std::array<double, kBands> timeCoeff_ {}, briefCoeff_ {};
+
+    // The bands of the bank, and the long look at the low end.
+    AuditoryBands<double> out_, long_;
+    int nb_ = kBands, detailBands_ = 0;
+    std::atomic<int> numBands_ { kBands };
+    bool detailed_ = false, longWarm_ = false;
+    std::atomic<Detail> detail_ { Detail::Fine }, detailInUse_ { Detail::Fine };
+    std::atomic<T> contrastKnee_ { T(1.5) };
+    std::unique_ptr<Oversampling<double, kMaxChannels>> decimator_;
+    std::unique_ptr<FFTReal<double>> longTransform_;
+    std::vector<double> longWindow_, longFrame_, longSpectrum_, longBinPower_, longBandPower_;
+    std::vector<std::vector<double>> longRing_, longChunk_;
+    std::array<double, kMaxBands> longPower_ {}, longCoeff_ {}, perOctave_ {}, perThirdBark_ {}, sidePole_ {};
+    std::array<double, kMaxBands> detailShare_ {}, detailGain_ {}, modelPart_ {};
+    std::array<int, kMaxBands> modelBand_ {}, modelNearest_ {};
+    std::array<double, kBands> modelShare_ {}, detailMean_ {};
+    double longScale_ = 1.0, detailGlide_ = 0.0;
+    int longFactor_ = 1, longFft_ = 0, longBins_ = 0, longEvery_ = 4, longPos_ = 0, longCount_ = 0, longPhase_ = 0;
 };
 
 } // namespace dspark

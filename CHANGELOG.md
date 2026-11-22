@@ -6,6 +6,15 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TonalBalance::setDetail()` (`Auditory`, `Fine` by default, `Finest`;
+  applied at the next `prepare()`), `setContrastKnee()` and `getNumBands()`.
+  `getCorrection()` and `getBandCentre()` now index the bands of the bank
+  (72, 87 or 122): loop over `getNumBands()` rather than `kBands`, which
+  stays the number of bands of the loudness model. A saved state without a
+  detail reads as `Fine`; `Auditory` gives the corrections of before.
+- `AuditoryBands::prepareDetailed()` (no band wider than a fraction of an
+  octave), `prepareLike()` (the same bands over another transform) and
+  `getWidthBark()`; `GraphicBank::prepare()` takes the width of each bell.
 - `Compressor`: three stages between the ballistics and the gain, all off by
   default. `setReleaseLanding(ms)` makes the last decibels of a release come
   back slowly: the gain that is heard takes every deeper reduction at once
@@ -3048,6 +3057,23 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
+- `TonalBalance`: the low end took one broad cut. Three bands 30 Hz wide
+  covered 20 to 100 Hz and the analysis could not tell 50 Hz from 70 Hz, so
+  a hole between two lumps was cut as deep as the lumps. Under 500 Hz the
+  dips and peaks are now read by a look of a third of a second in bands a
+  sixth of an octave wide (14 under 100 Hz); the balance still goes by the
+  auditory model. With lumps of +9 dB at 45 and 120 Hz and a hole of -9 dB
+  at 70 Hz, at the defaults, the audio that comes out moves by -1.09, -1.55
+  and +0.80 dB there, where it moved by -0.20, -1.50 and -0.33. Pink noise
+  is left within 0.2 dB. The detail costs 23 to 26 % more than before
+  (934 against 744 ns per stereo frame on one runner) and no latency.
+- `AlgorithmicReverb`: a band of the wet equalizer on the move advanced once
+  per block of the host, so its glide stepped and the output depended on the
+  block size (0.34 of full scale between blocks of 64 and of 1024 as a band
+  went from +18 to -18 dB; now none).
+- DSParkLab: the spectrum resolves 3 Hz in place of 12, and the Quality and
+  Detail controls of the spectral effects take effect when they are moved
+  (they waited for a reload, which put them back at their defaults).
 - `Compressor`: the measures of `setProgramRelease()` and
   `setAttackEmphasis()` had fixed windows (1.5 s and 30 ms), so "sustained"
   and "the leading edge" meant different things at different settings: with

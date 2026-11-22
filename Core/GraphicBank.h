@@ -83,8 +83,13 @@ public:
      * @param channels   Channels to run.
      * @param qScale     The bells' Q is the centre over the critical bandwidth
      *                   there, times this (0.25 to 8).
+     * @param widthsHz   Width of each bell in hertz, in place of the critical
+     *                   bandwidth (bands closer together than a third of a
+     *                   critical band need bells that narrow with them);
+     *                   nullptr, the default, keeps the critical bandwidth.
      */
-    void prepare(double sampleRate, const double* centresHz, int bands, int channels, double qScale = 1.0)
+    void prepare(double sampleRate, const double* centresHz, int bands, int channels, double qScale = 1.0,
+                 const double* widthsHz = nullptr)
     {
         if (!std::isfinite(sampleRate) || !(sampleRate > 0.0) || centresHz == nullptr || bands < 2) return;
         fs_ = sampleRate;
@@ -99,7 +104,9 @@ public:
             centre_[static_cast<size_t>(s)] = f;
             const double w = 2.0 * 3.141592653589793 * f / fs_;
             cw_[static_cast<size_t>(s)] = std::cos(w);
-            const double q = s == 0 || s == nb_ - 1 ? 0.0 : qs * f / AuditoryScale::criticalBandwidth(f);
+            const double width = widthsHz != nullptr && std::isfinite(widthsHz[s]) && widthsHz[s] > 0.0
+                               ? widthsHz[s] : AuditoryScale::criticalBandwidth(f);
+            const double q = s == 0 || s == nb_ - 1 ? 0.0 : qs * f / width;
             alpha_[static_cast<size_t>(s)] = (s == 0 || s == nb_ - 1) ? std::sin(w) * 0.7071067811865476
                                                                       : std::sin(w) / (2.0 * q);
         }

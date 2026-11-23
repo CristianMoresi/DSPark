@@ -691,12 +691,8 @@ public:
         std::atomic_thread_fence(std::memory_order_release);
         const bool one = linked_ || std::min(channels, channels_) < 2;
         playedOne_.store(one, std::memory_order_relaxed);
-        for (int ch = 0; ch < (one ? 1 : 2); ++ch)
-        {
-            const auto u = static_cast<std::size_t>(ch);
-            handOver(low_.getKeptKernel(ch), playedLow_[u], playedLowFlat_[u]);
-            handOver(high_.getKeptKernel(ch), playedHigh_[u], playedHighFlat_[u]);
-        }
+        handOverChannel<0>();
+        if (!one) handOverChannel<1>();
         playedVersion_.store(version + 2u, std::memory_order_release);
     }
 
@@ -1243,6 +1239,15 @@ private:
         flat.store(kernel == nullptr, std::memory_order_relaxed);
         if (kernel == nullptr) return;
         for (std::size_t i = 0; i < to.size(); ++i) to[i].store(static_cast<float>(kernel[i]), std::memory_order_relaxed);
+    }
+
+    /// A channel's kernels of both parts into what a display reads.
+    template <std::size_t Channel>
+    void handOverChannel() noexcept
+    {
+        static_assert(Channel < 2);
+        handOver(low_.getKeptKernel(static_cast<int>(Channel)), playedLow_[Channel], playedLowFlat_[Channel]);
+        handOver(high_.getKeptKernel(static_cast<int>(Channel)), playedHigh_[Channel], playedHighFlat_[Channel]);
     }
 
     /// The response of the kernels last handed over, into played_, if they are new.

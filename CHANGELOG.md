@@ -6,6 +6,17 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Compressor::setMidSideFocus()` (-1 to 1, 0 by default): in
+  `Route::MidSide`, how the compression leans to the middle or to the
+  sides, without changing route. Toward -1 the sides take less of their
+  reduction and makeup (in decibels, scaled by 1 + focus), at -1 only the
+  middle is compressed; toward 1 the same for the middle. The detectors and
+  the gain loop stay those of the route and the weights move sample by
+  sample across each block, so a sweep has no step: the sides' largest
+  second difference over a sweep from -1 to 0 is the tone's own (6.2e-4).
+  With both parts 12 dB over the threshold and linked, the sides lose 9.03,
+  4.52 and 0.00 dB at 0, -0.5 and -1; sides alone at -1 come out as they
+  went in, to the bit. State key `midSideFocus`.
 - `AlgorithmicReverb::setAirAbsorption()` (opt-in, 0 to 2, the network
   types): the air inside the tank, on top of the walls. The walls'
   absorption is a shelf, so above the high crossover every frequency

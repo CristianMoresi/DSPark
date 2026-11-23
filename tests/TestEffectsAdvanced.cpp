@@ -12057,3 +12057,84 @@ DSPARK_TEST(CrossoverFilter_topology_change_glides)
         }
     }
 }
+
+// The air's absorption: the very top of the tail goes sooner and keeps
+// falling over 8 kHz, the middle stays, the wet level is kept; at 0 nothing
+// changes, to the bit, and the springs keep their own.
+DSPARK_TEST(AlgoReverb_air_absorption_takes_the_top_sooner)
+{
+    const double fs = 48000.0;
+    const auto hall = [&](float air, float reset) {
+        ARevF rev;
+        algoReverbLateHall(rev, fs);
+        rev.setDecay(2.5f);
+        rev.setHighDecayMultiplier(0.4f);
+        rev.setHighCrossover(5000.0f);
+        rev.setAirAbsorption(air);
+        if (reset >= 0.0f) rev.setAirAbsorption(reset);
+        std::vector<float> right;
+        auto left = algoReverbIR(rev, fs, 5.0, false, &right);
+        return std::pair { std::move(left), std::move(right) };
+    };
+    const auto t60 = [&](const auto& lr, double band) {
+        return 0.5 * (algoReverbT60(lr.first, fs, band) + algoReverbT60(lr.second, fs, band));
+    };
+    const auto off = hall(0.0f, -1.0f), on = hall(1.0f, -1.0f);
+    for (const double band : { 1000.0, 4000.0, 8000.0, 16000.0 })
+        std::printf("    %5.0f Hz: T60 %.2f -> %.2f s with the air%c", band, t60(off, band), t60(on, band), 10);
+    EXPECT_LT(t60(on, 16000.0), 0.5 * t60(off, 16000.0));
+    EXPECT_LT(t60(on, 16000.0) / t60(on, 8000.0), 0.7);    // the top keeps falling
+    EXPECT_GT(t60(off, 16000.0) / t60(off, 8000.0), 0.75); // without it, a plateau
+    EXPECT_LT(t60(on, 8000.0), 0.8 * t60(off, 8000.0));
+    EXPECT_NEAR(t60(on, 1000.0) / t60(off, 1000.0), 1.0, 0.08);
+
+    // Back to 0: the same response as never set, to the bit.
+    const auto back = hall(1.0f, 0.0f);
+    EXPECT_TRUE(back.first == off.first && back.second == off.second);
+
+    // The wet level of pink noise held within half a decibel.
+    const auto pinkWet = [&](float air) {
+        ARevF rev;
+        algoReverbLateHall(rev, fs);
+        rev.setDecay(2.5f);
+        rev.setHighDecayMultiplier(0.4f);
+        rev.setAirAbsorption(air);
+        std::mt19937 rng(21);
+        std::normal_distribution<double> g(0.0, 0.1);
+        double b0 = 0, b1 = 0, b2 = 0, e = 0.0;
+        auto tb = makeBuffer(2, 256);
+        for (int blk = 0; blk < static_cast<int>(6.0 * fs) / 256; ++blk)
+        {
+            for (int i = 0; i < 256; ++i)
+            {
+                const double w = g(rng);
+                b0 = 0.99765 * b0 + w * 0.0990460;
+                b1 = 0.96300 * b1 + w * 0.2965164;
+                b2 = 0.57000 * b2 + w * 1.0526913;
+                const float p = static_cast<float>(b0 + b1 + b2 + w * 0.1848);
+                tb.ch(0)[i] = p;
+                tb.ch(1)[i] = p;
+            }
+            rev.processBlock(tb.view());
+            if (blk * 256 > static_cast<int>(2.0 * fs))
+                for (int i = 0; i < 256; ++i) e += static_cast<double>(tb.ch(0)[i]) * tb.ch(0)[i];
+        }
+        return 10.0 * std::log10(e);
+    };
+    const double levelChange = pinkWet(1.0f) - pinkWet(0.0f);
+    std::printf("    pink noise, wet level with the air %+.2f dB%c", levelChange, 10);
+    EXPECT_NEAR(levelChange, 0.0, 0.5);
+
+    // The springs keep their own absorption.
+    const auto spring = [&](float air) {
+        ARevF rev;
+        rev.prepare(spec(fs, 256, 2));
+        rev.setType(ARevF::Type::Spring);
+        rev.setMix(1.0f);
+        rev.setAirAbsorption(air);
+        auto w = makeBuffer(2, 64);
+        rev.processBlock(w.view());
+        return algoReverbIR(rev, fs, 1.0);
+    };
+    EXPECT_TRUE(spring(1.0f) == spring(0.0f));
+}

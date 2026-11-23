@@ -449,8 +449,8 @@ DSPARK_TEST(State_multiband_nested_blobs)
 // tone and oversampler band, the crossover's topology (alone and in the
 // multiband effects), the clipper's oversampler band, the chorus's taps,
 // tone, circuit and mix rule, the reverb's band limit, second slope, wet
-// equalizer loudness and plate tank, the equalizer's loudness and the tape's
-// alignment.
+// equalizer loudness, plate tank and air, the equalizer's loudness and the
+// tape's alignment.
 DSPARK_TEST(State_roundtrip_later_settings)
 {
     roundTripReads<Compressor<float>>(
@@ -501,12 +501,13 @@ DSPARK_TEST(State_roundtrip_later_settings)
             EXPECT_TRUE((c.getMixRule() == DryWetMixer<float>::MixRule::FullDryToHalf));
         });
     roundTripReads<AlgorithmicReverb<float>>(
-        [](auto& r) { r.setBandLimit(11000.0f); r.setDoubleSlope(0.7f); r.setPostEqLoudness(true); r.setPlateTank(true); },
+        [](auto& r) { r.setBandLimit(11000.0f); r.setDoubleSlope(0.7f); r.setPostEqLoudness(true); r.setPlateTank(true); r.setAirAbsorption(0.8f); },
         [](auto& r) {
             EXPECT_NEAR(r.getBandLimit(), 11000.0f, 1e-2f);
             EXPECT_NEAR(r.getDoubleSlope(), 0.7f, 1e-6f);
             EXPECT_TRUE(r.getPostEqLoudness());
             EXPECT_TRUE(r.isPlateTank());
+            EXPECT_NEAR(r.getAirAbsorption(), 0.8f, 1e-6f);
         });
     roundTripReads<Equalizer<float>>(
         [](auto& e) { e.setLoudnessCompensation(true); },

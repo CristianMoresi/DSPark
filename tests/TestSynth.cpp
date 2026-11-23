@@ -1525,3 +1525,99 @@ DSPARK_TEST(Synth_lfo_source_reaches_lfo_rate)
         cycles += (periods[i - 1] < mean && periods[i] >= mean) ? 1 : 0;
     EXPECT_NEAR(static_cast<double>(cycles), 20.0, 2.0);
 }
+
+// The Steps shape: held and gliding steps exact, random steps drawn per
+// cycle from the seed and always away from the step before, the swing, the
+// grid, any cycle read alike whatever was read before it, and a retrigger
+// that glides instead of stepping.
+DSPARK_TEST(Lfo_steps_glide_draw_swing_and_retrigger)
+{
+    using L = Lfo<double>;
+    L lfo;
+    lfo.prepare(48000.0);
+    lfo.setShape(L::Shape::Steps);
+    lfo.setNumSteps(4);
+    lfo.setStep(0, -0.5);
+    lfo.setStep(1, 0.5, 0.5);         // glides over its first half
+    lfo.setStep(2, 1.0, 1.0, 1.0);    // over all of it, fast start
+    lfo.setStep(3, 0.0);
+    // Held, and the straight glide of step 1 (0.25..0.5 of the cycle).
+    EXPECT_NEAR(lfo.stepsAt(0.1), -0.5, 1e-12);
+    EXPECT_NEAR(lfo.stepsAt(0.25), -0.5, 1e-12);
+    EXPECT_NEAR(lfo.stepsAt(0.25 + 0.0625), 0.0, 1e-12);   // halfway through its glide
+    EXPECT_NEAR(lfo.stepsAt(0.40), 0.5, 1e-12);
+    // The curved glide of step 2: above the straight line, then on the value.
+    EXPECT_GT(lfo.stepsAt(0.5 + 0.0625), 0.5 + 0.5 * 0.25);
+    EXPECT_NEAR(lfo.stepsAt(0.75 - 1e-12), 1.0, 1e-6);
+    // The first step of the next cycle comes from the last of this one.
+    EXPECT_NEAR(lfo.stepsAt(1.1), -0.5, 1e-12);
+
+    // Random steps: drawn per cycle, repeatable per seed, away from the step before.
+    lfo.setSeed(11);
+    lfo.setStep(1, 0.5);              // no glides: read at the middle of each step
+    lfo.setStep(2, 1.0);
+    for (int s = 0; s < 4; ++s) lfo.setStepRandom(s, s != 3);
+    std::vector<double> first;
+    for (int c = 0; c < 400; ++c)
+        for (int s = 0; s < 4; ++s)
+        {
+            const double v = lfo.stepsAt(c + (s + 0.5) / 4.0);
+            first.push_back(v);
+            const double before = s == 0 ? 0.0 : first[first.size() - 2];   // step 3 is set to 0
+            const double room = before < 0.0 ? 1.0 - before : before + 1.0;
+            if (s != 3) EXPECT_GT(std::abs(v - before), 0.25 * room - 1e-9);
+            EXPECT_TRUE(v >= -1.0 && v <= 1.0);
+        }
+    EXPECT_NE(first[0], first[4]);
+    // Read backwards, or by another instance with the same seed, every cycle
+    // is the same.
+    L other = lfo;
+    for (int c = 399; c >= 0; --c)
+        for (int s = 0; s < 4; ++s)
+            EXPECT_EQ(other.stepsAt(c + (s + 0.5) / 4.0), first[static_cast<size_t>(c * 4 + s)]);
+    other.setSeed(12);
+    EXPECT_NE(other.stepsAt(0.125), first[0]);
+
+    // The grid.
+    lfo.setStepQuantize(12);
+    for (int c = 0; c < 50; ++c)
+    {
+        const double v = lfo.stepsAt(c + 0.125) * 12.0;
+        EXPECT_NEAR(v, std::round(v), 1e-9);
+    }
+    lfo.setStepQuantize(0);
+
+    // The swing: at 0.5 the first step of a pair lasts 1.25 steps.
+    L sw;
+    sw.prepare(48000.0);
+    sw.setShape(L::Shape::Steps);
+    sw.setNumSteps(4);
+    sw.setStep(0, 1.0);
+    sw.setStep(1, -1.0);
+    sw.setStepSwing(0.5);
+    EXPECT_NEAR(sw.stepsAt(0.30), 1.0, 1e-12);    // past a plain step boundary (0.25), before 0.3125
+    EXPECT_NEAR(sw.stepsAt(0.32), -1.0, 1e-12);
+
+    // A retrigger glides from where the output was over the glide time.
+    L rt;
+    rt.prepare(48000.0);
+    rt.setShape(L::Shape::Steps);
+    rt.setNumSteps(2);
+    rt.setStep(0, -1.0);
+    rt.setStep(1, 1.0);
+    rt.setRateHz(2.0);
+    rt.setRetriggerGlideMs(2.0);
+    rt.reset();
+    for (int i = 0; i < 18000; ++i) (void)rt.advance();   // in step 1, at +1
+    double last = rt.value();
+    rt.reset();                                          // back to step 0, at -1
+    double maxStep = 0.0;
+    for (int i = 0; i < 200; ++i)
+    {
+        const double v = rt.advance();
+        maxStep = std::max(maxStep, std::abs(v - last));
+        last = v;
+    }
+    EXPECT_NEAR(last, -1.0, 1e-12);
+    EXPECT_LT(maxStep, 2.0 / 96.0 + 1e-9);   // 2 over 96 samples, no jump
+}

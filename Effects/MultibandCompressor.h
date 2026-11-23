@@ -173,11 +173,11 @@ public:
     /**
      * @brief Sets the number of active frequency bands.
      *
-     * Safe from any thread. A live change applies instantly (audible click)
-     * and re-initialises ALL split frequencies to the crossover's log-spaced
-     * defaults - reapply custom frequencies afterwards (see
-     * CrossoverFilter::setNumBands). Compressors of newly enabled bands are
-     * reset on the audio thread so they start clean.
+     * Safe from any thread. A live change fades over (see
+     * CrossoverFilter::setNumBands) and re-initialises ALL split frequencies
+     * to the crossover's log-spaced defaults - reapply custom frequencies
+     * afterwards, or use setNumBandsKeepingSplits(). Compressors of newly
+     * enabled bands are reset on the audio thread so they start clean.
      *
      * @param n Number of bands (clamped between 2 and MaxBands - a crossover
      *          needs at least one split point).
@@ -185,6 +185,16 @@ public:
     void setNumBands(int n) noexcept
     {
         crossover_.setNumBands(std::clamp(n, 2, MaxBands));
+    }
+
+    /**
+     * @brief Sets the number of active bands keeping the split frequencies
+     *        (see CrossoverFilter::setNumBandsKeepingSplits()). Safe from any thread.
+     * @param n Number of bands (clamped between 2 and MaxBands).
+     */
+    void setNumBandsKeepingSplits(int n) noexcept
+    {
+        crossover_.setNumBandsKeepingSplits(std::clamp(n, 2, MaxBands));
     }
 
     /**

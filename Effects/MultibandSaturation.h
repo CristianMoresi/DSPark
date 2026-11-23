@@ -170,8 +170,10 @@ public:
 
     // -- Crossover -------------------------------------------------------------
 
-    /** @brief Number of bands (2..MaxBands; any thread; re-spaces the split frequencies). */
+    /** @brief Number of bands (2..MaxBands; any thread; re-spaces the split frequencies; a live change fades, see CrossoverFilter::setNumBands()). */
     void setNumBands(int n) noexcept { crossover_.setNumBands(std::clamp(n, 2, MaxBands)); }
+    /** @brief Number of bands keeping the split frequencies (any thread; see CrossoverFilter::setNumBandsKeepingSplits()). */
+    void setNumBandsKeepingSplits(int n) noexcept { crossover_.setNumBandsKeepingSplits(std::clamp(n, 2, MaxBands)); }
     /** @brief Sets a split frequency (any thread). */
     void setCrossoverFrequency(int index, T hz) noexcept { crossover_.setCrossoverFrequency(index, hz); }
     /** @brief Slope of the crossover in dB per octave (any thread; see CrossoverFilter::setOrder()). */

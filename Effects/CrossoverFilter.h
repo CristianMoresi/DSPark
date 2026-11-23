@@ -62,7 +62,16 @@
  * whole, so the bands always come from one design and keep summing to the
  * delayed input (until a band-count change lands, the playing design's
  * bands are kept, missing ones silent and extra ones folded into the last
- * requested band). The design runs in small steps (the long inverse
+ * requested band). The first partition on a new design also runs the
+ * previous one, and each band goes from the previous design to the new
+ * along it (a linear ramp of one partition, 10.7 ms at 48 kHz; a band the
+ * previous design did not have rises from silence): no band steps from one
+ * design to the other. With a 1 kHz tone and a split moved from 500 Hz to
+ * 2 kHz, band 0's largest step between samples is the one of its new steady
+ * state (0.061 at 0.5 of amplitude; a swap in one sample jumped 0.380). That
+ * partition does the convolution twice: with a split moving every 200 ms,
+ * 12 bands in stereo at 64-sample blocks cost 4 % more on average and no
+ * more in the worst block. The design runs in small steps (the long inverse
  * transform is split into its passes) at a fixed share of the stereo steady
  * work per sample, so the time a change takes to land depends neither on the
  * host block size nor on the channel count. A change that arrives during a
@@ -253,6 +262,15 @@ public:
         ladderTmp_.assign(static_cast<size_t>(spec.maxBlockSize), 0.0);
         ladderActive_ = false;
 
+        // A change of the band count in the minimum-phase engine: both
+        // topologies run for kFadeSeconds and the bands go from one to the
+        // other, a chunk at a time through this scratch.
+        fadeLength_ = std::max(1, static_cast<int>(std::lround(kFadeSeconds * spec.sampleRate)));
+        fadeBands_.assign(static_cast<size_t>(MaxBands * numChannels_ * kFadeChunk), T(0));
+        fadeLower_.assign(static_cast<size_t>(MaxBands * numChannels_ * kFadeChunk), T(0));
+        fadeTop_.assign(static_cast<size_t>(numChannels_ * kFadeChunk), T(0));
+        lpFadeOld_.assign(static_cast<size_t>(MaxBands) * static_cast<size_t>(lpPart_), T(0));
+
         // Re-sync smoothers to the CURRENT targets. prepare() used to reset
         // all split frequencies to the log-spaced defaults, silently discarding
         // any configuration made before prepare().
@@ -265,7 +283,6 @@ public:
             frequencies_[i] = target;
         }
 
-        lastNumSplits_ = 0;
         lastMode_ = filterMode_.load(std::memory_order_relaxed);
         dirty_.store(true, std::memory_order_relaxed);
         // The first design is built whole here (setup thread); later changes
@@ -379,12 +396,20 @@ public:
         if (nS <= 0) return 0;
 
         if (lpActive)
+        {
             processLinearPhase(input, bandOutputs, n, nS, nCh);
-        else
-            processIIR(input, bandOutputs, n, nS, nCh);
+            passExtraChannels(input, bandOutputs, n, nS, nCh);
+            return n;
+        }
 
-        passExtraChannels(input, bandOutputs, n, nS, nCh);
-        return n;
+        // The minimum-phase engine changes its band count over a fade (a
+        // change that arrives during one waits for it to end).
+        if (iirBands_ == 0) iirBands_ = n;
+        else if (fadeLeft_ == 0 && n != iirBands_) startBandFade(n);
+        const int written = std::min(iirBands_, numOutputBands);
+        processIIR(input, bandOutputs, written, nS, nCh);
+        passExtraChannels(input, bandOutputs, written, nS, nCh);
+        return written;
     }
 
     // -- Configuration -------------------------------------------------------
@@ -394,12 +419,49 @@ public:
      *
      * @note Changing the band count re-initialises ALL split frequencies to
      *       log-spaced defaults (100 Hz .. 10 kHz); reapply custom frequencies
-     *       afterwards. A live topology change is applied instantly (click).
+     *       afterwards, or use setNumBandsKeepingSplits(). A live change goes
+     *       over without a step: in the minimum-phase engine the old and the
+     *       new topology run together for 20 ms and the bands move from one
+     *       to the other (a band that leaves folds into the new top band, one
+     *       that comes in rises from silence), so the band sum moves from one
+     *       allpass to the other; in the linear-phase engine the new design
+     *       comes in over a partition (see the file notes). Measured at LR24
+     *       with tones at 100 Hz, 3 kHz and 9 kHz, 3 to 4 bands: band 0's
+     *       largest step 0.0050 against 0.0049 steady (0.072 when the change
+     *       took one sample), the new top band's 0.187 against 0.184.
      */
     void setNumBands(int n) noexcept
     {
         numBands_.store(std::clamp(n, 2, MaxBands), std::memory_order_relaxed);
         initDefaultFrequencies();
+        dirty_.store(true, std::memory_order_release);
+        lpMagDirty_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Sets the number of output bands (2..MaxBands) and keeps the splits.
+     *
+     * The split frequencies do not depend on the band count: the count only
+     * says how many of the splits are used. A split that stays keeps its
+     * frequency (and, in the minimum-phase engine, its memory); a split
+     * that comes back takes the frequency it had, or, when that is not
+     * above the split below it, the point halfway in octaves between that
+     * split and 20 kHz. The change itself goes over as setNumBands()
+     * describes. Thread-safe.
+     */
+    void setNumBandsKeepingSplits(int n) noexcept
+    {
+        const int bands = std::clamp(n, 2, MaxBands);
+        for (int s = 1; s < bands - 1; ++s)
+        {
+            const T below = targetFrequencies_[static_cast<size_t>(s - 1)].load(std::memory_order_relaxed);
+            const T at = targetFrequencies_[static_cast<size_t>(s)].load(std::memory_order_relaxed);
+            if (!(at > below))
+                targetFrequencies_[static_cast<size_t>(s)].store(
+                    std::sqrt(std::max(below, T(1)) * T(20000)), std::memory_order_relaxed);
+        }
+        numBands_.store(bands, std::memory_order_relaxed);
+        freqUpdatePending_.store(true, std::memory_order_release);
         dirty_.store(true, std::memory_order_release);
         lpMagDirty_.store(true, std::memory_order_release);
     }
@@ -569,7 +631,11 @@ public:
         lpTaskUnits_ = 0;
         lpTaskDone_ = 0.0;
         lpTaskTotal_ = 0.0;
+        lpLaunchedSet_ = -1;
+        lpTaskFadeSet_ = -1;
         glideRemain_ = 0;
+        iirBands_ = 0;
+        fadeLeft_ = 0;
     }
 
 
@@ -631,6 +697,8 @@ private:
                       && (kLpRingBlocks & (kLpRingBlocks - 1)) == 0,
                   "the input history must hold the residual delay and the staged block");
     static constexpr int kGlideGrid = 32;           ///< IIR coefficient refresh grid during a glide (samples).
+    static constexpr double kFadeSeconds = 0.02;    ///< A band-count change in the minimum-phase engine.
+    static constexpr int kFadeChunk = 64;           ///< Samples per pass of that fade.
     // Linear-phase cost model, in units of one complex multiply-accumulate
     // bin (about 0.2 ns on a desktop core with AVX2). It weighs the steps of
     // a partition's work (spread over the partition) and of a design (paced
@@ -722,30 +790,9 @@ private:
         int numSplits = numBands_.load(std::memory_order_relaxed) - 1;
         double sr = spec_.sampleRate;
 
-        // Splits (and their allpass chains) re-activated by a band count
-        // increase would otherwise replay arbitrarily old filter history.
-        if (numSplits > lastNumSplits_)
-        {
-            for (int s = lastNumSplits_; s < numSplits; ++s)
-            {
-                splits_[s].lp.reset();
-                splits_[s].hp.reset();
-                for (int b = 0; b < s; ++b)
-                    allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.reset();
-                if (!ladders_.empty())
-                {
-                    for (int st = 0; st < kMaxStagesPerFilter; ++st)
-                    {
-                        ladders_[static_cast<size_t>(ladderLow(s, st))].reset();
-                        ladders_[static_cast<size_t>(ladderHigh(s, st))].reset();
-                    }
-                    for (int b = 0; b < s; ++b)
-                        for (int st = 0; st < 2; ++st)
-                            ladders_[static_cast<size_t>(ladderAllpass(b, s, st))].reset();
-                }
-            }
-        }
-        lastNumSplits_ = numSplits;
+        // Splits (and their allpass chains) that a band count increase brings
+        // back are reset where they come into the path (startBandFade()):
+        // a split still fading out keeps playing until then.
 
         // The phase-correction allpass per band/split must equal the allpass
         // that the split's LP/HP branches sum to: ONE first-order section for
@@ -978,12 +1025,165 @@ private:
                 glideRemain_ = kGlideGrid;
             }
             const int len = std::min(glideRemain_, nS - offset);
-            processIIRRange(input, outputs, numBands, nCh, offset, len);
+            processRange(input, outputs, numBands, nCh, offset, len);
             offset += len;
             glideRemain_ -= len;
         }
         if (offset < nS)
-            processIIRRange(input, outputs, numBands, nCh, offset, nS - offset);
+            processRange(input, outputs, numBands, nCh, offset, nS - offset);
+    }
+
+    /// A range of the minimum-phase engine: through the band fade while one runs.
+    void processRange(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nCh, int offset,
+                      int length) noexcept
+    {
+        while (fadeLeft_ > 0 && length > 0)
+        {
+            const int len = std::min({ length, fadeLeft_, kFadeChunk });
+            processFadeRange(input, outputs, numBands, nCh, offset, len);
+            fadeLeft_ -= len;
+            offset += len;
+            length -= len;
+        }
+        if (length > 0) processIIRRange(input, outputs, numBands, nCh, offset, length);
+    }
+
+    /// Starts the fade from the topology of iirBands_ bands to `bands`.
+    void startBandFade(int bands) noexcept
+    {
+        fadeFrom_ = iirBands_;
+        iirBands_ = bands;
+        fadeLeft_ = fadeLength_;
+        // The splits that come in, and the corrections of the bands below
+        // them, start from silence (their memory may be arbitrarily old).
+        for (int s = fadeFrom_ - 1; s < bands - 1; ++s)
+        {
+            splits_[static_cast<size_t>(s)].lp.reset();
+            splits_[static_cast<size_t>(s)].hp.reset();
+            for (int b = 0; b < s; ++b)
+                allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.reset();
+            if (!ladders_.empty())
+            {
+                for (int st = 0; st < kMaxStagesPerFilter; ++st)
+                {
+                    ladders_[static_cast<size_t>(ladderLow(s, st))].reset();
+                    ladders_[static_cast<size_t>(ladderHigh(s, st))].reset();
+                }
+                for (int b = 0; b < s; ++b)
+                    for (int st = 0; st < 2; ++st)
+                        ladders_[static_cast<size_t>(ladderAllpass(b, s, st))].reset();
+            }
+        }
+    }
+
+    /// Split `s` over `len` samples: its low branch from `work` into `low`, and `work` to its high branch.
+    void runSplit(int s, T* const* work, T* const* low, int nCh, int len) noexcept
+    {
+        if (ladderActive_)
+        {
+            const int perFilter = numStagesPerFilter_;
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                runLadders(work[ch], low[ch], len, ladderLow(s, 0), perFilter, ch);
+                runLadders(work[ch], work[ch], len, ladderHigh(s, 0), perFilter, ch);
+            }
+            advanceLadders(ladderLow(s, 0), perFilter, len);
+            advanceLadders(ladderHigh(s, 0), perFilter, len);
+            return;
+        }
+        for (int ch = 0; ch < nCh; ++ch) std::copy(work[ch], work[ch] + len, low[ch]);
+        splits_[static_cast<size_t>(s)].lp.processBlock(AudioBufferView<T>(low, nCh, len));
+        splits_[static_cast<size_t>(s)].hp.processBlock(AudioBufferView<T>(work, nCh, len));
+    }
+
+    /// The correction of band `b` for split `s`, in place over `len` samples.
+    void runAllpass(int b, int s, T* const* band, int nCh, int len) noexcept
+    {
+        if (ladderActive_)
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+                runLadders(band[ch], band[ch], len, ladderAllpass(b, s, 0), numStagesAllpass_, ch);
+            advanceLadders(ladderAllpass(b, s, 0), numStagesAllpass_, len);
+            return;
+        }
+        allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.processBlock(AudioBufferView<T>(band, nCh, len));
+    }
+
+    [[nodiscard]] T* fadeBandOf(std::vector<T>& scratch, int band, int ch) noexcept
+    {
+        return scratch.data()
+               + (static_cast<size_t>(band) * static_cast<size_t>(numChannels_) + static_cast<size_t>(ch))
+                     * static_cast<size_t>(kFadeChunk);
+    }
+
+    /**
+     * A chunk of the band fade. The larger topology runs whole; on the way
+     * the smaller one is read off it: its top band is what is left above its
+     * last split, its other bands are the larger topology's before the
+     * corrections of the splits it does not have. Each band then goes from
+     * the old topology's version to the new one's (a band beyond the smaller
+     * topology is silent in it; leaving, it folds into the top band).
+     */
+    void processFadeRange(AudioBufferView<T> input, AudioBufferView<T>* outputs, int numBands, int nCh,
+                          int offset, int len) noexcept
+    {
+        const int large = std::max(fadeFrom_, iirBands_);
+        const int small = std::min(fadeFrom_, iirBands_);
+        const bool adding = iirBands_ > fadeFrom_;
+        T* work[16] = {};
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            const T* src = input.getChannel(ch) + offset;
+            work[ch] = getWorkBufChannel(ch);
+            for (int i = 0; i < len; ++i) work[ch][i] = std::isfinite(src[i]) ? src[i] : T(0);
+        }
+        T* top[16] = {};
+        for (int ch = 0; ch < nCh; ++ch) top[ch] = fadeTop_.data() + static_cast<size_t>(ch) * kFadeChunk;
+        for (int s = 0; s < large - 1; ++s)
+        {
+            if (s == small - 1)
+                for (int ch = 0; ch < nCh; ++ch) std::copy(work[ch], work[ch] + len, top[ch]);
+            T* low[16] = {};
+            for (int ch = 0; ch < nCh; ++ch) low[ch] = fadeBandOf(fadeBands_, s, ch);
+            runSplit(s, work, low, nCh, len);
+        }
+        for (int ch = 0; ch < nCh; ++ch)
+            std::copy(work[ch], work[ch] + len, fadeBandOf(fadeBands_, large - 1, ch));
+        // The corrections, the smaller topology's lower bands read off
+        // before the first split it does not have (small - 1 <= large - 2).
+        for (int s = 1; s < large - 1; ++s)
+        {
+            if (s == small - 1)
+                for (int b = 0; b < small - 1; ++b)
+                    for (int ch = 0; ch < nCh; ++ch)
+                        std::copy_n(fadeBandOf(fadeBands_, b, ch), len, fadeBandOf(fadeLower_, b, ch));
+            for (int b = 0; b < s; ++b)
+            {
+                T* band[16] = {};
+                for (int ch = 0; ch < nCh; ++ch) band[ch] = fadeBandOf(fadeBands_, b, ch);
+                runAllpass(b, s, band, nCh, len);
+            }
+        }
+
+        // Each written band from the old version to the new one.
+        const T step = T(1) / static_cast<T>(fadeLength_);
+        const T start = static_cast<T>(fadeLength_ - fadeLeft_);
+        for (int b = 0; b < numBands; ++b)
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* out = outputs[b].getChannel(ch) + offset;
+                const T* lg = fadeBandOf(fadeBands_, b, ch);
+                const T* sm = b < small - 1 ? fadeBandOf(fadeLower_, b, ch) : b == small - 1 ? top[ch] : nullptr;
+                for (int i = 0; i < len; ++i)
+                {
+                    const T w = (start + static_cast<T>(i + 1)) * step;   // the new topology's share
+                    T inLarge = lg[i];
+                    if (!adding && b == small - 1)
+                        for (int k = b + 1; k < large; ++k) inLarge += fadeBandOf(fadeBands_, k, ch)[i];
+                    const T inSmall = sm != nullptr ? sm[i] : T(0);
+                    out[i] = adding ? inSmall + (inLarge - inSmall) * w : inLarge + (inSmall - inLarge) * w;
+                }
+            }
     }
 
     inline T* getWorkBufChannel(int ch) noexcept
@@ -1011,21 +1211,11 @@ private:
         // the reconstruction error back where the double memory removed it).
         T* work[16] = {};
         for (int ch = 0; ch < nCh; ++ch) work[ch] = getWorkBufChannel(ch);
-        if (ladderActive_)
-        {
-            processLadderRange(work, outputs, numBands, nCh, offset, blockLen);
-            return;
-        }
         for (int s = 0; s < numSplits; ++s)
         {
             T* low[16] = {};
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                low[ch] = outputs[s].getChannel(ch) + offset;
-                std::copy(work[ch], work[ch] + blockLen, low[ch]);
-            }
-            splits_[s].lp.processBlock(AudioBufferView<T>(low, nCh, blockLen));
-            splits_[s].hp.processBlock(AudioBufferView<T>(work, nCh, blockLen));
+            for (int ch = 0; ch < nCh; ++ch) low[ch] = outputs[s].getChannel(ch) + offset;
+            runSplit(s, work, low, nCh, blockLen);
         }
 
         for (int ch = 0; ch < nCh; ++ch)
@@ -1041,46 +1231,7 @@ private:
             {
                 T* band[16] = {};
                 for (int ch = 0; ch < nCh; ++ch) band[ch] = outputs[b].getChannel(ch) + offset;
-                allpassFlat_[static_cast<size_t>(b * kMaxSplits + s)].stages.processBlock(
-                    AudioBufferView<T>(band, nCh, blockLen));
-            }
-        }
-    }
-
-    /// processIIRRange() with the ladders: the same splits, residual and
-    /// phase correction, one channel after another through each filter.
-    void processLadderRange(T* const* work, AudioBufferView<T>* outputs, int numBands, int nCh, int offset,
-                            int blockLen) noexcept
-    {
-        const int numSplits = numBands - 1;
-        const int perFilter = numStagesPerFilter_;
-        for (int s = 0; s < numSplits; ++s)
-        {
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                runLadders(work[ch], outputs[s].getChannel(ch) + offset, blockLen, ladderLow(s, 0), perFilter, ch);
-                runLadders(work[ch], work[ch], blockLen, ladderHigh(s, 0), perFilter, ch);
-            }
-            advanceLadders(ladderLow(s, 0), perFilter, blockLen);
-            advanceLadders(ladderHigh(s, 0), perFilter, blockLen);
-        }
-
-        for (int ch = 0; ch < nCh; ++ch)
-        {
-            T* dst = outputs[numBands - 1].getChannel(ch) + offset;
-            std::copy(work[ch], work[ch] + blockLen, dst);
-        }
-
-        for (int s = 1; s < numSplits; ++s)
-        {
-            for (int b = 0; b < s; ++b)
-            {
-                for (int ch = 0; ch < nCh; ++ch)
-                {
-                    T* band = outputs[b].getChannel(ch) + offset;
-                    runLadders(band, band, blockLen, ladderAllpass(b, s, 0), numStagesAllpass_, ch);
-                }
-                advanceLadders(ladderAllpass(b, s, 0), numStagesAllpass_, blockLen);
+                runAllpass(b, s, band, nCh, blockLen);
             }
         }
     }
@@ -1339,6 +1490,9 @@ private:
             // The partition work in flight may still read the set the design
             // writes (right after a swap); the design then waits for it.
             if (lpDesignSet_ == lpTaskSet_ && lpTaskUnit_ < lpTaskUnits_) break;
+            // Nor the previous design while a fade from it is in flight or still to start.
+            if (lpDesignSet_ == lpTaskFadeSet_ && lpTaskUnit_ < lpTaskUnits_) break;
+            if (lpLaunchedSet_ >= 0 && lpLaunchedSet_ != lpActiveSet_ && lpDesignSet_ == lpLaunchedSet_) break;
             if (linearPhaseDesignStepCost() > lpDesignCredit_) break;
             lpDesignCredit_ -= linearPhaseDesignStep();
             if (!lpDesignActive_ && lpDesignRedo_) startLinearPhaseDesign();
@@ -1374,12 +1528,18 @@ private:
     /// then the residual band.
     [[nodiscard]] int lpUnitsPerChannel() const noexcept
     {
-        return 2 + (lpTaskBands_ - 1) * (kLpPartitions + 1);
+        const int fading = lpTaskFadeSet_ >= 0 ? lpTaskFadeBands_ - 1 : 0;
+        return 2 + (lpTaskBands_ - 1 + fading) * (kLpPartitions + 1);
     }
 
     /// Starts the work for the input partition just staged (ring block `block`).
     void launchLinearPhaseTask(int block) noexcept
     {
+        // The first partition on a new design also runs the previous one,
+        // and each band goes from that design to the new over the partition.
+        lpTaskFadeSet_ = (lpLaunchedSet_ >= 0 && lpLaunchedSet_ != lpActiveSet_) ? lpLaunchedSet_ : -1;
+        lpTaskFadeBands_ = lpTaskFadeSet_ >= 0 ? std::max(2, lpSetBands_[static_cast<size_t>(lpTaskFadeSet_)]) : 0;
+        lpLaunchedSet_ = lpActiveSet_;
         lpTaskSet_ = lpActiveSet_;
         lpTaskBands_ = std::max(2, lpSetBands_[static_cast<size_t>(lpActiveSet_)]);
         lpTaskBlock_ = block;
@@ -1388,6 +1548,11 @@ private:
         lpTaskUnits_ = numChannels_ * lpUnitsPerChannel();
         lpTaskDone_ = 0.0;
         lpTaskTotal_ = lpPartitionCost(lpTaskBands_, numChannels_, lpSetParts_[static_cast<size_t>(lpActiveSet_)]);
+        if (lpTaskFadeSet_ >= 0)
+            lpTaskTotal_ += static_cast<double>(numChannels_)
+                            * (static_cast<double>(lpSetParts_[static_cast<size_t>(lpTaskFadeSet_)]) * lpCostCma_
+                               + static_cast<double>(lpTaskFadeBands_ - 1) * lpCostIfft_
+                               + static_cast<double>(lpTaskFadeBands_ + lpTaskBands_) * lpCostResidualPerBand_);
     }
 
     /// Runs one unit of the partition work and returns its cost (units).
@@ -1413,33 +1578,70 @@ private:
         }
 
         const int conv = lpTaskBands_ - 1;
+        const int delayed = (lpTaskBlock_ + kLpRingBlocks - kLpPartitions / 2) & (kLpRingBlocks - 1);
+        const T* delayedInput = lpRingOf(ch) + static_cast<size_t>(delayed) * static_cast<size_t>(N);
         if (u == perCh - 1)
         {
+            if (lpTaskFadeSet_ >= 0) blendLinearPhaseFade(ch, next, delayedInput);
             // Residual band: the input delayed by the latency, minus the
             // convolved bands, so the bands sum to the delayed input exactly.
-            const int delayed = (lpTaskBlock_ + kLpRingBlocks - kLpPartitions / 2) & (kLpRingBlocks - 1);
             T* dst = lpOutOf(ch, next, conv);
-            std::copy_n(lpRingOf(ch) + static_cast<size_t>(delayed) * static_cast<size_t>(N), N, dst);
+            std::copy_n(delayedInput, N, dst);
             for (int b = 0; b < conv; ++b)
                 simd::addWithGainT(dst, lpOutOf(ch, next, b), T(-1), N); // exact: dst - src
             return static_cast<double>(lpTaskBands_) * lpCostResidualPerBand_;
         }
 
-        const int band = (u - 1) / (kLpPartitions + 1);
+        // The bands of the design (then, in a fade, those of the previous one).
+        int band = (u - 1) / (kLpPartitions + 1);
         const int step = (u - 1) - band * (kLpPartitions + 1);
+        const bool previous = band >= conv;
+        const int set = previous ? lpTaskFadeSet_ : lpTaskSet_;
+        if (previous) band -= conv;
         if (step < kLpPartitions)
         {
             if (step == 0) std::fill(lpAccum_.begin(), lpAccum_.end(), T(0));
-            if (lpPartOn_[static_cast<size_t>(lpTaskSet_ * kMaxSplits * kLpPartitions + band * kLpPartitions + step)] == 0)
+            if (lpPartOn_[static_cast<size_t>(set * kMaxSplits * kLpPartitions + band * kLpPartitions + step)] == 0)
                 return 0.0; // a dropped (negligible) partition
-            const T* kernel = lpKernelSet(lpTaskSet_) + static_cast<size_t>(band * kLpPartitions + step) * specLen;
+            const T* kernel = lpKernelSet(set) + static_cast<size_t>(band * kLpPartitions + step) * specLen;
             const int slot = (lpTaskFdl_ - step + kLpPartitions) % kLpPartitions;
             simd::complexMulAccum(lpAccum_.data(), fdl + static_cast<size_t>(slot) * specLen, kernel, N + 1);
             return lpCostCma_;
         }
         lpFft_->inverse(lpAccum_.data(), lpResult_.data());
-        std::copy_n(lpResult_.begin() + N, N, lpOutOf(ch, next, band));
+        T* to = previous ? lpFadeOld_.data() + static_cast<size_t>(band) * static_cast<size_t>(N) : lpOutOf(ch, next, band);
+        std::copy_n(lpResult_.begin() + N, N, to);
         return lpCostIfft_;
+    }
+
+    /**
+     * The fade of one channel's partition from the previous design to the
+     * new one. The previous design's bands (its residual made here) are
+     * read in the new band count: missing bands silent, extra ones folded
+     * into the last band. Each convolved band of the new design then moves
+     * from that version to its own along the partition; the residual made
+     * after this keeps the sum on the delayed input, exactly.
+     */
+    void blendLinearPhaseFade(int ch, int next, const T* delayedInput) noexcept
+    {
+        const int N = lpPart_;
+        const int before = lpTaskFadeBands_;
+        const int conv = lpTaskBands_ - 1;
+        auto old = [&](int b) { return lpFadeOld_.data() + static_cast<size_t>(b) * static_cast<size_t>(N); };
+        T* oldResidual = old(before - 1);
+        std::copy_n(delayedInput, N, oldResidual);
+        for (int b = 0; b < before - 1; ++b) simd::addWithGainT(oldResidual, old(b), T(-1), N);
+        const T invN = T(1) / static_cast<T>(N);
+        for (int b = 0; b < conv; ++b)
+        {
+            T* out = lpOutOf(ch, next, b);
+            const T* from = b < before ? old(b) : nullptr;
+            for (int i = 0; i < N; ++i)
+            {
+                const T was = from != nullptr ? from[i] : T(0);
+                out[i] = was + (out[i] - was) * (static_cast<T>(i + 1) * invN);
+            }
+        }
     }
 
     /// Runs the partition work in flight up to `staged` samples of its
@@ -1534,7 +1736,6 @@ private:
 
     int numStagesPerFilter_ = 2;
     int numStagesAllpass_ = 1;
-    int lastNumSplits_ = 0;
     FilterMode lastMode_ = FilterMode::MinimumPhase;
     std::array<SplitPoint, kMaxSplits> splits_ {};
 
@@ -1572,6 +1773,9 @@ private:
     int lpTaskUnits_ = 0;
     double lpTaskDone_ = 0.0;
     double lpTaskTotal_ = 0.0;
+    int lpLaunchedSet_ = -1;   // kernel set of the last partition work launched
+    int lpTaskFadeSet_ = -1;   // previous set the work in flight fades from (-1: none)
+    int lpTaskFadeBands_ = 0;
     // Cost model (units), set in prepare().
     double lpCostFft_ = 0.0, lpCostCma_ = 0.0, lpCostIfft_ = 0.0, lpCostResidualPerBand_ = 0.0;
     double lpCostMagChunk_ = 0.0, lpCostDesignFftStep_ = 0.0, lpCostPartitionStep_ = 0.0;
@@ -1589,6 +1793,12 @@ private:
     double lpDesignCredit_ = 0.0;
     double lpDesignRate_ = 0.0;   // design units per sample
     int glideRemain_ = 0;  // samples left in the current IIR glide segment
+    // The minimum-phase engine's band count and the fade of a change.
+    int iirBands_ = 0;     // bands of the topology heading to (0: none yet since a reset)
+    int fadeFrom_ = 0;     // bands of the topology fading out
+    int fadeLeft_ = 0;     // samples left of the fade
+    int fadeLength_ = 960;
+    std::vector<T> fadeBands_, fadeLower_, fadeTop_;   // [band][ch][kFadeChunk] scratch of the fade
     std::atomic<bool> lpMagDirty_ { true };
 
     std::vector<T> lpKernelSpec_;     // [set][(band * partitions + part) * specLen] kernel partition spectra
@@ -1597,6 +1807,7 @@ private:
     std::vector<T> lpRing_;           // [ch][ring block][lpPart_] input history
     std::vector<T> lpOut_;            // [((ch * 2 + buffer) * MaxBands + band) * lpPart_] output partitions
     std::vector<T> lpAccum_, lpResult_, lpScratch_;
+    std::vector<T> lpFadeOld_;        // [band][lpPart_] one channel's previous-design bands in a fade
     std::vector<double> lpCarry_;     // [bin] product of the high-passes below the band being designed
     std::vector<double> lpBinFreq_;   // [bin] design grid frequencies
     std::vector<T> lpMag_;            // [bin] magnitudes of the band being designed

@@ -1746,6 +1746,13 @@ public:
         dcBlocker_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, kDcCornerHz);
         dryDc_.setOrder(2);
         dryDc_.prepare(spec.sampleRate, DCBlocker<SampleType>::kMaxChannels, kDcCornerHz);
+        dcStep_ = 1.0 / std::max(1.0, kDcFadeSeconds * spec.sampleRate);
+        modeDipStep_ = 1.0 / std::max(1.0, kModeDipSeconds * spec.sampleRate);
+        dcScratch_.resize(spec.numChannels, spec.maxBlockSize);
+        dcWanted_ = dcBlockingEnabled_ && curveMakesDc();
+        dcShare_ = dcWanted_ ? 1.0 : 0.0;
+        modeDipping_ = false;
+        modeDip_ = 0.0;
         dryPre_.reset();
         dryPreLead_.prepare(spec.sampleRate, std::min(spec.numChannels, 8));   // as many as the pre-filter reaches
         dryDcLead_.prepare(spec.sampleRate, spec.numChannels);
@@ -1948,7 +1955,7 @@ private:
 
         const bool turn = (!normal || mix > 0.0f) && (!asked || askedTurn);
         dryPreLead_.aim(turn);
-        dryDcLead_.aim(turn && dcBlockingEnabled_);
+        dryDcLead_.aim(turn && dcWanted_);
         dryDcLead_.setCorner(detail::DryPhase::kButterworthShare * kDcCornerHz);
         if (run && (!dryRunning_ || delta != dryExact_))
         {
@@ -1967,6 +1974,7 @@ private:
     void processChunk(AudioBufferView<SampleType> buffer, const AudioBufferView<SampleType>* dryOut = nullptr,
                       int dryOffset = 0, bool dryTurn = false) noexcept
     {
+        dcWanted_ = dcBlockingEnabled_ && curveMakesDc();
         const bool dryWork = aimDryPhase(buffer.getNumSamples(), dryOut != nullptr, dryTurn);
         // Second-order antialiasing delays the wet path by whole base
         // samples (two at 2x, one otherwise; inside the algorithms and
@@ -2064,7 +2072,7 @@ private:
         if (second || dryThroughFilters_ || dryWork)
         {
             auto dryView = dryAligned_.toView().getSubView(0, std::min(buffer.getNumSamples(), dryAligned_.getNumSamples()));
-            if (dryWork && dryExact_ && dcBlockingEnabled_) dryDc_.processBlock(dryView);
+            if (dryWork && dryExact_ && (dcShare_ > 0.0 || dcWanted_)) applyDcShare(dryDc_, dryView, dcShare_);
             dryWetMixer_.pushDry(dryView);
         }
         if (dryOut != nullptr)
@@ -2168,8 +2176,9 @@ private:
             }
         }
 
-        if (dcBlockingEnabled_) dcBlocker_.processBlock(buffer);
+        if (dcShare_ > 0.0 || dcWanted_) dcShare_ = applyDcShare(dcBlocker_, buffer, dcShare_);
         applyOutputGain(buffer);
+        if (modeDipping_) applyModeDip(buffer);
 
         // Mix Output
         if (outputMode_ == OutputMode::WetOnly) {} 
@@ -2235,7 +2244,9 @@ public:
 
     /**
      * @brief Sets the routing configuration for multi-channel processing.
-     * @note Thread-Safe. Applies instantly on the next block.
+     * @note Thread-Safe. A change dips the wet side to the aligned dry in
+     *       5 ms, switches there (the curves start again from rest) and comes
+     *       back in 20 ms, so the switch has no step.
      * @param m The processing mode (Stereo, MidOnly, SideOnly, MidSide).
      */
     void setProcessingMode(ProcessingMode m){ pushParam([&](auto& p){ p.processingMode = m; }); }
@@ -2270,7 +2281,12 @@ public:
 
     /**
      * @brief Enables or disables the fixed 5 Hz DC blocker.
-     * @note Thread-Safe.
+     * @note Thread-Safe. It is in the path only while a curve in play makes
+     *       DC (Tube and MultiStage; Transformer, SoftClip, HardClip, Exciter
+     *       and Wavefolder with a character; Curve with its asymmetry; any
+     *       with setAsymmetry()): a symmetric curve keeps the low end's phase
+     *       (the pre-filter has taken the input's DC). It comes in and goes
+     *       out over 50 ms.
      * @param on True to enable DC blocking (default).
      */
     void setDcBlocking(bool on)             { pushParam([&](auto& p){ p.dcBlocking = on; }); }
@@ -2922,6 +2938,112 @@ protected:
         }
     }
 
+    /**
+     * @brief Whether a curve in play makes DC from a signal without it (the
+     *        pre-filter takes the input's away): measured, Tube and
+     *        MultiStage always; Transformer, SoftClip, HardClip, Exciter and
+     *        Wavefolder with a character; Curve with its asymmetry; any with
+     *        setAsymmetry(). Tape, Bitcrusher and Downsample never.
+     */
+    [[nodiscard]] bool curveMakesDc() noexcept
+    {
+        if (asymmetry_.load(std::memory_order_relaxed) != SampleType(0)) return true;
+        const auto makes = [this](Algorithm a) {
+            switch (a)
+            {
+                case Algorithm::Tube:
+                case Algorithm::MultiStage:  return true;
+                case Algorithm::Transformer:
+                case Algorithm::SoftClip:
+                case Algorithm::HardClip:
+                case Algorithm::Exciter:
+                case Algorithm::Wavefolder:  return applied_.character != SampleType(0);
+                case Algorithm::Curve:       return curve().getAsymmetry() != SampleType(0);
+                case Algorithm::Tape:
+                case Algorithm::Bitcrusher:
+                case Algorithm::Downsample:  return false;
+            }
+            return true;
+        };
+        if (makes(applied_.algorithm)) return true;
+        for (int a = 0; a < static_cast<int>(pool_.size()); ++a)
+            if (pool_[static_cast<std::size_t>(a)].get() == active_.load() && makes(static_cast<Algorithm>(a))) return true;
+        return false;
+    }
+
+    /**
+     * @brief The DC filter on a block by its share, which moves toward 1
+     *        while wanted and toward 0 otherwise (the filter comes back from
+     *        rest when it is wanted again). At 1 it is the filter itself.
+     * @return The share at the end of the block.
+     */
+    double applyDcShare(DCBlocker<SampleType>& filter, AudioBufferView<SampleType> view, double share) noexcept
+    {
+        const bool wanted = dcWanted_;
+        if (wanted && share >= 1.0)
+        {
+            filter.processBlock(view);
+            return 1.0;
+        }
+        if (wanted && share <= 0.0) filter.reset();
+        const int nS = std::min(view.getNumSamples(), dcScratch_.getNumSamples());
+        const int nCh = std::min(view.getNumChannels(), dcScratch_.getNumChannels());
+        for (int ch = 0; ch < nCh; ++ch)
+            std::copy_n(view.getChannel(ch), nS, dcScratch_.getChannel(ch));
+        filter.processBlock(dcScratch_.toView().getSubView(0, nS));
+        double s = share;
+        for (int i = 0; i < nS; ++i)
+        {
+            s = wanted ? std::min(1.0, s + dcStep_) : std::max(0.0, s - dcStep_);
+            const SampleType g = static_cast<SampleType>(s);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                SampleType* x = view.getChannel(ch);
+                x[i] += g * (dcScratch_.getChannel(ch)[i] - x[i]);
+            }
+        }
+        return s;
+    }
+
+    /**
+     * @brief A change of processing mode: the wet side goes to the aligned
+     *        dry over a ramp, the mode changes at the bottom (the curves
+     *        start again from rest there), and it comes back.
+     */
+    void applyModeDip(AudioBufferView<SampleType>& buffer) noexcept
+    {
+        const int nCh = std::min(buffer.getNumChannels(), dryWetMixer_.getDryNumChannels());
+        const int nS = std::min(buffer.getNumSamples(), dryWetMixer_.getDryCapturedSamples());
+        for (int i = 0; i < nS; ++i)
+        {
+            if (modeDipDown_) modeDip_ = std::min(1.0, modeDip_ + modeDipStep_);
+            else modeDip_ = std::max(0.0, modeDip_ - modeDipStep_ * kModeRiseShare);
+            const SampleType g = static_cast<SampleType>(modeDip_);
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                SampleType* wet = buffer.getChannel(ch);
+                wet[i] += g * (dryWetMixer_.getDryChannel(ch)[i] - wet[i]);
+            }
+        }
+        if (modeDipDown_ && modeDip_ >= 1.0)
+        {
+            // At the bottom: the new mode from the next block on.
+            procMode_ = pendingMode_;
+            for (auto& algo : pool_)
+                if (algo) algo->reset();
+            modeDipDown_ = false;
+        }
+        else if (!modeDipDown_ && modeDip_ <= 0.0)
+        {
+            modeDipping_ = false;
+            if (pendingMode_ != procMode_)
+            {
+                modeDipping_ = true;
+                modeDipDown_ = true;
+            }
+        }
+    }
+
     void applyParamSnapshot(const Params& p)
     {
         driveSmoother_.setTargetValue(std::clamp(static_cast<float>(p.driveDb), -24.0f, 48.0f));
@@ -2941,7 +3063,15 @@ protected:
         postTiltGainSmoother_.setTargetValue(std::clamp(static_cast<float>(p.postFilterTiltGain), -12.0f, 12.0f));
 
         dcBlockingEnabled_ = p.dcBlocking;
-        procMode_   = p.processingMode;
+        if (p.processingMode != procMode_ || modeDipping_)
+        {
+            pendingMode_ = p.processingMode;
+            if (!modeDipping_ && p.processingMode != procMode_)
+            {
+                modeDipping_ = true;
+                modeDipDown_ = true;
+            }
+        }
         outputMode_ = p.outputMode;
         currentAlgoType_.store(p.algorithm, std::memory_order_relaxed);
 
@@ -3793,10 +3923,23 @@ protected:
     // The dry side of the mix (audio thread): the phase of the two
     // high-passes, or the filters themselves for the Delta output.
     static constexpr double kDcCornerHz = 5.0;
+    static constexpr double kDcFadeSeconds = 0.05;     ///< The DC filter comes in or goes out in this time.
+    static constexpr double kModeDipSeconds = 0.005;   ///< The fall of a mode change's dip.
+    static constexpr double kModeRiseShare = 0.25;     ///< Its rise takes four times as long (the curves settle from rest).
     static constexpr double kDryHoldSeconds = 0.05;   ///< It is kept up this long after the mix has gone full wet.
     detail::DryPhase dryPreLead_, dryDcLead_;
     Biquad<SampleType> dryPre_;
     DCBlocker<SampleType> dryDc_;
+    // The DC filter in use: its share of the output (1 = filtered), heading for 1
+    // while a curve in play makes DC and for 0 otherwise (setDcBlocking()).
+    double dcShare_ = 1.0, dcStep_ = 1.0 / 2400.0;
+    bool dcWanted_ = true;
+    AudioBuffer<SampleType> dcScratch_;
+    // A change of processing mode: the wet side dips to the dry over a
+    // ramp, the mode changes at the bottom, and it comes back.
+    ProcessingMode pendingMode_ = ProcessingMode::Stereo;
+    double modeDip_ = 0.0, modeDipStep_ = 1.0 / 240.0;   ///< 0 = the wet side, 1 = the dry
+    bool modeDipping_ = false, modeDipDown_ = false;
     bool dryRunning_ = false, dryExact_ = false;
     int dryHoldSamples_ = 0;
 

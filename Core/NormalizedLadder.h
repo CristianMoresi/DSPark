@@ -581,11 +581,11 @@ private:
             if constexpr (W == 1) { (void)b; return a; }
             else return O::set2(a, b);
         };
-        std::array<V, Order + 1> x {};
+        V x[Order + 1] {};   // C arrays: a template argument would drop the vector type's attributes
         for (int m = 1; m <= Order; ++m)
             x[static_cast<size_t>(m)] = lanes(memLeft[static_cast<size_t>(m)], memRight[static_cast<size_t>(m)]);
 
-        std::array<V, Order + 1> vc {}, vs {}, vv {};
+        V vc[Order + 1] {}, vs[Order + 1] {}, vv[Order + 1] {};
         const auto broadcast = [&]() noexcept {
             for (int m = 0; m <= Order; ++m)
             {
@@ -596,10 +596,10 @@ private:
             }
         };
         const auto sample = [&](int i) noexcept {
-            V f;
+            V f {};
             if constexpr (W == 1) f = static_cast<double>(left[i]);
             else f = lanes(static_cast<double>(left[i]), static_cast<double>(right[i]));
-            std::array<V, Order + 1> g {};
+            V g[Order + 1] {};
             for (int m = Order; m >= 1; --m)
             {
                 const auto k = static_cast<size_t>(m);

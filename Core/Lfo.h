@@ -316,12 +316,15 @@ public:
             }
         }
         step = std::clamp(step, 0, numSteps_ - 1);
-        const double to = stepCache_[static_cast<size_t>(step)];
-        const double from = step > 0 ? stepCache_[static_cast<size_t>(step - 1)] : stepCacheBefore_;
-        const double glide = stepGlide_[static_cast<size_t>(step)];
+        // Indexed through stepIndex(), whose bounds are constants: the same
+        // index, one a compiler can prove inside the arrays.
+        const size_t at = stepIndex(step);
+        const double to = stepCache_[at];
+        const double from = step > 0 ? stepCache_[stepIndex(step - 1)] : stepCacheBefore_;
+        const double glide = stepGlide_[at];
         if (!(within < glide)) return to;
         const double x = within / glide;
-        const double c = stepCurve_[static_cast<size_t>(step)];
+        const double c = stepCurve_[at];
         const double bent = c > 0.0 ? 1.0 - std::pow(1.0 - x, 1.0 + 4.0 * c)
                           : c < 0.0 ? std::pow(x, 1.0 - 4.0 * c) : x;
         return from + (to - from) * bent;
@@ -452,8 +455,8 @@ private:
     /// room; then on the grid.
     [[nodiscard]] double stepValueIn(int64_t cycle, int step, double before) const noexcept
     {
-        double v = stepValue_[static_cast<size_t>(step)];
-        if (stepRandom_[static_cast<size_t>(step)])
+        double v = stepValue_[stepIndex(step)];
+        if (stepRandom_[stepIndex(step)])
         {
             const double u = 0.5 * (random(seed_ ^ 0x5DEECE66Dull, cycle * kMaxSteps + step) + 1.0);   // 0..1
             const bool up = before < 0.0;
@@ -481,16 +484,16 @@ private:
     {
         auto walk = [&](int64_t c, std::array<double, kMaxSteps>& out) {
             const int last = numSteps_ - 1;
-            double before = quantized(stepValue_[static_cast<size_t>(last)]);
+            double before = quantized(stepValue_[stepIndex(last)]);
             for (int s = 0; s < numSteps_; ++s)
             {
-                out[static_cast<size_t>(s)] = stepValueIn(c, s, before);
-                before = out[static_cast<size_t>(s)];
+                out[stepIndex(s)] = stepValueIn(c, s, before);
+                before = out[stepIndex(s)];
             }
         };
         std::array<double, kMaxSteps> previous {};
         walk(cycle - 1, previous);
-        stepCacheBefore_ = previous[static_cast<size_t>(numSteps_ - 1)];
+        stepCacheBefore_ = previous[stepIndex(numSteps_ - 1)];
         walk(cycle, stepCache_);
         stepCacheCycle_ = cycle;
     }

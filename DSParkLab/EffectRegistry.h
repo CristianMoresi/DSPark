@@ -893,6 +893,24 @@ inline EffectSlot makeSaturation()
     // 20: the band the oversampler's first stage keeps. Order MUST match
     // dspark::Oversampling<float>::Band (Preset=0, Audible=1).
     s.addChoice("Oversampling Band", {"Preset","Audible (to 20 kHz)"}, 0);
+    // 21: the base curve under the Curve controls. Order MUST match
+    // dspark::Saturation<float>::CurveBase.
+    s.addChoice("Curve Base", {"Tanh","Algebraic","Arctangent","Erf","Cubic","Valve","Rectifier"}, 0);
+    s.addSlider("Drive Pan", -1, 1, 0, "");                 // 22: the drive leans to one channel
+    // 23 to 30: the tone after the curve, gains then frequencies of its four sections.
+    s.addSlider("Low Shelf", -18, 18, 0, "dB");
+    s.addSlider("Low Mid", -18, 18, 0, "dB");
+    s.addSlider("High Mid", -18, 18, 0, "dB");
+    s.addSlider("High Shelf", -18, 18, 0, "dB");
+    s.addSlider("Low Shelf Freq", 20, 500, 100, "Hz", true);
+    s.addSlider("Low Mid Freq", 100, 2000, 500, "Hz", true);
+    s.addSlider("High Mid Freq", 500, 8000, 2500, "Hz", true);
+    s.addSlider("High Shelf Freq", 2000, 20000, 8000, "Hz", true);
+    auto tone = std::make_shared<std::array<std::atomic<float>, 8>>();
+    {
+        static constexpr float kToneDefaults[8] = { 0, 0, 0, 0, 100, 500, 2500, 8000 };
+        for (size_t t = 0; t < 8; ++t) (*tone)[t] = kToneDefaults[t];
+    }
     auto shape = std::make_shared<std::array<std::atomic<float>, 4>>();
     (*shape)[0] = 0.0f; (*shape)[1] = 1.0f; (*shape)[2] = 0.0f; (*shape)[3] = 200.0f;
     auto modeWanted  = std::make_shared<std::atomic<int>>(0);
@@ -924,9 +942,18 @@ inline EffectSlot makeSaturation()
         p->process(b);
     };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p, osWanted, shape, modeWanted, bandWanted](int i, float v) {
+    s.setParamFn = [p, osWanted, shape, modeWanted, bandWanted, tone](int i, float v) {
         auto& k = *shape;
+        if (i >= 23 && i <= 30) {
+            auto& t = *tone;
+            t[static_cast<size_t>(i - 23)] = v;
+            const int section = (i - 23) % 4;
+            p->setTone(section, t[static_cast<size_t>(section + 4)].load(), t[static_cast<size_t>(section)].load());
+            return;
+        }
         switch(i) {
+            case 21: p->setCurveBase(static_cast<dspark::Saturation<float>::CurveBase>(std::clamp(static_cast<int>(v), 0, 6))); break;
+            case 22: p->setDrivePan(v); break;
             case 20: bandWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
             case 8: case 9: case 10:
                 k[static_cast<size_t>(i - 8)] = v;
@@ -952,8 +979,9 @@ inline EffectSlot makeSaturation()
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
-    s.group("Main", { 0, 1, 2, 3, 4, 5, 17 });
-    s.group("Curve", { 8, 9, 10, 11, 12 });
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 17, 22 });
+    s.group("Curve", { 8, 9, 10, 21, 11, 12 });
+    s.group("Tone", { 23, 24, 25, 26, 27, 28, 29, 30 });
     s.group("Tracking & Loop", { 13, 14, 15, 16 });
     s.group("Oversampling", { 6, 7, 18, 20 });
     return s;
@@ -998,6 +1026,8 @@ inline EffectSlot makeMultibandSaturation()
     s.addToggle("Output Clip", false);                                                      // index 29: an oversampled clipper after the sum
     s.addSlider("Output Ceiling", -24, 0, 0, "dB");                                         // index 30
     s.addChoice("Oversampling Band", {"Preset","Audible (to 20 kHz)"}, 0);                  // index 31: every band's first stage
+    // Order MUST match CrossoverFilter::Topology (Cascade=0, Balanced=1).
+    s.addChoice("Crossover Topology", {"Cascade","Balanced"}, 0);                           // index 32
     auto bandWanted  = std::make_shared<std::atomic<int>>(0);
     auto bandApplied = std::make_shared<std::atomic<int>>(0);
     s.prepareFn = [p, modeApplied, bandApplied](auto& sp) {
@@ -1025,7 +1055,9 @@ inline EffectSlot makeMultibandSaturation()
         const auto placeSplits = [&]() {
             for (int x = 0; x < bands->load() - 1; ++x) p->setCrossoverFrequency(x, k[static_cast<size_t>(x)].load());
         };
-        if (i == 0) { bands->store(static_cast<int>(v + 0.5f)); p->setNumBands(bands->load()); placeSplits(); return; }
+        // The splits that stay keep their frequency and memory.
+        if (i == 0) { bands->store(static_cast<int>(v + 0.5f)); p->setNumBandsKeepingSplits(bands->load()); placeSplits(); return; }
+        if (i == 32) { p->setCrossoverTopology(static_cast<MbSat::Crossover::Topology>(std::clamp(static_cast<int>(v), 0, 1))); return; }
         if (i >= 1 && i <= 3) { k[static_cast<size_t>(i - 1)] = v; placeSplits(); return; }
         if (i == 4) { for (int b = 0; b < 4; ++b) p->setBandAlgorithm(b, static_cast<dspark::Saturation<float>::Algorithm>(static_cast<int>(v))); return; }
         if (i == 5) { modeWanted->store(static_cast<int>(v), std::memory_order_relaxed); return; }
@@ -1043,7 +1075,7 @@ inline EffectSlot makeMultibandSaturation()
             case 4: p->setBandSolo(band, v > 0.5f); break;
         }
     };
-    s.group("Main", { 0, 1, 2, 3, 4, 5, 26 });
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 26, 32 });
     s.group("Band 1", { 6, 7, 8, 9, 10 });
     s.group("Band 2", { 11, 12, 13, 14, 15 });
     s.group("Band 3", { 16, 17, 18, 19, 20 });
@@ -1184,12 +1216,21 @@ inline EffectSlot makeChorus()
     s.addChoice("Analog Mode", {"Slow","Fast","Vibrato"}, 0);           // 9
     s.addSlider("Analog Hiss", -120, -50, -84, "dBFS");                 // 10
     s.addChoice("Interpolation", {"Cubic","Sinc","Linear"}, 0);         // 11: the reads of the digital lines
+    s.addSlider("Analog Tap Phase", 0, 180, 180, "deg");                // 12: the analog taps' offset (a mode loads it)
+    s.addSlider("Analog Tone", -1, 1, 0, "");                           // 13: the corner after the lines
+    s.addToggle("Circuit Filters", false);                              // 14: the filter pair of a chorus circuit
+    // 15: order MUST match dspark::DryWetMixer<float>::MixRule.
+    s.addChoice("Mix Rule", {"Linear","Equal Power","Full Dry To Half"}, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p](int i, float v) {
         using CH = dspark::Chorus<float>;
         switch(i) {
+            case 12: p->setAnalogTapPhase(v); break;
+            case 13: p->setAnalogTone(v); break;
+            case 14: p->setAnalogCircuitFilters(v > 0.5f); break;
+            case 15: p->setMixRule(static_cast<dspark::DryWetMixer<float>::MixRule>(std::clamp(static_cast<int>(v), 0, 2))); break;
             case 0: p->setRate(v); break;
             case 1: p->setDepthMs(v); break;
             case 2: p->setMix(v); break;
@@ -1204,12 +1245,120 @@ inline EffectSlot makeChorus()
             case 11: p->setInterpolation(static_cast<CH::Interpolation>(static_cast<int>(v))); break;
         }
     };
-    // A mode loads rate, depth and centre: show them.
+    // A mode loads rate, depth, centre and the taps' offset: show them.
     s.readbackFn = [p](std::vector<float>& v) {
         v[0] = static_cast<float>(p->getRate());
         v[1] = static_cast<float>(p->getDepthMs());
         v[7] = static_cast<float>(p->getCenterDelay());
+        v[12] = static_cast<float>(p->getAnalogTapPhase());
     };
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7, 11, 15 });
+    s.group("Analog", { 8, 9, 10, 12, 13, 14 });
+    return s;
+}
+
+// A state-variable filter whose corner a step sequence (Lfo's Steps shape) or
+// an envelope triggered by the audio (TriggeredEnvelope) moves. The two
+// sources are owner-managed: the interface writes its wishes to atomics and
+// the audio thread hands them over between blocks.
+inline EffectSlot makeModFilter()
+{
+    struct Engine
+    {
+        dspark::StateVariableFilter<float> filter;
+        dspark::Lfo<float> lfo;
+        dspark::TriggeredEnvelope<float> env;
+        std::array<std::atomic<float>, 16> wish {};
+        std::atomic<int> version { 1 };
+        int applied = 0;
+        double rate = 48000.0;
+    };
+    auto e = std::make_shared<Engine>();
+    EffectSlot s;
+    s.name = "Mod Filter"; s.category = "Modulation";
+    s.addChoice("Source", {"Step Sequence","Triggered Envelope"}, 0);   // 0
+    s.addChoice("Mode", {"LowPass","BandPass","HighPass"}, 0);           // 1
+    s.addSlider("Cutoff", 60, 8000, 600, "Hz", true);                    // 2: the corner at rest
+    s.addSlider("Depth", 0, 5, 2.5f, "oct");                             // 3: how far the source moves it
+    s.addSlider("Q", 0.5f, 12, 3, "");                                   // 4
+    s.addSlider("Step Rate", 0.5f, 32, 8, "steps/s");                    // 5
+    s.addSlider("Steps", 2, 16, 8, "");                                  // 6
+    s.addSlider("Glide", 0, 1, 0.15f, "");                               // 7: the share of each step it glides over
+    s.addToggle("Random Steps", false);                                  // 8: each cycle draws its values
+    s.addSlider("Swing", -0.9f, 0.9f, 0, "");                            // 9
+    s.addSlider("Threshold", -60, 0, -30, "dB");                         // 10: the envelope's trigger
+    s.addSlider("Attack", 0.5f, 300, 5, "ms", true);                     // 11
+    s.addSlider("Decay", 10, 3000, 300, "ms", true);                     // 12
+    s.addSlider("Sustain", 0, 1, 0, "");                                 // 13
+    s.addSlider("Release", 10, 3000, 200, "ms", true);                   // 14
+    s.addSlider("Curve", -1, 1, 0, "");                                  // 15: the envelope's bend
+    {
+        static constexpr float kDefaults[16] = { 0, 0, 600, 2.5f, 3, 8, 8, 0.15f, 0, 0, -30, 5, 300, 0, 200, 0 };
+        for (size_t i = 0; i < 16; ++i) e->wish[i] = kDefaults[i];
+    }
+    // The sequence: eight values that walk around the corner at rest.
+    static constexpr double kPattern[16] = { 1.0, -0.6, 0.3, -1.0, 0.7, -0.3, 0.5, -0.8,
+                                             0.9, -0.5, 0.2, -0.9, 0.6, -0.2, 0.4, -0.7 };
+    const auto apply = [e]() {
+        const auto w = [&](int i) { return e->wish[static_cast<size_t>(i)].load(std::memory_order_relaxed); };
+        using SVF = dspark::StateVariableFilter<float>;
+        static constexpr SVF::Mode kModes[3] = { SVF::Mode::LowPass, SVF::Mode::BandPass, SVF::Mode::HighPass };
+        e->filter.setMode(kModes[std::clamp(static_cast<int>(w(1)), 0, 2)]);
+        e->filter.setQ(w(4));
+        const int steps = std::clamp(static_cast<int>(w(6) + 0.5f), 2, 16);
+        e->lfo.setShape(dspark::Lfo<float>::Shape::Steps);
+        e->lfo.setNumSteps(steps);
+        e->lfo.setRateHz(static_cast<double>(w(5)) / steps);
+        for (int k = 0; k < steps; ++k)
+        {
+            e->lfo.setStep(k, kPattern[k], static_cast<double>(w(7)));
+            e->lfo.setStepRandom(k, w(8) > 0.5f);
+        }
+        e->lfo.setStepSwing(static_cast<double>(w(9)));
+        e->env.setTrigger(dspark::TriggeredEnvelope<float>::Trigger::Audio);
+        e->env.setThresholdDb(w(10));
+        e->env.setTimes(0.0f, w(11), 0.0f, w(12), w(14));
+        e->env.setSustain(w(13));
+        e->env.setCurves(w(15), w(15), w(15));
+    };
+    s.prepareFn = [e, apply](auto& sp) {
+        e->rate = sp.sampleRate;
+        e->filter.prepare(sp);
+        e->lfo.prepare(sp.sampleRate);
+        e->lfo.setSeed(7);
+        e->env.prepare(sp.sampleRate);
+        apply();
+        e->applied = e->version.load(std::memory_order_acquire);
+    };
+    s.processFn = [e, apply](auto b) {
+        const int v = e->version.load(std::memory_order_acquire);
+        if (v != e->applied) { apply(); e->applied = v; }
+        const bool steps = e->wish[0].load(std::memory_order_relaxed) < 0.5f;
+        const double rest = static_cast<double>(e->wish[2].load(std::memory_order_relaxed));
+        const double depth = static_cast<double>(e->wish[3].load(std::memory_order_relaxed));
+        const int numCh = std::min(b.getNumChannels(), 2), n = b.getNumSamples();
+        for (int i = 0; i < n; ++i)
+        {
+            float key = 0.0f;
+            for (int ch = 0; ch < numCh; ++ch) key += b.getChannel(ch)[i];
+            key /= static_cast<float>(std::max(numCh, 1));
+            // The sequence moves the corner both ways around its rest, the
+            // envelope only up from it.
+            const double m = steps ? static_cast<double>(e->lfo.advance()) : static_cast<double>(e->env.process(key));
+            const double hz = std::clamp(rest * std::exp2(depth * m), 20.0, 0.45 * e->rate);
+            e->filter.setCutoff(static_cast<float>(hz));
+            for (int ch = 0; ch < numCh; ++ch) b.getChannel(ch)[i] = e->filter.processSample(b.getChannel(ch)[i], ch);
+        }
+    };
+    s.resetFn = [e]() { e->filter.reset(); e->lfo.reset(); e->env.reset(); };
+    s.setParamFn = [e](int i, float v) {
+        if (i < 0 || i >= 16) return;
+        e->wish[static_cast<size_t>(i)].store(v, std::memory_order_relaxed);
+        e->version.fetch_add(1, std::memory_order_release);
+    };
+    s.group("Main", { 0, 1, 2, 3, 4 });
+    s.group("Sequence", { 5, 6, 7, 8, 9 });
+    s.group("Envelope", { 10, 11, 12, 13, 14, 15 });
     return s;
 }
 
@@ -1829,6 +1978,8 @@ inline EffectSlot makeMultibandCompressor()
     s.addChoice("Crossover Structure", {"Direct form","Ladder"}, 0); // 11
     s.addChoice("Crossover Slope", {"6 dB/oct","12 dB/oct","24 dB/oct","36 dB/oct","48 dB/oct"}, 2); // 12
     s.addSlider("Mix", 0, 1, 1, "");   // 13: every band against itself as the crossover leaves it
+    // Order MUST match CrossoverFilter::Topology (Cascade=0, Balanced=1).
+    s.addChoice("Crossover Topology", {"Cascade","Balanced"}, 0); // 14
     s.prepareFn = [p](auto& sp) {
         p->prepare(sp);
         p->setNumBands(3);
@@ -1853,6 +2004,7 @@ inline EffectSlot makeMultibandCompressor()
             case 11: p->setCrossoverStructure(static_cast<typename dspark::CrossoverFilter<float, 12>::Structure>(static_cast<int>(v))); break;
             case 12: { static constexpr int slopes[] = {6,12,24,36,48}; p->setOrder(slopes[std::clamp(static_cast<int>(v), 0, 4)]); break; }
             case 13: p->setMix(v); break;
+            case 14: p->setCrossoverTopology(static_cast<typename dspark::CrossoverFilter<float, 12>::Topology>(std::clamp(static_cast<int>(v), 0, 1))); break;
         }
     };
     s.gainReductionDbFn = [p]() {
@@ -1992,6 +2144,7 @@ inline EffectSlot makeTapeMachine()
     s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0); // 24
     s.addSlider("Record Emphasis", -6, 6, 0, "dB");                         // 25
     s.addChoice("Bias Shape", {"Two Level","Four Level"}, 1);               // 26 - the library's default
+    s.addSlider("Alignment Tolerance", 0, 1, 0, "");                        // 27: each channel strays its own way
     auto shapeWanted = std::make_shared<std::atomic<int>>(0);
     // setAutomaticOversampling() and setBiasShape() are setup calls (they
     // re-prepare): the UI records the wish and the audio thread applies it
@@ -2059,12 +2212,20 @@ inline EffectSlot makeTapeMachine()
             case 24: filtWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
             case 25: p->setRecordEmphasis(v); break;
             case 26: shapeWanted->store(std::clamp(static_cast<int>(v), 0, 1), std::memory_order_relaxed); break;
+            case 27: p->setAlignmentTolerance(v); break;
         }
+    };
+    // The overload lamp before the tape, read at the internal rate.
+    s.statusFn = [p]() {
+        char b[96];
+        std::snprintf(b, sizeof(b), "Record peak L %.1f dB, R %.1f dB",
+                      static_cast<double>(p->getRecordPeakDb(0)), static_cast<double>(p->getRecordPeakDb(1)));
+        return std::string(b);
     };
     s.group("Main", { 0, 1, 26, 2, 3, 4, 5, 6, 7 });
     s.group("Machine", { 8, 15, 16, 19, 20, 21, 22 });
     s.group("Noise & Colour", { 9, 10, 11, 12, 13, 14 });
-    s.group("Alignment", { 17, 18, 25, 23, 24 });
+    s.group("Alignment", { 17, 18, 25, 27, 23, 24 });
     return s;
 }
 
@@ -2652,6 +2813,7 @@ inline std::vector<EffectSlot> createAllEffects()
         makeVibrato(),
         makeRingModulator(),
         makeFrequencyShifter(),
+        makeModFilter(),
         // Spatial
         makeDelay(),
         makeAlgorithmicReverb(),

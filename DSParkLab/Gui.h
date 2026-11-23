@@ -802,7 +802,7 @@ private:
             drawGrHistory(gr, graphW, innerH, sel->statusFn ? sel->statusFn() : std::string());
         }
         else
-            drawScope(engine, graphW, innerH);
+            drawScope(engine, graphW, innerH, sel && sel->statusFn ? sel->statusFn() : std::string());
 
         ImGui::SameLine();
         drawMeters(engine, meterW, innerH);
@@ -853,7 +853,7 @@ private:
         dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
     }
 
-    void drawScope(AudioEngine& engine, float w, float h)
+    void drawScope(AudioEngine& engine, float w, float h, const std::string& status)
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -873,6 +873,13 @@ private:
             dl->AddPolyline(pts, n, IM_COL32(110, 200, 150, 230), 0, 1.3f);
         }
         dl->AddText(ImVec2(p0.x + px(6.0f), p1.y - ImGui::GetTextLineHeight() - px(4.0f)), IM_COL32(150, 156, 170, 255), "Output");
+        if (!status.empty())
+        {
+            const ImVec2 ts = ImGui::CalcTextSize(status.c_str());
+            const ImVec2 a(p1.x - ts.x - px(12.0f), p0.y + px(5.0f));
+            dl->AddRectFilled(a, ImVec2(p1.x - px(4.0f), a.y + ts.y + px(6.0f)), IM_COL32(20, 22, 28, 220), px(3.0f));
+            dl->AddText(ImVec2(a.x + px(4.0f), a.y + px(3.0f)), IM_COL32(255, 214, 140, 255), status.c_str());
+        }
         dl->AddRect(p0, p1, IM_COL32(58, 64, 78, 255), 4.0f);
     }
 

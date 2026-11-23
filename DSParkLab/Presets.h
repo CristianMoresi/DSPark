@@ -234,6 +234,9 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
               { "High Thresh", -24 }, { "High Ratio", 2 }, { "Attack", 30 }, { "Release", 200 } });
         s->addPreset("De-harsh highs", "Only the top band, from 4 kHz.",
             { { "XOver High", 4000 }, { "Low Ratio", 1 }, { "Mid Ratio", 1 }, { "High Thresh", -30 }, { "High Ratio", 4 } });
+        s->addPreset("Glue, balanced tree", "The glue with the splits as a balanced tree. Switch Crossover Topology to compare: the sum is the same.",
+            { { "Crossover Topology", 1 }, { "Low Thresh", -24 }, { "Low Ratio", 2 }, { "Mid Thresh", -24 }, { "Mid Ratio", 2 },
+              { "High Thresh", -24 }, { "High Ratio", 2 }, { "Attack", 30 }, { "Release", 200 } });
     }
 
     // --- Distortion ---------------------------------------------------------------
@@ -263,6 +266,15 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
               { "Drive Compensation", 1 } });
         s->addPreset("Minimum-phase oversampling", "The tube curve at 8x with minimum-phase filters (no pre-ringing, no latency of the linear ones).",
             { { "Algorithm", 0 }, { "Drive", 14 }, { "Oversampling", 3 }, { "Oversampling Mode", 1 }, { "Drive Compensation", 1 } });
+        s->addPreset("Valve base curve", "The Curve controls over the valve base: the two halves bend differently (even harmonics). Switch Curve Base to Tanh to compare.",
+            { { "Algorithm", 10 }, { "Curve Base", 5 }, { "Drive", 12 }, { "Oversampling", 2 }, { "Drive Compensation", 1 } });
+        s->addPreset("Rectifier, an octave up", "The rectifier base turns the negative half back up: an octave over the note.",
+            { { "Algorithm", 10 }, { "Curve Base", 6 }, { "Drive", 18 }, { "Oversampling", 2 }, { "Drive Compensation", 1 } });
+        s->addPreset("Drive leaning left", "The left channel driven about 5 dB harder and the right 5 dB less, each brought back to its level. Move Drive Pan.",
+            { { "Algorithm", 3 }, { "Drive", 14 }, { "Drive Pan", -0.8f }, { "Drive Compensation", 1 } });
+        s->addPreset("Tone after the curve", "The tube curve with the lows lifted and the harsh mids and top taken down after it. Move the four tone gains.",
+            { { "Algorithm", 0 }, { "Drive", 14 }, { "Oversampling", 2 }, { "Drive Compensation", 1 },
+              { "Low Shelf", 4 }, { "High Mid", -4 }, { "High Mid Freq", 3000 }, { "High Shelf", -3 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Multiband Saturation"))
@@ -280,6 +292,8 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Bands", 3 }, { "Algorithm", 0 }, { "B1 Drive", 12 }, { "B2 Drive", 10 }, { "B3 Drive", 8 }, { "Oversampling Band", 1 } });
         s->addPreset("Gentle split, 6 dB/oct", "Wide crossovers: the bands overlap and the split is hardly heard.",
             { { "Bands", 3 }, { "Crossover Slope", 0 }, { "B1 Drive", 10 }, { "B3 Drive", 8 } });
+        s->addPreset("Four bands, balanced tree", "The splits arranged as a balanced tree: fewer phase corrections, the same sum. Switch Crossover Topology to compare, and move Bands: nothing steps.",
+            { { "Bands", 4 }, { "Crossover Topology", 1 }, { "B1 Drive", 10 }, { "B2 Drive", 8 }, { "B3 Drive", 6 }, { "B4 Drive", 4 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Lo-Fi"))
@@ -329,6 +343,8 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Bias Shape", 0 }, { "Drive", 6 } });
         s->addPreset("Four-level bias, over-biased", "Where the lift was largest (bias at 0.9). Switch Bias Shape to Two Level to compare.",
             { { "Bias Shape", 1 }, { "Bias", 0.9f }, { "Drive", 6 } });
+        s->addPreset("Channels not quite aligned", "Each channel with its own bias, treble and level, as on a real machine: the image moves a little, a mono sum stays whole. Watch the record peak over the scope.",
+            { { "Alignment Tolerance", 1 }, { "Drive", 6 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Tube Preamp"))
@@ -392,6 +408,28 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Centre Delay", 2 }, { "Depth", 1.5f }, { "Rate", 0.3f }, { "Feedback", 0.8f }, { "Mix", 0.5f }, { "Voices", 1 } });
         s->addPreset("Doubler", "A slow, shallow second voice 18 ms behind.",
             { { "Rate", 0.4f }, { "Depth", 2 }, { "Mix", 0.3f }, { "Voices", 2 }, { "Centre Delay", 18 } });
+        s->addPreset("Analog, circuit filters", "The analog model with the filter pair of a chorus circuit: darker, more of the clock through. Toggle Circuit Filters.",
+            { { "Model", 1 }, { "Analog Mode", 0 }, { "Mix", 0.5f }, { "Circuit Filters", 1 } });
+        s->addPreset("Analog, taps in phase", "Both taps moving together (0 degrees): the two lines move together and the chorus narrows to the middle. Move Analog Tap Phase.",
+            { { "Model", 1 }, { "Analog Mode", 0 }, { "Mix", 0.5f }, { "Analog Tap Phase", 0 } });
+        s->addPreset("Analog, darker tone", "The corner after the lines an octave lower.",
+            { { "Model", 1 }, { "Analog Mode", 1 }, { "Mix", 0.5f }, { "Analog Tone", -1 } });
+        s->addPreset("Hardware blend", "The mix rule of the hardware: at half, the dry whole plus the wet whole. Compare Mix Rule at Linear.",
+            { { "Model", 1 }, { "Analog Mode", 0 }, { "Mix", 0.5f }, { "Mix Rule", 2 } });
+    }
+
+    if (EffectSlot* s = findSlot(all, "Mod Filter"))
+    {
+        s->addPreset("Step sequence", "Eight steps at 8 a second walking the corner around 600 Hz, gliding a little into each.",
+            { { "Source", 0 }, { "Cutoff", 600 }, { "Depth", 2.5f }, { "Q", 4 }, { "Step Rate", 8 }, { "Steps", 8 }, { "Glide", 0.15f } });
+        s->addPreset("Random steps, swung", "Each cycle draws new values; the steps swing.",
+            { { "Source", 0 }, { "Cutoff", 800 }, { "Depth", 3 }, { "Q", 5 }, { "Step Rate", 6 }, { "Steps", 16 }, { "Random Steps", 1 }, { "Swing", 0.5f } });
+        s->addPreset("Envelope wah", "A band-pass that opens on every note the audio plays and falls back.",
+            { { "Source", 1 }, { "Mode", 1 }, { "Cutoff", 300 }, { "Depth", 4 }, { "Q", 5 }, { "Threshold", -30 }, { "Attack", 5 },
+              { "Decay", 250 }, { "Sustain", 0.2f }, { "Release", 150 } });
+        s->addPreset("Slow swell", "The envelope opens slowly and stays open while the note lasts.",
+            { { "Source", 1 }, { "Cutoff", 200 }, { "Depth", 5 }, { "Q", 2 }, { "Attack", 250 }, { "Decay", 600 }, { "Sustain", 0.7f },
+              { "Release", 800 }, { "Curve", 0.5f } });
     }
 
     if (EffectSlot* s = findSlot(all, "Phaser"))

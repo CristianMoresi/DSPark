@@ -1587,6 +1587,7 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("Double Slope", 0, 1, 0, "");                          // 45: a second, steeper slope beside the tank
     s.addToggle("Plate Tank", false);                                  // 46: Plate only: its own figure-eight tank
     s.addToggle("Wet EQ Loudness", false);                             // 47: the wet equalizer keeps the loudness
+    s.addSlider("Air Absorption", 0, 2, 0, "");                         // 48: the air takes the top of the tail sooner (1 = standard air)
     auto decayBand = std::make_shared<ARV::DecayBand>();
     auto wetBand = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
     auto noteFeel = std::make_shared<std::array<int, 2>>(std::array<int, 2> { 0, 0 });
@@ -1626,6 +1627,7 @@ inline EffectSlot makeAlgorithmicReverb()
             case 45: p->setDoubleSlope(v); return;
             case 46: p->setPlateTank(v > 0.5f); return;
             case 47: p->setPostEqLoudness(v > 0.5f); return;
+            case 48: p->setAirAbsorption(v); return;
             default: break;
         }
         switch(i) {
@@ -1674,7 +1676,7 @@ inline EffectSlot makeAlgorithmicReverb()
         v[17] = p->getWidth();
     };
     s.group("Main", { 0, 1, 2, 3, 4, 5, 17, 46 });
-    s.group("Decay & Tone", { 6, 7, 8, 9, 10, 18, 19, 44 });
+    s.group("Decay & Tone", { 6, 7, 8, 9, 10, 48, 18, 19, 44 });
     s.group("Space", { 11, 12, 13, 14, 15, 16, 31, 32, 33, 34 });
     s.group("Tail", { 20, 21, 22, 23, 24, 25, 26, 27, 35, 45 });
     s.group("Tempo", { 28, 29, 30 });

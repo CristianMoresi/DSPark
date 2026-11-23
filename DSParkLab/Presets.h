@@ -500,7 +500,11 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 3 }, { "Double Slope", 1 } });
         s->addPreset("Wet EQ that keeps the level", "A 6 dB high shelf on the wet signal at 4 kHz, its loudness taken back. Compare Wet EQ Loudness off.",
             { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 2 }, { "Wet EQ", 5 }, { "Wet EQ Freq", 4000 }, { "Wet EQ Gain", 6 }, { "Wet EQ Loudness", 1 } });
+        s->addPreset("Hall in air", "A large hall whose very top dies as the air takes it (Air Absorption at 1): no sizzle left ringing over 10 kHz. Compare Air Absorption at 0.",
+            { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 2.8f }, { "Size", 0.7f }, { "Pre-Delay", 20 }, { "Air Absorption", 1 } });
         s->addPreset("Cathedral", "Six seconds, as large as it goes.", { { "Type", 5 }, { "Mix", 0.4f }, { "Decay", 6 }, { "Size", 1 } });
+        s->addPreset("Cathedral in air", "Six seconds with the air of a large nave (Air Absorption at 1.5): the tail darkens as it goes.",
+            { { "Type", 5 }, { "Mix", 0.4f }, { "Decay", 6 }, { "Size", 1 }, { "Air Absorption", 1.5f } });
         s->addPreset("Gated", "The tail is cut when it falls under -30 dB.",
             { { "Type", 0 }, { "Mix", 0.45f }, { "Decay", 1.5f }, { "Gate (min = off)", -30 }, { "Gate Hold", 120 }, { "Gate Release", 60 } });
         s->addPreset("Out of the way of the dry", "The tail dips 9 dB while the source sounds (Dip Under Dry).",

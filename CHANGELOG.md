@@ -6,6 +6,22 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `AlgorithmicReverb::setAirAbsorption()` (opt-in, 0 to 2, the network
+  types): the air inside the tank, on top of the walls. The walls'
+  absorption is a shelf, so above the high crossover every frequency
+  decays in the HF time and the top octave rings as long as 8 kHz; in a
+  room the air takes more the higher the frequency. Each line takes a
+  16-tap minimum-phase FIR whose loss in decibels is b (1 - cos w), set so
+  that a round trip at 12 kHz loses what the air of ISO 9613-1 (20
+  degrees C, 50 % relative humidity) takes in that time; at 48 kHz that
+  law follows the air's from 4 to 16 kHz whatever a line's length. At 1,
+  a Hall of 2.4 s with the HF decay at 0.4 from 5 kHz: 16 kHz 1.05 ->
+  0.40 s, 8 kHz 1.22 -> 0.83 s, 4 kHz 1.65 -> 1.38 s, 1 kHz 2.39 -> 2.31 s;
+  the late tail's spectrum keeps falling over 8 kHz (-29 dB at 16 kHz
+  against the 0.5-4 kHz band, where it held at -13 from 10 kHz up); pink
+  noise comes out 0.14 dB quieter. At 0 the tank is as it was, to the bit;
+  springs and the plate's own tank keep their absorption. On, the tank
+  costs 13 % more (Full) and 9 % (Eco). State key `airAbsorption`.
 - `NormalizedLadderN<T, Order>` (in `Core/NormalizedLadder.h`, orders 1 to
   16): a whole filter as one normalized ladder of plane rotations, designed
   from its polynomials (the denominator stepped down to its reflection

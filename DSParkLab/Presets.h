@@ -308,8 +308,8 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Record Emphasis", 4 }, { "Drive", 6 } });
         s->addPreset("Speed transport", "The wow and flutter as changes of the tape's speed (Transport: Speed).",
             { { "Transport", 1 }, { "Wow/Flutter", 0.6f }, { "Drive", 4 } });
-        s->addPreset("Four-level bias", "The loud parts are no longer lifted before they saturate. Switch Bias Shape to Two Level to compare.",
-            { { "Bias Shape", 1 }, { "Drive", 6 } });
+        s->addPreset("Two-level bias, as it was", "The earlier carrier: it lifts the loud parts before they saturate. Switch Bias Shape to Four Level to compare.",
+            { { "Bias Shape", 0 }, { "Drive", 6 } });
         s->addPreset("Four-level bias, over-biased", "Where the lift was largest (bias at 0.9). Switch Bias Shape to Two Level to compare.",
             { { "Bias Shape", 1 }, { "Bias", 0.9f }, { "Drive", 6 } });
     }
@@ -481,11 +481,15 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
     if (EffectSlot* s = findSlot(all, "Denoiser"))
     {
         s->addPreset("Gentle, 12 dB", "Switch Learn Noise on over a passage of noise alone, then off.",
-            { { "Reduction", 12 }, { "Spectral Smoothing", 0.5f }, { "Gain Release", 80 } });
-        s->addPreset("Strong, 30 dB", "A deeper reduction with more smoothing.",
-            { { "Reduction", 30 }, { "Threshold", 3 }, { "Spectral Smoothing", 0.7f }, { "Gain Release", 150 } });
-        s->addPreset("As a minimum-phase filter", "The reduction applied as a filter with no latency of its own.",
-            { { "Reduction", 18 }, { "Filter Mode (minimum phase)", 1 }, { "Spectral Smoothing", 0.5f } });
+            { { "Reduction", 12 }, { "Detail", 12 }, { "Gain Release", 80 } });
+        s->addPreset("Strong, 30 dB", "A deeper reduction read in bands of a sixth, for a steadier residual.",
+            { { "Reduction", 30 }, { "Threshold", 3 }, { "Detail", 6 }, { "Gain Release", 150 } });
+        s->addPreset("Finest, each bin", "Detail at the top: down to the space between the partials. Turn it left to compare.",
+            { { "Reduction", 18 }, { "Detail", 96 } });
+        s->addPreset("The detail wide open", "The noise read by the octave: what plays keeps the noise around it.",
+            { { "Reduction", 18 }, { "Detail", 1 } });
+        s->addPreset("Shorter pre-echo", "Short frames only around attacks: what is spread ahead of them stays within 5 ms.",
+            { { "Reduction", 18 }, { "Filter Mode (5 ms at attacks)", 1 }, { "Detail", 96 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Tonal Balance"))
@@ -497,29 +501,37 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
         s->addPreset("Even power as the reference", "The reference is a programme with the same power in every band.",
             { { "Balance", 0.8f }, { "Reference", 1 } });
         s->addPreset("Towards a brighter balance", "The target leans 1.5 dB per octave to the top.", { { "Balance", 0.6f }, { "Tilt", 1.5f } });
-        s->addPreset("Low end in detail", "Dips and peaks at full with a small knee: the curve follows the lumps and the holes of the low end. Switch Detail to Auditory to hear how it was.",
-            { { "Balance", 0.5f }, { "Fill Dips", 1 }, { "Trim Peaks", 1 }, { "Contrast Knee", 1 }, { "Range", 9 }, { "Low Freq", 20 }, { "Detail", 1 } });
-        s->addPreset("Only the detail", "No broad balance: only what stands out of its two sides is trimmed and what falls under them filled. Move Contrast Knee.",
-            { { "Balance", 0 }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Range", 9 }, { "Low Freq", 20 }, { "Detail", 1 } });
-        s->addPreset("Finest low end", "A twelfth of an octave in the low end. Switch Detail to Fine to compare.",
-            { { "Balance", 0.5f }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Low Freq", 20 }, { "Detail", 2 } });
+        s->addPreset("Low end in detail", "Dips and peaks at full with a small knee: the curve follows the lumps and the holes of the low end. Turn Detail left for the broad shape.",
+            { { "Balance", 0.5f }, { "Fill Dips", 1 }, { "Trim Peaks", 1 }, { "Contrast Knee", 1 }, { "Range", 9 }, { "Low Freq", 20 }, { "Detail", 12 } });
+        s->addPreset("Only the detail", "No broad balance: only what stands out of its two sides is trimmed and what falls under them filled. Move Detail.",
+            { { "Balance", 0 }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Range", 9 }, { "Low Freq", 20 }, { "Detail", 6 } });
+        s->addPreset("Finest detail", "A 24th of an octave: single partials are trimmed and the space between them is left alone.",
+            { { "Balance", 0.5f }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Low Freq", 20 }, { "Detail", 24 } });
+        s->addPreset("The detail wide open", "The same amounts an octave wide: one broad shape.",
+            { { "Balance", 0.5f }, { "Fill Dips", 0.8f }, { "Trim Peaks", 0.8f }, { "Low Freq", 20 }, { "Detail", 1 } });
         s->addPreset("One curve for all, time focus", "A common response instead of one per band, and a shorter window at the top.",
             { { "Balance", 0.8f }, { "Response", 1 }, { "Time Focus", 1 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Resonance Suppressor"))
     {
-        s->addPreset("Polish", "A light hand: 9 dB at most.", { { "Strength", 0.4f }, { "Threshold", 3 }, { "Range", 9 } });
-        s->addPreset("Harsh voice", "Narrower and stronger. Hear Removed plays what it takes.",
-            { { "Strength", 0.8f }, { "Threshold", 2 }, { "Range", 15 }, { "Width", 0.25f } });
-        s->addPreset("Deep mode", "The deeper of the two modes.", { { "Strength", 0.7f }, { "Mode", 1 }, { "Range", 18 } });
-        s->addPreset("Knee and persistence", "A soft onset, and only what lasts 60 ms is treated: noise is left alone.",
-            { { "Strength", 0.7f }, { "Knee", 6 }, { "Persistence", 60 } });
+        s->addPreset("Polish", "A light hand: 6 dB at most.", { { "Strength", 0.6f }, { "Range", 6 } });
+        s->addPreset("Harsh voice", "A lower threshold and more range. Hear Removed plays what it takes.",
+            { { "Threshold", 3 }, { "Range", 15 }, { "Width", 0.25f } });
+        s->addPreset("Surgical", "The finest detail: narrow cuts, down into the low end (which then follows later).",
+            { { "Detail", 24 }, { "Range", 15 }, { "Threshold", 4 } });
+        s->addPreset("Broad", "The detail wide open: only what is wide is found, and the cuts are wide.",
+            { { "Detail", 2 }, { "Threshold", 3 } });
+        s->addPreset("Deep mode", "More detail and stronger: cuts up to half as wide and half as deep again, less under 150 Hz.", { { "Mode", 1 } });
+        s->addPreset("Boomy low end", "The sub guard open: a lone low line (hum, boom) is cut like any other.", { { "Sub Guard", 0 } });
+        s->addPreset("Knee and slow to act", "A soft threshold, and only what lasts 150 ms is treated.",
+            { { "Knee", 6 }, { "Persistence", 150 } });
         s->addPreset("Quiet passages left alone", "Under -50 dBFS it does less and less (Quiet Level).",
-            { { "Strength", 0.8f }, { "Quiet Level", -50 } });
-        s->addPreset("Time focus", "A shorter window at the top: the attacks keep their edge.", { { "Strength", 0.7f }, { "Time Focus", 1 } });
-        s->addPreset("By ear weighting", "The detection weighted as the ear hears.", { { "Strength", 0.7f }, { "Ear Weighting", 1 } });
-        s->addPreset("Middle and sides", "The pair treated as its middle and its sides.", { { "Strength", 0.7f }, { "Stereo", 1 }, { "Link", 0.5f } });
+            { { "Quiet Level", -50 } });
+        s->addPreset("By ear weighting", "The detection weighted as the ear hears.", { { "Ear Weighting", 1 } });
+        s->addPreset("Middle and sides", "The pair treated as its middle and its sides.", { { "Stereo", 1 }, { "Link", 0.5f } });
+        s->addPreset("Short ring", "Short kernels at the top: a cut there rings for less time after the event, as deep.",
+            { { "Threshold", 3 }, { "Short Kernel", 1 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Spectral Dynamic EQ"))
@@ -528,9 +540,16 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "B1 Shape", 1 }, { "B1 Freq", 3000 }, { "B1 Q", 1.5f }, { "B1 Threshold", -30 }, { "B1 Ratio", 4 }, { "B1 Range", -12 } });
         s->addPreset("Air under control", "A high shelf from 8 kHz.",
             { { "B2 Shape", 3 }, { "B2 Freq", 8000 }, { "B2 Threshold", -35 }, { "B2 Ratio", 3 }, { "B2 Range", -9 } });
-        s->addPreset("Both bands, time focus", "The two bands with a shorter window at the top.",
+        s->addPreset("Both bands, finest detail", "The two bands moving a 24th of an octave fine.",
+            { { "B1 Shape", 1 }, { "B1 Freq", 3000 }, { "B1 Q", 1.5f }, { "B1 Threshold", -30 }, { "B1 Ratio", 4 }, { "B1 Range", -12 },
+              { "B2 Shape", 3 }, { "B2 Freq", 8000 }, { "B2 Threshold", -35 }, { "B2 Ratio", 3 }, { "B2 Range", -9 }, { "Detail", 24 } });
+        s->addPreset("Both bands, time focus", "The two bands with a shorter window at the top, read where it is played.",
             { { "B1 Shape", 1 }, { "B1 Freq", 3000 }, { "B1 Q", 1.5f }, { "B1 Threshold", -30 }, { "B1 Ratio", 4 }, { "B1 Range", -12 },
               { "B2 Shape", 3 }, { "B2 Freq", 8000 }, { "B2 Threshold", -35 }, { "B2 Ratio", 3 }, { "B2 Range", -9 }, { "Time Focus", 1 } });
+        s->addPreset("Low end, line by line", "A wide bell over the bass that takes the notes that jump out, one by one.",
+            { { "B1 Shape", 1 }, { "B1 Freq", 90 }, { "B1 Q", 0.5f }, { "B1 Threshold", -14 }, { "B1 Ratio", 6 }, { "B1 Range", -9 }, { "Detail", 12 } });
+        s->addPreset("The detail wide open", "The same bell moving as one broad shape.",
+            { { "B1 Shape", 1 }, { "B1 Freq", 3000 }, { "B1 Q", 0.7f }, { "B1 Threshold", -20 }, { "B1 Ratio", 4 }, { "B1 Range", -12 }, { "Detail", 1 } });
         s->addPreset("Presence lifted", "A bell at 4 kHz that raises what passes the threshold.",
             { { "B1 Shape", 1 }, { "B1 Freq", 4000 }, { "B1 Q", 1 }, { "B1 Threshold", -40 }, { "B1 Ratio", 2 }, { "B1 Range", 6 } });
     }

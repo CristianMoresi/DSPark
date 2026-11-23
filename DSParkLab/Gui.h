@@ -980,8 +980,9 @@ private:
     {
         const int cols = std::max(1, static_cast<int>(width / cellW()));
         int col = 0, rows = 0;
-        for (int i = 0; i < static_cast<int>(s.params.size()); ++i)
+        for (int place = 0; place < static_cast<int>(s.params.size()); ++place)
         {
+            const int i = s.controlAt(place);
             if (s.groupOf(i) != tab) continue;
             const int sp = std::min(cols, spanOf(s.params[static_cast<size_t>(i)]));
             if (rows == 0) rows = 1;
@@ -1032,8 +1033,9 @@ private:
         const int cols = std::max(1, static_cast<int>(width / cellW()));
         const ImVec2 origin = ImGui::GetCursorPos();
         int col = 0, row = 0;
-        for (int i = 0; i < static_cast<int>(sel->params.size()); ++i)
+        for (int place = 0; place < static_cast<int>(sel->params.size()); ++place)
         {
+            const int i = sel->controlAt(place);
             if (sel->groupOf(i) != tab) continue;
             const auto& pd = sel->params[static_cast<size_t>(i)];
             const int sp = std::min(cols, spanOf(pd));
@@ -1067,6 +1069,14 @@ private:
         if (pd.unit == "Hz" && std::fabs(v) >= 1000.0f) std::snprintf(b, sizeof(b), "%.2f kHz", v / 1000.0f);
         else if (pd.unit == "Hz") std::snprintf(b, sizeof(b), std::fabs(v) < 100.0f ? "%.1f Hz" : "%.0f Hz", v);
         else if (pd.unit == ":1") std::snprintf(b, sizeof(b), "%.1f:1", v);
+        else if (pd.unit == "/oct")
+        {
+            // Parts of an octave: past a 24th the top of the knob is each bin by itself.
+            if (pd.max > 24.5f && v >= 0.98f * pd.max) std::snprintf(b, sizeof(b), "each bin");
+            else if (v < 1.05f) std::snprintf(b, sizeof(b), "1 oct");
+            else std::snprintf(b, sizeof(b), v < 3.0f ? "1/%.1f oct" : "1/%.0f oct", v);
+        }
+        else if (pd.unit == "oct") std::snprintf(b, sizeof(b), "%.2f oct", v);
         else if (integral(pd)) std::snprintf(b, sizeof(b), pd.unit.empty() ? "%.0f" : "%.0f %s", v, pd.unit.c_str());
         else if (pd.unit.empty()) std::snprintf(b, sizeof(b), "%.2f", v);
         else if (pd.unit == "ms" && std::fabs(v) >= 100.0f) std::snprintf(b, sizeof(b), "%.0f ms", v);

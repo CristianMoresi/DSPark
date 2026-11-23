@@ -173,6 +173,9 @@ public:
     // Tabs of the control panel, in order (see group()).
     std::vector<std::string> groups;
 
+    // The control drawn first on its tab, wherever it sits in params (-1: none).
+    int leadParam = -1;
+
     // Parameter read-back: refreshes values[] from the processor's getters, for
     // processors whose own logic moves parameters (a reverb Type loads a whole
     // preset, a damping knob drives the HF decay). Called by the interface
@@ -240,6 +243,14 @@ public:
         const auto& g = params[static_cast<size_t>(index)].group;
         if (!g.empty()) return g;
         return groups.empty() ? std::string("Main") : groups.front();
+    }
+
+    /// The control drawn at a place: the lead first, the others in their order.
+    [[nodiscard]] int controlAt(int place) const
+    {
+        if (leadParam < 0) return place;
+        if (place == 0) return leadParam;
+        return place <= leadParam ? place - 1 : place;
     }
 
     /// Every tab, in order ("Main" alone when no control is on a tab).

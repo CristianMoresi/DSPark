@@ -18,16 +18,10 @@ namespace dsplab {
 // frequency from 20 Hz to 20 kHz (dspark::SpectralReadout); this reads them
 // at the frequencies of the screen, between two points linearly.
 template <typename ValueAt>
-inline void readDisplayCurve(int points, ValueAt valueAt, const float* f, float* out, int n)
+inline void readDisplayCurve(ValueAt valueAt, const float* f, float* out, int n)
 {
-    const double span = std::log(1000.0), last = static_cast<double>(points - 1);
     for (int i = 0; i < n; ++i)
-    {
-        const double u = std::clamp(last * std::log(std::max(1.0, static_cast<double>(f[i])) / 20.0) / span, 0.0, last);
-        const int a = static_cast<int>(u), b = std::min(points - 1, a + 1);
-        const double t = u - static_cast<double>(a);
-        out[i] = static_cast<float>((1.0 - t) * static_cast<double>(valueAt(a)) + t * static_cast<double>(valueAt(b)));
-    }
+        out[i] = static_cast<float>(dspark::SpectralReadout<float>::between(static_cast<double>(f[i]), valueAt));
 }
 
 // =============================================================================
@@ -1940,7 +1934,7 @@ inline EffectSlot makeTapeMachine()
     s.addToggle("Auto Oversampling", false);                               // 23
     s.addChoice("Oversampling Filters", {"Linear Phase","Minimum Phase"}, 0); // 24
     s.addSlider("Record Emphasis", -6, 6, 0, "dB");                         // 25
-    s.addChoice("Bias Shape", {"Two Level","Four Level"}, 0);               // 26
+    s.addChoice("Bias Shape", {"Two Level","Four Level"}, 1);               // 26 - the library's default
     auto shapeWanted = std::make_shared<std::atomic<int>>(0);
     // setAutomaticOversampling() and setBiasShape() are setup calls (they
     // re-prepare): the UI records the wish and the audio thread applies it
@@ -2243,10 +2237,10 @@ inline EffectSlot makeSpectralDenoiser()
     s.addSlider("Reduction", 0, 40, 18, "dB");
     s.addSlider("Threshold", 1, 8, 2, "x");
     // The options (indices 3 to 10).
-    s.addSlider("Spectral Smoothing", 0, 0.95f, 0, "");                 // 3
+    s.addSlider("Detail", 1, 96, 96, "/oct", true);                     // 3 - parts of an octave; at the top each bin
     s.addSlider("Gain Release", 0, 500, 0, "ms");                       // 4
     s.addToggle("Hear Removed", false);                                 // 5
-    s.addToggle("Filter Mode (minimum phase)", false);                  // 6
+    s.addToggle("Filter Mode (5 ms at attacks)", false);                // 6
     s.addSlider("Link (filter mode)", 0, 1, 0, "");                     // 7
     // Order MUST match dspark::KeyEqualizer::Shape.
     s.addChoice("Sensitivity Band", {"Off","Low Cut","High Cut","Bell","Low Shelf","High Shelf","Tilt"}, 0); // 8
@@ -2262,7 +2256,7 @@ inline EffectSlot makeSpectralDenoiser()
             case 0: p->setLearning(v > 0.5f); break;
             case 1: p->setReduction(v); break;
             case 2: p->setThreshold(v); break;
-            case 3: p->setSpectralSmoothing(v); break;
+            case 3: p->setDetail(v >= 94.0f ? 0.0f : 1.0f / v); break;
             case 4: p->setGainRelease(v); break;
             case 5: p->setRemovalListen(v > 0.5f); break;
             case 6: p->setFilterMode(v > 0.5f); break;
@@ -2272,6 +2266,13 @@ inline EffectSlot makeSpectralDenoiser()
             case 10: sens->gainDb = v; p->setSensitivityBand(0, *sens); break;
         }
     };
+    // Live: the gain applied to the first channel.
+    s.magnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
+        readDisplayCurve([&](int k) { return p->getDisplayGain(k); }, f, mdb, n);
+    };
+    s.liveLabel = "Gain now";
+    s.displayRangeDb = 36.0f;
+    s.leadParam = 3;
     return s;
 }
 
@@ -2303,44 +2304,15 @@ inline EffectSlot makeTonalBalance()
     s.addToggle("Local Slope", false);                         // 16
     s.addChoice("Quality", {"Realtime","Render"}, 0); // 17 - order MUST match TonalBalance::Quality
     s.addToggle("Time Focus", false);                          // 18
-    s.addSlider("Contrast Knee", 0.1f, 12, 1.5f, "dB");           // 19 - the knee of dips and peaks
-    s.addChoice("Detail", {"Auditory (72 bands)","Fine (1/6 oct lows)","Finest (1/12 oct lows)"}, 1); // 20 - order MUST match TonalBalance::Detail
+    s.addSlider("Contrast Knee", 0.1f, 12, 3, "dB");           // 19 - the knee of dips and peaks
+    s.addSlider("Detail", 1, 24, 4, "/oct", true);                       // 20 - parts of an octave
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
-    // The band centres exist once the processor is prepared; the display
-    // reads them from this copy (taken where prepare() runs), and how many
-    // there are (the detail decides it).
-    using TB = dspark::TonalBalance<float>;
-    // Atomic, because a change of Detail lays the bands out again on the
-    // audio thread while the display reads them.
-    auto centres = std::make_shared<std::array<std::atomic<double>, TB::kMaxBands>>();
-    auto bandCount = std::make_shared<std::atomic<int>>(0);
-    auto ready = std::make_shared<std::atomic<bool>>(false);
     auto spec = std::make_shared<dspark::AudioSpec>();
-    const auto layOut = [p, centres, bandCount, ready](const dspark::AudioSpec& sp) {
-        ready->store(false, std::memory_order_release);
-        p->prepare(sp);
-        const int bands = p->getNumBands();
-        for (int b = 0; b < bands; ++b) (*centres)[static_cast<std::size_t>(b)].store(std::log(std::max(1.0, p->getBandCentre(b))), std::memory_order_relaxed);
-        bandCount->store(bands, std::memory_order_relaxed);
-        ready->store(true, std::memory_order_release);
-    };
-    s.prepareFn = [layOut, spec](auto& sp) { *spec = sp; layOut(sp); };
-    // Live: the correction of each band now (any thread), drawn between the
-    // band centres. Behind it: the reference shape the trend is pulled to.
-    s.magnitudeFn = [p, centres, bandCount, ready](const float* f, float* mdb, int n, double, const float*) {
-        const int bands = bandCount->load(std::memory_order_relaxed);
-        if (!ready->load(std::memory_order_acquire) || bands < 2) { std::fill(mdb, mdb + n, 0.0f); return; }
-        const auto& c = *centres;
-        int j = 0;
-        for (int i = 0; i < n; ++i)
-        {
-            const double lf = std::log(std::max(1.0f, f[i]));
-            while (j < bands - 2 && lf > c[static_cast<std::size_t>(j + 1)]) ++j;
-            const double span = c[static_cast<std::size_t>(j + 1)].load(std::memory_order_relaxed) - c[static_cast<std::size_t>(j)].load(std::memory_order_relaxed);
-            const double t = span > 0.0 ? std::clamp((lf - c[static_cast<std::size_t>(j)]) / span, 0.0, 1.0) : 0.0;
-            const double a = p->getCorrection(j), b = p->getCorrection(j + 1);
-            mdb[i] = static_cast<float>(a + t * (b - a));
-        }
+    s.prepareFn = [p, spec](auto& sp) { *spec = sp; p->prepare(sp); };
+    // Live: the correction the filter plays, point by point. Behind it: the
+    // reference shape the trend is pulled to.
+    s.magnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
+        readDisplayCurve([&](int k) { return p->getDisplayCorrection(k); }, f, mdb, n);
     };
     s.targetMagnitudeFn = [](const float* f, float* mdb, int n, double, const float* v) {
         for (int i = 0; i < n; ++i) mdb[i] = v[3] * std::log2(std::max(1.0f, f[i]) / 1000.0f);
@@ -2348,11 +2320,10 @@ inline EffectSlot makeTonalBalance()
     s.liveLabel = "Correction now";
     s.targetLabel = "Reference tilt";
     s.displayRangeDb = 12.0f;
-    // Quality and Detail take a prepare(): made here, where nothing processes
-    // beside it, when what is asked is not what runs.
-    s.processFn = [p, layOut, spec](auto b) {
-        if (spec->sampleRate > 0 && (p->getQuality() != p->getQualityInUse() || p->getDetail() != p->getDetailInUse()))
-            layOut(*spec);
+    // Quality takes a prepare(): made here, where nothing processes beside
+    // it, when what is asked is not what runs.
+    s.processFn = [p, spec](auto b) {
+        if (spec->sampleRate > 0 && p->getQuality() != p->getQualityInUse()) p->prepare(*spec);
         p->processBlock(b);
     };
     s.resetFn   = [p]() { p->reset(); };
@@ -2378,9 +2349,13 @@ inline EffectSlot makeTonalBalance()
             case 17: p->setQuality(static_cast<dspark::TonalBalance<float>::Quality>(static_cast<int>(v))); break;
             case 18: p->setTimeFocus(v > 0.5f); break;
             case 19: p->setContrastKnee(v); break;
-            case 20: p->setDetail(static_cast<dspark::TonalBalance<float>::Detail>(static_cast<int>(v))); break;
+            case 20: p->setDetail(1.0f / v); break;
         }
     };
+    s.leadParam = 20;
+    s.group("Main", { 20, 0, 1, 2, 3, 4, 6, 7 });
+    s.group("Shape", { 5, 19, 10, 11, 12, 8, 9, 13 });
+    s.group("Response", { 14, 15, 16, 17, 18 });
     return s;
 }
 
@@ -2390,9 +2365,9 @@ inline EffectSlot makeResonanceSuppressor()
     auto p = std::make_shared<RS>();
     EffectSlot s;
     s.name = "Resonance Suppressor"; s.category = "Spectral";
-    s.addSlider("Threshold", 0, 30, 3, "dB");                   // 0
-    s.addSlider("Strength", 0, 1, 0, "");                       // 1 - default 0 = no reduction
-    s.addSlider("Range", 0, 48, 12, "dB");                      // 2
+    s.addSlider("Threshold", 0, 30, 5, "dB");                   // 0 - the defaults are the library's
+    s.addSlider("Strength", 0, 1, 1, "");                       // 1
+    s.addSlider("Range", 0, 48, 9, "dB");                       // 2
     s.addSlider("Width", 0.05f, 4, 0.333f, "oct", true);        // 3
     s.addSlider("Attack", 0.5f, 500, 5, "ms", true);            // 4
     s.addSlider("Release", 5, 2000, 80, "ms", true);            // 5
@@ -2408,15 +2383,15 @@ inline EffectSlot makeResonanceSuppressor()
     s.addSlider("Sensitivity Gain", -12, 12, 6, "dB");          // 15
     s.addSlider("Mix", 0, 1, 1, "");                            // 16
     s.addSlider("Knee", 0, 12, 0, "dB");                        // 17
-    s.addSlider("Persistence", 0, 500, 0, "ms");                // 18
+    s.addSlider("Persistence", 0, 500, 50, "ms");               // 18
     s.addSlider("Quiet Level", -120, 0, -120, "dBFS");          // 19 - at -120: off
     s.addToggle("Ear Weighting", false);                        // 20
-    s.addChoice("Envelope Passes", {"One","Two"}, 0);           // 21
+    s.addSlider("Detail", 1, 24, 12, "/oct", true);             // 21 - parts of an octave
     s.addSlider("Width Taper", 0, 2, 0, "");                    // 22 - above 2 kHz
-    s.addToggle("Short Kernel", false);                         // 23
-    s.addSlider("Hear Band Low", 0, 20000, 0, "Hz");            // 24
-    s.addSlider("Hear Band High", 0, 20000, 0, "Hz");           // 25 - 0: all of it
-    s.addToggle("Time Focus", false);                           // 26
+    s.addSlider("Hear Band Low", 0, 20000, 0, "Hz");            // 23
+    s.addSlider("Hear Band High", 0, 20000, 0, "Hz");           // 24 - 0: all of it
+    s.addSlider("Sub Guard", 0, 1, 1, "");                      // 25 - how far a lone sub is spared, either mode
+    s.addToggle("Short Kernel", false);                         // 26 - a cut at the top rings for less time
     auto heardBand = std::make_shared<std::array<float, 2>>(std::array<float, 2>{ 0.0f, 0.0f });
     auto sens = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
     auto spec = std::make_shared<dspark::AudioSpec>();
@@ -2435,12 +2410,12 @@ inline EffectSlot makeResonanceSuppressor()
             case 18: p->setPersistence(v); break;
             case 19: p->setQuietLevel(v <= -119.5f ? -200.0f : v); break;
             case 20: p->setAuditoryWeighting(v > 0.5f); break;
-            case 21: p->setEnvelopePasses(static_cast<int>(v) + 1); break;
+            case 21: p->setDetail(1.0f / v); break;
             case 22: p->setWidthTaper(2000.0f, v); break;
-            case 23: p->setShortKernel(v > 0.5f); break;
-            case 26: p->setTimeFocus(v > 0.5f); break;
-            case 24: (*heardBand)[0] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
-            case 25: (*heardBand)[1] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
+            case 25: p->setFoundationGuard(v); break;
+            case 26: p->setShortKernel(v > 0.5f); break;
+            case 23: (*heardBand)[0] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
+            case 24: (*heardBand)[1] = v; p->setRemovalBand((*heardBand)[0], (*heardBand)[1]); break;
             case 0: p->setThreshold(v); break;
             case 1: p->setStrength(v); break;
             case 2: p->setRange(v); break;
@@ -2463,13 +2438,17 @@ inline EffectSlot makeResonanceSuppressor()
     // side with Mid/Side); filled: the resonances found over the threshold;
     // behind: the sensitivity curve, whose band is the node.
     s.magnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
-        readDisplayCurve(RS::kDisplayPoints, [&](int k) { return p->getDisplayReduction(0, k); }, f, mdb, n);
+        readDisplayCurve([&](int k) { return p->getDisplayReduction(0, k); }, f, mdb, n);
     };
     s.secondaryMagnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
-        readDisplayCurve(RS::kDisplayPoints, [&](int k) { return p->getDisplayReduction(1, k); }, f, mdb, n);
+        readDisplayCurve([&](int k) { return p->getDisplayReduction(1, k); }, f, mdb, n);
     };
+    // Filled: only what will be reduced, by the strength and within the range.
     s.activityFn = [p](const float* f, float* mdb, int n, double, const float*) {
-        readDisplayCurve(RS::kDisplayPoints, [&](int k) { return p->getDisplayExcess(0, k); }, f, mdb, n);
+        const float strength = p->getStrength(), range = p->getRange();
+        const float depth = p->getMode() == RS::Mode::Deep ? 1.5f : 1.0f; // Deep takes half as deep again
+        readDisplayCurve([&](int k) { return strength * p->getDisplayExcess(0, k); }, f, mdb, n);
+        for (int i = 0; i < n; ++i) mdb[i] = depth * std::clamp(mdb[i], 0.0f, range);
     };
     auto view = std::make_shared<dspark::KeyEqualizer<float, 2>>();
     s.targetMagnitudeFn = [view](const float* f, float* mdb, int n, double sr, const float* v) {
@@ -2489,10 +2468,11 @@ inline EffectSlot makeResonanceSuppressor()
     s.secondaryLabel = "Reduction, 2nd channel";
     s.activityLabel = "Resonance found";
     s.targetLabel = "Sensitivity";
-    s.group("Main", { 0, 1, 2, 3, 4, 5, 6 });
-    s.group("Stereo & Listen", { 7, 8, 9, 10, 11, 24, 25, 12 });
+    s.leadParam = 21;
+    s.group("Main", { 21, 0, 1, 2, 3, 4, 5, 6, 16 });
+    s.group("Stereo & Listen", { 7, 8, 9, 10, 11, 23, 24, 12 });
     s.group("Sensitivity", { 13, 14, 15, 20 });
-    s.group("Detection", { 16, 17, 18, 19, 21, 22, 23, 26 });
+    s.group("Detection", { 25, 17, 18, 19, 22, 26 });
     return s;
 }
 
@@ -2502,7 +2482,7 @@ inline EffectSlot makeSpectralDynamicEQ()
     auto p = std::make_shared<SD>();
     EffectSlot s;
     s.name = "Spectral Dynamic EQ"; s.category = "Spectral";
-    // Two bands of nine controls: order MUST match the setParamFn below and
+    // Two bands of eight controls: order MUST match the setParamFn below and
     // the shape choice dspark::SpectralDynamicEQ::Shape.
     for (int b = 0; b < 2; ++b)
     {
@@ -2515,9 +2495,9 @@ inline EffectSlot makeSpectralDynamicEQ()
         s.addSlider((n + "Range").c_str(), -24, 24, -12, "dB");
         s.addSlider((n + "Attack").c_str(), 0.5f, 500, 10, "ms", true);
         s.addSlider((n + "Release").c_str(), 5, 2000, 150, "ms", true);
-        s.addSlider((n + "Cells").c_str(), 1, 128, 32, "");
     }
-    s.addToggle("Time Focus", false);                           // 18
+    s.addSlider("Detail", 1, 24, 12, "/oct", true); // 16 - parts of an octave
+    s.addToggle("Time Focus", false);                // 17 - the top read where it is played, brief moves as brief
     auto bands = std::make_shared<std::array<SD::Band, 2>>();
     (*bands)[0].frequency = 2500.0f;
     (*bands)[1].frequency = 7000.0f;
@@ -2525,10 +2505,11 @@ inline EffectSlot makeSpectralDynamicEQ()
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
     s.setParamFn = [p, bands](int i, float v) {
-        if (i == 18) { p->setTimeFocus(v > 0.5f); return; }
-        if (i < 0 || i >= 18) return;
-        auto& b = (*bands)[static_cast<std::size_t>(i / 9)];
-        switch (i % 9) {
+        if (i == 16) { p->setDetail(1.0f / v); return; }
+        if (i == 17) { p->setTimeFocus(v > 0.5f); return; }
+        if (i < 0 || i >= 16) return;
+        auto& b = (*bands)[static_cast<std::size_t>(i / 8)];
+        switch (i % 8) {
             case 0: b.shape = static_cast<SD::Shape>(static_cast<int>(v)); break;
             case 1: b.frequency = v; break;
             case 2: b.q = v; break;
@@ -2537,21 +2518,20 @@ inline EffectSlot makeSpectralDynamicEQ()
             case 5: b.range = v; break;
             case 6: b.attack = v; break;
             case 7: b.release = v; break;
-            case 8: b.cells = static_cast<int>(v); break;
         }
-        p->setBand(i / 9, b);
+        p->setBand(i / 8, b);
     };
-    // Live: the gain of the last frame, cell by cell; behind: each band's
+    // Live: the gain of the last frame, point by point; behind: each band's
     // shape at its full range, where the nodes sit.
     s.magnitudeFn = [p](const float* f, float* mdb, int n, double, const float*) {
-        readDisplayCurve(SD::kDisplayPoints, [&](int k) { return p->getDisplayGain(k); }, f, mdb, n);
+        readDisplayCurve([&](int k) { return p->getDisplayGain(k); }, f, mdb, n);
     };
     s.targetMagnitudeFn = [](const float* f, float* mdb, int n, double sr, const float* v) {
         using BC = dspark::BiquadCoeffs;
         BC c[2]; bool on[2] = { false, false };
         for (int b = 0; b < 2; ++b)
         {
-            const float* x = v + 9 * b;
+            const float* x = v + 8 * b;
             const int shape = static_cast<int>(x[0]);
             const double fr = std::clamp(static_cast<double>(x[1]), 20.0, 0.45 * sr), q = std::max(0.1, static_cast<double>(x[2]));
             const double range = static_cast<double>(x[5]);
@@ -2567,13 +2547,13 @@ inline EffectSlot makeSpectralDynamicEQ()
             mdb[i] = static_cast<float>(20.0 * std::log10(std::max(1e-6, mag)));
         }
     };
-    s.curveNodes = { {1, 5, 2, 0}, {10, 14, 11, 9} };   // shown while the band is on
+    s.curveNodes = { {1, 5, 2, 0}, {9, 13, 10, 8} };   // shown while the band is on
     s.gainReductionDbFn = [p]() { return std::min(0.0f, static_cast<float>(p->getPeakGain())); };
     s.liveLabel = "Gain now";
     s.targetLabel = "Full range";
-    s.group("Band 1", { 0, 1, 2, 3, 4, 5, 6, 7, 8 });
-    s.group("Band 2", { 9, 10, 11, 12, 13, 14, 15, 16, 17 });
-    s.group("Detection", { 18 });
+    s.leadParam = 16;
+    s.group("Main", { 16, 17, 0, 1, 2, 3, 4, 5, 6, 7 });
+    s.group("Band 2", { 8, 9, 10, 11, 12, 13, 14, 15 });
     return s;
 }
 

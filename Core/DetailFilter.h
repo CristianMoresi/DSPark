@@ -143,8 +143,10 @@ namespace detail {
  * a moving curve at the rate of the kernels: by its first power near that
  * rate with a raised cosine, by its square with a straight line, which then
  * falls slowly away from it. The spline images by the cube and has no corner.
- * Kernels are designed in double, the signal runs in T. A flat curve returns
- * the input to the bit, late by a block.
+ * Kernels are designed in double; the signal runs in double by the block
+ * (where it leaves the products of float rounding 20 dB lower for a tenth
+ * more of the cost) and in T by the frame. A flat curve returns the input to
+ * the bit, late by a block.
  *
  * Audio thread, except prepare() (setup thread; allocates).
  *
@@ -155,6 +157,9 @@ template <FloatType T, DetailLatency L>
 class KernelConvolver
 {
 public:
+    /// What the signal runs in: double by the block, where it costs little; T by the frame.
+    using S = std::conditional_t<L == DetailLatency::Block, double, T>;
+
     /**
      * @brief Allocates.
      * @param sampleRate The rate this part runs at.
@@ -179,7 +184,7 @@ public:
         stride_ = 2 * (block_ + 1);
 
         design_ = std::make_unique<FFTReal<double>>(static_cast<std::size_t>(size_));
-        transform_ = std::make_unique<FFTReal<T>>(static_cast<std::size_t>(2 * block_));
+        transform_ = std::make_unique<FFTReal<S>>(static_cast<std::size_t>(2 * block_));
         minimumPhase_.prepare(bins_);
         logGain_.assign(static_cast<std::size_t>(bins_), T(0));
         spectrum_.assign(static_cast<std::size_t>(size_ + 2), 0.0);
@@ -198,26 +203,26 @@ public:
         for (int i = 0; i < fade; ++i)
         {
             const double u = static_cast<double>(i + 1) / fade, turn = 0.5 * std::numbers::pi * u;
-            older_[static_cast<std::size_t>(i)] = static_cast<T>(kByFour ? -0.25 * std::cos(turn) : 0.5 * (1.0 - u) * (1.0 - u));
-            newer_[static_cast<std::size_t>(i)] = static_cast<T>(kByFour ? 0.25 * std::sin(turn) : 0.5 * u * u);
+            older_[static_cast<std::size_t>(i)] = static_cast<S>(kByFour ? -0.25 * std::cos(turn) : 0.5 * (1.0 - u) * (1.0 - u));
+            newer_[static_cast<std::size_t>(i)] = static_cast<S>(kByFour ? 0.25 * std::sin(turn) : 0.5 * u * u);
         }
 
-        time_.assign(static_cast<std::size_t>(2 * block_ + 2), T(0));
-        sum_.assign(static_cast<std::size_t>(stride_), T(0));
-        for (auto* v : { &oldest_, &newest_ }) v->assign(static_cast<std::size_t>(block_), T(0));
+        time_.assign(static_cast<std::size_t>(2 * block_ + 2), S(0));
+        sum_.assign(static_cast<std::size_t>(stride_), S(0));
+        for (auto* v : { &oldest_, &newest_ }) v->assign(static_cast<std::size_t>(block_), S(0));
         const auto spectra = static_cast<std::size_t>(partitions_) * static_cast<std::size_t>(stride_);
         channel_.resize(static_cast<std::size_t>(channels_));
         slot_.resize(static_cast<std::size_t>(channels_));
         for (auto& c : channel_)
         {
-            for (auto* v : { &c.in, &c.before, &c.out }) v->assign(static_cast<std::size_t>(block_), T(0));
-            c.past.assign(spectra, T(0));
+            for (auto* v : { &c.in, &c.before, &c.out }) v->assign(static_cast<std::size_t>(block_), S(0));
+            c.past.assign(spectra, S(0));
         }
         for (auto& s : slot_)
         {
-            for (auto& k : s.partition) k.assign(spectra, T(0));
+            for (auto& k : s.partition) k.assign(spectra, S(0));
             if constexpr (kByFour)
-                for (auto* v : { &s.mean, &s.even, &s.odd }) v->assign(spectra, T(0));
+                for (auto* v : { &s.mean, &s.even, &s.odd }) v->assign(spectra, S(0));
             s.kept.assign(static_cast<std::size_t>(length_), 0.0);
         }
         prepared_ = true;
@@ -229,7 +234,7 @@ public:
     {
         if (!prepared_) return;
         for (auto& c : channel_)
-            for (auto* v : { &c.in, &c.before, &c.out, &c.past }) std::fill(v->begin(), v->end(), T(0));
+            for (auto* v : { &c.in, &c.before, &c.out, &c.past }) std::fill(v->begin(), v->end(), S(0));
         for (auto& s : slot_)
         {
             s.flat.fill(true);
@@ -286,7 +291,8 @@ public:
                 Channel& c = channel_[static_cast<std::size_t>(ch)];
                 T* x = buffer.getChannel(ch) + done;
                 std::copy_n(x, count, c.in.data() + at_);
-                std::copy_n(c.out.data() + at_, count, x);
+                const S* from = c.out.data() + at_;
+                for (int i = 0; i < count; ++i) x[i] = static_cast<T>(from[i]);
             }
             done += count;
             at_ += count;
@@ -302,16 +308,16 @@ private:
 
     struct Channel
     {
-        std::vector<T> in, before, out;
-        std::vector<T> past;                ///< The spectra of the last blocks, a partition each.
+        std::vector<S> in, before, out;
+        std::vector<S> past;                ///< The spectra of the last blocks, a partition each.
     };
 
     struct Slot
     {
-        std::array<std::vector<T>, kKernels> partition;
+        std::array<std::vector<S>, kKernels> partition;
         std::vector<double> kept;
         std::array<bool, kKernels> flat {};  ///< All set by reset().
-        std::vector<T> mean, even, odd;      ///< By four: their mean and the differences of the two pairs.
+        std::vector<S> mean, even, odd;      ///< By four: their mean and the differences of the two pairs.
         int newest = 0;
     };
 
@@ -348,8 +354,8 @@ private:
             if constexpr (kByFour)
             {
                 // The sums read a flat kernel as a spectrum: ones in the first partition.
-                std::fill(s.partition[newest].begin(), s.partition[newest].end(), T(0));
-                for (int k = 0; k <= block_; ++k) s.partition[newest][static_cast<std::size_t>(2 * k)] = T(1);
+                std::fill(s.partition[newest].begin(), s.partition[newest].end(), S(0));
+                for (int k = 0; k <= block_; ++k) s.partition[newest][static_cast<std::size_t>(2 * k)] = S(1);
                 combine(s);
             }
             return;
@@ -363,12 +369,12 @@ private:
         }
         minimumPhase_.build(*design_, h, c, size_, short_ ? shortTaper_.data() : taper_.data(), short_ ? shortLength_ : length_);
         std::copy_n(c, length_, s.kept.data());
-        T* to = s.partition[newest].data();
+        S* to = s.partition[newest].data();
         for (int p = 0; p < partitions_; ++p)
         {
-            std::fill(time_.begin(), time_.end(), T(0));
+            std::fill(time_.begin(), time_.end(), S(0));
             const int from = p * block_, count = std::min(block_, length_ - from);
-            for (int i = 0; i < count; ++i) time_[static_cast<std::size_t>(i)] = static_cast<T>(c[from + i]);
+            for (int i = 0; i < count; ++i) time_[static_cast<std::size_t>(i)] = static_cast<S>(c[from + i]);
             transform_->forward(time_.data(), to + p * stride_);
         }
         if constexpr (kByFour) combine(s);
@@ -379,15 +385,15 @@ private:
     {
         if (allFlat(s)) return;
         const auto at = [&s](int age) { return s.partition[static_cast<std::size_t>((s.newest + kKernels - age) % kKernels)].data(); };
-        const T* h0 = at(0);
-        const T* h1 = at(1);
-        const T* h2 = at(2);
-        const T* h3 = at(3);
-        T* mean = s.mean.data();
-        T* even = s.even.data();
-        T* odd = s.odd.data();
+        const S* h0 = at(0);
+        const S* h1 = at(1);
+        const S* h2 = at(2);
+        const S* h3 = at(3);
+        S* mean = s.mean.data();
+        S* even = s.even.data();
+        S* odd = s.odd.data();
         const int count = partitions_ * stride_;
-        for (int i = 0; i < count; ++i) mean[i] = T(0.25) * ((h0[i] + h2[i]) + (h1[i] + h3[i]));
+        for (int i = 0; i < count; ++i) mean[i] = S(0.25) * ((h0[i] + h2[i]) + (h1[i] + h3[i]));
         for (int i = 0; i < count; ++i) even[i] = h0[i] - h2[i];
         for (int i = 0; i < count; ++i) odd[i] = h1[i] - h3[i];
     }
@@ -400,7 +406,7 @@ private:
     }
 
     /// The newest block through one of a slot's kernels.
-    void play(const Channel& c, const Slot& s, int which, T* to) noexcept
+    void play(const Channel& c, const Slot& s, int which, S* to) noexcept
     {
         const auto w = static_cast<std::size_t>(which);
         if (s.flat[w])
@@ -412,9 +418,9 @@ private:
     }
 
     /// The newest block through a kernel given as the spectra of its partitions.
-    void playSpectra(const Channel& c, const T* kernel, T* to) noexcept
+    void playSpectra(const Channel& c, const S* kernel, S* to) noexcept
     {
-        std::fill(sum_.begin(), sum_.end(), T(0));
+        std::fill(sum_.begin(), sum_.end(), S(0));
         // The ring of spectra in its two runs, newest first.
         for (int p = 0; p <= head_; ++p)
             simd::complexMulAccum(sum_.data(), c.past.data() + (head_ - p) * stride_, kernel + p * stride_, block_ + 1);
@@ -436,7 +442,7 @@ private:
 
     void playFour(Channel& c, const Slot& s) noexcept
     {
-        T* out = c.out.data();
+        S* out = c.out.data();
         if (fading_ >= steps_ || allFlat(s))
         {
             std::copy_n(c.in.data(), block_, out); // nothing designed yet, or nothing but flat
@@ -445,10 +451,10 @@ private:
         playSpectra(c, s.mean.data(), out);
         playSpectra(c, s.even.data(), oldest_.data());
         playSpectra(c, s.odd.data(), newest_.data());
-        const T* evenShare = older_.data() + fading_ * block_;
-        const T* oddShare = newer_.data() + fading_ * block_;
-        const T* even = oldest_.data();
-        const T* odd = newest_.data();
+        const S* evenShare = older_.data() + fading_ * block_;
+        const S* oddShare = newer_.data() + fading_ * block_;
+        const S* even = oldest_.data();
+        const S* odd = newest_.data();
         for (int i = 0; i < block_; ++i) out[i] += evenShare[i] * even[i] + oddShare[i] * odd[i];
     }
 
@@ -461,14 +467,14 @@ private:
         {
             play(c, s, (s.newest + 1) % kKernels, oldest_.data());
             play(c, s, s.newest, newest_.data());
-            const T* older = older_.data() + fading_ * block_;
-            const T* newer = newer_.data() + fading_ * block_;
-            const T* first = oldest_.data();
-            const T* last = newest_.data();
-            T* out = c.out.data();
+            const S* older = older_.data() + fading_ * block_;
+            const S* newer = newer_.data() + fading_ * block_;
+            const S* first = oldest_.data();
+            const S* last = newest_.data();
+            S* out = c.out.data();
             for (int i = 0; i < block_; ++i)
             {
-                const T middle = out[i];
+                const S middle = out[i];
                 out[i] = middle + older[i] * (first[i] - middle) + newer[i] * (last[i] - middle);
             }
         }
@@ -481,9 +487,10 @@ private:
     int at_ = 0, head_ = 0, count_ = 0, fading_ = 2;
     bool prepared_ = false, linked_ = false;
     std::unique_ptr<FFTReal<double>> design_;
-    std::unique_ptr<FFTReal<T>> transform_;
+    std::unique_ptr<FFTReal<S>> transform_;
     MinimumPhase minimumPhase_;
-    std::vector<T> logGain_, time_, sum_, oldest_, newest_, older_, newer_;
+    std::vector<T> logGain_;
+    std::vector<S> time_, sum_, oldest_, newest_, older_, newer_;
     std::vector<double> spectrum_, kernel_, taper_, shortTaper_;
     std::vector<Channel> channel_;
     std::vector<Slot> slot_;

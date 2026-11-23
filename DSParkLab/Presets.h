@@ -51,6 +51,10 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Band 1 Type", 1 }, { "Band 1 Freq", 90 }, { "Band 1 Gain", 4 },
               { "Band 2 Freq", 400 }, { "Band 2 Gain", -2 }, { "Band 2 Q", 0.8f },
               { "Band 4 Type", 2 }, { "Band 4 Freq", 9000 }, { "Band 4 Gain", 4 } });
+        s->addPreset("Smile at the same loudness", "The smile with its loudness taken back (Loudness Compensation): it changes the colour, not the level. Compare it off.",
+            { { "Loudness Compensation", 1 }, { "Band 1 Type", 1 }, { "Band 1 Freq", 90 }, { "Band 1 Gain", 4 },
+              { "Band 2 Freq", 400 }, { "Band 2 Gain", -2 }, { "Band 2 Q", 0.8f },
+              { "Band 4 Type", 2 }, { "Band 4 Freq", 9000 }, { "Band 4 Gain", 4 } });
         s->addPreset("Smile, linear phase", "The same curve with no phase shift (Phase Mode). Compare with Minimum on transients.",
             { { "Phase Mode", 1 }, { "Band 1 Type", 1 }, { "Band 1 Freq", 90 }, { "Band 1 Gain", 4 },
               { "Band 2 Freq", 400 }, { "Band 2 Gain", -2 }, { "Band 2 Q", 0.8f },
@@ -450,6 +454,14 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
         s->addPreset("Large hall", "Almost three seconds.", { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 2.8f }, { "Size", 0.7f }, { "Pre-Delay", 20 } });
         s->addPreset("Chamber", "A dense chamber.", { { "Type", 2 }, { "Mix", 0.3f }, { "Decay", 1.4f } });
         s->addPreset("Spring", "The spring tank.", { { "Type", 4 }, { "Mix", 0.35f }, { "Decay", 2 } });
+        s->addPreset("Plate, its own tank", "A plate through its figure-eight tank, dense from the first milliseconds. Compare Plate Tank off: the same plate on the delay network.",
+            { { "Type", 3 }, { "Mix", 0.35f }, { "Decay", 2.5f }, { "Pre-Delay", 15 }, { "Plate Tank", 1 } });
+        s->addPreset("Early digital, 12 kHz", "A hall limited to 12 kHz by an elliptic wall, as early digital reverbs were. The decay is the same; compare Band Limit at its maximum (off).",
+            { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 2.4f }, { "Band Limit (max = off)", 12000 } });
+        s->addPreset("Hall with two slopes", "The first decibels fall faster than the rest, as in a hall coupled to a smaller room. Compare Double Slope at 0.",
+            { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 3 }, { "Double Slope", 1 } });
+        s->addPreset("Wet EQ that keeps the level", "A 6 dB high shelf on the wet signal at 4 kHz, its loudness taken back. Compare Wet EQ Loudness off.",
+            { { "Type", 1 }, { "Mix", 0.35f }, { "Decay", 2 }, { "Wet EQ", 5 }, { "Wet EQ Freq", 4000 }, { "Wet EQ Gain", 6 }, { "Wet EQ Loudness", 1 } });
         s->addPreset("Cathedral", "Six seconds, as large as it goes.", { { "Type", 5 }, { "Mix", 0.4f }, { "Decay", 6 }, { "Size", 1 } });
         s->addPreset("Gated", "The tail is cut when it falls under -30 dB.",
             { { "Type", 0 }, { "Mix", 0.45f }, { "Decay", 1.5f }, { "Gate (min = off)", -30 }, { "Gate Hold", 120 }, { "Gate Release", 60 } });

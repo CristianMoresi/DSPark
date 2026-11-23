@@ -174,6 +174,9 @@ inline EffectSlot makeEqualizer()
     // Resonant Shelves (index 32): the Q of a shelf above 0.71 makes it rise
     // over its plateau next to the corner (and dip on the other side).
     s.addToggle("Resonant Shelves", false);
+    // Loudness Compensation (index 33): a gain takes back the bands' change
+    // of the K-weighted loudness of pink noise.
+    s.addToggle("Loudness Compensation", false);
     // Type index -> framework enum. The UI groups cuts after the shelves;
     // the enum orders LowPass/HighPass there, so the mapping is direct.
     auto toType = [](float v) {
@@ -190,6 +193,7 @@ inline EffectSlot makeEqualizer()
         if (i == 22) { p->setAnalogResponse(v > 0.5f); return; }
         if (i == 31) { p->setStructure(static_cast<EQ::Structure>(std::clamp(static_cast<int>(v), 0, 1))); return; }
         if (i == 32) { p->setResonantShelves(v > 0.5f); return; }
+        if (i == 33) { p->setLoudnessCompensation(v > 0.5f); return; }
         if (i >= 27 && i <= 30)
         {
             auto cfg = p->getBandConfig(i - 27);
@@ -254,7 +258,7 @@ inline EffectSlot makeEqualizer()
     s.group("Band 2", { 5, 6, 7, 8, 9, 24, 28 });
     s.group("Band 3", { 10, 11, 12, 13, 14, 25, 29 });
     s.group("Band 4", { 15, 16, 17, 18, 19, 26, 30 });
-    s.group("Engine", { 20, 21, 22, 31, 32 });
+    s.group("Engine", { 20, 21, 22, 31, 32, 33 });
     return s;
 }
 
@@ -1430,6 +1434,10 @@ inline EffectSlot makeAlgorithmicReverb()
     s.addSlider("Wet EQ Freq", 20, 20000, 1000, "Hz", true);           // 41
     s.addSlider("Wet EQ Gain", -24, 24, 0, "dB");                      // 42
     s.addSlider("Wet EQ Q", 0.1f, 10, 0.7071f, "", true);              // 43
+    s.addSlider("Band Limit (max = off)", 2000, 20000, 20000, "Hz", true); // 44: an elliptic wall on the wet signal
+    s.addSlider("Double Slope", 0, 1, 0, "");                          // 45: a second, steeper slope beside the tank
+    s.addToggle("Plate Tank", false);                                  // 46: Plate only: its own figure-eight tank
+    s.addToggle("Wet EQ Loudness", false);                             // 47: the wet equalizer keeps the loudness
     auto decayBand = std::make_shared<ARV::DecayBand>();
     auto wetBand = std::make_shared<dspark::KeyEqualizer<float, 2>::Band>();
     auto noteFeel = std::make_shared<std::array<int, 2>>(std::array<int, 2> { 0, 0 });
@@ -1465,6 +1473,10 @@ inline EffectSlot makeAlgorithmicReverb()
             case 41: wetBand->frequency = v; p->setPostEqBand(0, *wetBand); return;
             case 42: wetBand->gainDb = v; p->setPostEqBand(0, *wetBand); return;
             case 43: wetBand->q = v; p->setPostEqBand(0, *wetBand); return;
+            case 44: p->setBandLimit(v >= 19900.0f ? 0.0f : v); return;
+            case 45: p->setDoubleSlope(v); return;
+            case 46: p->setPlateTank(v > 0.5f); return;
+            case 47: p->setPostEqLoudness(v > 0.5f); return;
             default: break;
         }
         switch(i) {
@@ -1512,12 +1524,12 @@ inline EffectSlot makeAlgorithmicReverb()
         v[16] = std::max(p->getLateLevel(), -60.0f);
         v[17] = p->getWidth();
     };
-    s.group("Main", { 0, 1, 2, 3, 4, 5, 17 });
-    s.group("Decay & Tone", { 6, 7, 8, 9, 10, 18, 19 });
+    s.group("Main", { 0, 1, 2, 3, 4, 5, 17, 46 });
+    s.group("Decay & Tone", { 6, 7, 8, 9, 10, 18, 19, 44 });
     s.group("Space", { 11, 12, 13, 14, 15, 16, 31, 32, 33, 34 });
-    s.group("Tail", { 20, 21, 22, 23, 24, 25, 26, 27, 35 });
+    s.group("Tail", { 20, 21, 22, 23, 24, 25, 26, 27, 35, 45 });
     s.group("Tempo", { 28, 29, 30 });
-    s.group("Bands", { 36, 37, 38, 39, 40, 41, 42, 43 });
+    s.group("Bands", { 36, 37, 38, 39, 40, 41, 42, 43, 47 });
     return s;
 }
 

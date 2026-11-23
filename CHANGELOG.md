@@ -6,6 +6,33 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `AlgorithmicReverb::setPlateTank()` (opt-in, `Type::Plate`): the plate's
+  own tank, the figure-eight of Dattorro's plate, instead of the delay
+  network. Two branches feed each other through modulated and fixed
+  all-passes, delays, damping and decay; each side is read at seven
+  points inside. Its echo density 10 ms into the tail is 0.96 of noise's
+  (the network's plate: 0.07); its wet level is the network's within
+  0.25 dB from 1.5 to 8 s of decay, and its decay the one asked within 5 %
+  from 2 s up (12 % short at 1.5 s: a branch takes a third of a second).
+  Size and Bass Decay do not reach it. State key `plateTank`.
+- `AlgorithmicReverb::setBandLimit()` (opt-in): an elliptic wall on the wet
+  signal, outside the tank, so the decay does not change: within 0.05 dB
+  to the corner and 100 dB down a fifth of an octave over it, from 1 kHz
+  to 0.4 of the rate; a move fades over 20 ms. State key `bandLimit`.
+- `AlgorithmicReverb::setDoubleSlope()` (opt-in, 0 to 1): four lines of
+  their own beside the tank decay in 0.3 of its times, so the first
+  decibels of the tail fall faster: at 1 the early decay time falls to
+  0.87 (Hall) and 0.90 (Room) of what it was, the T30 moves under 3 % and
+  the tail's energy under 0.2 dB. State key `doubleSlope`.
+- `Equalizer::setLoudnessCompensation()` and
+  `KeyEqualizer::setLoudnessCompensation()` (opt-in), and
+  `AlgorithmicReverb::setPostEqLoudness()` for its wet equalizer: a gain
+  takes back the bands' change of the K-weighted loudness of pink noise
+  and moves in 50 ms when they change. Over 200 random settings of one to
+  four bells, shelves and tilts within 12 dB, pink noise comes out
+  0.08 LU from its loudness in the median and 0.56 LU at worst (the key
+  equalizer: 0.05 and 0.48 over 100). State keys `loudnessComp` and
+  `<prefix>loudness`.
 - `Oversampling::Band::Audible` (opt-in): the first stage is fitted, in
   `prepare()`, to the host rate: it keeps 20 kHz and stops its own image,
   instead of the preset's band in fractions of the rate. With `High`, 111,

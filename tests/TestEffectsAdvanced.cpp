@@ -11809,3 +11809,136 @@ DSPARK_TEST(AlgoReverb_plate_tank_decays_as_asked_and_keeps_the_level)
     EXPECT_NEAR(t1k, 2.0, 0.25);
     EXPECT_LT(t4k, t1k);
 }
+
+// A new linear-phase design comes in over a partition: band 0 of a 1 kHz tone
+// whose split moves from 500 Hz to 2 kHz steps no more than in its new steady
+// state (the swap in one sample jumped 0.380 against 0.061), and the bands
+// keep summing to the delayed input through the change, also when the band
+// count changes with it.
+DSPARK_TEST(CrossoverFilter_linear_phase_design_change_glides)
+{
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    using X = CrossoverFilter<float, 12>;
+    auto run = [&](bool alsoBands, std::vector<float>& band0, double& sumError) {
+        auto x = std::make_unique<X>();
+        x->setNumBands(2);
+        x->setCrossoverFrequency(0, 500.0f);
+        x->setFilterMode(X::FilterMode::LinearPhase);
+        x->prepare(spec(fs, 256, 1));
+        const int latency = x->getLatency();
+        std::vector<float> in(256), all;
+        std::vector<std::vector<float>> out(3, std::vector<float>(256));
+        band0.clear();
+        sumError = 0.0;
+        for (int k = 0; k < 375; ++k)
+        {
+            if (k == 188)
+            {
+                if (alsoBands)
+                {
+                    x->setNumBandsKeepingSplits(3);
+                    x->setCrossoverFrequency(1, 6000.0f);
+                }
+                x->setCrossoverFrequency(0, 2000.0f);
+            }
+            for (int i = 0; i < 256; ++i)
+                in[static_cast<size_t>(i)] = 0.5f * float(std::sin(2.0 * kPi * 1000.0 * (k * 256 + i) / fs))
+                                           + 0.2f * float(std::sin(2.0 * kPi * 9000.0 * (k * 256 + i) / fs));
+            all.insert(all.end(), in.begin(), in.end());
+            float* ic[1] = { in.data() };
+            AudioBufferView<float> views[3];
+            for (int b = 0; b < 3; ++b)
+            {
+                std::fill(out[static_cast<size_t>(b)].begin(), out[static_cast<size_t>(b)].end(), 0.0f);
+                float* p[1] = { out[static_cast<size_t>(b)].data() };
+                views[b] = AudioBufferView<float>(p, 1, 256);
+            }
+            const int n = x->processBlock(AudioBufferView<float>(ic, 1, 256), views, 3);
+            for (int i = 0; i < 256; ++i)
+            {
+                band0.push_back(out[0][static_cast<size_t>(i)]);
+                float sum = 0.0f;
+                for (int b = 0; b < n; ++b) sum += out[static_cast<size_t>(b)][static_cast<size_t>(i)];
+                const int at = k * 256 + i - latency;
+                if (at >= 0) sumError = std::max(sumError, double(std::abs(sum - all[static_cast<size_t>(at)])));
+            }
+        }
+    };
+    for (bool alsoBands : { false, true })
+    {
+        std::vector<float> band0;
+        double sumError = 0.0;
+        run(alsoBands, band0, sumError);
+        auto maxStep = [&](size_t a, size_t b) {
+            double m = 0;
+            for (size_t i = a + 1; i < b; ++i) m = std::max(m, double(std::abs(band0[i] - band0[i - 1])));
+            return m;
+        };
+        const size_t change = 188 * 256;
+        const double after = maxStep(change + 9600, band0.size());
+        std::printf("    design change%s: band 0 step %.4f (steady %.4f), sum error %.2g%c",
+                    alsoBands ? " with a band more" : "", maxStep(change, change + 9600), after, sumError, 10);
+        EXPECT_LT(maxStep(change, change + 9600), after * 1.15);
+        EXPECT_LT(sumError, 1e-5);
+    }
+}
+
+// The band count of the minimum-phase engine changes over 20 ms: from 3 to
+// 4 bands and back, with tones in every band, no band steps more than in its
+// steady state, and setNumBandsKeepingSplits() keeps the splits it had.
+DSPARK_TEST(CrossoverFilter_band_count_change_fades_and_keeps_splits)
+{
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    for (int order : { 24, 48 })
+        for (bool ladder : { false, true })
+        {
+            auto x = std::make_unique<CrossoverFilter<float, 12>>();
+            x->setOrder(order);
+            if (ladder) x->setStructure(CrossoverFilter<float, 12>::Structure::Ladder);
+            x->setNumBands(3);
+            x->setCrossoverFrequency(0, 200.0f);
+            x->setCrossoverFrequency(1, 2000.0f);
+            x->prepare(spec(fs, 256, 1));
+            std::vector<float> in(256);
+            std::vector<std::vector<float>> out(4, std::vector<float>(256)), rec(4);
+            for (int k = 0; k < 280; ++k)
+            {
+                if (k == 94) x->setNumBandsKeepingSplits(4);
+                if (k == 188) x->setNumBandsKeepingSplits(3);
+                for (int i = 0; i < 256; ++i)
+                {
+                    const double t = (k * 256 + i) / fs;
+                    in[static_cast<size_t>(i)] = float(0.4 * std::sin(2 * kPi * 100 * t) + 0.3 * std::sin(2 * kPi * 3000 * t)
+                                                     + 0.2 * std::sin(2 * kPi * 9000 * t));
+                }
+                float* ic[1] = { in.data() };
+                AudioBufferView<float> views[4];
+                for (int b = 0; b < 4; ++b)
+                {
+                    std::fill(out[static_cast<size_t>(b)].begin(), out[static_cast<size_t>(b)].end(), 0.0f);
+                    float* p[1] = { out[static_cast<size_t>(b)].data() };
+                    views[b] = AudioBufferView<float>(p, 1, 256);
+                }
+                const int n = x->processBlock(AudioBufferView<float>(ic, 1, 256), views, 4);
+                for (int b = 0; b < 4; ++b)
+                    for (int i = 0; i < 256; ++i) rec[static_cast<size_t>(b)].push_back(b < n ? out[static_cast<size_t>(b)][static_cast<size_t>(i)] : 0.0f);
+            }
+            EXPECT_NEAR(x->getCrossoverFrequency(0), 200.0f, 0.01f);
+            EXPECT_NEAR(x->getCrossoverFrequency(1), 2000.0f, 0.01f);
+            EXPECT_NEAR(x->getCrossoverFrequency(2), 6324.555f, 0.5f);
+            auto maxStep = [&](int b, size_t from, size_t to) {
+                double m = 0;
+                for (size_t i = from + 1; i < to; ++i)
+                    m = std::max(m, double(std::abs(rec[static_cast<size_t>(b)][i] - rec[static_cast<size_t>(b)][i - 1])));
+                return m;
+            };
+            const size_t up = 94 * 256, down = 188 * 256;
+            for (int b = 0; b < 3; ++b)
+            {
+                const double steady = std::max(maxStep(b, up - 9600, up), maxStep(b, up + 9600, down));
+                EXPECT_LT(maxStep(b, up, up + 4800), steady * 1.1 + 1e-4);
+                EXPECT_LT(maxStep(b, down, down + 4800), steady * 1.1 + 1e-4);
+            }
+            EXPECT_LT(maxStep(3, up, up + 4800), maxStep(3, up + 9600, down) * 1.1);
+        }
+}

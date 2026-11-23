@@ -6,6 +6,27 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Oversampling::Band::Audible` (opt-in): the first stage is fitted, in
+  `prepare()`, to the host rate: it keeps 20 kHz and stops its own image,
+  instead of the preset's band in fractions of the rate. With `High`, 111,
+  63, 23, 19, 15 and 15 taps at 44.1, 48, 88.2, 96, 176.4 and 192 kHz
+  (127 with the preset), so the latency at 2x is 56, 32, 12, 10, 8 and 8
+  samples (64); at 96 kHz what aliases under 20 kHz stays at -82.6 dB. The
+  fit takes 0.2 to 0.4 ms at 96 kHz and 3 to 7 ms at 44.1 kHz.
+  `getBand()`, `getStageLength()` and `getFirstStageTransition()` tell it.
+  `setOversamplingBand()` offers it in `Saturation`, `MultibandSaturation`
+  (every band) and `Clipper`; state key `oversamplingBand`.
+- `KeyEqualizer`: a band on the move glides through real designs of its own
+  form, a stretch of 1/1500 s at a time, instead of interpolating its
+  coefficients; a change of form
+  crosses from one bank to another, the new one faded in; and a band can
+  sit on the middle or on the sides of a pair (`Placement`, state key
+  `b%d.place`): with a key the same in both channels a band on the sides
+  leaves the detector as it was, to the bit. `processFrame()` takes a pair
+  at once, `getResponse()` the curve of each part. `BiquadCascade` gains a
+  per-sample pass that leaves sections out for a channel. `Compressor`
+  (`KeyPlacement`) and the wet equalizer of `AlgorithmicReverb` take whole
+  frames.
 - `TapeMachine::setBiasShape()` (setup thread): `FourLevel`, the default
   (see Fixed), or `TwoLevel`, the carrier of 1.8.1, kept to compare. State
   key `biasShape`; a state without it takes the default.

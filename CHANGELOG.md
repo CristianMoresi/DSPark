@@ -6,6 +6,59 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TriggeredEnvelope` (new, `Core/TriggeredEnvelope.h`): delay, attack,
+  hold, decay, sustain and release, each timed stage landing on its last
+  sample exactly; the attack, decay and release bend from slow start to
+  fast start; the trigger is notes or the audio of a key signal (a peak
+  level over a threshold starts it, and it lets go after the level has
+  stayed 6 dB under for 50 ms, both adjustable); a bipolar mode centres
+  the output on the sustain. Nothing steps when a control moves: a curve
+  that changes in the middle of its stage takes the phase that keeps the
+  output where it is, a sustain changed in the decay bends what is left of
+  it, and the attack and release start from the output's value.
+- `Lfo`: a `Steps` shape, a sequence of up to 16 steps over the cycle, each
+  held or gliding to its value from the step before over a share of its
+  length along a curve. A random step draws its value per cycle from the
+  seed, at least a quarter of the room away from the step before; a swing
+  moves the boundary inside each pair of steps; a grid quantizes the values
+  (semitones, when the output is mapped to a pitch range). Any cycle reads
+  alike whatever was read before it. `setRetriggerGlideMs()` (0 by default)
+  makes `reset()` glide from the output it was at, for any shape.
+- `CrossoverFilter::setTopology()` (opt-in, minimum-phase engine): `Balanced`
+  splits at the middle split first and divides each half the same way, each
+  branch taking the phase corrections of the other half once: 6 correction
+  chains with 6 bands where the cascade has 10, 22 with 12 where it has 55.
+  The bands sum to the cascade's allpass (1.2e-7 apart on noise of 0.2);
+  their skirts differ (band 0 of six at LR24 is -102 dB at 2 kHz, -78 in the
+  cascade). 48 kHz stereo, default splits: 6 bands 31.9 against 38.7 ns per
+  frame at LR24 (46.6 against 54.6 at LR48), 12 bands 84.5 against 139.8
+  (119.5 against 186.5). A change of topology goes over without a step.
+  `setCrossoverTopology()` in `MultibandSaturation` and
+  `MultibandCompressor`; state keys `topology` and `xoverTopology`.
+- `CrossoverFilter::setNumBandsKeepingSplits()`, also in
+  `MultibandSaturation` and `MultibandCompressor`: the band count without
+  re-spacing the splits; a split that stays keeps its frequency and memory,
+  one that comes back takes the frequency it had (or, when that is not above
+  the split below, the point halfway in octaves to 20 kHz).
+- `Saturation::setTone()`: four sections after the curve, a low shelf
+  (100 Hz), two bells of Q 0.7 (500 Hz and 2.5 kHz) and a high shelf
+  (8 kHz). A section at 0 dB is out of the path; it comes in, moves and goes
+  out over 20 ms, and leaves once its poles have died away, so the largest
+  step between samples stays the steady one. Each bell gives its gain at its
+  centre within 0.1 dB. State keys `tone%dHz` and `tone%dDb`.
+- `Saturation::setCurveBase()`: the base curve under the three controls of
+  `Algorithm::Curve`: tanh (the default), algebraic, arctangent, the error
+  function, a cubic that reaches its ceiling at 1.5, a valve (asymmetric:
+  1 - e^-x on the positive half) and a rectifier (it turns back toward 0 on
+  the negative half: an octave up, H2 -16 dBc at +24 dB). Each keeps a slope
+  of 1 at 0 (small-signal gain within 0.04 dB) and the ceiling. State key
+  `curveBase`.
+- `Saturation::setDrivePan()` (-1 to 1): the drive leans to one channel (or
+  to the middle or the sides in a mid-side mode) by up to 6 dB, each
+  channel coming out by the inverse, so the level holds where the curve is
+  straight and only how much each side saturates moves (at -1 and SoftClip
+  +12 dB on a 1 kHz tone, -10.4 and -23.5 dB of distortion against -15.3
+  centred). Centred it is what it was, to the bit. State key `drivePan`.
 - `AlgorithmicReverb::setPlateTank()` (opt-in, `Type::Plate`): the plate's
   own tank, the figure-eight of Dattorro's plate, instead of the delay
   network. Two branches feed each other through modulated and fixed
@@ -1914,6 +1967,37 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `CrossoverFilter` in linear phase: a new design comes in over a
+  partition, each band going from the previous design to the new along it
+  (10.7 ms at 48 kHz), where the kernel set was swapped in one sample. With
+  a 1 kHz tone and a split moved from 500 Hz to 2 kHz, band 0's largest
+  step between samples is the one of its new steady state (0.061 at 0.5 of
+  amplitude; the swap jumped 0.380), and the bands keep summing to the
+  delayed input to 6e-8, also when the band count changes with it. That
+  partition convolves twice: with a split moving every 200 ms, 12 bands in
+  stereo at 64-sample blocks cost 4 % more on average and no more in the
+  worst block.
+- `CrossoverFilter` in minimum phase: a change of band count goes over
+  20 ms, the old and the new topology run together and each band moving
+  from one to the other (a band that leaves folds into the new top band, one
+  that comes in rises from silence), where it was instant. From 3 to 4
+  bands at LR24 with tones in every band, band 0's largest step is 0.0050
+  against 0.0049 steady (0.072 before) and the new top band's 0.187 against
+  0.184 (0.296); at LR48 0.0053 against 0.0052 (0.136). With the bands
+  unchanged the output is the same to the bit.
+- `Saturation`: the DC filter of the output runs only where a curve makes DC
+  (Tube and MultiStage always; Transformer, SoftClip, HardClip, Exciter and
+  Wavefolder with a character other than 0; Curve with asymmetry or the
+  valve and rectifier bases; any with `setAsymmetry()`), and comes in and
+  goes out over 50 ms: symmetric curves no longer turn the phase of the low
+  end (20.7 degrees at 20 Hz). A change of processing mode dips the wet side
+  to the dry over 5 ms, changes at the bottom and comes back over a
+  quarter of a second: the largest step is the steady one (low tones jumped
+  up to 42 times it).
+- `Saturation`: with the drive knob still, its gain is worked out once per
+  block instead of once per oversampled sample, to the bit: at 4x, SoftClip
+  52 against 59 ns per sample, Tube 61.4 against 64.7, Curve 84.3 against
+  87.6.
 - `Equalizer` in `LinearPhase`: the design keeps each band's magnitude curve
   on its grid, so a change computes the curve of the band that changed and
   one product of the curves, where every section of every band was evaluated

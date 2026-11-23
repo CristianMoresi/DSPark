@@ -8,6 +8,7 @@
 #include "../Core/Synthesizer.h"
 #include "../Core/Sampler.h"
 #include "../Core/Lfo.h"
+#include "../Core/TriggeredEnvelope.h"
 #include "../Core/FFT.h"
 #include "../Core/WindowFunctions.h"
 
@@ -1620,4 +1621,91 @@ DSPARK_TEST(Lfo_steps_glide_draw_swing_and_retrigger)
     }
     EXPECT_NEAR(last, -1.0, 1e-12);
     EXPECT_LT(maxStep, 2.0 / 96.0 + 1e-9);   // 2 over 96 samples, no jump
+}
+
+// ============================================================================
+// TriggeredEnvelope
+// ============================================================================
+
+// Every stage takes exactly its samples; a curve or a sustain that changes in
+// the middle of a stage keeps the output where it is; the audio trigger
+// starts above its threshold and lets go only after the key has stayed 6 dB
+// below it for the wait; the bipolar output is centred on the sustain.
+DSPARK_TEST(TriggeredEnvelope_stages_curves_and_audio_trigger)
+{
+    using E = TriggeredEnvelope<double>;
+    E env;
+    env.prepare(48000.0);
+    env.setTimes(1.0, 2.0, 1.0, 4.0, 2.0);   // 48, 96, 48, 192, 96 samples
+    env.setSustain(0.5);
+    env.setCurves(0.7, -0.5, 0.3);
+    env.noteOn();
+    std::vector<double> out;
+    for (int i = 0; i < 48 + 96 + 48 + 192 + 50; ++i) out.push_back(env.process());
+    EXPECT_EQ(out[47], 0.0);                        // the delay
+    EXPECT_GT(out[48], 0.0);
+    EXPECT_LT(out[48 + 94], 1.0);
+    EXPECT_EQ(out[48 + 95], 1.0);                   // the attack lands on its 96th sample
+    EXPECT_EQ(out[48 + 96 + 47], 1.0);              // the hold
+    EXPECT_LT(out[48 + 96 + 48], 1.0);
+    EXPECT_NEAR(out[48 + 96 + 48 + 191], 0.5, 1e-12);   // the decay lands on its 192nd
+    EXPECT_TRUE(env.getStage() == E::Stage::Sustain);
+    // Fast-start attack: above the straight line at a quarter of it.
+    EXPECT_GT(out[48 + 23], 0.25 + 0.1);
+
+    // A curve and a sustain changed in the middle of the decay: no jump.
+    E mid;
+    mid.prepare(48000.0);
+    mid.setTimes(0.0, 1.0, 0.0, 20.0, 10.0);
+    mid.setSustain(0.3);
+    mid.noteOn();
+    double last = 0.0, worst = 0.0, typical = 0.0;
+    for (int i = 0; i < 2000; ++i)
+    {
+        if (i == 400) mid.setCurves(0.0, 0.9, 0.0);
+        if (i == 600) mid.setSustain(0.6);
+        if (i == 1200) mid.setSustain(0.2);   // in the sustain: moves at the decay's pace
+        if (i == 1300) mid.setCurves(0.0, -0.9, 0.0);
+        const double v = mid.process();
+        const double step = std::abs(v - last);
+        if (i == 400 || i == 600 || i == 1200 || i == 1300) worst = std::max(worst, step);
+        else if (i > 60 && i < 1900) typical = std::max(typical, step);
+        last = v;
+    }
+    EXPECT_LT(worst, typical * 1.25);   // a slope that changes, not a value that jumps
+    EXPECT_NEAR(last, 0.2, 1e-12);
+
+    // The audio trigger.
+    E key;
+    key.prepare(48000.0);
+    key.setTrigger(E::Trigger::Audio);
+    key.setThresholdDb(-20.0);
+    key.setTimes(0.0, 1.0, 0.0, 5.0, 5.0);
+    key.setSustain(0.8);
+    auto burst = [&](double amp, int n) {
+        for (int i = 0; i < n; ++i) (void)key.process(amp * std::sin(0.3 * i));
+    };
+    burst(0.05, 4800);                               // below the threshold: nothing
+    EXPECT_TRUE(key.getStage() == E::Stage::Idle);
+    burst(0.2, 4800);                                // above: it starts
+    EXPECT_TRUE(key.getStage() == E::Stage::Sustain);
+    burst(0.07, 9600);                               // 3 dB under the threshold: inside the hysteresis
+    EXPECT_TRUE(key.getStage() == E::Stage::Sustain);
+    burst(0.02, 1200);                               // 14 dB under, for 25 ms: still waiting
+    EXPECT_TRUE(key.getStage() == E::Stage::Sustain);
+    burst(0.02, 2400);                               // past the 50 ms wait: it lets go
+    EXPECT_TRUE(key.getStage() == E::Stage::Release || key.getStage() == E::Stage::Idle);
+
+    // Bipolar: 0 while it sustains, -1 at rest, +1 at the top.
+    E bi;
+    bi.prepare(48000.0);
+    bi.setBipolar(true);
+    bi.setSustain(0.25);
+    bi.setTimes(0.0, 1.0, 1.0, 1.0, 1.0);
+    EXPECT_EQ(bi.process(), -1.0);
+    bi.noteOn();
+    double top = -1.0, held = 0.0;
+    for (int i = 0; i < 400; ++i) { const double v = bi.process(); top = std::max(top, v); held = v; }
+    EXPECT_EQ(top, 1.0);
+    EXPECT_NEAR(held, 0.0, 1e-12);
 }

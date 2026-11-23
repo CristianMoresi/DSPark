@@ -6,6 +6,49 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `NormalizedLadderN<T, Order>` (in `Core/NormalizedLadder.h`, orders 1 to
+  16): a whole filter as one normalized ladder of plane rotations, designed
+  from its polynomials (the denominator stepped down to its reflection
+  coefficients, the taps taken from the top), with no roots to find. With
+  no input its memory can only lose energy whatever the coefficients do, so
+  a knob moved at audio rate stays bounded; a ramp moves every rotation and
+  tap linearly. A fifth-order low-pass matches a direct form of the same
+  polynomials to -247 dB and the analog prototype within 0.01 dB; a corner
+  swept from 300 Hz to 6 kHz by a 30 Hz sine, designed every 8 samples,
+  stays bounded. Pairs of channels run in the two lanes of one register:
+  7.7 ns per stereo frame at order 5 (three biquad sections, 6.7).
+  `FilterDesign::bilinearPolynomial()` takes an analog network of any order,
+  numerator and denominator as polynomials in s, to the digital ones it
+  takes, with an optional frequency kept in place.
+- `Chorus::setAnalogTapPhase()` (0 to 180 degrees between the analog
+  model's two taps, gliding; the presets set 180, 0 for Vibrato),
+  `setAnalogTone()` (the corner after the lines an octave down or up) and
+  `setAnalogCircuitFilters()` (the filter pair of a chorus circuit: two
+  slightly resonant sections at 8 kHz before the line and a damped one at
+  5.6 kHz after it, a darker wet with more of the clock's images through).
+  `setMixRule()` offers the mixer's rules. State keys `analogTapPhase`,
+  `analogTone`, `analogCircuit` and `mixRule`.
+- `BucketBrigade::setShape()`, `setCorners()`, `setCornersNow()` and
+  `getOutputCorner()`: the line's low-passes are state-variable sections in
+  the trapezoidal form, whose corners glide over 32 steps of the line, and
+  can be the pair of a chorus circuit (`Shape::Chorus`).
+- `DryWetMixer::MixRule::FullDryToHalf` (the dry whole up to half, the wet
+  whole from half: at half, dry plus wet, as a hardware blend knob) and
+  `getMixRule()`.
+- `LevelFollower::setVuEnabled()` and `getVuLevel()` / `getVuLevelDb()`: a
+  volume-unit needle, the rectified signal through the needle's second-order
+  mass, spring and damping (2.15 Hz, damping 0.813), calibrated so a steady
+  sine reads its RMS. A step to a 1 kHz tone reaches 99 % of its reading in
+  301 ms and overshoots it by 1.25 %. Off by default, when it costs nothing.
+- `TapeMachine::getRecordPeak()` / `getRecordPeakDb()`: the overload lamp
+  before the tape, read at the internal rate (a 12 kHz tone read at eight
+  phases of the host's samples, 3 dB apart at the host rate, reads within
+  0.8 dB), falling with a 300 ms time constant.
+- `TapeMachine::setAlignmentTolerance()` (0 to 1, 0 by default, every
+  channel the same to the bit): each channel strays its own fixed way, up to
+  8 % of bias, 0.75 dB of playback treble and 0.25 dB of level, in magnitude
+  only, so a mono sum keeps within half a decibel of the channels' level at
+  10 kHz. State key `alignTolerance`.
 - `TriggeredEnvelope` (new, `Core/TriggeredEnvelope.h`): delay, attack,
   hold, decay, sustain and release, each timed stage landing on its last
   sample exactly; the attack, decay and release bend from slow start to
@@ -1967,6 +2010,30 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Changed
 
+- `Chorus` in the analog model: the lines' anti-alias and reconstruction
+  filters are fourth-order Butterworth at 7 kHz, the same in the three
+  modes and fixed in hertz, where they sat at a fifth of the slowest clock
+  the sweep needs (so they moved with the depth and differed between
+  modes); they go lower only when a setting makes the clock too slow for
+  them. The line's hiss is high-passed at 200 Hz. A change of engine
+  (`setModel()`) runs the incoming engine unheard until its line is full and
+  then crosses over 10 ms: the largest step between samples at the change is
+  1.13 times the steady one (9.77 before, the incoming line starting empty).
+- `Delay` with `Character::Bucket`: while the delay glides, the device's
+  filters follow it, worked out every 32 samples and aimed at where the
+  corner will be at the end of the next 32. Against filters that follow the
+  delay exactly, -90.2 dB (redesigning them on a 2 % change of the delay
+  left -41.4). A change of character crosses over 10 ms with the incoming
+  one running from the change; a switch to Bucket fills the device first,
+  unheard (the level held within 0.09 dB, where it fell by 69 dB while the
+  line filled).
+- `TapeTransport`, and the transport of `TapeMachine` and `Delay`'s tape:
+  the deviation is worked out every 16 samples (the rotations exact there,
+  the noises and the scrape at that rate with their inputs scaled to keep
+  their spectra) and followed by a straight line, -123 dB from the deviation
+  of every sample under 100 Hz. The transport costs 9.0 ns a sample (15.6
+  before) and `Delay`'s tape echo 71.0 ns a stereo frame (102.6). The tape's
+  hum is a rotation per sample, its radius held on the circle every block.
 - `CrossoverFilter` in linear phase: a new design comes in over a
   partition, each band going from the previous design to the new along it
   (10.7 ms at 48 kHz), where the kernel set was swapped in one sample. With

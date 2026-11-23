@@ -248,6 +248,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         r.setGateHoldNote(AR::NoteValue::Quarter); r.setInputWidth(0.6f); r.setWidthLaw(AR::WidthLaw::PowerKept);
         r.setModulationStyle(AR::ModulationStyle::Segments); r.setSpaceLayout(AR::SpaceLayout::Geometric);
         r.setShimmer(0.3f);
+        r.setBandLimit(11000.0f); r.setDoubleSlope(0.7f); r.setPostEqLoudness(true);
         KeyEqualizer<float, 2>::Band b; b.shape = KeyEqualizer<float, 2>::Shape::Bell; b.frequency = 900.0f; b.gainDb = -3.0f;
         r.setPostEqBand(2, b);
     })));
@@ -257,6 +258,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         r.setDryDip(9.0f); r.setGate(-35.0f); r.setGateHold(300.0f); r.setGateRelease(80.0f);
     })));
     EXPECT_TRUE((roundTrip<Equalizer<float>>([](auto& e) {
+        e.setLoudnessCompensation(true);
         Equalizer<float>::BandConfig b;
         b.frequency = 320.0f; b.gain = 4.0f; b.q = 1.4f;
         e.setBand(0, b);

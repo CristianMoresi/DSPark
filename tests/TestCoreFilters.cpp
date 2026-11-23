@@ -12,6 +12,7 @@
 #include "../Core/GraphicBank.h"
 #include "../Core/LaneCascade.h"
 #include "../Core/KeyEqualizer.h"
+#include "../Analysis/LoudnessMeter.h"
 #include "../Core/CabinetModel.h"
 #include "../Core/NormalizedLadder.h"
 #include "../Core/StateVariableFilter.h"
@@ -5323,4 +5324,83 @@ DSPARK_TEST(KeyEqualizer_bands_sit_on_the_middle_or_on_the_sides)
         EXPECT_NEAR(20.0 * std::log10(late / 0.25), 0.0, 0.01);
         EXPECT_LT(step, 0.14);        // the step of the tone 12 dB up is 0.13
     }
+}
+
+DSPARK_TEST(KeyEqualizer_loudness_compensation_keeps_pink_noise_as_loud)
+{
+    // A hundred settings drawn at random (one to four bells, shelves or
+    // tilts): with the compensation, pink noise comes out as loud as it went
+    // in, as BS.1770 measures it; off, the equalizer is what it was, to the bit.
+    constexpr double fs = 48000.0;
+    constexpr int kSamples = 2 * 48000;
+    std::vector<float> pink(static_cast<size_t>(kSamples));
+    {
+        uint32_t seed = 5u;
+        double b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+        for (auto& v : pink)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const double w = static_cast<int32_t>(seed) / 2147483648.0;
+            b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.96900 * b2 + w * 0.1538520;
+            b3 = 0.86650 * b3 + w * 0.3104856; b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+            v = static_cast<float>(0.05 * (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362));
+            b6 = w * 0.115926;
+        }
+    }
+    auto run = [&](KeyEq2* eq, std::vector<float>* keep) {
+        LoudnessMeter<float> meter;
+        meter.prepare(fs, 2);
+        if (keep) keep->clear();
+        for (int i = 0; i < kSamples; ++i)
+        {
+            float frame[2] = { pink[static_cast<size_t>(i)], pink[static_cast<size_t>(i)] };
+            if (eq)
+            {
+                (void)eq->sync();
+                eq->processFrame(frame, 2);
+                eq->advance(1);
+            }
+            if (keep) keep->push_back(frame[0]);
+            if (i >= kSamples / 4) meter.process(&frame[0], &frame[1], 1);
+        }
+        return static_cast<double>(meter.getIntegratedLUFS());
+    };
+    const double dry = run(nullptr, nullptr);
+    uint32_t seed = 13u;
+    auto draw = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0; };
+    std::vector<double> off;
+    for (int s = 0; s < 100; ++s)
+    {
+        auto eq = std::make_unique<KeyEq2>();
+        eq->prepare(fs);
+        eq->setLoudnessCompensation(true);
+        const int bands = 1 + static_cast<int>(draw() * 4.0);
+        for (int b = 0; b < bands; ++b)
+        {
+            const int kind = static_cast<int>(draw() * 4.0);
+            const auto shape = kind == 0 ? KeyEq2::Shape::LowShelf : kind == 1 ? KeyEq2::Shape::HighShelf
+                             : kind == 2 ? KeyEq2::Shape::Tilt : KeyEq2::Shape::Bell;
+            eq->setBand(b, keyEqBand(shape, static_cast<float>(60.0 * std::pow(200.0, draw())),
+                                     static_cast<float>(-12.0 + 24.0 * draw()), static_cast<float>(0.5 * std::pow(8.0, draw())),
+                                     kind == 2 ? static_cast<float>(-3.0 + 6.0 * draw()) : 12.0f));
+        }
+        off.push_back(std::abs(run(eq.get(), nullptr) - dry));
+    }
+    std::sort(off.begin(), off.end());
+    std::printf("    key loudness kept: median %.3f LU, worst %.3f LU%c", off[off.size() / 2], off.back(), 10);
+    EXPECT_LT(off[off.size() / 2], 0.5);
+    EXPECT_LT(off.back(), 1.0);
+
+    std::vector<float> a, b;
+    auto plain = std::make_unique<KeyEq2>(), other = std::make_unique<KeyEq2>();
+    for (auto* e : { plain.get(), other.get() })
+    {
+        e->prepare(fs);
+        e->setBand(0, keyEqBand(KeyEq2::Shape::Bell, 2000.0f, 6.0f, 1.0f, 12.0f));
+    }
+    (void)run(plain.get(), &a);
+    other->setLoudnessCompensation(true);
+    other->setLoudnessCompensation(false);
+    (void)run(other.get(), &b);
+    EXPECT_TRUE(a == b);
 }

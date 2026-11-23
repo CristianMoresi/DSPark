@@ -11570,3 +11570,152 @@ DSPARK_TEST(Spectral_first_states_are_converted)
     EXPECT_NEAR(detailOf(1.0f, 128), 1.0f / 24.0f, 1e-5f);
     EXPECT_EQ(detailOf(0.3f, 1), 1.0f);
 }
+
+DSPARK_TEST(AlgoReverb_band_limit_is_a_wall_outside_the_tank)
+{
+    // The band limit runs on the wet output, outside the tank: the same
+    // reverb fed the same noise, with and without it, differs by the wall's
+    // response only (steady noise, so its delay does not move the energy).
+    // Flat to the corner within its ripple, 90 dB down a fifth of an octave
+    // over it (measured 0.050 and -102.9 dB); switched off again, the output
+    // is the plain one to the bit.
+    using ARevD = AlgorithmicReverb<double>;
+    constexpr double fs = 48000.0;
+    constexpr int kBlock = 256, kN = 65536;
+    auto run = [&](double limit, double offAt, std::vector<double>& out) {
+        ARevD rev;
+        rev.prepare(spec(fs, kBlock, 2));
+        rev.setType(ARevD::Type::Hall);
+        rev.setMix(1.0);
+        rev.setDamping(0.2);
+        rev.setBandLimit(limit);
+        const int total = 3 * kN;
+        out.assign(static_cast<size_t>(total), 0.0);
+        std::vector<double> l(kBlock), r(kBlock);
+        uint32_t seed = 7u;
+        for (int off = 0; off < total; off += kBlock)
+        {
+            if (offAt > 0.0 && off == static_cast<int>(offAt * fs) / kBlock * kBlock) rev.setBandLimit(0.0);
+            for (int i = 0; i < kBlock; ++i)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                const double x = 0.25 * static_cast<int32_t>(seed) / 2147483648.0;
+                l[static_cast<size_t>(i)] = x;
+                r[static_cast<size_t>(i)] = -x;
+            }
+            double* ch[2] = { l.data(), r.data() };
+            rev.processBlock(AudioBufferView<double>(ch, 2, kBlock));
+            for (int i = 0; i < kBlock; ++i) out[static_cast<size_t>(off + i)] = l[static_cast<size_t>(i)];
+        }
+    };
+    std::vector<double> plain, walled, back;
+    run(0.0, 0.0, plain);
+    run(8000.0, 0.0, walled);
+    run(8000.0, 1.0, back);
+
+    FFTReal<double> fft(kN);
+    auto power = [&](const std::vector<double>& x, std::vector<double>& p) {
+        std::vector<double> seg(kN), bins(kN + 2);
+        for (int i = 0; i < kN; ++i)
+            seg[static_cast<size_t>(i)] = x[static_cast<size_t>(kN + i)] * (0.5 - 0.5 * std::cos(6.283185307179586 * i / kN));
+        fft.forward(seg.data(), bins.data());
+        p.assign(kN / 2 + 1, 0.0);
+        for (int k = 0; k <= kN / 2; ++k)
+            p[static_cast<size_t>(k)] = bins[2 * static_cast<size_t>(k)] * bins[2 * static_cast<size_t>(k)]
+                                      + bins[2 * static_cast<size_t>(k) + 1] * bins[2 * static_cast<size_t>(k) + 1];
+    };
+    std::vector<double> pp, pw;
+    power(plain, pp);
+    power(walled, pw);
+    const double df = fs / kN;
+    auto bandDb = [&](double lo, double hi) {
+        double a = 0.0, b = 0.0;
+        for (int k = static_cast<int>(lo / df); k <= static_cast<int>(hi / df); ++k)
+        {
+            a += pw[static_cast<size_t>(k)];
+            b += pp[static_cast<size_t>(k)];
+        }
+        return 10.0 * std::log10(a / b);
+    };
+    double worstPass = 0.0;
+    for (double lo = 100.0; lo < 7600.0; lo *= 1.25)
+        worstPass = std::max(worstPass, std::abs(bandDb(lo, std::min(lo * 1.25, 7600.0))));
+    const double stopFrom = 8000.0 * FilterDesign::ellipticStopRatio();
+    std::printf("    band limit 8 kHz: pass %.3f dB at most, stop %.1f dB%c", worstPass, bandDb(stopFrom * 1.02, 20000.0), 10);
+    EXPECT_LT(worstPass, 0.08);       // measured 0.050: the ripple
+    EXPECT_LT(bandDb(stopFrom * 1.02, 20000.0), -90.0);
+
+    // Switched off at 1 s: after its 20 ms fade the output is the plain one.
+    bool same = true;
+    for (int i = static_cast<int>(1.1 * fs); i < 3 * kN; ++i)
+        same = same && back[static_cast<size_t>(i)] == plain[static_cast<size_t>(i)];
+    EXPECT_TRUE(same);
+}
+
+
+namespace {
+// The late field's impulse response (left), early reflections off.
+std::vector<double> lateIR(AlgorithmicReverb<double>::Type type, double decay, double slope)
+{
+    using ARevD = AlgorithmicReverb<double>;
+    ARevD rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(type);
+    rev.setMix(1.0);
+    rev.setModulation(0.0);
+    rev.setEarlyLevel(-60.0);
+    rev.setDecay(decay);
+    rev.setDoubleSlope(slope);
+    const int total = static_cast<int>(3.0 * decay * 48000.0) / 256 * 256;
+    std::vector<double> ir(static_cast<size_t>(total));
+    std::vector<double> l(256), r(256);
+    for (int off = 0; off < total; off += 256)
+    {
+        for (int i = 0; i < 256; ++i) l[static_cast<size_t>(i)] = r[static_cast<size_t>(i)] = off + i == 0 ? 1.0 : 0.0;
+        double* ch[2] = { l.data(), r.data() };
+        rev.processBlock(AudioBufferView<double>(ch, 2, 256));
+        for (int i = 0; i < 256; ++i) ir[static_cast<size_t>(off + i)] = l[static_cast<size_t>(i)];
+    }
+    return ir;
+}
+
+// Early decay time (0 to -10 dB, times 6) and T30 (-5 to -35 dB, times 2) of
+// the backward energy curve, in seconds; and the total energy.
+struct Decays { double edt = 0.0, t30 = 0.0, energy = 0.0; };
+Decays schroederDecays(const std::vector<double>& ir)
+{
+    Decays d;
+    for (const double v : ir) d.energy += v * v;
+    double rem = d.energy;
+    int t0 = -1, t5 = -1, t10 = -1, t35 = -1;
+    for (int i = 0; i < static_cast<int>(ir.size()); ++i)
+    {
+        const double db = 10.0 * std::log10(rem / d.energy + 1e-300);
+        if (t0 < 0 && ir[static_cast<size_t>(i)] != 0.0) t0 = i;
+        if (t5 < 0 && db <= -5.0) t5 = i;
+        if (t10 < 0 && db <= -10.0) t10 = i;
+        if (t35 < 0 && db <= -35.0) { t35 = i; break; }
+        rem -= ir[static_cast<size_t>(i)] * ir[static_cast<size_t>(i)];
+    }
+    d.edt = 6.0 * (t10 - t0) / 48000.0;
+    d.t30 = 2.0 * (t35 - t5) / 48000.0;
+    return d;
+}
+} // namespace
+
+DSPARK_TEST(AlgoReverb_double_slope_shortens_the_early_decay_only)
+{
+    using Type = AlgorithmicReverb<double>::Type;
+    for (const auto [type, decay] : { std::pair { Type::Hall, 2.0 }, std::pair { Type::Room, 1.0 } })
+    {
+        const Decays a = schroederDecays(lateIR(type, decay, 0.0));
+        const Decays b = schroederDecays(lateIR(type, decay, 1.0));
+        std::printf("    %s %.1f s: EDT/T30 %.3f -> %.3f, T30 %.3f -> %.3f s, energy %+.2f dB%c",
+                    type == Type::Hall ? "Hall" : "Room", decay, a.edt / a.t30, b.edt / b.t30, a.t30, b.t30,
+                    10.0 * std::log10(b.energy / a.energy), 10);
+        EXPECT_LT(b.edt / b.t30, 0.92 * (a.edt / a.t30));   // measured 0.87 (Hall), 0.90 (Room)
+        EXPECT_NEAR(b.t30 / a.t30, 1.0, 0.03);
+        EXPECT_NEAR(10.0 * std::log10(b.energy / a.energy), 0.0, 0.5);
+    }
+}
+

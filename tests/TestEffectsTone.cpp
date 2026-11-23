@@ -16,6 +16,7 @@
 #include "../Effects/Clipper.h"
 #include "../Effects/MultibandSaturation.h"
 #include "../Effects/LoFi.h"
+#include "../Analysis/LoudnessMeter.h"
 
 #include <algorithm>
 #include <cmath>
@@ -7174,4 +7175,78 @@ DSPARK_TEST(Saturation_and_clipper_offer_the_audible_oversampling_band)
     EXPECT_EQ(multi->getLatency(), before - 32);
     EXPECT_TRUE(multi->getBandSaturation(0).getOversamplingBand() == Sat8::OversamplingBand::Audible);
     EXPECT_TRUE(multi->getBandSaturation(2).getOversamplingBand() == Sat8::OversamplingBand::Audible);
+}
+
+DSPARK_TEST(Equalizer_loudness_compensation_keeps_pink_noise_as_loud)
+{
+    // Two hundred settings drawn at random (one to four bells, shelves or
+    // tilts, +-12 dB): with the compensation, pink noise comes out as loud
+    // as it went in, as BS.1770 measures it.
+    constexpr double fs = 48000.0;
+    constexpr int kBlock = 512, kBlocks = 2 * 48000 / 512;
+    std::vector<float> pink(static_cast<size_t>(kBlock * kBlocks));
+    {
+        uint32_t seed = 3u;
+        double b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+        for (auto& v : pink)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const double w = static_cast<int32_t>(seed) / 2147483648.0;
+            b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.96900 * b2 + w * 0.1538520;
+            b3 = 0.86650 * b3 + w * 0.3104856; b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+            v = static_cast<float>(0.05 * (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362));
+            b6 = w * 0.115926;
+        }
+    }
+    auto loudness = [&](Equalizer<float>* eq) {
+        LoudnessMeter<float> meter;
+        meter.prepare(fs, 2);
+        std::vector<float> l(kBlock), r(kBlock);
+        for (int b = 0; b < kBlocks; ++b)
+        {
+            std::copy_n(pink.data() + b * kBlock, kBlock, l.data());
+            std::copy_n(pink.data() + b * kBlock, kBlock, r.data());
+            float* ch[2] = { l.data(), r.data() };
+            if (eq) eq->processBlock(AudioBufferView<float>(ch, 2, kBlock));
+            if (b >= kBlocks / 4) meter.process(l.data(), r.data(), kBlock);
+        }
+        return static_cast<double>(meter.getIntegratedLUFS());
+    };
+    const double dry = loudness(nullptr);
+    uint32_t seed = 11u;
+    auto draw = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0; };
+    std::vector<double> off;
+    for (int s = 0; s < 200; ++s)
+    {
+        auto eq = std::make_unique<Equalizer<float>>();
+        eq->prepare(spec(fs, kBlock, 2));
+        eq->setLoudnessCompensation(true);
+        const int bands = 1 + static_cast<int>(draw() * 4.0);
+        eq->setNumBands(bands);
+        for (int b = 0; b < bands; ++b)
+        {
+            Equalizer<float>::BandConfig c;
+            const int kind = static_cast<int>(draw() * 4.0);
+            c.type = kind == 0 ? Equalizer<float>::BandType::LowShelf : kind == 1 ? Equalizer<float>::BandType::HighShelf
+                   : kind == 2 ? Equalizer<float>::BandType::Tilt : Equalizer<float>::BandType::Peak;
+            c.frequency = static_cast<float>(60.0 * std::pow(200.0, draw()));
+            c.gain = static_cast<float>(-12.0 + 24.0 * draw());
+            c.q = static_cast<float>(0.5 * std::pow(8.0, draw()));
+            eq->setBand(b, c);
+        }
+        off.push_back(std::abs(loudness(eq.get()) - dry));
+    }
+    std::sort(off.begin(), off.end());
+    std::printf("    loudness kept: median %.3f LU, worst %.3f LU%c", off[off.size() / 2], off.back(), 10);
+    EXPECT_LT(off[off.size() / 2], 0.5);
+    EXPECT_LT(off.back(), 1.0);
+
+    // Off, the equalizer is what it was, and a flat one adds nothing.
+    auto flat = std::make_unique<Equalizer<float>>();
+    flat->prepare(spec(fs, kBlock, 2));
+    flat->setLoudnessCompensation(true);
+    flat->setNumBands(1);
+    flat->setBand(0, 1000.0f, 0.0f);
+    EXPECT_NEAR(loudness(flat.get()), dry, 1e-4);
+    EXPECT_NEAR(static_cast<double>(flat->getCompensationDb()), 0.0, 1e-6);
 }

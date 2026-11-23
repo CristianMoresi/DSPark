@@ -34,8 +34,10 @@
  * alternating dH/dt that erased the loop's remanence (a 0.001*a field tick
  * erased all of it within 50 ms; now 1.5%), kept a -7.5 dB error after any
  * abrupt onset, and at 1x in TapeMachine could pin the core silent. Solved
- * per sample by Newton-Raphson on M_n, seeded by an explicit Euler predictor;
- * converges in 1-3 iterations at audio rates. All internal state is double
+ * per sample by Newton-Raphson on M_n, seeded by an explicit Euler predictor
+ * (or, for a field with a period of its own, by the same phase of the last
+ * two periods: setPredictorPeriod()); converges in 1-3 iterations at audio
+ * rates. All internal state is double
  * regardless of T: the model mixes quantities spanning ~9 orders of
  * magnitude.
  *
@@ -54,7 +56,9 @@
 #include "DspMath.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 
 namespace dspark {
 
@@ -86,6 +90,9 @@ public:
         hPrev_ = 0.0;
         hDotPrev_ = 0.0;
         wPrev_ = 0.0;
+        past_.fill(0.0);
+        pastAt_ = 0;
+        pastCount_ = 0;
     }
 
     /**
@@ -114,6 +121,42 @@ public:
         c_     = std::clamp(c, 0.0, 0.999);
         chi_   = ms_ / a_;
     }
+
+    /**
+     * @brief Where the solver stops: a Newton step under this share of Ms.
+     *
+     * At the default (1e-9) the model is evaluated once more at the point
+     * reached. A looser stop takes that last evaluation from the slope of the
+     * step just made, and from the second step on stops as well when what is
+     * left, read from the rate the steps shrink at (a cube over a square, as
+     * Newton's), is under it. A non-finite or non-positive value is ignored.
+     *
+     * @param relative The share of Ms, 1e-12 to 1e-3.
+     */
+    void setTolerance(double relative) noexcept
+    {
+        if (!(relative > 0.0) || !std::isfinite(relative)) return;
+        tolerance_ = std::clamp(relative, 1e-12, 1e-3);
+        bySlope_ = tolerance_ > 1e-9;
+    }
+
+    /**
+     * @brief The period of the field in samples, for the predictor (0, the
+     *        default, for none). With a field that repeats itself every
+     *        `period` samples beside a slower programme (a bias carrier),
+     *        the Newton steps start from dM/dt at the same phase of the
+     *        last two periods, carried on in a line, in place of the last
+     *        one: fewer steps, the same answer within the tolerance.
+     * @param period 0, or 1 to kMaxPeriod samples (others are ignored).
+     */
+    void setPredictorPeriod(int period) noexcept
+    {
+        if (period < 0 || period > kMaxPeriod || period == period_) return;
+        period_ = period;
+        pastCount_ = 0;
+    }
+    /** @return The period the predictor follows (0: none). */
+    [[nodiscard]] int getPredictorPeriod() const noexcept { return period_; }
 
     /** @brief Saturation magnetization Ms (A/m). */
     [[nodiscard]] double getSaturation() const noexcept { return ms_; }
@@ -150,10 +193,21 @@ public:
         // with Newton steps.
         constexpr double kGain = 1.0 / (1.0 + kAlpha);
         const double step = 2.0 * invFs2_ * kGain;          // T / (1 + a)
-        double m = m_ + 2.0 * invFs2_ * wPrev_;
         const double rhs = m_ + step * kAlpha * wPrev_;
+        double m = m_ + 2.0 * invFs2_ * wPrev_;
+        if (period_ > 0 && pastCount_ >= 2 * period_)
+        {
+            // W at this phase a period and two periods ago, carried on: the
+            // corrector's own equation then gives the M it implies.
+            const double one = past_[static_cast<std::size_t>((pastAt_ + kRing - period_) & (kRing - 1))];
+            const double two = past_[static_cast<std::size_t>((pastAt_ + kRing - 2 * period_) & (kRing - 1))];
+            m = rhs + step * (2.0 * one - two);
+        }
 
         double w = 0.0, dwdm = 0.0;
+        bool settled = false;
+        const double stop = tolerance_ * ms_;
+        double before = 0.0;
         for (int it = 0; it < 4; ++it)
         {
             evaluate(m, h, hDot, w, dwdm);
@@ -161,14 +215,34 @@ public:
             const double gp = 1.0 - step * dwdm;
             const double dm = g / gp;
             m -= dm;
-            if (std::abs(dm) < 1e-9 * ms_)
+            const double size = std::abs(dm);
+            // Loose: the steps shrinking as Newton's do (each under half the
+            // last), what is left is about step^3 / last^2.
+            const bool shrunk = bySlope_ && it > 0 && size < 0.5 * before && size * size * size < stop * before * before;
+            before = size;
+            if (size < stop || shrunk)
+            {
+                if (bySlope_)
+                {
+                    w -= dwdm * dm;
+                    settled = true;
+                }
                 break;
+            }
         }
-        // Physical clamp: |M| cannot exceed the saturation magnetization.
-        m = std::clamp(m, -ms_, ms_);
-
-        evaluate(m, h, hDot, w, dwdm);
+        if (!settled || std::abs(m) > ms_)
+        {
+            // Physical clamp: |M| cannot exceed the saturation magnetization.
+            m = std::clamp(m, -ms_, ms_);
+            evaluate(m, h, hDot, w, dwdm);
+        }
         wPrev_ = w;
+        if (period_ > 0)
+        {
+            past_[static_cast<std::size_t>(pastAt_)] = w;
+            pastAt_ = (pastAt_ + 1) & (kRing - 1);
+            if (pastCount_ < 2 * period_) ++pastCount_;
+        }
         hPrev_ = h;
         hDotPrev_ = hDot;
         m_ = m;
@@ -197,12 +271,13 @@ private:
         }
         else
         {
-            const double e = std::exp(x);
-            const double ie = 1.0 / e;
-            const double sh = 0.5 * (e - ie);
-            const double ch = 0.5 * (e + ie);
-            const double coth = ch / sh;
-            const double csch2 = 1.0 / (sh * sh);
+            // With u = e^(2x) - 1: coth = 1 + 2/u and csch^2 = 4 (u + 1)/u^2,
+            // one exponential and one division (expm1 keeps u whole for a
+            // small x, where e^(2x) - 1 would lose its digits).
+            const double u = std::expm1(2.0 * x);
+            const double r = 1.0 / u;
+            const double coth = 1.0 + 2.0 * r;
+            const double csch2 = 4.0 * (u + 1.0) * r * r;
             const double ix = 1.0 / x;
             l   = coth - ix;
             lp  = ix * ix - csch2;
@@ -236,7 +311,8 @@ private:
         if (std::abs(d1) < d1Min)
             d1 = (d1 >= 0.0) ? d1Min : -d1Min;
 
-        const double phi1 = oneMc * deltaM * dM / d1;
+        const double invD1 = 1.0 / d1;
+        const double phi1 = oneMc * deltaM * dM * invD1;
         const double cChiLp = c_ * chi_ * lp;
 
         const double num = phi1 + cChiLp;
@@ -248,25 +324,34 @@ private:
         double den = 1.0 - alpha_ * cChiLp;
         if (std::abs(den) < 0.01)
             den = (den >= 0.0) ? 0.01 : -0.01;
-        w = hDot * num / den;
+        const double invDen = 1.0 / den;
+        w = hDot * num * invDen;
 
         // Analytic dW/dM for the Newton step.
         const double alphaOverA = alpha_ / a_;
         const double dmAn  = ms_ * lp * alphaOverA - 1.0;          // d(M_an - M)/dM
-        const double dPhi1 = oneMc * deltaM * dmAn * (oneMc * delta * k_) / (d1 * d1);
+        const double dPhi1 = oneMc * deltaM * dmAn * (oneMc * delta * k_) * (invD1 * invD1);
         const double dLp   = lpp * alphaOverA;
         const double dNum  = dPhi1 + c_ * chi_ * dLp;
         const double dDen  = -alpha_ * c_ * chi_ * dLp;
-        dwdm = hDot * (dNum * den - num * dDen) / (den * den);
+        dwdm = hDot * (dNum * den - num * dDen) * (invDen * invDen);
     }
 
     /// Damping of the alpha transform: the derivative's homogeneous mode
     /// decays by 0.9 per sample (it was undamped at 1).
     static constexpr double kAlpha = 0.9;
 
+public:
+    static constexpr int kMaxPeriod = 8; ///< The longest period the predictor follows.
+
+private:
+    static constexpr int kRing = 16;     ///< dM/dt kept: two of the longest periods.
+
     // -- Members ----------------------------------------------------------------
     double ms_ = 3.5e5, a_ = 2.2e4, alpha_ = 1.6e-3, k_ = 2.7e4, c_ = 1.7e-1;
     double chi_ = 3.5e5 / 2.2e4;
+    double tolerance_ = 1e-9;   ///< setTolerance().
+    bool bySlope_ = false;      ///< The last evaluation comes from the slope.
 
     double invFs2_ = 0.5 / 48000.0;
     double fs2_ = 2.0 * 48000.0;
@@ -275,6 +360,8 @@ private:
     double hPrev_ = 0.0;
     double hDotPrev_ = 0.0;
     double wPrev_ = 0.0;
+    std::array<double, kRing> past_ {}; ///< dM/dt of the last samples, for the predictor.
+    int pastAt_ = 0, pastCount_ = 0, period_ = 0;
 };
 
 } // namespace dspark

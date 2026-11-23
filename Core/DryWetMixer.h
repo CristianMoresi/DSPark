@@ -22,7 +22,7 @@
  * the dry-snapshot readouts getDryChannel() / getDryCapturedSamples(), which
  * expose plain processing-thread state. setMixRule() belongs to the control
  * thread (ONE non-audio writer; single relaxed word read once per mixWet()).
- * getMixRule-style readback is not provided; prepare() and
+ * getMixRule() reads it back from any thread; prepare() and
  * setLatencyCompensation() (and getLatencyCompensation()) allocate/touch
  * setup state and belong to the setup thread. Moves are setup-time only.
  *
@@ -87,7 +87,10 @@ public:
         /** Linear crossfade. Best for highly correlated signals (EQ, saturation). */
         Linear,
         /** Constant power crossfade. Best for uncorrelated signals (Reverb, Delay). */
-        EqualPower
+        EqualPower,
+        /** The dry stays whole up to half and then falls; the wet rises to whole at half:
+            at 0.5 the output is dry plus wet, as in hardware that adds the two. */
+        FullDryToHalf
     };
 
     DryWetMixer() noexcept = default;
@@ -168,12 +171,16 @@ public:
      * Control thread (single-word relaxed atomic). mixWet() reads the rule
      * once per block, so a change lands at the next block boundary.
      *
-     * @param rule The chosen MixRule (Linear or EqualPower).
+     * @param rule The chosen MixRule (out-of-range values read as Linear).
      */
     void setMixRule(MixRule rule) noexcept
     {
-        mixRule_.store(rule, std::memory_order_relaxed);
+        const int r = static_cast<int>(rule);
+        mixRule_.store(r >= 0 && r <= 2 ? rule : MixRule::Linear, std::memory_order_relaxed);
     }
+
+    /** @return The rule of the mix (any thread). */
+    [[nodiscard]] MixRule getMixRule() const noexcept { return mixRule_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Delays the captured dry signal to compensate for an effect's
@@ -334,6 +341,17 @@ public:
                         const T d = std::sqrt(std::max(T(0), T(1) - m));
                         wetData[i] = dryData[i] * d + wetData[i] * w;
                     }
+                }
+            }
+            else if (rule == MixRule::FullDryToHalf)
+            {
+                // dry min(1, 2 (1 - m)), wet min(1, 2 m).
+                for (int i = 0; i < nSamples; ++i)
+                {
+                    const T m = needsSmoothing ? mix0 + mixStep * T(i) : mix0;
+                    const T w = std::min(T(1), T(2) * m);
+                    const T d = std::min(T(1), T(2) * (T(1) - m));
+                    wetData[i] = dryData[i] * d + wetData[i] * w;
                 }
             }
             else // MixRule::Linear

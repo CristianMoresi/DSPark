@@ -775,6 +775,10 @@ READOUTS = {
     ("Effects/DynamicEQ.h", "read"):
         "control/GUI readout (getState); no previously adopted copy to keep, "
         "not real-time",
+    ("Core/DetailFilter.h", "refreshPlayed"):
+        "control/GUI readout (playedValue, playedExtreme and the effects' "
+        "getDisplay* readers); the audio thread is the WRITER here "
+        "(publishPlayed), so this reader is not on the audio path",
     ("Analysis/SpectrumAnalyzer.h", "snapshotFrame"):
         "control/GUI readout (getMagnitudesDb, getPeakHoldDb); the audio thread "
         "is the WRITER here, so this reader is not on the audio path. It is "

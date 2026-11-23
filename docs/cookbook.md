@@ -276,8 +276,10 @@ is setup-thread only - it reallocates and may re-calibrate like
   the internal rate, so 4x/48k puts it ultrasonic (48 kHz), and every harmonic
   the hysteresis draws from it folds onto 0, the carrier or the internal
   Nyquist frequency, where the downsampler removes its products with the
-  programme. CPU scales ~linearly with the factor (4x is the reference cost of
-  physical AC bias). `setOversampling(1)` turns the resampler off (zero added
+  programme. From 88.2 to under 352.8 kHz of internal rate (2x and 4x at
+  44.1 and 48 kHz) the core solves each internal sample in two steps, at
+  the same latency. CPU scales ~linearly with the factor (4x is the reference
+  cost of physical AC bias). `setOversampling(1)` turns the resampler off (zero added
   latency) but then drops the carrier in-band (12 kHz at 48k) - use 1x only
   under a high host rate or an already-oversampled section.
 - `Saturation` **defaults to 2x**: at 1x its curves fold their harmonics back
@@ -313,8 +315,8 @@ and every processor with a factor takes `setAutomaticOversampling(true)`,
 which makes each `prepare()` choose the factor that keeps the internal rate
 its default factor has at 44.1 kHz. The nonlinear stage then sounds the same
 in a 48 kHz and a 96 kHz session, and the 96 kHz session costs what the
-48 kHz one does (a `TapeMachine` at 192 kHz: 0.27 of the cost of its 4x,
-with the same distortion to four digits).
+48 kHz one does (a `TapeMachine` at 176.4 kHz takes the two steps of its
+4x at 44.1 kHz, without the resampler).
 
 A dry/wet mix around an oversampled section needs the dry signal delayed
 like the wet one. `OversamplingDryPath<float>` does it for either filter

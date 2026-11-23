@@ -6,19 +6,71 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
-- `TapeMachine::setBiasShape(BiasShape::FourLevel)` (setup thread; off by
-  default): the gain of the tape no longer rises with the level before it
-  saturates. The two-level carrier lifts 10 kHz by up to 3.2 dB at the
-  nominal bias and the loud parts by up to 9.9 dB at full bias; with four
-  levels the gain holds and then falls at any bias. It is another sound
-  (1 kHz at 0 dBFS leaves 1.9 dB lower), it runs at no less than 352.8 kHz
-  (8x at 48 kHz) and costs about twice as much. State key `biasShape`.
-- `TonalBalance::setDetail()` (`Auditory`, `Fine` by default, `Finest`;
-  applied at the next `prepare()`), `setContrastKnee()` and `getNumBands()`.
-  `getCorrection()` and `getBandCentre()` now index the bands of the bank
-  (72, 87 or 122): loop over `getNumBands()` rather than `kBands`, which
-  stays the number of bands of the loudness model. A saved state without a
-  detail reads as `Fine`; `Auditory` gives the corrections of before.
+- `TapeMachine::setBiasShape()` (setup thread): `FourLevel`, the default
+  (see Fixed), or `TwoLevel`, the carrier of 1.8.1, kept to compare. State
+  key `biasShape`; a state without it takes the default.
+- `SpectralReadout::gainPoint()`: a point of a frame of gains no higher
+  than 1, in decibels, made on the thread that reads it.
+- `simd::complexExp()`: e^z of each bin of an interleaved complex spectrum,
+  in place. The baseline is the standard library's, bin by bin; with AVX2
+  and FMA four bins go at a time by polynomials, within 4e-16 of it (2.4
+  times faster at 2049 bins), and any four with a value out of their range
+  go through the library. Minimum-phase designs use it.
+- `DetailAnalysis::read(channel, power, first, end)`: the reading of a span
+  of the grid only.
+- `DetailFilter::publishPlayed()`, `playedValue()` and `playedExtreme()`:
+  the audio thread hands the kernels it plays to a display (a copy, every
+  21 ms in the three effects), and the response is made by the thread that
+  reads it, when they are new. `getDisplayGain()`, `getDisplayReduction()`,
+  `getPeakReduction()`, `getDisplayCorrection()` and `TonalBalance::getResponse()`
+  read it so: the same values, at no cost to the audio thread (in
+  `SpectralDynamicEQ` it was a sixth of its cost).
+- `Hysteresis::setTolerance()`: where the solver stops (looser, it also
+  stops when what is left, read from the rate its steps shrink at, is
+  under it), and `setPredictorPeriod()`: for a field with a period of its
+  own, the solver starts from the same phase of the last two periods. The
+  tape with four levels, at 1e-6 and its carrier's period of four, costs
+  a fifth to a quarter less than the two-level tape of before (950 in place of 1270
+  ns a sample at 48 kHz, 1050 in place of 1260 with a loud top), 141 dB
+  or more from the exact solver; the default
+  (1e-9) is unchanged.
+- `SpectralProcessor::processBlock()` with two callbacks: every channel's
+  spectrum of a hop is seen before the first is processed.
+- `setDetail()` in the four spectral effects: how finely the curve moves
+  across frequency, in octaves, for what is read, what is played and what
+  is drawn. It moves while playing, at the same latency. `TonalBalance`
+  (1/4 by default), `ResonanceSuppressor` (1/12) and `SpectralDynamicEQ`
+  (1/12) go from an octave to 1/24, which is told apart from 200 Hz up (a
+  twelfth from 100 Hz, a sixth from 50 Hz). In `SpectralDenoiser` it is the
+  band in which signal and profile are read, from an octave down to each
+  bin by itself (the default: at the rate's own transform or a shorter one,
+  the output as before to the bit); a bin is
+  23 Hz with the 2048 of 48 kHz, so in the low end the noise between close
+  lines stays under them. States saved with the older controls are converted.
+- `DetailFilter` and `DetailAnalysis` (new, `Core/`): a curve on 1024
+  points of log frequency played in minimum phase, with detail in the low
+  end too, and the reading that goes with it, through a window that
+  follows the detail (21 to 341 ms at 48 kHz). The filter plays 11.3 of
+  12 dB a 24th of an octave wide from 200 Hz, keeps its images under -132 dBc and sounds
+  -98 dB or less more than 1 ms ahead of an attack; the latency is 2048
+  samples at 44.1 and 48 kHz. `getPlayedCurve()` is the response applied.
+  Before its kernels are designed each point holds its moves over the
+  three curves that play one in full, so a brief move is played as deep as
+  it is drawn (`setHold()`: `DetailHold::Largest`, its largest of the
+  three, the steadiest; `Reach`, a new move for the three and then the
+  curve, so a move that lasts ends when it is drawn; or `None`).
+  `setShortKernel()` cuts the kernels of the high part to its window and
+  tapers them over their whole length: of a cut of 24 dB at 3 kHz the
+  energy half a window after the peak of the response falls from -33.8 to
+  -48.1 dB (0.04 octave wide) and from -32.1 to -43.2 (0.14), at the same
+  depth; the fine detail of the low end keeps the length it takes.
+  `DetailAnalysis::setTimeFocus()` reads the shortest window through
+  `SpectralFocus` and gives that reading a hop later, centred where the
+  next window down is.
+  `DetailFilter<T, DetailLatency::Block>` convolves the same kernels in
+  partitions: 774 samples, the broad and the high of a curve still leading.
+- `TonalBalance::setContrastKnee()` (the knee of dips and peaks) and
+  `getNumBands()` (the 72 of the loudness model).
 - `AuditoryBands::prepareDetailed()` (no band wider than a fraction of an
   octave), `prepareLike()` (the same bands over another transform) and
   `getWidthBark()`; `GraphicBank::prepare()` takes the width of each bell.
@@ -119,21 +171,17 @@ All notable user-facing changes to DSPark are documented here.
 - `Equalizer::getAnalogBandResponse()`: the response of a band of the analog
   response as its sections are at this moment, a glide in flight included
   (audio thread).
-- `setTimeFocus()` in `TonalBalance`, `ResonanceSuppressor` and
-  `SpectralDynamicEQ` (off by default), and `SpectralFilter::setTimeFocus()`
-  under the last two: the analysis reads each frequency through a stretch of
-  the window of its own, shorter as frequency rises (`SpectralFocus`), so
-  what an event at the top sets off stays next to it. The tonal balance, at a
-  common response of 10 ms, follows a turn from dark to bright at 8 kHz in
-  20 ms in place of 28, with the same corrections on a steady programme
-  (within 0.03 dB). The suppressor's reduction of a 10 ms burst at 8 kHz
-  starts 17 ms before the burst comes out in place of 71 and lasts 128 ms in
-  place of 245, and it leaves the grain of a white noise alone (0.02 dB
-  taken in place of 0.31); a held line stands less above the envelope and is
-  reduced less at the same settings (6.7 dB where the whole window gives
-  11.2). The spectral dynamic equaliser cuts a held tone the same, and the
-  cut of the same burst lasts 21 ms in place of 43 and starts 17 ms ahead of
-  it in place of 28.
+- `setTimeFocus()` in `TonalBalance`, `SpectralDynamicEQ` and
+  `SpectralFilter` (off by default): the analysis reads each frequency
+  through a stretch of the window of its own, shorter as frequency rises
+  (`SpectralFocus`), so what an event at the top sets off stays next to
+  it. The tonal balance, at a common response of 10 ms, follows a turn
+  from dark to bright at 8 kHz in 20 ms in place of 28, with the same
+  corrections on a steady programme. The spectral dynamic equaliser reads
+  the top a hop later too, where its curve is played, and plays a brief
+  move as brief as it is drawn: it cuts a held tone the same, and its cut
+  of a 10 ms burst at 8 kHz lasts 34.5 ms in place of 50 and starts 9 ms
+  before the burst comes out in place of 20, 5.2 dB deep in place of 12.
 - `SpectralFocus` (in `Core/SpectralEnvelope.h`): a frame's spectrum read
   through a window that shortens as frequency rises, from the one transform
   of the whole window. The complex spectrum is smoothed across frequency
@@ -143,13 +191,12 @@ All notable user-facing changes to DSPark are documented here.
   a window of 2048 at 48 kHz takes 16 ms at any frequency. The powers are
   scaled so that a noise reads through it what it reads through the whole
   window (within 0.27 dB by octaves).
-- `TonalBalance::setQuality(Quality::Render)`: half the hop and the bank
-  refined three times at every hop, for a bounce: the bank's response
-  misses the corrections asked by 0.055 dB in place of 0.086, at about
-  three times the cost and the same latency. `setQualityFollowsRender()`
-  with `setOfflineRendering()` takes it by itself at the `prepare()` of an
-  offline render (`getQualityInUse()` tells which). State keys `quality`
-  and `qualityFollowsRender`.
+- `TonalBalance::setQuality(Quality::Render)`: the loudness model twice as
+  often and every window of the detail at every hop, for a bounce: the
+  same curve within 0.01 dB on a steady programme, the same latency.
+  `setQualityFollowsRender()` with `setOfflineRendering()` takes it by
+  itself at the `prepare()` of an offline render (`getQualityInUse()` tells
+  which). State keys `quality` and `qualityFollowsRender`.
 - `TonalBalance::setLocalSlope()`: what a band lacks or has in excess is
   turned into decibels with the slope of the loudness curve at the band's
   own level, in place of a fixed exponent. Near the threshold in quiet that
@@ -194,41 +241,29 @@ All notable user-facing changes to DSPark are documented here.
 - `ResonanceSuppressor::setMix()`: how much of the filter is applied, taken
   inside it (its gain becomes 1 - mix + mix * gain before the minimum-phase
   design), so the part left alone and the part reduced never meet in two
-  phases: a line taken 11.15 dB down at a mix of 1 sits 3.90 dB down at
-  0.5, which is the mix of its two amplitudes. State key `mix`.
+  phases and the curve drawn is the one played. State key `mix`.
 - `ResonanceSuppressor::setKnee()`, 0 to 12 dB: a soft knee at the
-  threshold. A line that hovers there moves a quarter less from frame to
-  frame with a knee of 6 dB (0.60 to 0.45 dB). State key `knee`.
-- `ResonanceSuppressor::setPersistence()`, 0 to 500 ms: the excess of each
-  bin is averaged over that time while it grows and followed at once when
-  it falls, so only what lasts counts. White noise read with no threshold
-  loses 1.43 dB counted at once, 0.77 with 20 ms, 0.25 with 60 ms and 0.04
-  with 150; a click keeps its peak (0.83 dB down at once, 0.16 with 60 ms)
-  and a line that rings is taken as before. State key `persistence`.
-- `ResonanceSuppressor::setQuietLevel()`, -120 to 0 dBFS: each bin is read
-  as its amplitude plus that level, so quiet passages, tails and the noise
-  of a room show no resonance. With it at -60 dBFS a line taken 11.1 dB
-  down at full level is taken 2.3 dB down forty decibels lower and left
-  alone sixty lower (without it, 11.15 dB at any level). State key
-  `quietLevel`.
+  threshold, so a line that hovers there moves less from frame to frame
+  (0.80 to 0.44 dB with a knee of 6 dB). State key `knee`.
+- `ResonanceSuppressor::setPersistence()`, 0 to 500 ms (50 by default): a
+  peak is treated once it has lasted that long, so a click and the grain of
+  a noise are left and what rings is taken. State key `persistence`.
+- `ResonanceSuppressor::setQuietLevel()`, -120 to 0 dBFS: each point is
+  read as its amplitude plus that level, so quiet passages, tails and the
+  noise of a room show no resonance. State key `quietLevel`.
 - `ResonanceSuppressor::setAuditoryWeighting()`: the amount weighed by the
   threshold of hearing in quiet (a third of its distance in dB to its lowest
   point comes off the weight): the same excess weighs 0.44 at 150 Hz and as
   before at 3 kHz. State key `auditory`.
-- `ResonanceSuppressor::setEnvelopePasses()` and `setWidthTaper()`, on
-  `SpectralEnvelope::setPasses()` and `setTaper()`: two passes of the
-  envelope's smoothing keep its width and lose its tails (a line of 20 dB
-  stands half a decibel further out; wide rises are read alike), and the
-  taper narrows the smoothing above a corner (a rise of 10 dB an octave wide
-  stands 0.9 dB over an envelope a third of an octave wide, and 0.1 dB over
-  one tapered with an exponent of 1). `SpectralEnvelope::excess()` gives the
-  spectrum less its envelope with its sign. State keys `envelopePasses`,
-  `taperHz` and `taperExponent`.
-- `SpectralFilter::setShortKernel()` and `ResonanceSuppressor::setShortKernel()`:
-  the filter's impulse response cut to half the transform and tapered over
-  its whole length. Of the response of a cut of 24 dB, the energy past half
-  a window falls from -33 to -43 dB, at the same depth. State key
-  `shortKernel`.
+- `ResonanceSuppressor::setWidthTaper()`: the width a peak is compared over
+  narrows above a corner. State keys `taperHz` and `taperExponent`.
+- `SpectralEnvelope::setPasses()` (two passes keep the width and lose the
+  tails), `setTaper()` and `excess()` (the spectrum less its envelope, with
+  its sign).
+- `SpectralFilter::setShortKernel()`: the filter's impulse response cut to
+  half the transform and tapered over its whole length. Of the response of
+  a cut of 24 dB, the energy past half a window falls from -33 to -43 dB,
+  at the same depth.
 - `ResonanceSuppressor::setQualityFollowsRender()` and
   `setOfflineRendering()`: with the first on, a `prepare()` made while the
   host renders offline takes the Offline quality whatever `setQuality()`
@@ -238,9 +273,7 @@ All notable user-facing changes to DSPark are documented here.
   in one band alone (a line inside it is heard as in the whole removal, one
   outside it 34 dB lower).
 - `SpectralFilter`: a key that is the programme itself is read as no key,
-  with one transform per channel and hop instead of two (the suppressor
-  keyed by its own programme: 378 to 357 ns per stereo frame, the cost of
-  the unkeyed one).
+  with one transform per channel and hop instead of two.
 - `TapeMachine::Speed::IPS_3_75`: 3.75 ips, with 90 us and the low-frequency
   constant in both standards. The head loses more of the top (at full losses
   10 kHz is 8.7 dB down, against 4.1 at 7.5 ips, 2.0 at 15 and 1.0 at 30),
@@ -796,62 +829,82 @@ All notable user-facing changes to DSPark are documented here.
   a LaneCascade in mono and on a BiquadCascade with more channels (no
   latency).
 - `TonalBalance` (new, `Effects/TonalBalance.h`): an adaptive equalizer
-  driven by an auditory model. Every hop (128 samples at 48 kHz, a
-  transform of 2048 with an asymmetric window weighted toward the recent
-  samples, both scaling by octaves with the rate) the programme's power is
-  smoothed across frequency, read in 72 bands uniform in Bark, its stereo
-  covariance smoothed in time (longer in the low end) and read as the power
-  of the dominant component, and turned into specific loudness. A broad
-  trend across the bands is compared with a reference shape (a tilt) and
-  each band with the trend; soft-knee curves with a slope on each side turn
-  those deviations into corrections (`setBalance()`, `setFillDips()`,
-  `setTrimPeaks()`, `setRange()`, `setKnee()`, `setFrequencyRange()` with edges
-  one Bark wide, 40 Hz to 16 kHz by default), offset so the total loudness
-  stays, and drive a GraphicBank. `setLevelCompensation()` converts loudness
-  to decibels with each band's exponent. A key can drive it (with a fade).
-  On pink noise with a peak at 3 kHz the peak comes down 3.2 dB, 300 Hz
-  moves 0.9 dB and the level 1.2 dB (what is kept is the loudness); the
-  latency is 16.2 ms at 48 kHz; it costs 780 to 1060 ns per stereo frame.
-- `ResonanceSuppressor` (new, `Effects/ResonanceSuppressor.h`): it finds
-  what stands over the envelope of the spectrum (in decibels or in
-  amplitude), frame by frame, and lowers it over a threshold by a share of
-  the excess, limited, weighted by a sensitivity curve of six bands, with an
-  attack and a release per bin that are slower in the low end, smoothed
-  across bins and applied by a SpectralFilter (no pre-echo). The window is
-  about 46 ms at any rate; stereo per bin with a link (one detector and one
-  filter at full link) or mid and side with a side weight; a key can drive it;
-  removal and focus listening; an offline quality (eight times padding,
-  sixteen frames per window). A 2 kHz line in white noise comes down 11.2 dB
-  while the noise at 600 Hz moves 0.2 dB; it costs 270 ns per stereo frame.
+  driven by an auditory model. Every hop of the model (128 samples at
+  48 kHz) the programme is read in 72 bands uniform in Bark, as the power
+  of its dominant component wherever it sits in the pair, and turned into
+  specific loudness; the broad trend goes toward a reference shape
+  (`setBalance()`, `setTilt()`). The dips and the peaks are read over the
+  whole band at the detail (`setFillDips()`, `setTrimPeaks()`), each point
+  against its two sides; space between two partials narrower than a sixth
+  of an octave is neither raised nor cut. The corrections are limited
+  (`setRange()`, `setKnee()`, `setFrequencyRange()`, 40 Hz to 16 kHz by
+  default), offset so the total loudness stays, and played by a
+  `DetailFilter`; `getDisplayCorrection()` is the response it plays. A
+  correction reaches the audio some 6 ms after the instant it reads (its
+  kernels are blended smoothly, which keeps what a moving curve leaves
+  beside a line 2 to 30 dB lower than with a bank of filters).
+  `setLevelCompensation()` converts loudness to decibels with each band's
+  exponent. A key can drive it (with a fade). Lines a sixth or a twelfth of
+  an octave from their gaps move 8.2 dB or more apart in the audio at full
+  settings from 50 and 100 Hz up, a 24th 9.3 dB or more from 200 Hz. The
+  latency is 774 samples at 48 kHz (16.1 ms).
+- `ResonanceSuppressor` (new, `Effects/ResonanceSuppressor.h`): a resonance
+  is a peak, within the detail, that stands over the loudest of its
+  comparable neighbours and lasts. A partial like the others of its series,
+  the fundamental of a note, a slope and the grain of a noise are none, and
+  a sub bass that carries a programme is taken by less the lower it is, not
+  at all under 70 Hz and whole from 320 Hz, in either mode
+  (`setFoundationGuard()`). `Mode::Deep` is more detail and stronger: it
+  reads and cuts in half the detail, takes both of two resonances closer
+  than it and takes up to half as deep again (under about 150 Hz it is no
+  narrower and can be a fifth deeper only). What passes the threshold (5 dB
+  by default) is lowered by a share (all of it), up to the range (9 dB),
+  weighted by a sensitivity curve of six bands, with an attack and a
+  release that are slower in the low end, and played by a `DetailFilter`.
+  Stereo per point with a link, or mid and side with a side weight; a key;
+  removal and focus listening; an offline quality. A burst of 10 ms at the
+  top is over before it counts, so it has no time focus to turn on (a
+  state that asks for one is read without it); `setShortKernel()` makes a
+  cut at the top ring for less time (see `DetailFilter`). On 57 recordings the
+  level moves 0.10 dB at the median at the defaults and 0.77 in Deep; a resonance 12 dB over
+  partials a sixth of an octave apart comes down 6.8 to 7.1 dB from 50 Hz to
+  10 kHz, the partials 0.2 dB at most.
 - `SpectralDynamicEQ` (new, `Effects/SpectralDynamicEQ.h`): four dynamic
-  bands (bell or shelves) that act cell by cell inside themselves: a band
-  is cut into up to 128 cells placed by its weight (equal steps of its shape
-  integrated over log frequency: they crowd where the band acts); each
-  cell's level is
-  the largest power of the key in it weighted by the band's shape, the
-  threshold is relative to the band's recent peak, each cell has an attack
-  and a release (faster in the upper cells), and the actions are projected
-  onto the bins with the band's shape, between its flat and its full
-  response, and applied as a minimum-phase filter. A loud tone at 2.5 kHz in
-  a bell at 2 kHz comes down 6.5 dB while a quiet one at 1.5 kHz in the
-  same bell does not move; it costs 190 ns per stereo frame.
-- `SpectralReadout` (in `Core/SpectralFilter.h`): a per-bin quantity of the
-  last frame published at 128 points, evenly in log frequency from 20 Hz to
-  20 kHz, each point keeping the largest magnitude of the bins within half a
-  point of it (a notch one bin wide still shows), for a display read from
-  any thread. `ResonanceSuppressor::getDisplayReduction()` (the reduction as
-  it is applied), `getDisplayExcess()` (what the detector found over the
-  threshold) and `getPeakReduction()`; `SpectralDynamicEQ::getDisplayGain()`
-  and `getPeakGain()`.
-- `SpectralDenoiser`: options, all off by default (the output is then the
-  same as before, to the bit): `setSpectralSmoothing()` across bins,
-  `setGainRelease()` per bin (slower in the low end), a sensitivity curve
+  bands (bell or shelves) that decide where it acts, and the detail how
+  finely: each point inside a band has a level of its own, read against a
+  threshold under the band's recent peak, with an attack and a release,
+  moves by the band's shape up to its range, and is played by a
+  `DetailFilter`. A key can drive it. Lines a sixth or a twelfth of an
+  octave from their gaps move 9.7 of 11.4 dB apart or more in the audio, a
+  24th 7.6 or more; with the detail an octave wide the same lines leave
+  0.18 dB of ripple. A burst of 10 ms at 8 kHz is cut 12 dB deep, from
+  20 ms before it comes out, for 50 ms (each point holds a new move for
+  the three curves that play it in full, and no longer).
+- `SpectralReadout` (in `Core/SpectralFilter.h`): a curve published at 1024
+  points, evenly in log frequency from 20 Hz to 20 kHz, for a display read
+  from any thread; `between()` reads it at any frequency, as a display
+  should draw it (a cubic: straight lines lose half a decibel of a peak a
+  24th of an octave wide). `TonalBalance::getDisplayCorrection()`,
+  `ResonanceSuppressor::getDisplayReduction()`, `getDisplayExcess()` (what
+  will be reduced) and `getPeakReduction()`,
+  `SpectralDynamicEQ::getDisplayGain()` and `getPeakGain()`,
+  `SpectralDenoiser::getDisplayGain()`: the gain and reduction curves are
+  what is applied, within 0.5 dB of what the audio measures on a steady
+  programme (the denoiser's, but for what moving gains leave beside a line,
+  and for the short frames its filter mode plays at attacks).
+- `SpectralDenoiser`: options, all off by default (at the rate's own
+  transform or a shorter one the output is then the same as before, to the
+  bit; a longer one, see Fixed): `setDetail()` (see above), `setGainRelease()`
+  per bin (slower in the low end), a sensitivity curve
   (`setSensitivityBand()`) weighting the reduction, `setRemovalListen()`,
-  `setFilterMode()` (the gains applied as a minimum-phase filter, the same
-  latency, the same reduction of learned noise: -18.0 dB, as the STFT)
-  with `setLink()` between channels, and `prepare(spec, 0)` choosing the
-  transform size by the rate. State keys `smoothing`, `release`,
-  `filterMode`, `link` and the sensitivity bands (`sens*`).
+  `setFilterMode()` (what is spread ahead of an attack stays within a short
+  frame of 5 ms: the default path, with those frames where an attack is
+  ahead and for 11 ms after it, at the same latency; from 6 ms ahead of a
+  hit out of silence it is 101 dB under it, where the default path leaves
+  52; nearer than that the short frame still spreads) with `setLink()`
+  between channels, and `prepare(spec, 0)` choosing the transform size by
+  the rate. State keys `detailOctaves`, `release`, `filterMode`, `link` and
+  the sensitivity bands (`sens*`).
 - Removal listening (`setRemovalListen()`, a monitoring control outside the state):
   `Compressor` (the aligned input minus the compressed signal before the
   makeup gain), `DeEsser` and `DynamicEQ` (the input late by the latency
@@ -1829,8 +1882,8 @@ All notable user-facing changes to DSPark are documented here.
   decibel (its top within 0.01 octaves), whatever the block size and a sample
   at a time. A design costs half a microsecond per section.
 - `TonalBalance` weighs each band by how audible it is (nothing under its
-  threshold in quiet, in full from 10 dB over it), and reads a dip as a band
-  under the audible bands both below and above it and a peak as a band over
+  threshold in quiet, in full from 10 dB over it), and reads a dip as a detail
+  under both of its audible sides and a peak as one over
   both. In the bands at the ends, where the threshold climbs, a programme's
   loudness is almost nothing: it read as a hole of tens of decibels, so Fill
   Dips raised 20 to 50 Hz and 12 to 20 kHz to the range (+3.3 to +6 dB on a
@@ -3063,16 +3116,36 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Fixed
 
-- `TonalBalance`: the low end took one broad cut. Three bands 30 Hz wide
-  covered 20 to 100 Hz and the analysis could not tell 50 Hz from 70 Hz, so
-  a hole between two lumps was cut as deep as the lumps. Under 500 Hz the
-  dips and peaks are now read by a look of a third of a second in bands a
-  sixth of an octave wide (14 under 100 Hz); the balance still goes by the
-  auditory model. With lumps of +9 dB at 45 and 120 Hz and a hole of -9 dB
-  at 70 Hz, at the defaults, the audio that comes out moves by -1.09, -1.55
-  and +0.80 dB there, where it moved by -0.20, -1.50 and -0.33. Pink noise
-  is left within 0.2 dB. The detail costs 23 to 26 % more than before
-  (934 against 744 ns per stereo frame on one runner) and no latency.
+- `SpectralDenoiser` prepared with a transform longer than the rate's own
+  left images of held lines between them, up to 9 dB over the noise that
+  went in (two lines a sixth of an octave apart at 400 Hz, at 8192). Its
+  frames are now a sixteenth of it apart (some four times the cost), and
+  the most left of those images in what was measured is 1.1 dB over the
+  noise. A hum 1.5 bins from a note can lose by it (one case of 36 tried in
+  a prototype, by 8.8 dB), and bass notes by 0.2 dB from 32768. On 57
+  recordings with noise the error falls by 0.6 to 0.7 dB at the median at
+  4096, 8192 and 16384, and on every one. The rate's own transform and the
+  shorter ones are unchanged to the bit.
+- `TransformerModel`: a partial mix lost up to 1.34 dB at 20 Hz to phase
+  alone (core 0; 0.39 dB at the default core). The dry side now leads as
+  the magnetizing corner does, by phase alone: 0.09 dB at most. At a mix
+  of 0 and of 1 the output is the same to the bit.
+- `TonalBalance`, `SpectralDynamicEQ` and `ResonanceSuppressor` had no
+  resolution in the low end, and their curves were drawn without the detail
+  they played: one window of 2048 read a line and the gap beside it 0.2 dB
+  apart at 50 Hz. A sixth of an octave at 50 Hz, the balance now moves 8.2
+  of the 11.4 dB asked (a twelfth: 0.23 dB at most before), the dynamic
+  equalizer 9.8 (-0.49 before) and the suppressor takes 7.0 dB of a
+  resonance (0.03 before). What is drawn is the response applied.
+- `ResonanceSuppressor` took every partial and the noise for resonances at
+  its defaults: on 57 recordings the level fell by 1.16 dB at the median,
+  and now moves 0.08 dB. DSParkLab starts it at the library's own defaults
+  and fills in red only what will be reduced.
+- `TonalBalance`: the search for the offset that keeps the loudness stopped
+  where a step had left every band at the range, and kept that step: on
+  hits between silences the whole curve jumped by up to 6 dB and the
+  loudness it keeps was 1.15 dB up. It now steps back inside its bracket
+  (0.0000 dB).
 - `AlgorithmicReverb`: a band of the wet equalizer on the move advanced once
   per block of the host, so its glide stepped and the output depended on the
   block size (0.34 of full scale between blocks of 64 and of 1024 as a band
@@ -3092,9 +3165,10 @@ All notable user-facing changes to DSPark are documented here.
 - `Saturation` in `OutputMode::Delta`: the dry side did not cross the
   high-passes of the wet side, so a quiet tone that the curve leaves alone
   came through at -2.9 dB at 50 Hz and -29 dB at 1 kHz (now -115 and -95 dB).
-- DSParkLab: the spectrum resolves 3 Hz in place of 12, and the Quality and
-  Detail controls of the spectral effects take effect when they are moved
-  (they waited for a reload, which put them back at their defaults).
+- DSParkLab: the spectrum resolves 3 Hz in place of 12, the Quality
+  controls of the spectral effects take effect when they are moved (they
+  waited for a reload, which put them back at their defaults), and Detail
+  is their first knob, finer to the right and read as a part of an octave.
 - `Compressor`: the measures of `setProgramRelease()` and
   `setAttackEmphasis()` had fixed windows (1.5 s and 30 ms), so "sustained"
   and "the leading edge" meant different things at different settings: with
@@ -3165,21 +3239,35 @@ All notable user-facing changes to DSPark are documented here.
   signal). The delay of the gain now slides to its new value a quarter of a
   sample per sample: no step.
 - `ResonanceSuppressor`: a link between 0 and 1 behaved as 0, because each
-  channel designed its filter without the power of the other. With a line on
-  the left only, the right channel took 1.3 dB at the line unlinked
-  and 22.2 dB linked, and the same 1.3 dB at any link in
-  between; it now takes 12.2 dB at a link of one half. The level each
-  channel is read by goes that share of the way to the level of the pair's
-  mean power, in decibels in `Mode::Smooth` and in amplitude in `Mode::Deep`.
-- `ResonanceSuppressor` with `Quality::Offline`: the detector's smoothings
-  were counted in hops and in bins, so with four times the hops and four
-  times the bins of `Quality::Realtime` it smoothed a quarter as long and a
-  quarter as wide, and found other resonances (pink noise with three lines:
-  the reductions of the two qualities 1.3 dB apart on average over the
-  curve, 4.5 dB at the worst point; a 500 Hz line taken 9.9 dB down in one
-  and 14.1 dB in the other). They are now times and widths in hertz: 0.04 dB
-  apart on average, 1.0 dB at the worst point, the line 9.9 and 9.4 dB down.
-  `Quality::Realtime` is unchanged to the bit.
+  channel designed its filter without the power of the other. The level
+  each channel is read by now goes that share of the way to the level of
+  the pair's mean power, in decibels in `Mode::Smooth` and in amplitude in
+  `Mode::Deep`.
+- `TapeMachine`: the two-level bias carrier of 1.8.1 lifted the gain with the
+  level before it saturated (3.2 dB at 10 kHz at the nominal bias, up to
+  9.9 dB at full bias). The carrier now has four levels by default: the gain
+  holds and then falls, at any bias (1 kHz at 0 dBFS leaves 1.9 dB lower).
+  From 44.1 to under 352.8 kHz of internal rate the core solves each
+  internal sample in two steps, so the factor stays 4x and the top is
+  cleaner than before (a 13.15 kHz tone at -6 dBFS: -118 dBc in place of
+  -90), at the same latency and a fifth to a quarter less of CPU (see
+  `Hysteresis::setPredictorPeriod()`). At 1x the gain no longer rises at
+  the nominal bias (it rose 1.7 to 3.1 dB) and an impulse comes out at the
+  latency reported (it came 3 samples late); with no bias at all 10 kHz
+  still rises 0.9 dB, and at 48 kHz a quiet 10 kHz comes out 0.6 dB under
+  where it is at 4x at the nominal bias (4.1 with no bias). The drive
+  knob now raises the level at every programme level (two levels turned it
+  down past +12 dB on a loud programme, 4.55 to 3.11 dB); what it raises a
+  soft programme more than a loud one is the compression of the tape
+  (11.8 and 2.2 dB at +24 dB, the link's 6 between them). A change of
+  sound: the state
+  of an older session takes it too, `setBiasShape(TwoLevel)` gives the old.
+- `SpectralDenoiser::setFilterMode()`: the minimum-phase filter turned the
+  phase of what it kept with every gain that moved. A steady line at 50 Hz
+  came out with products at -26 dBc where the default path has -59, and
+  programmes and attacks were further from the clean ones. Its gains are
+  now zero phase, with short frames only at attacks: held lines as clean as
+  the default path, at under half the cost it had.
 - `SpectralDenoiser` in filter mode with a link between 0 and 1: the gains of
   the two channels were mixed, the first channel reading the second one's
   gains of the frame before, so the channels were not treated alike
@@ -3191,13 +3279,9 @@ All notable user-facing changes to DSPark are documented here.
   part, so with one channel a delayed copy of the other the band powers took
   a comb and the corrections followed it (a delay of a quarter of a
   millisecond: corrections up to 0.78 dB away from those of two equal
-  channels; now 0.19 dB). The bank's solution was refined one hop in eight
-  and left plain on the other seven, so on a steady programme the response
-  stepped with a period of eight hops (0.09 dB at 9 kHz with corrections of
-  12 dB; now under 0.001 dB: the hops in between carry the correction). And
-  the loudness offset was scaled by each band's weight and then limited,
-  which left the total loudness up to 0.02 dB away; it is now solved with
-  the limits and the weights in place. The analysis costs 9 % more.
+  channels; now 0.001 dB). And the loudness offset was scaled by each
+  band's weight and then limited, which left the total loudness up to
+  0.02 dB away; it is now solved with the limits and the weights in place.
 - `DeEsser` and `DynamicEQ`: the detector's band-pass (and the low-pass and
   high-pass of the shelves) was a bilinear design, which narrows toward
   Nyquist, so near the top of the band the detector heard a narrower band
@@ -3211,18 +3295,6 @@ All notable user-facing changes to DSPark are documented here.
   step of level on the way (a tone held 6 dB down, its range set to 18 dB,
   came up to -3.5 dB first). The weight now follows the filter's glide: the
   tone goes down without rising.
-- `SpectralDynamicEQ`: a band edited at work kept each cell's action by
-  index, so after moving its frequency, Q or cell count the reduction sat
-  at other frequencies. The actions are now carried to the new cells by
-  frequency (nothing outside the span the band had), and a span that moved
-  takes its level reference from the new span after half a second. A cell
-  also looks half a cell into its neighbours with a fading weight, so a
-  partial that crosses a border no longer changes hands (a tone with a slow
-  vibrato across the borders of a bell of 8 cells: largest step of the
-  reduction between 10 ms windows 1.56 dB before, 0.16 dB now, and the mean
-  reduction 11.1 dB where it was 9.7). The band's shape comes from its
-  analog prototype, so a band near the top of the audio band keeps its
-  width.
 - `Equalizer` with `BandType::ConstantTilt`: with the pivot at one end of
   the band the other end rose without limit (a pivot at 20 Hz and +6 dB per
   octave lifted 20 kHz by 60 dB). The end that rises is now held to 36 dB:

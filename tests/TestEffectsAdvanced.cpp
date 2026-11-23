@@ -45,6 +45,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <random>
 #include <vector>
 #include <array>
 #include <atomic>
@@ -11941,4 +11942,118 @@ DSPARK_TEST(CrossoverFilter_band_count_change_fades_and_keeps_splits)
             }
             EXPECT_LT(maxStep(3, up, up + 4800), maxStep(3, up + 9600, down) * 1.1);
         }
+}
+
+// The balanced tree sums to the same allpass as the cascade at every slope,
+// in both structures (measured 1.2e-7 apart on noise of 0.2), and fewer
+// corrections make it cheaper; its skirts differ (band 0 of six at LR24
+// is -102 dB at 2 kHz against -78 in the cascade).
+DSPARK_TEST(CrossoverFilter_balanced_tree_sums_like_the_cascade)
+{
+    using X = CrossoverFilter<float, 12>;
+    for (int order : { 6, 12, 24, 36, 48 })
+        for (bool ladder : { false, true })
+            for (int bands : { 5, 12 })
+            {
+                auto sumOf = [&](X::Topology topology, std::vector<float>& sum, double& lowAt2k) {
+                    auto x = std::make_unique<X>();
+                    x->setOrder(order);
+                    if (ladder) x->setStructure(X::Structure::Ladder);
+                    x->setTopology(topology);
+                    x->setNumBands(bands);
+                    x->prepare(spec(48000.0, 256, 1));
+                    std::mt19937 rng(3);
+                    std::normal_distribution<float> g(0.0f, 0.2f);
+                    std::vector<float> in(256);
+                    std::vector<std::vector<float>> out(12, std::vector<float>(256));
+                    sum.clear();
+                    lowAt2k = 0.0;
+                    for (int k = 0; k < 80; ++k)
+                    {
+                        for (int i = 0; i < 256; ++i)
+                            in[static_cast<size_t>(i)] = k < 60 ? g(rng) : float(std::sin(2.0 * 3.14159265358979 * 2000.0 * (k * 256 + i) / 48000.0));
+                        float* ic[1] = { in.data() };
+                        AudioBufferView<float> views[12];
+                        for (int b = 0; b < bands; ++b)
+                        {
+                            float* p[1] = { out[static_cast<size_t>(b)].data() };
+                            views[b] = AudioBufferView<float>(p, 1, 256);
+                        }
+                        x->processBlock(AudioBufferView<float>(ic, 1, 256), views, bands);
+                        for (int i = 0; i < 256; ++i)
+                        {
+                            float s = 0.0f;
+                            for (int b = 0; b < bands; ++b) s += out[static_cast<size_t>(b)][static_cast<size_t>(i)];
+                            if (k < 60) sum.push_back(s);
+                            else if (k >= 70) lowAt2k = std::max(lowAt2k, double(std::abs(out[0][static_cast<size_t>(i)])));
+                        }
+                    }
+                };
+                std::vector<float> cascade, tree;
+                double lowCascade = 0.0, lowTree = 0.0;
+                sumOf(X::Topology::Cascade, cascade, lowCascade);
+                sumOf(X::Topology::Balanced, tree, lowTree);
+                double d = 0.0;
+                for (size_t i = 0; i < cascade.size(); ++i) d = std::max(d, double(std::abs(cascade[i] - tree[i])));
+                EXPECT_LT(d, 2e-6);
+                if (order == 24 && bands == 5) EXPECT_LT(lowTree, lowCascade);   // band 0 falls faster above
+            }
+}
+
+// A change of topology, and a change of band count on the balanced tree,
+// go over 20 ms without a step in any band.
+DSPARK_TEST(CrossoverFilter_topology_change_glides)
+{
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    using X = CrossoverFilter<float, 12>;
+    for (bool ladder : { false, true })
+    {
+        auto x = std::make_unique<X>();
+        if (ladder) x->setStructure(X::Structure::Ladder);
+        x->setNumBands(4);
+        x->setCrossoverFrequency(0, 200.0f);
+        x->setCrossoverFrequency(1, 2000.0f);
+        x->setCrossoverFrequency(2, 6000.0f);
+        x->prepare(spec(fs, 256, 1));
+        std::vector<float> in(256);
+        std::vector<std::vector<float>> out(5, std::vector<float>(256)), rec(5);
+        for (int k = 0; k < 380; ++k)
+        {
+            if (k == 94) x->setTopology(X::Topology::Balanced);
+            if (k == 188) x->setNumBandsKeepingSplits(5);
+            if (k == 282) x->setTopology(X::Topology::Cascade);
+            for (int i = 0; i < 256; ++i)
+            {
+                const double t = (k * 256 + i) / fs;
+                in[static_cast<size_t>(i)] = float(0.4 * std::sin(2 * kPi * 100 * t) + 0.3 * std::sin(2 * kPi * 3000 * t)
+                                                 + 0.2 * std::sin(2 * kPi * 9000 * t) + 0.1 * std::sin(2 * kPi * 16000 * t));
+            }
+            float* ic[1] = { in.data() };
+            AudioBufferView<float> views[5];
+            for (int b = 0; b < 5; ++b)
+            {
+                std::fill(out[static_cast<size_t>(b)].begin(), out[static_cast<size_t>(b)].end(), 0.0f);
+                float* p[1] = { out[static_cast<size_t>(b)].data() };
+                views[b] = AudioBufferView<float>(p, 1, 256);
+            }
+            const int n = x->processBlock(AudioBufferView<float>(ic, 1, 256), views, 5);
+            for (int b = 0; b < 5; ++b)
+                for (int i = 0; i < 256; ++i) rec[static_cast<size_t>(b)].push_back(b < n ? out[static_cast<size_t>(b)][static_cast<size_t>(i)] : 0.0f);
+        }
+        auto maxStep = [&](int b, size_t from, size_t to) {
+            double m = 0;
+            for (size_t i = from + 1; i < to; ++i)
+                m = std::max(m, double(std::abs(rec[static_cast<size_t>(b)][i] - rec[static_cast<size_t>(b)][i - 1])));
+            return m;
+        };
+        for (int change : { 94, 188, 282 })
+        {
+            const size_t at = static_cast<size_t>(change) * 256;
+            for (int b = 0; b < (change == 94 ? 4 : 5); ++b)
+            {
+                const double steady = std::max(maxStep(b, at - 9600, at), maxStep(b, at + 9600, at + 19200));
+                EXPECT_LT(maxStep(b, at, at + 4800), steady * 1.1 + 1e-4);
+            }
+        }
+    }
 }

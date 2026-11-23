@@ -1421,7 +1421,9 @@ template <typename T>
 class CurveAlgorithm final : public SaturationAlgorithm<T>
 {
     std::atomic<T> hardness_ { T(0) }, curvature_ { T(1) }, asymmetry_ { T(0) };
+    std::atomic<int> base_ { 0 };
     T knee_ = T(0), span_ = T(1), invSpan_ = T(1), power_ = T(1), invPower_ = T(1), negative_ = T(1), positive_ = T(1);
+    int baseNow_ = 0;
 
 public:
     void prepare(const AudioSpec&) noexcept override {}
@@ -1438,9 +1440,13 @@ public:
     [[nodiscard]] T getHardness() const noexcept { return hardness_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getCurvature() const noexcept { return curvature_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getAsymmetry() const noexcept { return asymmetry_.load(std::memory_order_relaxed); }
+    /** Publishes the base curve (an index of Saturation::CurveBase). */
+    void setBase(int base) noexcept { base_.store(std::clamp(base, 0, 6), std::memory_order_relaxed); }
+    [[nodiscard]] int getBase() const noexcept { return base_.load(std::memory_order_relaxed); }
 
     void update(T, T, const AudioSpec&) noexcept override
     {
+        baseNow_ = base_.load(std::memory_order_relaxed);
         knee_ = hardness_.load(std::memory_order_relaxed);
         span_ = T(1) - knee_;
         invSpan_ = T(1) / span_;
@@ -1451,6 +1457,29 @@ public:
         positive_ = (asym < T(0)) ? std::pow(T(2), -asym) : T(1);
     }
 
+    /**
+     * The base curve beyond the knee, v >= 0, each with a slope of 1 at 0
+     * and heading for 1: tanh; algebraic v / sqrt(1 + v^2); arctangent
+     * (2 / pi) atan(pi v / 2); the error function erf(sqrt(pi) v / 2); a
+     * cubic that reaches 1 at v = 1.5 and stays (finite support); a valve,
+     * 1 - e^-v on the positive half and algebraic on the negative one; and
+     * a rectifier, tanh on the positive half and tanh(v) e^-v on the
+     * negative one, which turns back toward 0.
+     */
+    [[nodiscard]] inline T bend(T v, bool negative) const noexcept
+    {
+        switch (baseNow_)
+        {
+            case 1: return v / std::sqrt(T(1) + v * v);
+            case 2: return T(0.6366197723675814) * std::atan(T(1.5707963267948966) * v);
+            case 3: return std::erf(T(0.886226925452758) * v);
+            case 4: return v >= T(1.5) ? T(1) : v - T(4.0 / 27.0) * v * v * v;
+            case 5: return negative ? v / std::sqrt(T(1) + v * v) : -std::expm1(-v);
+            case 6: return negative ? std::tanh(v) * std::exp(-v) : std::tanh(v);
+            default: return std::tanh(v);
+        }
+    }
+
     /** The curve on a driven sample. */
     [[nodiscard]] inline T shape(T x) const noexcept
     {
@@ -1458,7 +1487,8 @@ public:
         const T u = std::abs(x) * side;
         if (u <= knee_) return x;
         const T v = (u - knee_) * invSpan_;
-        const T bent = (power_ == T(1)) ? std::tanh(v) : std::pow(std::tanh(std::pow(v, power_)), invPower_);
+        const bool neg = x < T(0);
+        const T bent = (power_ == T(1)) ? bend(v, neg) : std::pow(std::max(T(0), bend(std::pow(v, power_), neg)), invPower_);
         return std::copysign((knee_ + span_ * bent) / side, x);
     }
 
@@ -1638,6 +1668,9 @@ public:
     };
 
     /** @brief How the oversampler filters (see setOversamplingMode()). */
+    /** @brief The base curve of Algorithm::Curve (see setCurveBase()). */
+    enum class CurveBase { Tanh, Algebraic, Arctangent, Erf, Cubic, Valve, Rectifier };
+
     enum class OversamplingMode
     {
         LinearPhase,    ///< Linear-phase half-bands: the latency of the factor, the dry path a delay.
@@ -2344,7 +2377,19 @@ public:
         if (!std::isfinite(amount)) return;
         slewSensitivity_.store(std::clamp(amount, SampleType(0), SampleType(1)), std::memory_order_relaxed);
     }
-    
+
+    /**
+     * @brief The base curve of the Curve algorithm, the shape its three
+     *        controls bend (see CurveBase); tanh by default. Each has a slope
+     *        of 1 at 0 and heads for the ceiling; Valve and Rectifier treat
+     *        the two halves differently (even harmonics and DC).
+     * @note Thread-Safe. Taken at the next block.
+     */
+    void setCurveBase(CurveBase base) noexcept { curve().setBase(static_cast<int>(base)); }
+
+    /** @return The base curve of Algorithm::Curve. */
+    [[nodiscard]] CurveBase getCurveBase() const noexcept { return static_cast<CurveBase>(curve().getBase()); }
+
     /**
      * @brief Shapes the Curve algorithm.
      * @note Thread-Safe. Taken at the next block; values that are not finite
@@ -2768,6 +2813,7 @@ public:
         w.write("curveHardness", static_cast<float>(getCurveHardness()));
         w.write("curveCurvature", static_cast<float>(getCurveCurvature()));
         w.write("curveAsymmetry", static_cast<float>(getCurveAsymmetry()));
+        w.write("curveBase", static_cast<int32_t>(curve().getBase()));
         w.write("asymmetry", static_cast<float>(getAsymmetry()));
         w.write("programNoise", static_cast<float>(getProgramNoise()));
         w.write("levelTracking", static_cast<float>(getLevelTracking()));
@@ -2811,6 +2857,7 @@ public:
         setCurveShape(static_cast<SampleType>(r.read("curveHardness", 0.0f)),
                       static_cast<SampleType>(r.read("curveCurvature", 1.0f)),
                       static_cast<SampleType>(r.read("curveAsymmetry", 0.0f)));
+        setCurveBase(static_cast<CurveBase>(std::clamp(static_cast<int>(r.read("curveBase", 0)), 0, 6)));
         setAsymmetry(static_cast<SampleType>(r.read("asymmetry", 0.0f)));
         setProgramNoise(static_cast<SampleType>(r.read("programNoise", -120.0f)));
         setLevelTracking(static_cast<SampleType>(r.read("levelTracking", 0.0f)));
@@ -2958,7 +3005,7 @@ protected:
                 case Algorithm::HardClip:
                 case Algorithm::Exciter:
                 case Algorithm::Wavefolder:  return applied_.character != SampleType(0);
-                case Algorithm::Curve:       return curve().getAsymmetry() != SampleType(0);
+                case Algorithm::Curve:       return curve().getAsymmetry() != SampleType(0) || curve().getBase() >= static_cast<int>(CurveBase::Valve);
                 case Algorithm::Tape:
                 case Algorithm::Bitcrusher:
                 case Algorithm::Downsample:  return false;

@@ -240,6 +240,16 @@ public:
         crossover_.setStructure(structure);
     }
 
+    /**
+     * @brief Cascade or balanced arrangement of the minimum-phase splits
+     *        (see CrossoverFilter::setTopology(); any thread).
+     * @param topology Cascade (default) or Balanced.
+     */
+    void setCrossoverTopology(typename CrossoverFilter<T, MaxBands>::Topology topology) noexcept
+    {
+        crossover_.setTopology(topology);
+    }
+
     // -- Per-band compressor access ------------------------------------------
 
     /**
@@ -366,6 +376,12 @@ public:
         return crossover_.getStructure();
     }
 
+    /** @brief Returns the arrangement of the minimum-phase splits. */
+    [[nodiscard]] typename CrossoverFilter<T, MaxBands>::Topology getCrossoverTopology() const noexcept
+    {
+        return crossover_.getTopology();
+    }
+
     /** @brief Returns the total latency of the multi-band system. */
     [[nodiscard]] int getLatency() const noexcept
     {
@@ -395,6 +411,7 @@ public:
         w.write("order", crossover_.getOrder());
         w.write("xoverMode", static_cast<int32_t>(crossover_.getFilterMode()));
         w.write("xoverStructure", static_cast<int32_t>(crossover_.getStructure()));
+        w.write("xoverTopology", static_cast<int32_t>(crossover_.getTopology()));
         char key[24];
         for (int i = 0; i < n - 1; ++i)
         {
@@ -421,6 +438,8 @@ public:
             r.read("xoverMode", 0)));
         setCrossoverStructure(static_cast<typename CrossoverFilter<T, MaxBands>::Structure>(
             std::clamp(r.read("xoverStructure", 0), 0, 1)));
+        setCrossoverTopology(static_cast<typename CrossoverFilter<T, MaxBands>::Topology>(
+            std::clamp(r.read("xoverTopology", 0), 0, 1)));
         char key[24];
         for (int i = 0; i < n - 1; ++i)
         {

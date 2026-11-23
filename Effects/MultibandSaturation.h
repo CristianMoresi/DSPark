@@ -182,12 +182,15 @@ public:
     void setCrossoverMode(typename Crossover::FilterMode mode) noexcept { crossover_.setFilterMode(mode); }
     /** @brief Direct-form or ladder sections in the minimum-phase crossover (any thread; see CrossoverFilter::setStructure()). */
     void setCrossoverStructure(typename Crossover::Structure structure) noexcept { crossover_.setStructure(structure); }
+    /** @brief Cascade or balanced arrangement of the minimum-phase splits (any thread; see CrossoverFilter::setTopology()). */
+    void setCrossoverTopology(typename Crossover::Topology topology) noexcept { crossover_.setTopology(topology); }
 
     [[nodiscard]] int getNumBands() const noexcept { return crossover_.getNumBands(); }
     [[nodiscard]] T getCrossoverFrequency(int index) const noexcept { return crossover_.getCrossoverFrequency(index); }
     [[nodiscard]] int getOrder() const noexcept { return crossover_.getOrder(); }
     [[nodiscard]] typename Crossover::FilterMode getCrossoverMode() const noexcept { return crossover_.getFilterMode(); }
     [[nodiscard]] typename Crossover::Structure getCrossoverStructure() const noexcept { return crossover_.getStructure(); }
+    [[nodiscard]] typename Crossover::Topology getCrossoverTopology() const noexcept { return crossover_.getTopology(); }
 
     // -- Bands ---------------------------------------------------------------
 
@@ -334,6 +337,7 @@ public:
         w.write("order", crossover_.getOrder());
         w.write("xoverMode", static_cast<int32_t>(crossover_.getFilterMode()));
         w.write("xoverStructure", static_cast<int32_t>(crossover_.getStructure()));
+        w.write("xoverTopology", static_cast<int32_t>(crossover_.getTopology()));
         w.write("mix", static_cast<float>(getMix()));
         w.write("outputClip", getOutputClip());
         w.write("outputCeiling", static_cast<float>(getOutputCeiling()));
@@ -369,6 +373,7 @@ public:
         setOrder(r.read("order", int32_t(24)));
         setCrossoverMode(static_cast<typename Crossover::FilterMode>(std::clamp(static_cast<int>(r.read("xoverMode", int32_t(0))), 0, 1)));
         setCrossoverStructure(static_cast<typename Crossover::Structure>(std::clamp(static_cast<int>(r.read("xoverStructure", int32_t(0))), 0, 1)));
+        setCrossoverTopology(static_cast<typename Crossover::Topology>(std::clamp(static_cast<int>(r.read("xoverTopology", int32_t(0))), 0, 1)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setOutputClip(r.read("outputClip", false));
         setOutputCeiling(static_cast<T>(r.read("outputCeiling", 0.0f)));

@@ -7430,3 +7430,68 @@ DSPARK_TEST(Saturation_drive_pan_moves_the_saturation_not_the_level)
     EXPECT_NEAR(10.0 * std::log10(el / e0), 0.0, 0.05);
     EXPECT_NEAR(10.0 * std::log10(er / e0), 0.0, 0.05);
 }
+
+DSPARK_TEST(Saturation_tone_sections_are_exact_and_move_without_a_step)
+{
+    // Every section at 0 dB is no tone at all, to the bit; a bell is its
+    // gain at its centre; and a section that comes in, or goes out, glides.
+    using Sat = Saturation<double>;
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    auto level = [&](int section, double hz, double db, double probe) {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(Sat::Algorithm::SoftClip);
+        if (section >= 0) s->setTone(section, hz, db);
+        s->prepare(spec(fs, 480, 1));
+        std::vector<double> x(480);
+        double e = 0;
+        for (int b = 0; b < 100; ++b)
+        {
+            for (int i = 0; i < 480; ++i)
+                x[static_cast<size_t>(i)] = 0.001 * std::sin(2.0 * kPi * probe * (b * 480 + i) / fs);
+            double* c[1] = { x.data() };
+            s->processBlock(AudioBufferView<double>(c, 1, 480));
+            if (b >= 50)
+                for (double v : x) e += v * v;
+        }
+        return e;
+    };
+    const double base500 = level(-1, 0, 0, 500.0), base2500 = level(-1, 0, 0, 2500.0);
+    EXPECT_NEAR(10.0 * std::log10(level(1, 500.0, 6.0, 500.0) / base500), 6.0, 0.1);
+    EXPECT_NEAR(10.0 * std::log10(level(2, 2500.0, -6.0, 2500.0) / base2500), -6.0, 0.1);
+
+    auto run = [&](bool touch, bool move, std::vector<double>& out) {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(Sat::Algorithm::SoftClip);
+        if (touch)
+            for (int k = 0; k < 4; ++k) s->setTone(k, 300.0 * (k + 1), 0.0);
+        s->prepare(spec(fs, 480, 1));
+        std::vector<double> x(480);
+        out.clear();
+        for (int b = 0; b < 100; ++b)
+        {
+            if (move && b == 30) s->setTone(0, 100.0, 12.0);
+            if (move && b == 60) s->setTone(0, 100.0, 0.0);
+            for (int i = 0; i < 480; ++i)
+                x[static_cast<size_t>(i)] = 0.05 * std::sin(2.0 * kPi * 100.0 * (b * 480 + i) / fs);
+            double* c[1] = { x.data() };
+            s->processBlock(AudioBufferView<double>(c, 1, 480));
+            out.insert(out.end(), x.begin(), x.end());
+        }
+    };
+    std::vector<double> a, b;
+    run(false, false, a);
+    run(true, false, b);
+    EXPECT_TRUE(a == b);
+    run(false, true, b);
+    auto maxStep = [&](int fromBlock, int toBlock) {
+        double m = 0;
+        for (int i = fromBlock * 480 + 1; i < toBlock * 480; ++i)
+            m = std::max(m, std::abs(b[static_cast<size_t>(i)] - b[static_cast<size_t>(i - 1)]));
+        return m;
+    };
+    const double regime = std::max(maxStep(10, 29), maxStep(45, 59));
+    std::printf("    tone in/out: steps %.5f / %.5f, regime %.5f%c", maxStep(29, 36), maxStep(59, 66), regime, 10);
+    EXPECT_LT(maxStep(29, 36), regime * 1.15);
+    EXPECT_LT(maxStep(59, 66), regime * 1.15);
+    EXPECT_GT(maxStep(45, 59), maxStep(10, 29) * 1.5);
+}

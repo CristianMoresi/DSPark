@@ -1431,8 +1431,9 @@ DSPARK_TEST(SimdOps_runtime_dispatch_matches_the_baseline)
 DSPARK_TEST(SimdOps_complex_exp_matches_the_library)
 {
     // e^re (cos im + i sin im) a bin: the baseline is the library's to the
-    // bit; the AVX2+FMA copy is within 4e-16 of it (1e-15 allowed here), and a
-    // group of four holding a value out of its range is the library's again.
+    // bit; the AVX2+FMA copy (the baseline itself in a build for AVX2 and FMA)
+    // is within 4e-16 of it (1e-15 allowed here), and a group of four holding
+    // a value out of its range is the library's again.
     using namespace dspark;
     DispatchScope scope;
     constexpr int kBins = 211;
@@ -1462,22 +1463,9 @@ DSPARK_TEST(SimdOps_complex_exp_matches_the_library)
     const auto same = [](double a, double b) {
         return std::isnan(a) ? std::isnan(b) : a == b;
     };
-
-    simd::setRuntimeDispatch(false);
-    for (int bins : { 0, 1, 3, 4, 5, 67, kBins })
-    {
-        const auto z = run(bins);
-        bool exact = true;
-        for (int i = 0; i < 2 * kBins; ++i)
-            exact = exact && same(z[static_cast<size_t>(i)], i < 2 * bins ? library[static_cast<size_t>(i)] : input[static_cast<size_t>(i)]);
-        EXPECT_TRUE(exact);
-    }
-    simd::complexExp(nullptr, 4);
-    if (!simd::runtimeDispatchSupported()) return;
-
-    simd::setRuntimeDispatch(true);
-    for (int bins : { 1, 4, 7, 64, kBins })
-    {
+    // The four-at-a-time copy against the library: close, special values and
+    // the bins past the count left as they were.
+    const auto nearLibrary = [&](int bins) {
         const auto z = run(bins);
         double worst = 0.0;
         bool special = true, untouched = true;
@@ -1501,7 +1489,34 @@ DSPARK_TEST(SimdOps_complex_exp_matches_the_library)
         EXPECT_LT(worst, 1e-15);
         EXPECT_TRUE(special);
         EXPECT_TRUE(untouched);
+    };
+    // A build for AVX2 and FMA takes the four-at-a-time copy whatever the
+    // run-time setting: that copy is its baseline.
+#if defined(DSPARK_SIMD_AVX) && defined(__AVX2__) && defined(DSPARK_SIMD_FMA)
+    constexpr bool wideBaseline = true;
+#else
+    constexpr bool wideBaseline = false;
+#endif
+
+    simd::setRuntimeDispatch(false);
+    for (int bins : { 0, 1, 3, 4, 5, 67, kBins })
+    {
+        if constexpr (wideBaseline)
+            nearLibrary(bins);
+        else
+        {
+            const auto z = run(bins);
+            bool exact = true;
+            for (int i = 0; i < 2 * kBins; ++i)
+                exact = exact && same(z[static_cast<size_t>(i)], i < 2 * bins ? library[static_cast<size_t>(i)] : input[static_cast<size_t>(i)]);
+            EXPECT_TRUE(exact);
+        }
     }
+    simd::complexExp(nullptr, 4);
+    if (!simd::runtimeDispatchSupported()) return;
+
+    simd::setRuntimeDispatch(true);
+    for (int bins : { 1, 4, 7, 64, kBins }) nearLibrary(bins);
 }
 
 DSPARK_TEST(SimdOps_dot_product_of_four_matches_four_dot_products)

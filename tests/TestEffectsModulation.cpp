@@ -16,6 +16,7 @@
 #include "../Effects/DeEsser.h"
 #include "../Effects/NoiseGenerator.h"
 #include "../Core/BucketBrigade.h"
+#include "../Core/TapeTransport.h"
 #include "../Core/FFT.h"
 
 #include <algorithm>
@@ -3100,4 +3101,47 @@ DSPARK_TEST(Chorus_and_delay_engine_changes_fill_then_open)
     const double before = m14Rms(x, at - 9600, at), after = m14Rms(x, at + 24000, at + 48000);
     for (size_t w = at; w + 480 < at + 9600; w += 240)
         EXPECT_GT(20.0 * std::log10(m14Rms(x, w, w + 480) / std::min(before, after)), -1.0);
+}
+
+// The transport works its deviation out every 16 samples and draws a line
+// between: under 100 Hz the delay it gives is the one of a deviation worked
+// out at every sample (the rotations alone, the noises off) to better than
+// -80 dB.
+DSPARK_TEST(TapeTransport_control_rate_matches_every_sample_under_100_Hz)
+{
+    const double fs = 48000.0;
+    TapeTransport<double>::Settings s;
+    s.noise = 0.0;
+    s.scrape = 0.0;
+    TapeTransport<double> tape;
+    tape.prepare(fs, 4800.0, 15.0, s);
+    // The same rotations, every sample.
+    const double dt = 1.0 / fs, restore = dt / s.restoreSeconds;
+    double cap = 0.0, reel = 0.0, ref = 4800.0;
+    std::vector<double> a, b;
+    for (int i = 0; i < 96000; ++i)
+    {
+        a.push_back(tape.next(1.0));
+        cap += (15.0 / 3.0) * dt;
+        cap -= std::floor(cap);
+        reel += (15.0 * 0.04) * dt;
+        reel -= std::floor(reel);
+        const double twoPi = 2.0 * 3.14159265358979323846;
+        const double dev = s.reel * std::sin(twoPi * reel) + s.capstan * (std::sin(twoPi * cap) + s.capstanSecond * std::sin(2.0 * twoPi * cap));
+        ref += std::clamp(-dev + restore * (4800.0 - ref), -s.maxStep, s.maxStep);
+        b.push_back(ref);
+    }
+    // Both under 100 Hz (two one-poles), the error against the modulation.
+    const double k = 1.0 - std::exp(-2.0 * 3.14159265358979323846 * 100.0 / fs);
+    double e1 = 0.0, e2 = 0.0, m1 = 0.0, m2 = 0.0, err = 0.0, mod = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        e1 += k * ((a[i] - b[i]) - e1);
+        e2 += k * (e1 - e2);
+        m1 += k * ((b[i] - 4800.0) - m1);
+        m2 += k * (m1 - m2);
+        if (i > 24000) { err += e2 * e2; mod += m2 * m2; }
+    }
+    std::printf("    transport, control rate against every sample: %.1f dB%c", 10.0 * std::log10(err / mod), 10);
+    EXPECT_LT(10.0 * std::log10(err / mod), -80.0);
 }

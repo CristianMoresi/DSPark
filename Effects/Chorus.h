@@ -32,19 +32,32 @@
  *   the channels summed to mono, high-passed at 5 Hz, into two bucket-brigade
  *   lines of 512 stages (Core/BucketBrigade.h) whose clocks a triangle wave
  *   moves in opposition (the right tap is the left one inverted, so the two
- *   delays always add up to twice the centre; in phase in the Vibrato mode),
- *   each with the device's anti-alias and reconstruction filters at a fifth
- *   of the slowest clock (one input low-pass shared by the two lines), and
- *   the line's hiss, which grows with the delay (a slower clock). The dry
+ *   delays always add up to twice the centre; in phase in the Vibrato mode;
+ *   setAnalogTapPhase() sets any offset between, gliding), each with the
+ *   device's anti-alias and reconstruction filters (fourth-order
+ *   Butterworth at 7 kHz, one input low-pass shared by the two lines), and
+ *   the line's hiss, high-passed at 200 Hz, which grows with the delay (a
+ *   slower clock). The corners are fixed in hertz and the same in the three
+ *   modes, lower only when a setting makes the clock too slow for them (a
+ *   fifth of the slowest clock the sweep needs); setAnalogTone() moves the
+ *   output's; setAnalogCircuitFilters() takes the pair of a chorus circuit
+ *   instead (BucketBrigade::Shape::Chorus: two slightly resonant sections
+ *   at 8 kHz before the line and a damped one at 5.6 kHz after it, a darker
+ *   wet that lets more of the clock's images through). The dry
  *   signal keeps its stereo; there is no feedback and the voices, feedback
  *   and interpolation settings do not apply. setAnalogMode() loads three
  *   presets of rate, depth and centre; the centre, the depth and the taps'
  *   offset glide (50 ms) instead of stepping at the block rate, and the
- *   filters' corner moves at most an octave in a quarter of a second. The
+ *   filters' corners move at most an octave in a quarter of a second. The
  *   lines run with their high precision (BucketBrigade::Precision::High) and,
  *   below 88.2 kHz, at twice the rate, so the images of their clock are
  *   filtered as in the device instead of folding into the band; from
  *   176.4 kHz the analog engine runs at half the rate.
+ *
+ * A change of engine (setModel()) does not cut: the incoming engine runs
+ * from the change, unheard, until its line is full, and then the two cross
+ * over 10 ms. setMixRule() offers the mixer's rules, among them the one of
+ * the hardware (DryWetMixer::MixRule::FullDryToHalf: at half, dry plus wet).
  *
  * Threading: prepare() belongs to the setup thread (allocates; never call it
  * concurrently with processing). processBlock() and reset() belong to the
@@ -177,6 +190,9 @@ public:
             b.setPrecision(BucketBrigade<T>::Precision::High);
             b.prepare(engineRate_, kAnalogStages, 4000.0, lineFactor);
         }
+        hissHpCoeff_ = std::exp(-2.0 * 3.141592653589793 * kHissHighPassHz / engineRate_);
+        switchBuffer_.resize(spec.numChannels, spec.maxBlockSize);
+        switchFade_ = std::max(1, static_cast<int>(kSwitchFadeSeconds * spec.sampleRate));
         analogCornerFor_ = -1.0;
         analogGlide_ = 1.0 - std::exp(-1.0 / (kAnalogGlideSeconds * engineRate_));
         {
@@ -241,7 +257,11 @@ public:
         engineOut_ = {};
         engineLast_ = {};
         noiseLp_ = {};
+        hissHpX_ = {};
+        hissHpY_ = {};
         decimatePhase_ = 0;
+        switching_ = false;
+        playing_ = model_.load(std::memory_order_relaxed);
         // A reset starts on the target layout: phases set, voices at level.
         const int nv = numVoices_.load(std::memory_order_relaxed);
         for (int v = 0; v < kMaxVoices; ++v)
@@ -360,7 +380,7 @@ public:
     }
 
 
-    /** @brief Selects the engine (see Model). Thread-safe; the engines do not crossfade. */
+    /** @brief Selects the engine (see Model). Thread-safe; the change fills the incoming engine, then crosses over (see the file notes). */
     void setModel(Model m) noexcept
     {
         model_.store(m == Model::Analog ? Model::Analog : Model::Digital, std::memory_order_relaxed);
@@ -378,7 +398,7 @@ public:
     /**
      * @brief Loads a preset of the analog model: rate, depth and centre (through
      *        their setters) and whether the taps move in opposition or in
-     *        phase. In the analog model the centre, the depth and the taps'
+     *        phase (setAnalogTapPhase()). In the analog model the centre, the depth and the taps'
      *        offset glide to a new setting with a 50 ms time constant (the
      *        rate only changes the sweep's speed, so it needs none).
      *        Out-of-range values are clamped.
@@ -393,6 +413,7 @@ public:
         setRate(static_cast<T>(kRate[m]));
         setDepthMs(static_cast<T>(kDepth[m]));
         setCenterDelay(static_cast<T>(kCentre[m]));
+        setAnalogTapPhase(m == 2 ? T(0) : T(180));
     }
     /** @return The analog preset last loaded. */
     [[nodiscard]] AnalogMode getAnalogMode() const noexcept { return static_cast<AnalogMode>(analogMode_.load(std::memory_order_relaxed)); }
@@ -409,6 +430,46 @@ public:
     }
     /** @return The hiss level of the analog lines. */
     [[nodiscard]] T getAnalogNoise() const noexcept { return analogNoiseDb_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief The offset between the analog model's two taps, 0 to 180
+     *        degrees of the sweep (180 in opposition, 0 in phase; the
+     *        presets set 180, and 0 for Vibrato). It glides with the 50 ms
+     *        of the analog settings. Non-finite values are ignored.
+     */
+    void setAnalogTapPhase(T degrees) noexcept
+    {
+        if (std::isfinite(degrees)) analogTapPhase_.store(std::clamp(degrees, T(0), T(180)), std::memory_order_relaxed);
+    }
+    /** @return The offset between the analog taps, in degrees. */
+    [[nodiscard]] T getAnalogTapPhase() const noexcept { return analogTapPhase_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief The tone of the analog wet, -1 to 1: the corner of the filter
+     *        after the lines moves by up to an octave down or up (0, the
+     *        default, leaves it at 7 kHz; 5.6 kHz with the circuit pair).
+     *        Non-finite values are ignored.
+     */
+    void setAnalogTone(T tone) noexcept
+    {
+        if (std::isfinite(tone)) analogTone_.store(std::clamp(tone, T(-1), T(1)), std::memory_order_relaxed);
+    }
+    /** @return The tone of the analog wet. */
+    [[nodiscard]] T getAnalogTone() const noexcept { return analogTone_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief The analog lines with the filter pair of a chorus circuit (see
+     *        the file notes) instead of the Butterworth pair. Thread-safe;
+     *        applied at the next block.
+     */
+    void setAnalogCircuitFilters(bool on) noexcept { analogCircuit_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the analog lines use the circuit pair. */
+    [[nodiscard]] bool getAnalogCircuitFilters() const noexcept { return analogCircuit_.load(std::memory_order_relaxed); }
+
+    /** @brief The rule of the dry/wet mix (Linear by default; see DryWetMixer::MixRule). Thread-safe. */
+    void setMixRule(typename DryWetMixer<T>::MixRule rule) noexcept { mixer_.setMixRule(rule); }
+    /** @return The rule of the dry/wet mix. */
+    [[nodiscard]] typename DryWetMixer<T>::MixRule getMixRule() const noexcept { return mixer_.getMixRule(); }
 
     /** @brief Serializes the parameter state (setup/UI threads; allocates). */
     [[nodiscard]] std::vector<uint8_t> getState() const
@@ -430,6 +491,10 @@ public:
         w.write("model", static_cast<int32_t>(getModel()));
         w.write("analogMode", analogMode_.load(std::memory_order_relaxed));
         w.write("analogNoise", static_cast<float>(getAnalogNoise()));
+        w.write("analogTapPhase", static_cast<float>(getAnalogTapPhase()));
+        w.write("analogTone", static_cast<float>(getAnalogTone()));
+        w.write("analogCircuit", getAnalogCircuitFilters());
+        w.write("mixRule", static_cast<int32_t>(getMixRule()));
         return w.blob();
     }
 
@@ -453,6 +518,11 @@ public:
         // The preset index only (rate, depth and centre were read above).
         analogMode_.store(std::clamp(static_cast<int>(r.read("analogMode", 0)), 0, 2), std::memory_order_relaxed);
         setAnalogNoise(static_cast<T>(r.read("analogNoise", -84.0f)));
+        // A state without the offset takes the one of its preset.
+        setAnalogTapPhase(static_cast<T>(r.read("analogTapPhase", analogMode_.load(std::memory_order_relaxed) == 2 ? 0.0f : 180.0f)));
+        setAnalogTone(static_cast<T>(r.read("analogTone", 0.0f)));
+        setAnalogCircuitFilters(r.read("analogCircuit", false));
+        setMixRule(static_cast<typename DryWetMixer<T>::MixRule>(std::clamp(static_cast<int>(r.read("mixRule", 0)), 0, 2)));
         return true;
     }
 
@@ -518,24 +588,95 @@ protected:
         const int nCh = std::min({ buffer.getNumChannels(), spec_.numChannels, kMaxChannels });
         const int nS  = buffer.getNumSamples();
 
-        // 1. Read atomics once per block
+        const T mixVal = mix_.load(std::memory_order_relaxed);
+
+        mixer_.pushDry(buffer);
+        const Model wanted = model_.load(std::memory_order_relaxed);
+        if (!switching_ && wanted != playing_) startSwitch(wanted);
+        if (switching_) processSwitch(buffer, nCh, nS);
+        else runEngine(playing_, buffer, nCh, nS);
+        mixer_.mixWet(buffer, mixVal);
+    }
+
+    void runEngine(Model engine, AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
+        if (engine == Model::Analog) processAnalog(buffer, nCh, nS);
+        else processDigital(buffer, nCh, nS);
+    }
+
+    /// Starts a change of engine: the incoming one from silence, unheard until its line is full.
+    void startSwitch(Model to) noexcept
+    {
+        switching_ = true;
+        incoming_ = to;
+        const double reach = static_cast<double>(centerDelayMs_.load(std::memory_order_relaxed) + depthMs_.load(std::memory_order_relaxed)) * 1e-3;
+        if (to == Model::Analog)
+        {
+            for (auto& b : bbd_) b.reset();
+            analogPrimed_ = false;
+            analogCornerFor_ = -1.0;
+            hpX1_ = hpY1_ = 0.0;
+            for (auto& s : decimateState_) s = {};
+            engineOut_ = {};
+            engineLast_ = {};
+            noiseLp_ = {};
+            hissHpX_ = {};
+            hissHpY_ = {};
+            // The line, its filters and their settling.
+            fillLeft_ = static_cast<int>((reach + kSwitchSettleSeconds) * spec_.sampleRate);
+        }
+        else
+        {
+            for (int ch = 0; ch < kMaxChannels; ++ch) fbState_[ch] = T(0);
+            fillLeft_ = static_cast<int>(reach * spec_.sampleRate) + 4;
+        }
+        fadeLeft_ = switchFade_;
+    }
+
+    /// A block of a change of engine: both run; the incoming one is heard once its line is full.
+    void processSwitch(AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
+        auto incoming = switchBuffer_.toView().getSubView(0, nS);
+        for (int ch = 0; ch < nCh; ++ch) std::copy_n(buffer.getChannel(ch), nS, incoming.getChannel(ch));
+        runEngine(playing_, buffer, nCh, nS);
+        T* scratch[kMaxChannels] = {};
+        for (int ch = 0; ch < nCh; ++ch) scratch[ch] = incoming.getChannel(ch);
+        runEngine(incoming_, AudioBufferView<T>(scratch, nCh, nS), nCh, nS);
+        const int fill = fillLeft_, fade = fadeLeft_;
+        for (int ch = 0; ch < nCh; ++ch)
+        {
+            T* out = buffer.getChannel(ch);
+            const T* in = incoming.getChannel(ch);
+            int f = fill, g = fade;
+            for (int i = 0; i < nS; ++i)
+            {
+                if (f > 0) { --f; continue; }
+                if (g > 0) --g;
+                const T w = T(1) - static_cast<T>(g) / static_cast<T>(switchFade_);
+                out[i] += (in[i] - out[i]) * w;
+            }
+        }
+        const int filled = std::min(fillLeft_, nS);
+        fillLeft_ -= filled;
+        fadeLeft_ = std::max(0, fadeLeft_ - (nS - filled));
+        if (fillLeft_ == 0 && fadeLeft_ == 0)
+        {
+            playing_ = incoming_;
+            switching_ = false;
+        }
+    }
+
+    /** @brief The digital engine on one block (wet only). */
+    void processDigital(AudioBufferView<T> buffer, int nCh, int nS) noexcept
+    {
         T targetRate   = rate_.load(std::memory_order_relaxed);
         T targetDepth  = depthMs_.load(std::memory_order_relaxed);
         T targetCenter = centerDelayMs_.load(std::memory_order_relaxed);
         T fbVal        = feedback_.load(std::memory_order_relaxed);
-        T mixVal       = mix_.load(std::memory_order_relaxed);
         int nVoices    = numVoices_.load(std::memory_order_relaxed);
         bool autoD     = autoDepth_.load(std::memory_order_relaxed);
         Interpolation interp = interpolation_.load(std::memory_order_relaxed);
         if (interp == Interpolation::Sinc && !sinc_) interp = Interpolation::Hermite;
-
-        mixer_.pushDry(buffer);
-        if (model_.load(std::memory_order_relaxed) == Model::Analog)
-        {
-            processAnalog(buffer, nCh, nS);
-            mixer_.mixWet(buffer, mixVal);
-            return;
-        }
 
         // Deferred LFO config on the AUDIO thread (setters only publish). A
         // voice-count change needs no phase reset: the glide below moves the
@@ -696,8 +837,6 @@ protected:
             voiceGain_[vi] = moveTowards(gainStart[vi], gainTarget[vi],
                                          voiceFadeStep_ * static_cast<T>(nS));
         }
-
-        mixer_.mixWet(buffer, mixVal);
     }
 
     [[nodiscard]] static T moveTowards(T from, T to, T delta) noexcept
@@ -727,7 +866,7 @@ protected:
         const double rate = static_cast<double>(rate_.load(std::memory_order_relaxed));
         const double centreSet = static_cast<double>(centerDelayMs_.load(std::memory_order_relaxed)) * 1e-3;
         const double depthSet = std::min(static_cast<double>(depthMs_.load(std::memory_order_relaxed)) * 1e-3, 0.9 * centreSet);
-        const double offsetSet = analogMode_.load(std::memory_order_relaxed) == 2 ? 0.0 : 0.5;
+        const double offsetSet = static_cast<double>(analogTapPhase_.load(std::memory_order_relaxed)) / 360.0;
         if (!analogPrimed_)
         {
             centreFrom_ = centreNow_ = centreSet;
@@ -735,8 +874,9 @@ protected:
             offsetNow_ = offsetSet;
             analogPrimed_ = true;
         }
-        // The filters sit at a fifth of the slowest clock the sweep needs,
-        // where it is or where it is going, whichever is longer.
+        // The filters sit at their fixed corners, lower only when the slowest
+        // clock the sweep needs (where it is or where it is going, whichever
+        // is longer) would leave the input filter too high for it.
         // The corner moves at most an octave in a quarter of a second: a jump
         // of the filters' coefficients would leave a step in their output.
         const double reach = std::max(centreNow_ + std::min(depthNow_, 0.9 * centreNow_), centreSet + depthSet);
@@ -746,11 +886,25 @@ protected:
             const double most = std::exp2(static_cast<double>(nS) / (kCornerOctaveSeconds * spec_.sampleRate));
             slowest = std::clamp(slowest, analogCornerFor_ / most, analogCornerFor_ * most);
         }
-        if (std::abs(slowest - analogCornerFor_) > 1e-3 * slowest)
+        const double tone = static_cast<double>(analogTone_.load(std::memory_order_relaxed));
+        if (std::abs(slowest - analogCornerFor_) > 1e-3 * slowest || tone != analogToneFor_
+            || analogCircuit_.load(std::memory_order_relaxed) != circuitFor_)
         {
-            for (auto& b : bbd_) b.setCorner(0.2 * slowest);
-            noiseCoeff_ = 1.0 - std::exp(-2.0 * 3.141592653589793 * std::min(0.2 * slowest, 0.45 * engineRate_) / engineRate_);
+            const bool circuit = analogCircuit_.load(std::memory_order_relaxed);
+            if (circuit != circuitFor_)
+            {
+                for (auto& b : bbd_) b.setShape(circuit ? BucketBrigade<T>::Shape::Chorus : BucketBrigade<T>::Shape::Butterworth);
+                circuitFor_ = circuit;
+            }
+            const double inputHz = circuit ? kCircuitInputHz : kAnalogCornerHz;
+            const double outputHz = circuit ? kCircuitOutputHz : kAnalogCornerHz;
+            const double input = std::min(inputHz, (circuit ? kCircuitClockShare : kAnalogClockShare) * slowest);
+            const double output = input * (outputHz / inputHz) * std::exp2(tone);
+            for (auto& b : bbd_) b.setCorners(input, output);
+            const double heard = bbd_[0].getOutputCorner();
+            noiseCoeff_ = 1.0 - std::exp(-2.0 * 3.141592653589793 * std::min(heard, 0.45 * engineRate_) / engineRate_);
             analogCornerFor_ = slowest;
+            analogToneFor_ = tone;
         }
         const T noiseDb = analogNoiseDb_.load(std::memory_order_relaxed);
         // White noise through a one-pole at the corner, scaled by that
@@ -813,7 +967,11 @@ protected:
                     {
                         noiseRng_ = noiseRng_ * 1664525u + 1013904223u;
                         const double n = static_cast<double>(noiseRng_ >> 8) / 8388608.0 - 1.0;
-                        noiseLp_[k] += noiseCoeff_ * (n - noiseLp_[k]);
+                        // A hiss without lows: a high-pass, then the low-pass at the corner.
+                        const double hissHp = hissHpCoeff_ * (hissHpY_[k] + n - hissHpX_[k]);
+                        hissHpX_[k] = n;
+                        hissHpY_[k] = hissHp;
+                        noiseLp_[k] += noiseCoeff_ * (hissHp - noiseLp_[k]);
                         y[k] += noiseAmp * (d[k] / std::max(centre, 1e-4)) * noiseLp_[k];
                     }
                     engineLast_[k] = engineOut_[k];
@@ -859,6 +1017,14 @@ protected:
     static constexpr double kRise = 0.53;       ///< The sweep's rising share of its period.
     static constexpr double kAnalogGlideSeconds = 0.05;   ///< Glide of the analog centre, depth and offset.
     static constexpr double kCornerOctaveSeconds = 0.25;  ///< The analog filters' corner moves an octave in this time at most.
+    static constexpr double kAnalogCornerHz = 7000.0;     ///< The analog filters' corner (tone 0).
+    static constexpr double kAnalogClockShare = 0.2;      ///< The corner at most this share of the slowest clock.
+    static constexpr double kCircuitInputHz = 8000.0;     ///< The circuit pair: the input filter's corner.
+    static constexpr double kCircuitOutputHz = 5600.0;    ///< The circuit pair: the output filter's corner (tone 0).
+    static constexpr double kCircuitClockShare = 0.23;    ///< The circuit pair's input corner at most this share of the slowest clock.
+    static constexpr double kHissHighPassHz = 200.0;      ///< The hiss has no lows under this.
+    static constexpr double kSwitchFadeSeconds = 0.01;    ///< A change of engine crosses over in this.
+    static constexpr double kSwitchSettleSeconds = 0.003; ///< The analog line's filters settle in this after it fills.
 
     static constexpr T kMaxGlideHz = T(0.5);   ///< Phase glide: half a cycle per second.
 
@@ -900,6 +1066,17 @@ protected:
     std::atomic<Model> model_ { Model::Digital };
     std::atomic<int> analogMode_ { 0 };
     std::atomic<T> analogNoiseDb_ { T(-84) };
+    std::atomic<T> analogTapPhase_ { T(180) };
+    std::atomic<T> analogTone_ { T(0) };
+    std::atomic<bool> analogCircuit_ { false };
+    bool circuitFor_ = false;
+    double analogToneFor_ = 0.0, hissHpCoeff_ = 0.0;
+    std::array<double, 2> hissHpX_ {}, hissHpY_ {};
+    // A change of engine.
+    Model playing_ = Model::Digital, incoming_ = Model::Digital;
+    bool switching_ = false;
+    int fillLeft_ = 0, fadeLeft_ = 0, switchFade_ = 480;
+    AudioBuffer<T> switchBuffer_;
     std::array<BucketBrigade<T>, 2> bbd_ {};
     bool halfRate_ = false;
     double engineRate_ = 48000.0, analogCornerFor_ = -1.0, hpCoeff_ = 0.0, noiseCoeff_ = 0.0;

@@ -25,6 +25,12 @@
  * the tape reaches with the same inertia (the pitch bends while it glides,
  * as on a tape echo whose speed is changed).
  *
+ * The deviation is worked out every 16 samples (the rotations' sines, the
+ * noises and the scrape at that rate, their filters at its coefficients and
+ * their inputs scaled to keep their spectra) and followed by a straight
+ * line between: under 100 Hz it is the deviation of every sample to better
+ * than -80 dB, at a sixteenth of the trigonometry and the noise.
+ *
  * Threading: everything on the audio thread or the stream owner (the class
  * holds no atomics: its owner publishes its settings).
  *
@@ -83,14 +89,16 @@ public:
         up_ = std::exp(-dt / s_.speedUpSeconds);
         down_ = std::exp(-dt / s_.slowDownSeconds);
         restore_ = dt / s_.restoreSeconds;
-        noiseA_ = std::exp(-2.0 * std::numbers::pi * 3.0 * dt);
-        scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dt);
-        scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dt);
+        // The noises and the scrape run at the control rate.
+        const double dc = static_cast<double>(kControl) * dt;
+        noiseA_ = std::exp(-2.0 * std::numbers::pi * 3.0 * dc);
+        scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dc);
+        scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dc);
         {
             // RMS of a uniform noise in [-1, 1) through two such one-poles.
             const double a = noiseA_;
             const double gain = (1.0 - a) * (1.0 + a * a) / ((1.0 + a) * (1.0 + a) * (1.0 + a));
-            noiseNorm_ = 1.0 / std::sqrt(std::max(1e-30, gain / 3.0));
+            noiseNorm_ = 1.0 / (kControlNoise * std::sqrt(std::max(1e-30, gain / 3.0)));
         }
         lo_ = 3.0;
         hi_ = 1e12;
@@ -105,6 +113,8 @@ public:
         capPhase_ = reelPhase_ = 0.0;
         noise1_ = noise2_ = scrape1_ = scrape2_ = 0.0;
         rng_ = 0x2C1B3C6Du;
+        devFrom_ = devTo_ = 0.0;
+        controlAt_ = 0;
     }
 
     /** @brief A new nominal speed: the tape glides to it from the speed it has. */
@@ -165,32 +175,11 @@ public:
     {
         speed_ = speedTarget_ + ((speed_ < speedTarget_) ? up_ : down_) * (speed_ - speedTarget_);
         if (std::abs(speed_ - speedTarget_) < 1e-12) speed_ = speedTarget_;
-        const double ipsNow = ips_ * speed_;
-        const double dt = 1.0 / fs_;
-        capPhase_ += kCapstanHzPerIps * ipsNow * dt;
-        if (capPhase_ >= 1.0) capPhase_ -= 1.0;
-        reelPhase_ += kReelHzPerIps * ipsNow * dt;
-        if (reelPhase_ >= 1.0) reelPhase_ -= 1.0;
-
-        rng_ = rng_ * 1664525u + 1013904223u;
-        const double n = static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0;
-        noise1_ = noiseA_ * noise1_ + (1.0 - noiseA_) * n;
-        noise2_ = noiseA_ * noise2_ + (1.0 - noiseA_) * noise1_;
-        scrape1_ = scrapeA1_ * scrape1_ + (1.0 - scrapeA1_) * n;
-        scrape2_ = scrapeA2_ * scrape2_ + (1.0 - scrapeA2_) * n;
-
-        double deviation = 0.0;
-        if (depth > 0.0)
-        {
-            const double twoPi = 2.0 * std::numbers::pi;
-            const double cap = twoPi * capPhase_;
-            const double reel = s_.reel != 0.0 ? s_.reel * std::sin(twoPi * reelPhase_) : 0.0;
-            deviation = depth * std::sqrt(15.0 / ips_)
-                * (reel
-                 + s_.capstan * (std::sin(cap) + s_.capstanSecond * std::sin(2.0 * cap))
-                 + s_.noise * noiseNorm_ * noise2_
-                 + s_.scrape * (scrape1_ - scrape2_));
-        }
+        // The deviation of the control point ahead; a straight line to it.
+        if (controlAt_ == 0) advanceControl(depth);
+        const double share = static_cast<double>(++controlAt_) / static_cast<double>(kControl);
+        if (controlAt_ == kControl) controlAt_ = 0;
+        const double deviation = devFrom_ + (devTo_ - devFrom_) * share;
         const double target = nominal_ / speed_;
         const double step = std::clamp(-deviation + restore_ * (target - delay_), -s_.maxStep, s_.maxStep);
         delay_ = std::clamp(delay_ + step, lo_, hi_);
@@ -198,6 +187,46 @@ public:
     }
 
 private:
+    static constexpr int kControl = 16;   ///< Samples between control points.
+
+    /// The rotations, the noises and the scrape a control step on, and the
+    /// deviation there (the next stretch heads to it).
+    void advanceControl(double depth) noexcept
+    {
+        const double ipsNow = ips_ * speed_;
+        const double dc = static_cast<double>(kControl) / fs_;
+        capPhase_ += kCapstanHzPerIps * ipsNow * dc;
+        capPhase_ -= std::floor(capPhase_);
+        reelPhase_ += kReelHzPerIps * ipsNow * dc;
+        reelPhase_ -= std::floor(reelPhase_);
+        rng_ = rng_ * 1664525u + 1013904223u;
+        // One draw per control step: scaled by 1 / sqrt(kControl) it holds
+        // the spectrum the filters gave a draw per sample.
+        const double n = (static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0) * kControlNoise;
+        noise1_ = noiseA_ * noise1_ + (1.0 - noiseA_) * n;
+        noise2_ = noiseA_ * noise2_ + (1.0 - noiseA_) * noise1_;
+        scrape1_ = scrapeA1_ * scrape1_ + (1.0 - scrapeA1_) * n;
+        scrape2_ = scrapeA2_ * scrape2_ + (1.0 - scrapeA2_) * n;
+        devFrom_ = devTo_;
+        devTo_ = deviationNow(depth);
+    }
+
+    /// The deviation at the control point.
+    [[nodiscard]] double deviationNow(double depth) const noexcept
+    {
+        if (!(depth > 0.0)) return 0.0;
+        const double twoPi = 2.0 * std::numbers::pi;
+        const double cap = twoPi * capPhase_;
+        const double reel = s_.reel != 0.0 ? s_.reel * std::sin(twoPi * reelPhase_) : 0.0;
+        return depth * std::sqrt(15.0 / ips_)
+             * (reel
+              + s_.capstan * (std::sin(cap) + s_.capstanSecond * std::sin(2.0 * cap))
+              + s_.noise * noiseNorm_ * noise2_
+              + s_.scrape * (scrape1_ - scrape2_));
+    }
+
+    static constexpr double kControlNoise = 0.25;   ///< 1 / sqrt(kControl).
+
     static constexpr double kCapstanHzPerIps = 1.0 / 3.0;   ///< Capstan rotation: 5 Hz at 15 ips.
     static constexpr double kReelHzPerIps = 0.04;           ///< Reel rotation: 0.6 Hz at 15 ips.
 
@@ -209,6 +238,8 @@ private:
     double speed_ = 1.0, speedTarget_ = 1.0, delay_ = 96.0;
     double capPhase_ = 0.0, reelPhase_ = 0.0, noise1_ = 0.0, noise2_ = 0.0, scrape1_ = 0.0, scrape2_ = 0.0;
     uint32_t rng_ = 0x2C1B3C6Du;
+    double devFrom_ = 0.0, devTo_ = 0.0;
+    int controlAt_ = 0;
 };
 
 } // namespace dspark

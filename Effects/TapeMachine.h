@@ -431,9 +431,11 @@ public:
 
         // Per-sample modulation smoothing constants (precomputed once).
         const double dt = 1.0 / sampleRate_;
-        driftA_ = std::exp(-2.0 * std::numbers::pi * 0.10 * dt);
-        scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dt);
-        scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dt);
+        // The transport's noises run at the control rate (nextTransportMod()).
+        const double dControl = static_cast<double>(kTransportControl) * dt;
+        driftA_ = std::exp(-2.0 * std::numbers::pi * 0.10 * dControl);
+        scrapeA1_ = std::exp(-2.0 * std::numbers::pi * 90.0 * dControl);
+        scrapeA2_ = std::exp(-2.0 * std::numbers::pi * 40.0 * dControl);
         // The speed transport: the head distance is the delay centre at the
         // nominal speed.
         tapeTransport_.prepare(sampleRate_, static_cast<double>(delayCenter_), speedIps_ > 0.0 ? speedIps_ : 15.0);
@@ -488,7 +490,6 @@ public:
         wakeHold_ = 0;
         tapeTransport_.reset();
         lastMod_ = 0.0;
-        humPhase_ = 0.0;
         aimRamps(true);
         firPos_ = 0;
         delayPos_ = 0;
@@ -506,6 +507,11 @@ public:
         modPhaseFlut2_ = 0.0;
         driftState_ = 0.0;
         scrapeLp1_ = scrapeLp2_ = 0.0;
+        modFrom_ = modTo_ = 0.0;
+        modAt_ = 0;
+        humCos_ = 1.0;
+        humSin_ = 0.0;
+        humStepFor_ = -1.0;
         rng_ = 0x1357feedu;
         rngNoise_ = 0x2468beefu;
         hSm_ = hScale_;   // no fade-in on start; a running calibration continues
@@ -1102,6 +1108,17 @@ private:
         const bool monitorMoving = monitorRamp_.now != 1.0 || monitorRamp_.target != 1.0;
         aimDryPhase(mixTarget);
         const double humStep = (mains_.load(std::memory_order_relaxed) == 1 ? 60.0 : 50.0) / sampleRate_;
+        if (humStep != humStepFor_)
+        {
+            humStepFor_ = humStep;
+            humRotCos_ = std::cos(2.0 * std::numbers::pi * humStep);
+            humRotSin_ = std::sin(2.0 * std::numbers::pi * humStep);
+        }
+        {
+            const double r = 1.0 / std::sqrt(humCos_ * humCos_ + humSin_ * humSin_);
+            humCos_ *= r;
+            humSin_ *= r;
+        }
 
         // 1. Dry snapshot for the latency-compensated mix (through the
         //    oversampler's filters when they are minimum phase).
@@ -1465,10 +1482,12 @@ private:
             if (humActive)
             {
                 const double amp = hum_.next();
-                humPhase_ += humStep;
-                if (humPhase_ >= 1.0) humPhase_ -= 1.0;
-                const double ph = 2.0 * std::numbers::pi * humPhase_;
-                const double h = amp * kHumNorm * (std::sin(ph) + 0.5 * std::sin(2.0 * ph));
+                // A rotation per sample (its second harmonic 2 sin cos), the
+                // radius held on the circle every block.
+                const double s = humSin_ * humRotCos_ + humCos_ * humRotSin_;
+                humCos_ = humCos_ * humRotCos_ - humSin_ * humRotSin_;
+                humSin_ = s;
+                const double h = amp * kHumNorm * (humSin_ + humSin_ * humCos_);
                 for (int ch = 0; ch < nCh; ++ch) wet_[static_cast<size_t>(ch)] += h;
             }
 
@@ -2279,20 +2298,39 @@ private:
     }
 
     /** @brief Shared transport modulation in samples: drift + wow + flutter + scrape. */
+    /**
+     * The modulated transport's delay offset for the next frame: worked out
+     * every kTransportControl frames (the sines exact there, the noises at
+     * that rate with their inputs scaled to keep their spectra) and followed
+     * by a straight line between.
+     */
     [[nodiscard]] double nextTransportMod(double depth) noexcept
+    {
+        if (modAt_ == 0)
+        {
+            modFrom_ = modTo_;
+            modTo_ = transportModAhead(depth);
+        }
+        const double share = static_cast<double>(++modAt_) / static_cast<double>(kTransportControl);
+        if (modAt_ == kTransportControl) modAt_ = 0;
+        return modFrom_ + (modTo_ - modFrom_) * share;
+    }
+
+    [[nodiscard]] double transportModAhead(double depth) noexcept
     {
         // Always advance the transport state so engaging the control later
         // does not jump phases; only the output is scaled by depth.
-        const double dt = 1.0 / sampleRate_;
+        const double dt = static_cast<double>(kTransportControl) / sampleRate_;
         modPhaseWow_ += 0.55 * dt;
-        if (modPhaseWow_ >= 1.0) modPhaseWow_ -= 1.0;
+        modPhaseWow_ -= std::floor(modPhaseWow_);
         modPhaseFlut_ += 8.3 * dt;
-        if (modPhaseFlut_ >= 1.0) modPhaseFlut_ -= 1.0;
+        modPhaseFlut_ -= std::floor(modPhaseFlut_);
         modPhaseFlut2_ += 23.0 * dt;
-        if (modPhaseFlut2_ >= 1.0) modPhaseFlut2_ -= 1.0;
+        modPhaseFlut2_ -= std::floor(modPhaseFlut2_);
 
         rng_ = rng_ * 1664525u + 1013904223u;
-        const double n = static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0;
+        // One draw a control step, scaled by 1 / sqrt(kTransportControl).
+        const double n = (static_cast<double>(rng_ >> 8) / 8388608.0 - 1.0) * 0.25;
 
         // Slow drift: heavily low-passed random walk, clamped to +/-18 samples.
         driftState_ = driftA_ * driftState_ + (1.0 - driftA_) * n * 600.0;
@@ -2419,6 +2457,10 @@ private:
     int delayCenter_ = 96;
     int delayMask_ = 255;
     double driftA_ = 0.0, scrapeA1_ = 0.0, scrapeA2_ = 0.0;
+    static constexpr int kTransportControl = 16;   ///< Frames between the modulated transport's control points.
+    double modFrom_ = 0.0, modTo_ = 0.0;
+    int modAt_ = 0;
+    double humCos_ = 1.0, humSin_ = 0.0, humRotCos_ = 1.0, humRotSin_ = 0.0, humStepFor_ = -1.0;
 
     std::vector<std::vector<T>> dryRing_;
     int dryPos_ = 0;
@@ -2519,7 +2561,7 @@ private:
     int formApplied_ = -1;
     double speedIps_ = 0.0, lastMod_ = 0.0;
     TapeTransport<T> tapeTransport_;
-    double humPhase_ = 0.0, hissNorm_ = 1.0, firNorm_ = 1.0, xtNorm_ = 1.0;
+    double hissNorm_ = 1.0, firNorm_ = 1.0, xtNorm_ = 1.0;
     double asymMeanA_ = 0.0, trMeanA_ = 0.0;
     LinearRamp hiss_, hum_, xt_, tr_, asym_, monitorRamp_ { 1.0, 1.0, 0.0 };
     std::vector<double> wet_, asymMean_, trMean_;

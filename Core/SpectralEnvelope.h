@@ -122,10 +122,46 @@ public:
     void compute(const T* in, T* out) const noexcept
     {
         if (out != in) std::copy(in, in + n_, out);
+        computeInterleaved<1>(out);
+    }
+
+    /**
+     * @brief The envelopes of several spectra at once, in place: each what
+     *        compute() gives for its own. The recursion waits on itself at
+     *        every bin, so a few run in the time of one.
+     * @tparam Lanes How many spectra (1 to 8).
+     * @param values numBins groups of `Lanes` values, one of each spectrum.
+     */
+    template <int Lanes>
+    void computeInterleaved(T* values) const noexcept
+    {
+        static_assert(Lanes >= 1 && Lanes <= 8);
+        if (n_ < 2) return;
+        const T* coeff = coeff_.data();
         for (int pass = 0; pass < passes_; ++pass)
         {
-            for (int k = 1; k < n_; ++k) out[k] += coeff_[static_cast<size_t>(k)] * (out[k - 1] - out[k]);
-            for (int k = n_ - 2; k >= 0; --k) out[k] += coeff_[static_cast<size_t>(k)] * (out[k + 1] - out[k]);
+            std::array<T, static_cast<size_t>(Lanes)> y;
+            std::copy_n(values, Lanes, y.data());
+            for (int k = 1; k < n_; ++k)
+            {
+                T* v = values + Lanes * k;
+                for (int j = 0; j < Lanes; ++j)
+                {
+                    const auto u = static_cast<size_t>(j);
+                    y[u] = v[j] + coeff[k] * (y[u] - v[j]);
+                    v[j] = y[u];
+                }
+            }
+            for (int k = n_ - 2; k >= 0; --k)
+            {
+                T* v = values + Lanes * k;
+                for (int j = 0; j < Lanes; ++j)
+                {
+                    const auto u = static_cast<size_t>(j);
+                    y[u] = v[j] + coeff[k] * (y[u] - v[j]);
+                    v[j] = y[u];
+                }
+            }
         }
     }
 

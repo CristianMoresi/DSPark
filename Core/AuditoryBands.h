@@ -55,6 +55,7 @@
 #include "DspMath.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -165,6 +166,7 @@ public:
         bark_.resize(static_cast<size_t>(n_));
         exponent_.resize(static_cast<size_t>(n_));
         threshold_.resize(static_cast<size_t>(n_));
+        thresholdLoudness_.resize(static_cast<size_t>(n_));
         narrow_.resize(static_cast<size_t>(n_));
         widthBins_.resize(static_cast<size_t>(n_));
         for (int b = 0; b < n_; ++b)
@@ -295,7 +297,11 @@ public:
         if (!std::isfinite(dbSpl)) return;
         refSpl_ = std::clamp(dbSpl, 60.0, 130.0);
         for (int b = 0; b < n_; ++b)
-            threshold_[static_cast<size_t>(b)] = std::pow(10.0, (AuditoryScale::thresholdInQuietDb(centre_[static_cast<size_t>(b)]) - refSpl_) / 10.0);
+        {
+            const auto i = static_cast<size_t>(b);
+            threshold_[i] = std::pow(10.0, (AuditoryScale::thresholdInQuietDb(centre_[i]) - refSpl_) / 10.0);
+            thresholdLoudness_[i] = std::pow(threshold_[i], exponent_[i]);
+        }
     }
 
     [[nodiscard]] int getNumBands() const noexcept { return n_; }
@@ -320,6 +326,8 @@ public:
     [[nodiscard]] double getExponent(int band) const noexcept { return exponent_[static_cast<size_t>(std::clamp(band, 0, n_ - 1))]; }
     /** @return The threshold in quiet of a band, as a power relative to a full-scale sine. */
     [[nodiscard]] double getThreshold(int band) const noexcept { return threshold_[static_cast<size_t>(std::clamp(band, 0, n_ - 1))]; }
+    /** @return The threshold to the exponent of a band: what specificLoudness() takes off. */
+    [[nodiscard]] double getThresholdLoudness(int band) const noexcept { return thresholdLoudness_[static_cast<size_t>(std::clamp(band, 0, n_ - 1))]; }
 
     /**
      * @brief Band powers from a power spectrum.
@@ -329,15 +337,50 @@ public:
      */
     void bandPowers(const T* binPower, T* out) const noexcept
     {
-        for (int b = 0; b < n_; ++b) out[b] = T(0);
-        for (int k = 1; k < numBins_; ++k)
+        bandPowersInterleaved<1>(binPower, out);
+    }
+
+    /**
+     * @brief The band powers of several spectra at once: each what
+     *        bandPowers() gives for its own.
+     * @tparam Lanes How many spectra (1 to 8).
+     * @param binPower numBins groups of `Lanes` powers, one of each spectrum.
+     * @param out      getNumBands() groups of `Lanes` powers, the same way.
+     */
+    template <int Lanes>
+    void bandPowersInterleaved(const T* binPower, T* out) const noexcept
+    {
+        static_assert(Lanes >= 1 && Lanes <= 8);
+        constexpr auto lanes = static_cast<size_t>(Lanes);
+        std::fill_n(out, n_ * Lanes, T(0));
+        // The bins that feed the same two bands lie together: their sums are
+        // carried in registers from the first to the last of them.
+        for (int k = 1; k < numBins_;)
         {
             const int lower = binBand_[static_cast<size_t>(k)];
-            if (lower < -1) continue;
-            const double p = static_cast<double>(binPower[k]);
-            const double w = binWeight_[static_cast<size_t>(k)];
-            if (lower >= 0 && lower < n_ && !narrow_[static_cast<size_t>(lower)]) out[lower] += static_cast<T>(w * p);
-            if (lower + 1 >= 0 && lower + 1 < n_ && !narrow_[static_cast<size_t>(lower + 1)]) out[lower + 1] += static_cast<T>((1.0 - w) * p);
+            if (lower < -1)
+            {
+                ++k;
+                continue;
+            }
+            const bool intoLower = lower >= 0 && lower < n_ && !narrow_[static_cast<size_t>(lower)];
+            const bool intoUpper = lower + 1 < n_ && !narrow_[static_cast<size_t>(lower + 1)];
+            std::array<T, lanes> below {}, above {};
+            if (intoLower) std::copy_n(out + Lanes * lower, Lanes, below.data());
+            if (intoUpper) std::copy_n(out + Lanes * (lower + 1), Lanes, above.data());
+            for (; k < numBins_ && binBand_[static_cast<size_t>(k)] == lower; ++k)
+            {
+                const double w = binWeight_[static_cast<size_t>(k)], rest = 1.0 - w;
+                const T* power = binPower + Lanes * k;
+                for (size_t j = 0; j < lanes; ++j)
+                {
+                    const double p = static_cast<double>(power[j]);
+                    below[j] += static_cast<T>(w * p);
+                    above[j] += static_cast<T>(rest * p);
+                }
+            }
+            if (intoLower) std::copy_n(below.data(), Lanes, out + Lanes * lower);
+            if (intoUpper) std::copy_n(above.data(), Lanes, out + Lanes * (lower + 1));
         }
         for (int b = 0; b < n_; ++b)
         {
@@ -346,7 +389,9 @@ public:
             const double pos = std::clamp(centre_[i] / binHz_, 0.0, static_cast<double>(numBins_ - 1));
             const int k = std::min(static_cast<int>(pos), numBins_ - 2);
             const double f = pos - k;
-            out[b] = static_cast<T>(widthBins_[i] * ((1.0 - f) * static_cast<double>(binPower[k]) + f * static_cast<double>(binPower[k + 1])));
+            const T* at = binPower + Lanes * k;
+            for (int j = 0; j < Lanes; ++j)
+                out[Lanes * b + j] = static_cast<T>(widthBins_[i] * ((1.0 - f) * static_cast<double>(at[j]) + f * static_cast<double>(at[j + Lanes])));
         }
     }
 
@@ -375,7 +420,7 @@ public:
         {
             const auto i = static_cast<size_t>(b);
             const double th = threshold_[i], a = exponent_[i];
-            out[b] = static_cast<T>(std::pow(std::max(0.0, static_cast<double>(bandPower[b])) + th, a) - std::pow(th, a));
+            out[b] = static_cast<T>(std::pow(std::max(0.0, static_cast<double>(bandPower[b])) + th, a) - thresholdLoudness_[i]);
         }
     }
 
@@ -401,6 +446,7 @@ private:
         bark_.resize(static_cast<size_t>(n_));
         exponent_.resize(static_cast<size_t>(n_));
         threshold_.resize(static_cast<size_t>(n_));
+        thresholdLoudness_.resize(static_cast<size_t>(n_));
         narrow_.resize(static_cast<size_t>(n_));
         widthBins_.resize(static_cast<size_t>(n_));
         widthBark_.resize(static_cast<size_t>(n_));
@@ -457,7 +503,7 @@ private:
 
     double fs_ = 48000.0, binHz_ = 23.4375, z0_ = 0.0, dz_ = 0.3, refSpl_ = 100.0;
     int numBins_ = 0, n_ = 0;
-    std::vector<double> centre_, bark_, exponent_, threshold_, widthBins_, widthBark_;
+    std::vector<double> centre_, bark_, exponent_, threshold_, thresholdLoudness_, widthBins_, widthBark_;
     std::vector<bool> narrow_;
     bool uniform_ = true;
     std::vector<int> binBand_;

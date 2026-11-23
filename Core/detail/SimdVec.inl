@@ -956,6 +956,14 @@ inline void dotProductStridedKernel(const double* shared, const double* first, s
     }
 }
 
+/// complexExp() of one bin by the standard library: e^re (cos im + i sin im).
+inline void complexExpBin(double* z) noexcept
+{
+    const double magnitude = std::exp(z[0]), phase = z[1];
+    z[0] = magnitude * std::cos(phase);
+    z[1] = magnitude * std::sin(phase);
+}
+
 #if defined(DSPARK_VEC_AVX)
 /// dotProduct() at 8 float lanes.
 inline float dotProductWide(const float* DSPARK_RESTRICT a, const float* DSPARK_RESTRICT b, int count) noexcept
@@ -1110,6 +1118,25 @@ inline void dotProduct4Wide(const double* shared, const double* const* other, in
     }
 }
 
+/// complexMulAccum() at 2 complex double bins per iteration, with no fused
+/// product: the sums of the scalar form. Returns the bins it has done.
+inline int complexMulAccumWide(double* DSPARK_RESTRICT accum, const double* DSPARK_RESTRICT a,
+                               const double* DSPARK_RESTRICT b, int bins) noexcept
+{
+    int k = 0;
+    for (; k + 1 < bins; k += 2)
+    {
+        const __m256d va    = _mm256_loadu_pd(a + 2 * k);
+        const __m256d vb    = _mm256_loadu_pd(b + 2 * k);
+        const __m256d aRe   = _mm256_movedup_pd(va);
+        const __m256d aIm   = _mm256_permute_pd(va, 0xF);
+        const __m256d bSwap = _mm256_permute_pd(vb, 0x5);
+        const __m256d prod  = _mm256_addsub_pd(_mm256_mul_pd(aRe, vb), _mm256_mul_pd(aIm, bSwap));
+        _mm256_storeu_pd(accum + 2 * k, _mm256_add_pd(_mm256_loadu_pd(accum + 2 * k), prod));
+    }
+    return k;
+}
+
 /// complexMulAccum() at 4 complex float bins per iteration.
 inline void complexMulAccumWide(float* DSPARK_RESTRICT accum, const float* DSPARK_RESTRICT a,
                                 const float* DSPARK_RESTRICT b, int bins) noexcept
@@ -1145,4 +1172,85 @@ inline void complexMulAccumWide(float* DSPARK_RESTRICT accum, const float* DSPAR
         accum[2 * k + 1] += re1 * im2 + im1 * re2;
     }
 }
+
+#if defined(DSPARK_VEC_AVX2) && defined(DSPARK_VEC_FMA)
+/// complexExp() at four bins an iteration, by polynomials: the exponential
+/// after a reduction by ln 2 (in two parts) to [-ln2/2, ln2/2], by its series
+/// to degree 13; sine and cosine after a reduction by pi/2 (in three parts) to
+/// [-pi/4, pi/4], by their series to degrees 17 and 16, swapped and signed by
+/// the quadrant. A group of four with a real part beyond +-700, an imaginary
+/// part beyond +-1e5 or a value not finite goes through the library. Returns
+/// the bins done (a multiple of four).
+inline int complexExpWide(double* data, int bins) noexcept
+{
+    constexpr double kRound = 6755399441055744.0;   // 1.5 * 2^52: adding it rounds to an integer
+    constexpr double kLog2e = 1.4426950408889634;
+    constexpr double kLn2Hi = 6.93147180369123816490e-01, kLn2Lo = 1.90821492927058770002e-10;
+    constexpr double kTwoOverPi = 0.63661977236758134308;
+    constexpr double kPio2a = 1.57079632673412561417e+00, kPio2b = 6.07710050650619224932e-11;
+    constexpr double kPio2c = 2.02226624879595063154e-21;
+    constexpr double kExp[14] = { 1.0, 1.0, 1.0 / 2.0, 1.0 / 6.0, 1.0 / 24.0, 1.0 / 120.0, 1.0 / 720.0, 1.0 / 5040.0,
+                                  1.0 / 40320.0, 1.0 / 362880.0, 1.0 / 3628800.0, 1.0 / 39916800.0,
+                                  1.0 / 479001600.0, 1.0 / 6227020800.0 };
+    constexpr double kSin[8] = { -1.0 / 6.0, 1.0 / 120.0, -1.0 / 5040.0, 1.0 / 362880.0, -1.0 / 39916800.0,
+                                 1.0 / 6227020800.0, -1.0 / 1307674368000.0, 1.0 / 355687428096000.0 };
+    constexpr double kCos[8] = { -1.0 / 2.0, 1.0 / 24.0, -1.0 / 720.0, 1.0 / 40320.0, -1.0 / 3628800.0,
+                                 1.0 / 479001600.0, -1.0 / 87178291200.0, 1.0 / 20922789888000.0 };
+    const __m256d round = _mm256_set1_pd(kRound);
+    // The bits of kRound less the exponent bias: what is left of k + kRound is k + 1023.
+    const __m256i bias = _mm256_set1_epi64x(static_cast<long long>(0x4338000000000000ull) - 1023);
+    const __m256i one = _mm256_set1_epi64x(1);
+    int k = 0;
+    for (; k + 4 <= bins; k += 4)
+    {
+        double* z = data + 2 * k;
+        const __m256d a = _mm256_loadu_pd(z), b = _mm256_loadu_pd(z + 4);
+        // x0 x2 | x1 x3 and p0 p2 | p1 p3.
+        const __m256d x = _mm256_unpacklo_pd(a, b), p = _mm256_unpackhi_pd(a, b);
+        const __m256d inside = _mm256_and_pd(
+            _mm256_and_pd(_mm256_cmp_pd(x, _mm256_set1_pd(-700.0), _CMP_GE_OQ), _mm256_cmp_pd(x, _mm256_set1_pd(700.0), _CMP_LE_OQ)),
+            _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), p), _mm256_set1_pd(1e5), _CMP_LE_OQ));
+        if (_mm256_movemask_pd(inside) != 0xF)
+        {
+            for (int j = 0; j < 4; ++j) complexExpBin(z + 2 * j);
+            continue;
+        }
+        // e^x = 2^k e^r.
+        const __m256d t = _mm256_fmadd_pd(x, _mm256_set1_pd(kLog2e), round);
+        const __m256d kd = _mm256_sub_pd(t, round);
+        __m256d r = _mm256_fnmadd_pd(kd, _mm256_set1_pd(kLn2Hi), x);
+        r = _mm256_fnmadd_pd(kd, _mm256_set1_pd(kLn2Lo), r);
+        __m256d e = _mm256_set1_pd(kExp[13]);
+        for (int i = 12; i >= 0; --i) e = _mm256_fmadd_pd(e, r, _mm256_set1_pd(kExp[i]));
+        const __m256d scale = _mm256_castsi256_pd(_mm256_slli_epi64(_mm256_sub_epi64(_mm256_castpd_si256(t), bias), 52));
+        const __m256d magnitude = _mm256_mul_pd(e, scale);
+        // p = n pi/2 + q.
+        const __m256d nt = _mm256_fmadd_pd(p, _mm256_set1_pd(kTwoOverPi), round);
+        const __m256d nd = _mm256_sub_pd(nt, round);
+        __m256d q = _mm256_fnmadd_pd(nd, _mm256_set1_pd(kPio2a), p);
+        q = _mm256_fnmadd_pd(nd, _mm256_set1_pd(kPio2b), q);
+        q = _mm256_fnmadd_pd(nd, _mm256_set1_pd(kPio2c), q);
+        const __m256d q2 = _mm256_mul_pd(q, q);
+        __m256d s = _mm256_set1_pd(kSin[7]), c = _mm256_set1_pd(kCos[7]);
+        for (int i = 6; i >= 0; --i)
+        {
+            s = _mm256_fmadd_pd(s, q2, _mm256_set1_pd(kSin[i]));
+            c = _mm256_fmadd_pd(c, q2, _mm256_set1_pd(kCos[i]));
+        }
+        s = _mm256_fmadd_pd(_mm256_mul_pd(s, q2), q, q);
+        c = _mm256_fmadd_pd(c, q2, _mm256_set1_pd(1.0));
+        // The quadrant n mod 4 is in the low bits: odd swaps the two, bit 1 (of n, and of n + 1) signs them.
+        const __m256i n = _mm256_castpd_si256(nt);
+        const __m256d odd = _mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(n, one), one));
+        const __m256d sine = _mm256_blendv_pd(s, c, odd), cosine = _mm256_blendv_pd(c, s, odd);
+        const __m256d sineSign = _mm256_castsi256_pd(_mm256_slli_epi64(_mm256_srli_epi64(n, 1), 63));
+        const __m256d cosineSign = _mm256_castsi256_pd(_mm256_slli_epi64(_mm256_srli_epi64(_mm256_add_epi64(n, one), 1), 63));
+        const __m256d re = _mm256_mul_pd(magnitude, _mm256_xor_pd(cosine, cosineSign));
+        const __m256d im = _mm256_mul_pd(magnitude, _mm256_xor_pd(sine, sineSign));
+        _mm256_storeu_pd(z, _mm256_unpacklo_pd(re, im));
+        _mm256_storeu_pd(z + 4, _mm256_unpackhi_pd(re, im));
+    }
+    return k;
+}
+#endif
 #endif

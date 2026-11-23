@@ -12,7 +12,7 @@
  *
  * Build flags: an x86-64 build for the generic baseline also carries AVX2+FMA
  * copies of the kernels that gain from them (the Vec abstraction, firCorrelate,
- * dotProduct, complexMulAccum and the FFT passes) and selects them at run time
+ * dotProduct, complexMulAccum, complexExp and the FFT passes) and selects them at run time
  * on CPUs that support them (see setRuntimeDispatch()). /arch:AVX2 (MSVC) or
  * -march=x86-64-v3 (GCC/Clang) still widens the rest of the code when you
  * control the deployment target. WebAssembly: compile with -msimd128 -msse2 so
@@ -128,6 +128,7 @@
 #endif
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -1308,16 +1309,91 @@ inline void complexMulAccum(float* DSPARK_RESTRICT accum, const float* DSPARK_RE
 #endif
 }
 
-/** @brief Double overload (scalar on purpose: double spectra are an offline path). */
+/** @brief Double overload: the products and sums of the scalar form, two or four lanes at a time. */
 inline void complexMulAccum(double* DSPARK_RESTRICT accum, const double* DSPARK_RESTRICT a,
                             const double* DSPARK_RESTRICT b, int bins) noexcept
 {
-    for (int k = 0; k < bins; ++k)
+    int k = 0;
+#if defined(DSPARK_SIMD_AVX)
+    k = complexMulAccumWide(accum, a, b, bins);
+#elif defined(DSPARK_SIMD_SSE2)
+  #if defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive()) k = avx2::complexMulAccumWide(accum, a, b, bins);
+  #endif
+    const __m128d negRe = _mm_set_pd(0.0, -0.0);
+    for (; k < bins; ++k)
+    {
+        const __m128d va = _mm_loadu_pd(a + 2 * k), vb = _mm_loadu_pd(b + 2 * k);
+        const __m128d p1 = _mm_mul_pd(_mm_unpacklo_pd(va, va), vb);
+        const __m128d p2 = _mm_xor_pd(_mm_mul_pd(_mm_unpackhi_pd(va, va), _mm_shuffle_pd(vb, vb, 1)), negRe);
+        _mm_storeu_pd(accum + 2 * k, _mm_add_pd(_mm_loadu_pd(accum + 2 * k), _mm_add_pd(p1, p2)));
+    }
+#elif defined(DSPARK_SIMD_NEON)
+    alignas(16) static constexpr uint64_t kNegRe[2] = { 0x8000000000000000ull, 0ull };
+    const uint64x2_t negRe = vld1q_u64(kNegRe);
+    for (; k < bins; ++k)
+    {
+        const float64x2_t va = vld1q_f64(a + 2 * k), vb = vld1q_f64(b + 2 * k);
+        const float64x2_t p1 = vmulq_f64(vtrn1q_f64(va, va), vb);
+        const float64x2_t p2 = vreinterpretq_f64_u64(
+            veorq_u64(vreinterpretq_u64_f64(vmulq_f64(vtrn2q_f64(va, va), vextq_f64(vb, vb, 1))), negRe));
+        vst1q_f64(accum + 2 * k, vaddq_f64(vld1q_f64(accum + 2 * k), vaddq_f64(p1, p2)));
+    }
+#endif
+    for (; k < bins; ++k)
     {
         const double re1 = a[2 * k], im1 = a[2 * k + 1];
         const double re2 = b[2 * k], im2 = b[2 * k + 1];
         accum[2 * k]     += re1 * re2 - im1 * im2;
         accum[2 * k + 1] += re1 * im2 + im1 * re2;
+    }
+}
+
+// ============================================================================
+// complexExp -- z[k] = e^z[k] over interleaved complex bins
+// ============================================================================
+
+/**
+ * @brief The exponential of each complex bin of an interleaved [re, im, ...]
+ *        spectrum, in place: e^re (cos im + i sin im).
+ *
+ * What a minimum-phase design does with the spectrum of its cepstrum. The
+ * baseline takes each bin from the standard library. Builds and CPUs with AVX2
+ * and FMA (at compile time, or after the run-time check of an x86-64 baseline
+ * build: see setRuntimeDispatch()) take four bins at a time by polynomials,
+ * within 4e-16 of the library's result relative to the bin's magnitude
+ * (measured), and leave to the library any four with a real part beyond +-700,
+ * an imaginary part beyond +-1e5 or a value that is not finite.
+ *
+ * @param data Interleaved complex bins, overwritten.
+ * @param bins How many complex bins (none for zero or less).
+ */
+inline void complexExp(double* data, int bins) noexcept
+{
+    if (data == nullptr || bins <= 0) return;
+    int k = 0;
+#if defined(DSPARK_SIMD_AVX) && defined(__AVX2__) && defined(DSPARK_SIMD_FMA)
+    k = complexExpWide(data, bins);
+#elif defined(DSPARK_SIMD_DISPATCH_AVX2)
+    if (isRuntimeDispatchActive()) k = avx2::complexExpWide(data, bins);
+#endif
+    // One function a loop over packed values, a chunk at a time, for
+    // compilers with vector forms of these functions.
+    constexpr int kChunk = 64;
+    double magnitude[kChunk], cosine[kChunk], sine[kChunk];
+    while (k < bins)
+    {
+        const int n = bins - k < kChunk ? bins - k : kChunk;
+        double* z = data + 2 * k;
+        for (int j = 0; j < n; ++j) magnitude[j] = std::exp(z[2 * j]);
+        for (int j = 0; j < n; ++j) cosine[j] = std::cos(z[2 * j + 1]);
+        for (int j = 0; j < n; ++j) sine[j] = std::sin(z[2 * j + 1]);
+        for (int j = 0; j < n; ++j)
+        {
+            z[2 * j] = magnitude[j] * cosine[j];
+            z[2 * j + 1] = magnitude[j] * sine[j];
+        }
+        k += n;
     }
 }
 

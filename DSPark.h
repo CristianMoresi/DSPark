@@ -401,7 +401,7 @@
  * | `Sampler<T>`             | Core/Sampler.h        | Polyphonic multi-zone sampler: alias-free transposition, loops      |
  * | `SampleZoneSpec<T>`      | Core/SampleZone.h     | One sample zone: keys, velocities, tuning, gain, pan, loop          |
  * | `Synthesizer<T>`         | Core/Synthesizer.h    | Polyphonic analog/FM/wavetable synth with samples and mod matrix    |
- * | `Lfo<T>`                 | Core/Lfo.h            | Modulation LFO: 7 shapes, tempo sync, delay, fade-in, seeded random |
+ * | `Lfo<T>`                 | Core/Lfo.h            | Modulation LFO: 7 shapes and 16 steps, tempo sync, delay, fade-in, seeded random |
  * | `DryWetMixer<T>`         | Core/DryWetMixer.h    | Dry/wet parallel mix for effects                                    |
  *
  * @subsection classes_analysis Analysis & Metering

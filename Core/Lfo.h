@@ -22,6 +22,17 @@
  * - SampleAndHold: a new uniform random value every cycle.
  * - SmoothRandom: a cosine glide from one random value to the next over each
  *   cycle: continuous in value, with zero slope at every cycle boundary.
+ * - Steps: a sequence of up to 16 steps over the cycle (setNumSteps(),
+ *   setStep()). Each step holds its value, or glides to it from the step
+ *   before over a share of its length along a curve; a random step draws a
+ *   value per cycle from the seed that is always at least a quarter of the
+ *   room away from the step before; a swing moves the boundary inside each
+ *   pair of steps; the values can be quantized to a grid (semitones, when
+ *   the owner maps the output to a pitch range). It depends on the
+ *   instance's steps, so it is read with stepsAt(), not valueAt().
+ *
+ * reset() can glide from the output it was at to the new start over a few
+ * milliseconds (setRetriggerGlideMs()), so a retrigger does not step.
  *
  * The rate is in Hz, or a note division of a tempo in BPM. Delay and fade-in
  * shape the output's depth after reset(): silent for the delay, then a
@@ -30,7 +41,8 @@
  *
  * Threading: owner-managed. Setters, reset() and generation belong to the
  * owning thread (a synthesizer voice or its engine). valueAt() is a pure
- * static function. No allocation anywhere.
+ * static function; stepsAt() reads the instance (and caches the cycle it
+ * read last). No allocation anywhere.
  *
  * Dependencies: DspMath.h.
  */
@@ -38,7 +50,9 @@
 #include "DspMath.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace dspark {
@@ -73,9 +87,13 @@ public:
         SawDown,
         Square,
         SampleAndHold,
-        SmoothRandom
+        SmoothRandom,
+        Steps
     };
-    static constexpr int kNumShapes = 7;
+    static constexpr int kNumShapes = 8;
+
+    /// Most steps of the Steps shape.
+    static constexpr int kMaxSteps = 16;
 
     /** @brief Note values for tempo sync (four beats to the whole note). */
     enum class Division
@@ -135,6 +153,9 @@ public:
      */
     void reset() noexcept
     {
+        // The glide of a retrigger starts from where the output is now.
+        retrigFrom_ = static_cast<double>(value());
+        retrigLeft_ = retrigSamples_;
         cycles_ = startPhase_;
         age_ = 0;
     }
@@ -188,7 +209,123 @@ public:
     }
 
     /** @brief Seed of the random shapes (the same seed repeats the same sequence). */
-    void setSeed(uint64_t seed) noexcept { seed_ = seed; }
+    void setSeed(uint64_t seed) noexcept { seed_ = seed; stepCacheCycle_ = kNoCycle; }
+
+    /**
+     * @brief How long reset() glides from the output it was at to the new
+     *        start, in ms (0, the default, jumps; >= 0, non-finite ignored).
+     */
+    void setRetriggerGlideMs(double ms) noexcept
+    {
+        if (!(ms >= 0.0) || !std::isfinite(ms)) return;
+        retrigMs_ = ms;
+        updateEnvelope();
+    }
+
+    // -- The Steps shape (owning thread) ---------------------------------------
+
+    /** @brief Steps in a cycle, 1..kMaxSteps (16, the default). */
+    void setNumSteps(int count) noexcept
+    {
+        numSteps_ = std::clamp(count, 1, kMaxSteps);
+        stepCacheCycle_ = kNoCycle;
+    }
+    [[nodiscard]] int getNumSteps() const noexcept { return numSteps_; }
+
+    /**
+     * @brief One step: its value, how much of its length it glides to it
+     *        from the step before, and the curve of that glide.
+     *
+     * @param index  0..kMaxSteps-1 (others are ignored).
+     * @param value  -1..1.
+     * @param glide  0 (holds from its start) to 1 (glides over all of it).
+     * @param curve  -1 (slow start) to 1 (fast start); 0 is a straight line.
+     * Non-finite values are ignored.
+     */
+    void setStep(int index, double value, double glide = 0.0, double curve = 0.0) noexcept
+    {
+        if (index < 0 || index >= kMaxSteps || !std::isfinite(value) || !std::isfinite(glide) || !std::isfinite(curve)) return;
+        const auto i = static_cast<size_t>(index);
+        stepValue_[i] = std::clamp(value, -1.0, 1.0);
+        stepGlide_[i] = std::clamp(glide, 0.0, 1.0);
+        stepCurve_[i] = std::clamp(curve, -1.0, 1.0);
+        stepCacheCycle_ = kNoCycle;
+    }
+
+    /** @brief Makes a step draw its value from the seed every cycle (see the file notes). */
+    void setStepRandom(int index, bool random) noexcept
+    {
+        if (index < 0 || index >= kMaxSteps) return;
+        stepRandom_[static_cast<size_t>(index)] = random;
+        stepCacheCycle_ = kNoCycle;
+    }
+
+    [[nodiscard]] double getStepValue(int index) const noexcept { return stepValue_[stepIndex(index)]; }
+    [[nodiscard]] double getStepGlide(int index) const noexcept { return stepGlide_[stepIndex(index)]; }
+    [[nodiscard]] double getStepCurve(int index) const noexcept { return stepCurve_[stepIndex(index)]; }
+    [[nodiscard]] bool isStepRandom(int index) const noexcept { return stepRandom_[stepIndex(index)]; }
+
+    /**
+     * @brief Moves the boundary inside each pair of steps, -1..1: at 0.5 the
+     *        first step of a pair lasts 1.25 steps and the second 0.75
+     *        (the boundary moves by half the value, in steps).
+     */
+    void setStepSwing(double swing) noexcept
+    {
+        if (std::isfinite(swing)) swing_ = std::clamp(swing, -1.0, 1.0);
+    }
+    [[nodiscard]] double getStepSwing() const noexcept { return swing_; }
+
+    /**
+     * @brief Quantizes the step values to a grid of 1/divisions (0, the
+     *        default, leaves them free; 12 puts them on semitones when the
+     *        owner maps -1..1 to -12..12 semitones). Glides move between
+     *        the quantized values.
+     */
+    void setStepQuantize(int divisions) noexcept
+    {
+        stepQuantize_ = std::clamp(divisions, 0, 1200);
+        stepCacheCycle_ = kNoCycle;
+    }
+    [[nodiscard]] int getStepQuantize() const noexcept { return stepQuantize_; }
+
+    /**
+     * @brief The Steps shape's value at an absolute cycle position (the
+     *        integer part is the cycle whose random steps are drawn).
+     */
+    [[nodiscard]] double stepsAt(double cycles) const noexcept
+    {
+        if (!std::isfinite(cycles)) cycles = 0.0;
+        const double index = std::floor(cycles);
+        const double ph = cycles - index;
+        const auto cycle = static_cast<int64_t>(index);
+        if (cycle != stepCacheCycle_) fillStepCache(cycle);
+        // Where the phase is in the steps, with the swing inside each pair.
+        const double pos = ph * static_cast<double>(numSteps_);
+        int step = static_cast<int>(pos);
+        double within = pos - static_cast<double>(step);
+        if (swing_ != 0.0 && numSteps_ >= 2)
+        {
+            const int pair = step / 2;
+            if (2 * pair + 1 < numSteps_)
+            {
+                const double inPair = pos - 2.0 * static_cast<double>(pair);   // 0..2
+                const double edge = 1.0 + 0.5 * swing_;
+                if (inPair < edge) { step = 2 * pair; within = inPair / edge; }
+                else { step = 2 * pair + 1; within = (inPair - edge) / (2.0 - edge); }
+            }
+        }
+        step = std::clamp(step, 0, numSteps_ - 1);
+        const double to = stepCache_[static_cast<size_t>(step)];
+        const double from = step > 0 ? stepCache_[static_cast<size_t>(step - 1)] : stepCacheBefore_;
+        const double glide = stepGlide_[static_cast<size_t>(step)];
+        if (!(within < glide)) return to;
+        const double x = within / glide;
+        const double c = stepCurve_[static_cast<size_t>(step)];
+        const double bent = c > 0.0 ? 1.0 - std::pow(1.0 - x, 1.0 + 4.0 * c)
+                          : c < 0.0 ? std::pow(x, 1.0 - 4.0 * c) : x;
+        return from + (to - from) * bent;
+    }
 
     /** @brief Effective rate in Hz (the synced one when tempo sync is on). */
     [[nodiscard]] double getRateHz() const noexcept { return increment_ * sampleRate_; }
@@ -201,7 +338,11 @@ public:
     /** @brief The output now (shape times delay/fade depth), without advancing. */
     [[nodiscard]] T value() const noexcept
     {
-        return static_cast<T>(valueAt(shape_, cycles_, seed_) * depthAt(age_));
+        const double shaped = (shape_ == Shape::Steps) ? stepsAt(cycles_) : valueAt(shape_, cycles_, seed_);
+        const double v = shaped * depthAt(age_);
+        if (retrigLeft_ <= 0) return static_cast<T>(v);
+        const double share = static_cast<double>(retrigLeft_) / static_cast<double>(retrigSamples_);
+        return static_cast<T>(v + (retrigFrom_ - v) * share);
     }
 
     /**
@@ -214,6 +355,7 @@ public:
         const auto n = static_cast<int64_t>(std::max(samples, 0));
         cycles_ += increment_ * static_cast<double>(n);
         age_ += n;
+        retrigLeft_ = std::max<int64_t>(0, retrigLeft_ - n);
         return v;
     }
 
@@ -228,6 +370,7 @@ public:
         const double scale = (rateScale >= 0.0) ? std::min(rateScale, 64.0) : 0.0;
         cycles_ += increment_ * scale * static_cast<double>(n);
         age_ += n;
+        retrigLeft_ = std::max<int64_t>(0, retrigLeft_ - n);
         return v;
     }
 
@@ -247,7 +390,8 @@ public:
      * @brief The shape's value at an absolute cycle position.
      *
      * The integer part of `cycles` is the cycle index the random shapes hash
-     * with `seed`; the fraction is the phase within the cycle.
+     * with `seed`; the fraction is the phase within the cycle. Steps depends
+     * on an instance's steps: it reads 0 here (use stepsAt()).
      */
     [[nodiscard]] static double valueAt(Shape shape, double cycles, uint64_t seed) noexcept
     {
@@ -271,6 +415,7 @@ public:
                 const double b = random(seed, static_cast<int64_t>(index) + 1);
                 return a + (b - a) * 0.5 * (1.0 - std::cos(pi<double> * ph));
             }
+            case Shape::Steps: return 0.0;
         }
         return 0.0;
     }
@@ -296,6 +441,58 @@ private:
     {
         delaySamples_ = static_cast<int64_t>(std::llround(delayMs_ * 0.001 * sampleRate_));
         fadeSamples_ = static_cast<int64_t>(std::llround(fadeMs_ * 0.001 * sampleRate_));
+        retrigSamples_ = static_cast<int64_t>(std::llround(retrigMs_ * 0.001 * sampleRate_));
+        retrigLeft_ = std::min(retrigLeft_, retrigSamples_);
+    }
+
+    [[nodiscard]] static size_t stepIndex(int index) noexcept { return static_cast<size_t>(std::clamp(index, 0, kMaxSteps - 1)); }
+
+    /// A step's value in a cycle: its own, or drawn from the seed at least a
+    /// quarter of the room away from `before`, toward the side with more
+    /// room; then on the grid.
+    [[nodiscard]] double stepValueIn(int64_t cycle, int step, double before) const noexcept
+    {
+        double v = stepValue_[static_cast<size_t>(step)];
+        if (stepRandom_[static_cast<size_t>(step)])
+        {
+            const double u = 0.5 * (random(seed_ ^ 0x5DEECE66Dull, cycle * kMaxSteps + step) + 1.0);   // 0..1
+            const bool up = before < 0.0;
+            const double room = up ? 1.0 - before : before + 1.0;   // 1..2
+            const double away = room * (0.25 + 0.75 * u);
+            v = std::clamp(up ? before + away : before - away, -1.0, 1.0);
+        }
+        return quantized(v);
+    }
+
+    /// A value on the grid of setStepQuantize().
+    [[nodiscard]] double quantized(double v) const noexcept
+    {
+        if (stepQuantize_ <= 0) return v;
+        const double q = static_cast<double>(stepQuantize_);
+        return std::clamp(std::round(v * q) / q, -1.0, 1.0);
+    }
+
+    /// The step values of a cycle, and the last value of the cycle before
+    /// (where its first step glides from). A cycle depends on its own draws
+    /// only: a random first step moves away from the value the last step
+    /// is set to (the value it plays when it is not random), so any cycle
+    /// reads alike whatever was read before it.
+    void fillStepCache(int64_t cycle) const noexcept
+    {
+        auto walk = [&](int64_t c, std::array<double, kMaxSteps>& out) {
+            const int last = numSteps_ - 1;
+            double before = quantized(stepValue_[static_cast<size_t>(last)]);
+            for (int s = 0; s < numSteps_; ++s)
+            {
+                out[static_cast<size_t>(s)] = stepValueIn(c, s, before);
+                before = out[static_cast<size_t>(s)];
+            }
+        };
+        std::array<double, kMaxSteps> previous {};
+        walk(cycle - 1, previous);
+        stepCacheBefore_ = previous[static_cast<size_t>(numSteps_ - 1)];
+        walk(cycle, stepCache_);
+        stepCacheCycle_ = cycle;
     }
 
     double sampleRate_ = 48000.0;
@@ -308,6 +505,24 @@ private:
     double delayMs_ = 0.0;
     double fadeMs_ = 0.0;
     uint64_t seed_ = 0;
+
+    // The Steps shape.
+    static constexpr int64_t kNoCycle = INT64_MIN;
+    int numSteps_ = kMaxSteps;
+    std::array<double, kMaxSteps> stepValue_ {};
+    std::array<double, kMaxSteps> stepGlide_ {};
+    std::array<double, kMaxSteps> stepCurve_ {};
+    std::array<bool, kMaxSteps> stepRandom_ {};
+    double swing_ = 0.0;
+    int stepQuantize_ = 0;
+    mutable std::array<double, kMaxSteps> stepCache_ {};   ///< The step values of stepCacheCycle_.
+    mutable double stepCacheBefore_ = 0.0;                 ///< The last step value of the cycle before.
+    mutable int64_t stepCacheCycle_ = kNoCycle;
+    // The glide of a retrigger.
+    double retrigMs_ = 0.0;
+    int64_t retrigSamples_ = 0;
+    int64_t retrigLeft_ = 0;
+    double retrigFrom_ = 0.0;
 
     double increment_ = 1.0 / 48000.0;
     double cycles_ = 0.0;

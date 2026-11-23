@@ -1487,8 +1487,14 @@ public:
         const T u = std::abs(x) * side;
         if (u <= knee_) return x;
         const T v = (u - knee_) * invSpan_;
-        const bool neg = x < T(0);
-        const T bent = (power_ == T(1)) ? bend(v, neg) : std::pow(std::max(T(0), bend(std::pow(v, power_), neg)), invPower_);
+        T bent;
+        if (baseNow_ == 0) [[likely]]
+            bent = (power_ == T(1)) ? std::tanh(v) : std::pow(std::tanh(std::pow(v, power_)), invPower_);
+        else
+        {
+            const bool neg = x < T(0);
+            bent = (power_ == T(1)) ? bend(v, neg) : std::pow(std::max(T(0), bend(std::pow(v, power_), neg)), invPower_);
+        }
         return std::copysign((knee_ + span_ * bent) / side, x);
     }
 
@@ -1784,6 +1790,7 @@ public:
         dcScratch_.resize(spec.numChannels, spec.maxBlockSize);
         dcWanted_ = dcBlockingEnabled_ && curveMakesDc();
         dcShare_ = dcWanted_ ? 1.0 : 0.0;
+        dcSnap_ = true;
         modeDipping_ = false;
         modeDip_ = 0.0;
         dryPre_.reset();
@@ -1870,6 +1877,10 @@ public:
         postFilter_.reset();
         dcBlocker_.reset();
         dryWetMixer_.reset();
+        dcSnap_ = true;
+        modeDipping_ = false;
+        modeDip_ = 0.0;
+        procMode_ = pendingMode_ = applied_.processingMode;
         dryRunning_ = false;
         dryHoldSamples_ = 0;
         if (oversampler_) oversampler_->reset();
@@ -2008,6 +2019,29 @@ private:
                       int dryOffset = 0, bool dryTurn = false) noexcept
     {
         dcWanted_ = dcBlockingEnabled_ && curveMakesDc();
+        if (dcSnap_)
+        {
+            // The first block after prepare() or reset(): the filter as the
+            // curve in play wants it, with nothing to fade from.
+            dcSnap_ = false;
+            dcShare_ = dcWanted_ ? 1.0 : 0.0;
+            dcBlocker_.reset();
+            dryDc_.reset();
+        }
+        {
+            const SampleType pan = drivePan_.load(std::memory_order_relaxed);
+            panning_ = pan != SampleType(0) || panNow_ != SampleType(0);
+            if (panning_)
+            {
+                const auto gains = [](SampleType p) {
+                    const SampleType g = static_cast<SampleType>(std::pow(10.0, kDrivePanDb * static_cast<double>(p) / 20.0));
+                    return std::array<SampleType, 2> { SampleType(1) / g, g };
+                };
+                panFrom_ = gains(panNow_);
+                panTo_ = gains(pan);
+                panNow_ = pan;
+            }
+        }
         const bool dryWork = aimDryPhase(buffer.getNumSamples(), dryOut != nullptr, dryTurn);
         // Second-order antialiasing delays the wet path by whole base
         // samples (two at 2x, one otherwise; inside the algorithms and
@@ -2365,6 +2399,24 @@ public:
     {
         return static_cast<Antialiasing>(antialiasOrder_.load(std::memory_order_relaxed));
     }
+
+    /**
+     * @brief The panorama of the drive, -1 to 1 (0, the default, is centred):
+     *        the first channel the curve sees gets up to 6 dB more drive and
+     *        the second up to 6 dB less (at -1), or the other way (at +1);
+     *        each comes out by the inverse, so its level holds where the
+     *        curve is straight and only how much it saturates moves. In a
+     *        mid-side mode the two are the middle and the sides. It moves
+     *        across a block. Thread-safe; values that are not finite are
+     *        ignored.
+     */
+    void setDrivePan(SampleType pan) noexcept
+    {
+        if (std::isfinite(pan)) drivePan_.store(std::clamp(pan, SampleType(-1), SampleType(1)), std::memory_order_relaxed);
+    }
+
+    /** @return The panorama of the drive, -1 to 1. */
+    [[nodiscard]] SampleType getDrivePan() const noexcept { return drivePan_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Sets a derivative-based (slew rate) saturation multiplier.
@@ -2814,6 +2866,7 @@ public:
         w.write("curveCurvature", static_cast<float>(getCurveCurvature()));
         w.write("curveAsymmetry", static_cast<float>(getCurveAsymmetry()));
         w.write("curveBase", static_cast<int32_t>(curve().getBase()));
+        w.write("drivePan", static_cast<float>(getDrivePan()));
         w.write("asymmetry", static_cast<float>(getAsymmetry()));
         w.write("programNoise", static_cast<float>(getProgramNoise()));
         w.write("levelTracking", static_cast<float>(getLevelTracking()));
@@ -2858,6 +2911,7 @@ public:
                       static_cast<SampleType>(r.read("curveCurvature", 1.0f)),
                       static_cast<SampleType>(r.read("curveAsymmetry", 0.0f)));
         setCurveBase(static_cast<CurveBase>(std::clamp(static_cast<int>(r.read("curveBase", 0)), 0, 6)));
+        setDrivePan(static_cast<SampleType>(r.read("drivePan", 0.0f)));
         setAsymmetry(static_cast<SampleType>(r.read("asymmetry", 0.0f)));
         setProgramNoise(static_cast<SampleType>(r.read("programNoise", -120.0f)));
         setLevelTracking(static_cast<SampleType>(r.read("levelTracking", 0.0f)));
@@ -3256,12 +3310,24 @@ protected:
         //    shared by both algorithms of a crossfade (each used to advance
         //    the smoothers again, so a preset change depended on the host's
         //    block partition by up to 0.45 of full scale).
-        for (int i = 0; i < nS; ++i)
+        // With the knob still the smoother gives its target at every sample:
+        // one gain for the block (the same bits) instead of a power a sample.
+        if (!driveSmoother_.isSmoothing())
         {
-            driveRamp_[static_cast<size_t>(i)] =
-                decibelsToGain(static_cast<SampleType>(driveSmoother_.getNextValue()));
-            charRamp_[static_cast<size_t>(i)] = static_cast<SampleType>(characterSmoother_.getNextValue());
+            const SampleType still = decibelsToGain(static_cast<SampleType>(driveSmoother_.getNextValue()));
+            for (int i = 0; i < nS; ++i)
+            {
+                driveRamp_[static_cast<size_t>(i)] = still;
+                charRamp_[static_cast<size_t>(i)] = static_cast<SampleType>(characterSmoother_.getNextValue());
+            }
         }
+        else
+            for (int i = 0; i < nS; ++i)
+            {
+                driveRamp_[static_cast<size_t>(i)] =
+                    decibelsToGain(static_cast<SampleType>(driveSmoother_.getNextValue()));
+                charRamp_[static_cast<size_t>(i)] = static_cast<SampleType>(characterSmoother_.getNextValue());
+            }
 
         // 4. Primary Saturation (and secondary if xfade)
         if (xfading)
@@ -3438,12 +3504,14 @@ protected:
                 {
                     SampleType drift = useDrift ? driftView.getChannel(ch)[i] : SampleType(1);
                     SampleType* data = buffer.getChannel(ch);
+                    const SampleType pg = panning_ && ch < 2 ? panGain(ch, i, nS) : SampleType(1);
                     if constexpr (requires { ExactAlgo::kSelfAligned; })
-                        data[i] = algo->processSecond(data[i], driveGainS * drift, charS * drift, ch);
+                        data[i] = algo->processSecond(data[i], driveGainS * drift * pg, charS * drift, ch);
                     else if constexpr (requires { algo->processSecond(data[i], driveGainS, charS, ch); })
-                        data[i] = algo->padKernel(algo->processSecond(data[i], driveGainS * drift, charS * drift, ch), ch);
+                        data[i] = algo->padKernel(algo->processSecond(data[i], driveGainS * drift * pg, charS * drift, ch), ch);
                     else
-                        data[i] = algo->align(algo->processSample(data[i], driveGainS * drift, charS * drift, ch), ch);
+                        data[i] = algo->align(algo->processSample(data[i], driveGainS * drift * pg, charS * drift, ch), ch);
+                    if (pg != SampleType(1)) data[i] /= pg;
                 }
             }
             return;
@@ -3458,9 +3526,22 @@ protected:
             {
                 SampleType drift = useDrift ? driftView.getChannel(ch)[i] : SampleType(1);
                 SampleType* data = buffer.getChannel(ch);
+                if (panning_ && ch < 2) [[unlikely]]
+                {
+                    const SampleType pg = panGain(ch, i, nS);
+                    data[i] = algo->processSample(data[i], driveGainS * drift * pg, charS * drift, ch) / pg;
+                    continue;
+                }
                 data[i] = algo->processSample(data[i], driveGainS * drift, charS * drift, ch);
             }
         }
+    }
+
+    /** @brief The drive's gain of a channel at a sample of the block (a straight line between its ends). */
+    [[nodiscard]] SampleType panGain(int ch, int i, int samples) const noexcept
+    {
+        const auto c = static_cast<std::size_t>(ch);
+        return panFrom_[c] + (panTo_[c] - panFrom_[c]) * static_cast<SampleType>(i + 1) / static_cast<SampleType>(std::max(1, samples));
     }
 
     void applyOutputGain(AudioBufferView<SampleType> buffer) noexcept
@@ -3980,7 +4061,14 @@ protected:
     // The DC filter in use: its share of the output (1 = filtered), heading for 1
     // while a curve in play makes DC and for 0 otherwise (setDcBlocking()).
     double dcShare_ = 1.0, dcStep_ = 1.0 / 2400.0;
+    // The panorama of the drive: its value now and the gains of a block's two ends.
+    std::atomic<SampleType> drivePan_ { SampleType(0) };
+    SampleType panNow_ = SampleType(0);
+    std::array<SampleType, 2> panFrom_ { SampleType(1), SampleType(1) }, panTo_ { SampleType(1), SampleType(1) };
+    bool panning_ = false;
+    static constexpr double kDrivePanDb = 6.0;
     bool dcWanted_ = true;
+    bool dcSnap_ = true;
     AudioBuffer<SampleType> dcScratch_;
     // A change of processing mode: the wet side dips to the dry over a
     // ramp, the mode changes at the bottom, and it comes back.

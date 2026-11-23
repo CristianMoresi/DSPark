@@ -26,8 +26,11 @@
  * stages (Core/BucketBrigade.h) whose clock the delay sets, with its filters
  * at 0.3 of the clock (so a longer delay is darker: about 2 kHz at 300 ms)
  * and its hiss; the feedback goes round the device, and the shortest delay
- * is 32 samples. setCharacterNoise() sets the hiss of both. The characters
- * do not crossfade: a switch to Bucket starts the device empty.
+ * is 32 samples. While the delay glides the filters follow it, worked out
+ * every 32 samples and glided between. setCharacterNoise() sets the hiss of
+ * both. The characters
+ * cross over 10 ms when one is changed, the incoming one running from the
+ * change: a switch to Bucket fills the device first, unheard.
  *
  * The delay time is kept in milliseconds: prepare() at a new rate, or a state
  * blob from another rate, keeps the echo time. A time set in samples before
@@ -253,6 +256,7 @@ public:
         }
         for (auto& b : bbd_) b.prepare(spec.sampleRate, kBucketStages, 0.45 * spec.sampleRate);
         headCoeff_ = 1.0 - std::exp(-2.0 * 3.141592653589793 * std::min(kHeadLossHz, 0.45 * spec.sampleRate) / spec.sampleRate);
+        switchFade_ = std::max(1, static_cast<int>(kSwitchFadeSeconds * spec.sampleRate));
 
         mixSmoother_.reset(spec.sampleRate, timeMs, 1.0f);
         insertMixMaxStep_ = static_cast<SampleType>(1.0 / std::max(1.0, spec.sampleRate * 0.02));
@@ -287,6 +291,8 @@ public:
         for (auto& b : bbd_) b.reset();
         tapeSeeded_.fill(false);
         bucketCornerFor_.fill(-1.0);
+        bucketTick_.fill(0);
+        switchLeft_.fill(0);
         bucketHissCoeff_.fill(0.5);
         hissDbFor_.fill(1.0);   // not a level: the first hiss sample computes its gain
         headLp_.fill(0.0);
@@ -1030,85 +1036,41 @@ private:
                                   static_cast<SampleType>(maxDelaySamples_ - 1));
 
         const Character chr = character_.load(std::memory_order_relaxed);
-        if (chr != lastCharacter_) [[unlikely]] switchCharacter(chr);
-        if (chr == Character::Tape)
-        {
-            // The tape reaches the set delay as a speed, with the motor's
-            // inertia, and wanders by its wow and flutter.
-            auto& tp = tape_[static_cast<size_t>(ch)];
-            const double target = static_cast<double>(delaySamples);
-            if (!tapeSeeded_[static_cast<size_t>(ch)])
-            {
-                tp.setTargetDelayNow(target);
-                tapeSeeded_[static_cast<size_t>(ch)] = true;
-            }
-            else
-            {
-                tp.setTargetDelay(target);
-            }
-            delaySamples = std::clamp(static_cast<SampleType>(tp.next(static_cast<double>(wowFlutter_.load(std::memory_order_relaxed)))),
-                                      minDelay, static_cast<SampleType>(maxDelaySamples_ - 1));
-        }
+        if (chr != lastCharacter_) [[unlikely]] switchCharacter(chr, delaySamples);
 
         SampleType* data = delayBuffer_.getChannel(ch);
-        int writeIdx = writeIndices_[ch];
+        const int writeIdx = writeIndices_[ch];
+        const auto c = static_cast<size_t>(ch);
 
-        // Read position writeIdx - delaySamples, split into an integer index
-        // and a fraction in [0, 1] without ever forming the wrapped float
-        // position: writeIdx - delay + size rounded up to exactly `size` when
-        // the position fell a hair below 0, which masked the index to 0 while
-        // the "fraction" became `size` (a Hermite blow-up, heard as random
-        // zips on moving Haas/binaural delays).
         SampleType delayed;
-        if (chr == Character::Bucket)
+        if (switchLeft_[c] > 0) [[unlikely]]
         {
-            delayed = bucketRead(ch, input + s.lastFeedback, delaySamples);
+            // A change of character: the incoming one runs from the change,
+            // unheard until a bucket line has filled, then the two cross.
+            const double outgoing = readCharacter(switchFrom_, ch, input, delaySamples, minDelay, sinc, s);
+            const double incoming = readCharacter(lastCharacter_, ch, input, delaySamples, minDelay, sinc, s);
+            const int left = switchLeft_[c]--;
+            const double w = left > switchFade_ ? 0.0
+                           : static_cast<double>(switchFade_ - left + 1) / static_cast<double>(switchFade_);
+            double y = outgoing + (incoming - outgoing) * w;
+            const double hissOut = switchFrom_ != Character::Clean ? 1.0 - w : 0.0;
+            const double hissIn = lastCharacter_ != Character::Clean ? w : 0.0;
+            if (hissOut + hissIn > 0.0)
+            {
+                const Character heard = (w > 0.0 && lastCharacter_ != Character::Clean) || switchFrom_ == Character::Clean
+                                            ? lastCharacter_ : switchFrom_;
+                y += (hissOut + hissIn) * hiss(ch, hissCoeffOf(ch, heard));
+            }
+            delayed = static_cast<SampleType>(y);
         }
         else
         {
-        const int dInt = static_cast<int>(delaySamples);            // >= 3
-        const SampleType dFrac = delaySamples - static_cast<SampleType>(dInt);
-        int idx0;
-        SampleType frac;
-        if (dFrac > SampleType(0))
-        {
-            idx0 = (writeIdx - dInt - 1) & bufferMask_;
-            frac = SampleType(1) - dFrac;
+            // The character in play (a change waiting for another to end is not yet).
+            const Character now = lastCharacter_;
+            double y = readCharacter(now, ch, input, delaySamples, minDelay, sinc, s);
+            if (now != Character::Clean) y += hiss(ch, hissCoeffOf(ch, now));
+            delayed = static_cast<SampleType>(y);
         }
-        else
-        {
-            idx0 = (writeIdx - dInt) & bufferMask_;
-            frac = SampleType(0);
-        }
-
-        if (sinc)
-        {
-            delayed = sinc_->readRing(data, static_cast<int64_t>(bufferMask_),
-                                      static_cast<int64_t>(idx0), static_cast<double>(frac));
-        }
-        else
-        {
-        // 3rd-order Hermite Interpolation (4-point)
-
-        int idxM1 = (idx0 - 1 + maxDelaySamples_) & bufferMask_;
-        int idx1  = (idx0 + 1) & bufferMask_;
-        int idx2  = (idx0 + 2) & bufferMask_;
-
-        SampleType ym1 = data[idxM1];
-        SampleType y0  = data[idx0];
-        SampleType y1  = data[idx1];
-        SampleType y2  = data[idx2];
-
-        // Hermite polynomial logic
-        SampleType c = (y1 - ym1) * SampleType(0.5);
-        SampleType v = y0 - y1;
-        SampleType w = c + v;
-        SampleType a = w + v + (y2 - y0) * SampleType(0.5);
-        SampleType b = w + a;
-        delayed = ((((a * frac) - b) * frac + c) * frac + y0);
-        }
-        }
-        if (chr != Character::Clean) delayed = colour(ch, delayed, chr);
 
         // Feedback processing. The filters run on every sample of the straight
         // path, silence and zero feedback included: skipping them froze their
@@ -1152,26 +1114,134 @@ private:
         return out;
     }
 
-    /** @brief A character switch: the tape starts from where the read point is; the bucket line empty. */
-    void switchCharacter(Character chr) noexcept
+    /**
+     * @brief A character switch: the incoming character runs from here (the
+     *        tape from where the read point is, the bucket line from empty,
+     *        unheard until it has filled) and the two cross over 10 ms. A
+     *        switch that comes during one waits for it to end.
+     */
+    void switchCharacter(Character chr, SampleType delaySamples) noexcept
     {
+        for (int ch = 0; ch < std::min(numChannels_, kMaxChannels); ++ch)
+            if (switchLeft_[static_cast<size_t>(ch)] > 0) return;
+        switchFrom_ = lastCharacter_;
         lastCharacter_ = chr;
-        tapeSeeded_.fill(false);
+        if (chr == Character::Tape) tapeSeeded_.fill(false);
+        int fill = 0;
         if (chr == Character::Bucket)
+        {
             for (auto& b : bbd_) b.reset();
+            bucketCornerFor_.fill(-1.0);
+            fill = static_cast<int>(delaySamples) + static_cast<int>(kBucketSettleSeconds * static_cast<double>(sampleRate_));
+        }
+        switchLeft_.fill(fill + switchFade_);
     }
 
-    /** @brief One sample through the bucket-brigade line, its filters at 0.3 of the clock. */
+    /** @brief The ring read `delaySamples` behind the write point (Hermite, or the sinc reader). */
+    SampleType readRing(int ch, SampleType delaySamples, bool sinc) noexcept
+    {
+        SampleType* data = delayBuffer_.getChannel(ch);
+        const int writeIdx = writeIndices_[ch];
+        // Read position writeIdx - delaySamples, split into an integer index
+        // and a fraction in [0, 1] without ever forming the wrapped float
+        // position: writeIdx - delay + size rounded up to exactly `size` when
+        // the position fell a hair below 0, which masked the index to 0 while
+        // the "fraction" became `size` (a Hermite blow-up, heard as random
+        // zips on moving Haas/binaural delays).
+        const int dInt = static_cast<int>(delaySamples);            // >= 3
+        const SampleType dFrac = delaySamples - static_cast<SampleType>(dInt);
+        int idx0;
+        SampleType frac;
+        if (dFrac > SampleType(0))
+        {
+            idx0 = (writeIdx - dInt - 1) & bufferMask_;
+            frac = SampleType(1) - dFrac;
+        }
+        else
+        {
+            idx0 = (writeIdx - dInt) & bufferMask_;
+            frac = SampleType(0);
+        }
+        if (sinc)
+            return sinc_->readRing(data, static_cast<int64_t>(bufferMask_), static_cast<int64_t>(idx0), static_cast<double>(frac));
+        // 3rd-order Hermite interpolation (4-point).
+        const int idxM1 = (idx0 - 1 + maxDelaySamples_) & bufferMask_;
+        const int idx1  = (idx0 + 1) & bufferMask_;
+        const int idx2  = (idx0 + 2) & bufferMask_;
+        const SampleType ym1 = data[idxM1];
+        const SampleType y0  = data[idx0];
+        const SampleType y1  = data[idx1];
+        const SampleType y2  = data[idx2];
+        const SampleType c = (y1 - ym1) * SampleType(0.5);
+        const SampleType v = y0 - y1;
+        const SampleType w = c + v;
+        const SampleType a = w + v + (y2 - y0) * SampleType(0.5);
+        const SampleType b = w + a;
+        return ((((a * frac) - b) * frac + c) * frac + y0);
+    }
+
+    /**
+     * @brief The delayed sample of a character, before its hiss: the ring
+     *        (Clean), the ring at the tape transport's read point through the
+     *        playback head's loss (Tape), or the bucket line (Bucket).
+     */
+    double readCharacter(Character chr, int ch, SampleType input, SampleType delaySamples, SampleType minDelay,
+                         bool sinc, ChannelState& s) noexcept
+    {
+        const auto c = static_cast<size_t>(ch);
+        if (chr == Character::Bucket)
+            return static_cast<double>(bucketRead(ch, input + s.lastFeedback, delaySamples));
+        SampleType d = delaySamples;
+        if (chr == Character::Tape)
+        {
+            // The tape reaches the set delay as a speed, with the motor's
+            // inertia, and wanders by its wow and flutter.
+            auto& tp = tape_[c];
+            const double target = static_cast<double>(delaySamples);
+            if (!tapeSeeded_[c])
+            {
+                tp.setTargetDelayNow(target);
+                tapeSeeded_[c] = true;
+            }
+            else
+            {
+                tp.setTargetDelay(target);
+            }
+            d = std::clamp(static_cast<SampleType>(tp.next(static_cast<double>(wowFlutter_.load(std::memory_order_relaxed)))),
+                           minDelay, static_cast<SampleType>(maxDelaySamples_ - 1));
+        }
+        const double y = static_cast<double>(readRing(ch, d, sinc));
+        if (chr != Character::Tape) return y;
+        headLp_[c] += headCoeff_ * (y - headLp_[c]);
+        return headLp_[c];
+    }
+
+    /**
+     * @brief One sample through the bucket-brigade line, its filters at 0.3
+     *        of the clock: the corner is worked out every 32 samples from the
+     *        delay there, and the line glides to it over those 32.
+     */
     SampleType bucketRead(int ch, SampleType in, SampleType delaySamples) noexcept
     {
         const auto c = static_cast<size_t>(ch);
         auto& b = bbd_[c];
         const double fs = static_cast<double>(sampleRate_);
         const double d = static_cast<double>(delaySamples);
-        if (std::abs(d - bucketCornerFor_[c]) > 0.02 * d)
+        if (bucketCornerFor_[c] < 0.0 || ++bucketTick_[c] >= kBucketCornerGrid)
         {
-            b.setCorner(std::min(0.3 * b.clockFor(d / fs), 0.45 * fs));
-            bucketHissCoeff_[c] = 1.0 - std::exp(-2.0 * 3.141592653589793 * b.getCorner() / fs);
+            bucketTick_[c] = 0;
+            const double corner = std::min(0.3 * b.clockFor(d / fs), 0.45 * fs);
+            if (bucketCornerFor_[c] < 0.0) b.setCornersNow(corner, corner);
+            else
+            {
+                // The line glides over the next 32 samples: to where the
+                // corner will be at their end, if the delay goes on moving
+                // as it did over the last 32.
+                const double before = std::min(0.3 * b.clockFor(bucketCornerFor_[c] / fs), 0.45 * fs);
+                const double ahead = std::clamp(2.0 * corner - before, 0.5 * corner, 2.0 * corner);
+                b.setCorner(ahead);
+            }
+            bucketHissCoeff_[c] = 1.0 - std::exp(-2.0 * 3.141592653589793 * corner / fs);
             bucketCornerFor_[c] = d;
         }
         // The device's own delay (its filters, its hold) comes off the
@@ -1184,20 +1254,16 @@ private:
      *        head's loss (tape) and the hiss, white noise through a one-pole
      *        at the head's corner or the device's, scaled by that filter's gain.
      */
-    SampleType colour(int ch, SampleType delayed, Character chr) noexcept
+    [[nodiscard]] double hissCoeffOf(int ch, Character chr) const noexcept
+    {
+        return chr == Character::Tape ? headCoeff_ : bucketHissCoeff_[static_cast<size_t>(ch)];
+    }
+
+    /** @brief One sample of a character's hiss (0 when it is off). */
+    double hiss(int ch, double hissCoeff) noexcept
     {
         const auto c = static_cast<size_t>(ch);
-        double y = static_cast<double>(delayed);
-        double hissCoeff = headCoeff_;
-        if (chr == Character::Tape)
-        {
-            headLp_[c] += headCoeff_ * (y - headLp_[c]);
-            y = headLp_[c];
-        }
-        else
-        {
-            hissCoeff = bucketHissCoeff_[c];
-        }
+        double y = 0.0;
         const double noiseDb = static_cast<double>(characterNoiseDb_.load(std::memory_order_relaxed));
         if (noiseDb > -120.0)
         {
@@ -1211,9 +1277,9 @@ private:
             hissRng_[c] = hissRng_[c] * 1664525u + 1013904223u;
             const double n = static_cast<double>(hissRng_[c] >> 8) / 8388608.0 - 1.0;
             hissLp_[c] += hissCoeff * (n - hissLp_[c]);
-            y += hissAmp_[c] * hissLp_[c];
+            y = hissAmp_[c] * hissLp_[c];
         }
-        return static_cast<SampleType>(y);
+        return y;
     }
 
     /** @brief One-pole coefficient shared by the feedback LP and HP filters. */
@@ -1265,6 +1331,9 @@ private:
 
     // Characters.
     static constexpr int kBucketStages = 4096;
+    static constexpr int kBucketCornerGrid = 32;            ///< The bucket corner is worked out every this many samples.
+    static constexpr double kBucketSettleSeconds = 0.004;   ///< A filled bucket line's filters settle in this.
+    static constexpr double kSwitchFadeSeconds = 0.01;      ///< A change of character crosses over in this.
     static constexpr double kHeadLossHz = 7000.0;   ///< Playback head loss of the tape echo.
     std::atomic<Character> character_ { Character::Clean };
     std::atomic<SampleType> wowFlutter_ { SampleType(0.5) };
@@ -1274,6 +1343,10 @@ private:
     std::vector<BucketBrigade<SampleType>> bbd_;
     std::array<bool, kMaxChannels> tapeSeeded_ {};
     std::array<double, kMaxChannels> bucketCornerFor_ {};
+    std::array<int, kMaxChannels> bucketTick_ {};
+    std::array<int, kMaxChannels> switchLeft_ {};   ///< Samples left of a change of character (its fill, then its fade).
+    Character switchFrom_ = Character::Clean;
+    int switchFade_ = 480;
     std::array<double, kMaxChannels> headLp_ {}, hissLp_ {}, bucketHissCoeff_ {};
     std::array<double, kMaxChannels> hissAmp_ {}, hissDbFor_ {}, hissCoeffFor_ {};
     std::array<uint32_t, kMaxChannels> hissRng_ {};

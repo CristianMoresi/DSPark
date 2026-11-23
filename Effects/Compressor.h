@@ -646,6 +646,12 @@ public:
     {
         keyEq_.reset();
         routeDelay_.reset();
+        {
+            // The parts' weights start at the focus, without a glide from 1.
+            const T focus = midSideFocus_.load(std::memory_order_relaxed);
+            partFrom_[0] = focus > T(0) ? T(1) - focus : T(1);
+            partFrom_[1] = focus < T(0) ? T(1) + focus : T(1);
+        }
         toneLow_.reset();
         toneHigh_.reset();
         toneActive_ = false;       // designed again, for the rate in use, at the next block
@@ -939,6 +945,25 @@ public:
 
     /** @brief What of a stereo pair is compressed (setRoute()). */
     [[nodiscard]] Route getRoute() const noexcept { return route_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief In Route::MidSide, how the compression leans to the middle or to
+     *        the sides, -1 to 1: at 0 (the default) each part takes its whole
+     *        gain; toward -1 the sides take less of theirs (their reduction
+     *        and makeup in decibels scaled by 1 + focus), at -1 only the
+     *        middle is compressed and the sides come out as they went in;
+     *        toward 1 the same for the middle. The detectors and the gain
+     *        loop are those of the route, so the focus sweeps without a step:
+     *        it moves across each block, sample by sample. Non-finite values
+     *        are ignored. State key "midSideFocus" (absent = 0).
+     */
+    void setMidSideFocus(T focus) noexcept
+    {
+        if (std::isfinite(focus)) midSideFocus_.store(std::clamp(focus, T(-1), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @return The lean of the compression to the middle (-1) or the sides (1). */
+    [[nodiscard]] T getMidSideFocus() const noexcept { return midSideFocus_.load(std::memory_order_relaxed); }
 
     /** @brief Sets dry/wet balance for parallel (New York) compression (1.0 = fully wet). */
     void setMix(T dryWet) noexcept
@@ -1929,7 +1954,13 @@ private:
             {
                 T* pair[2] = { left, right };
                 T* keys[2] = { keyMid, keySide };
+                const T focus = midSideFocus_.load(std::memory_order_relaxed);
+                partTo_[0] = focus > T(0) ? T(1) - focus : T(1);
+                partTo_[1] = focus < T(0) ? T(1) + focus : T(1);
+                parted_ = partFrom_[0] != T(1) || partFrom_[1] != T(1) || partTo_[0] != T(1) || partTo_[1] != T(1);
                 processBlockImpl(AudioBufferView<T>(pair, 2, m), AudioBufferView<T>(keys, 2, m));
+                partFrom_ = partTo_;
+                parted_ = false;
             }
             else
             {
@@ -1981,6 +2012,7 @@ public:
         w.write("stereoLink", static_cast<float>(stereoLink_.load(std::memory_order_relaxed)));
         w.write("linkMode", static_cast<int32_t>(linkMode_.load(std::memory_order_relaxed)));
         w.write("route", static_cast<int32_t>(getRoute()));
+        w.write("midSideFocus", static_cast<float>(getMidSideFocus()));
         w.write("mix", static_cast<float>(mix_.load(std::memory_order_relaxed)));
         w.write("lookahead", static_cast<float>(lookaheadMs_.load(std::memory_order_relaxed)));
         w.write("hold", static_cast<float>(holdMs_.load(std::memory_order_relaxed)));
@@ -2051,6 +2083,7 @@ public:
         setStereoLink(static_cast<T>(r.read("stereoLink", 1.0f)));
         setLinkMode(static_cast<LinkMode>(r.read("linkMode", 0)));
         setRoute(static_cast<Route>(r.read("route", 0)));
+        setMidSideFocus(static_cast<T>(r.read("midSideFocus", 0.0f)));
         setMix(static_cast<T>(r.read("mix", 1.0f)));
         setLookahead(static_cast<T>(r.read("lookahead", 0.0f)));
         setHoldTime(static_cast<T>(r.read("hold", 0.0f)));
@@ -2232,7 +2265,7 @@ protected:
         // rounding of level + 1 * (linked - level)). SplitPolarity's adaptive
         // release reads each channel's own output, so it keeps the
         // per-channel path.
-        const bool shared = (sLink >= T(1)) && !splitAdaptive && nCh > 1;
+        const bool shared = (sLink >= T(1)) && !splitAdaptive && nCh > 1 && !parted_;
         // The dominant link reads the pair as one (two channels, some link).
         const bool dominantLink = linkMode == LinkMode::Dominant && nCh == 2 && sLink > T(0);
         if (dominantLink) flushLinkCovariance();
@@ -2475,9 +2508,16 @@ protected:
                     T heardGR = heldBack(rampedIn(loopGR, ch, rampLength, ramp), ch, slide, gainLine);
                     if (amount < T(1)) heardGR *= amount;
                     if (gainSmooth) heardGR = smoothedGain(heardGR, ch);
-                    const T outLin = (heardGR == loopGR) ? gainLin : decibelsToGain(heardGR);
+                    T partMakeup = makeupLin;
+                    if (parted_)
+                    {
+                        const T w = partWeight(ch, i, nS);
+                        heardGR *= w;
+                        partMakeup = weightedGain(makeupLin, w);
+                    }
+                    const T outLin = (heardGR == loopGR) ? gainLin : (heardGR == T(0) ? T(1) : decibelsToGain(heardGR));
                     applyGain(audio, ch, i, gainLin, heardGR, audioDelay, charType,
-                              colorAmt, makeupLin, mixVal, outLin);
+                              colorAmt, partMakeup, mixVal, outLin);
                     if (keyedLoop) fbLastOutput_[ch] = loopSource[ch] * gainLin;
                     if (ch == 0 || heardGR < blockGR)
                         blockGR = heardGR; // Track worst-case GR for metering
@@ -2782,6 +2822,17 @@ protected:
                 }
             }
 
+            // The parts' weights (MidSide with a focus): the heard gain in
+            // decibels of each part, sample by sample across the block.
+            if (parted_)
+                for (int g = 0; g < nGain; ++g)
+                    for (int k = 0; k < m; ++k)
+                    {
+                        const T w = partWeight(g, o + k, nS);
+                        gain[g][k] *= w;
+                        if (ff.splitAdaptive) level[g][k] = weightedGain(level[g][k], w);
+                    }
+
             // E. Metering, adaptive makeup (frame by frame, like the
             //    per-sample path) and the linear gains.
             if (ff.adaptiveMakeup)
@@ -2821,11 +2872,19 @@ protected:
             {
                 T* data = audio.getChannel(ch) + o;
                 const T* gl = level[ff.shared ? 0 : ch];
+                // A part's makeup takes its weight too (MidSide with a focus).
+                T partMk[kChunk];
+                const T* mkUse = mkLin;
+                if (parted_)
+                {
+                    for (int k = 0; k < m; ++k) partMk[k] = weightedGain(mkLin[k], partWeight(ch, o + k, nS));
+                    mkUse = partMk;
+                }
                 if (plain)
                 {
                     // No lookahead and fully wet: one multiply chain per sample.
                     fbLastOutput_[ch] = data[m - 1] * gl[m - 1]; // pre-makeup history
-                    for (int k = 0; k < m; ++k) data[k] = (data[k] * gl[k]) * mkLin[k];
+                    for (int k = 0; k < m; ++k) data[k] = (data[k] * gl[k]) * mkUse[k];
                     continue;
                 }
                 const T* dry = (ff.lookahead > 0) ? delayed[ch] : data;
@@ -2834,7 +2893,7 @@ protected:
                 {
                     const T input = dry[k];
                     wet = input * gl[k];
-                    const T out = wet * mkLin[k];
+                    const T out = wet * mkUse[k];
                     data[k] = removal ? input - wet : ((mixA[k] < T(1)) ? (input * (T(1) - mixA[k]) + out * mixA[k]) : out);
                 }
                 // Feedback history (pre-makeup) for a later topology switch.
@@ -3090,6 +3149,22 @@ protected:
                                               programState_[static_cast<size_t>(ch)], balance_));
         return cfg.decoupled ? applyBallisticsDecoupled(targetGR_Db, ch, cfg.splitAdaptive)
                              : applyBallistics(targetGR_Db, ch, cfg.splitAdaptive);
+    }
+
+    /// The weight of a part's heard gain at sample idx of a block of n
+    /// (MidSide with a focus): from the block's first weight to its last.
+    [[nodiscard]] T partWeight(int ch, int idx, int n) const noexcept
+    {
+        const auto c = static_cast<std::size_t>(std::clamp(ch, 0, 1));
+        return partFrom_[c] + (partTo_[c] - partFrom_[c]) * static_cast<T>(idx + 1) / static_cast<T>(std::max(n, 1));
+    }
+
+    /// A linear gain with its decibels scaled by w: 1 at w = 0, itself at w = 1.
+    [[nodiscard]] static T weightedGain(T g, T w) noexcept
+    {
+        if (w == T(1)) return g;
+        if (w == T(0) || !(g > T(0))) return T(1);
+        return std::exp(w * std::log(g));
     }
 
     /**
@@ -5786,6 +5861,11 @@ protected:
 
     // The routes of a pair (setRoute()).
     std::atomic<Route> route_ { Route::Stereo };
+    std::atomic<T> midSideFocus_ { T(0) };
+    // The weights of the two parts' heard gain in decibels across the block
+    // being processed (MidSide with a focus; audio thread), from and to.
+    std::array<T, 2> partFrom_ { T(1), T(1) }, partTo_ { T(1), T(1) };
+    bool parted_ = false;
     Route routeIn_ = Route::Stereo;                 ///< The route the states carry (audio thread).
     bool routeWas_ = false;                         ///< The last block ran a route.
     int routeBlock_ = 0, routeReach_ = 0;

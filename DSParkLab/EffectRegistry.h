@@ -508,6 +508,7 @@ inline EffectSlot makeCompressor()
     // dspark::Compressor<float>::KeyPlacement (Stereo=0, Mid=1, Side=2).
     s.addChoice("Key Low Cut On", {"Both channels","Middle","Sides"}, 0);
     s.addChoice("Key Bell On", {"Both channels","Middle","Sides"}, 0);
+    s.addSlider("Mid/Side Focus", -1, 1, 0, "");   // 62: in Mid + Side, the lean to the middle (-1) or the sides (1)
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -597,6 +598,7 @@ inline EffectSlot makeCompressor()
             case 57: p->setControlLeak(v); break;
             case 58: p->setDetectorAsymmetry(v); break;
             case 59: p->setRoute(static_cast<dspark::Compressor<float>::Route>(static_cast<int>(v))); break;
+            case 62: p->setMidSideFocus(v); break;
             case 60: case 61:
             {
                 auto& k = *key;
@@ -624,7 +626,7 @@ inline EffectSlot makeCompressor()
     s.group("Timing", { 13, 14, 15, 20, 21, 22, 23, 32 });
     s.group("Key", { 24, 25, 26, 27, 28, 29, 30, 31, 33, 60, 61 });
     s.group("Colour Stage", { 36, 37, 38, 39, 40, 41, 42 });
-    s.group("Curve", { 47, 48, 49, 50, 51, 59 });
+    s.group("Curve", { 47, 48, 49, 50, 51, 59, 62 });
     s.group("Control Path", { 52, 53, 54, 55, 56, 57, 58 });
     return s;
 }

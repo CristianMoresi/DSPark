@@ -71,6 +71,9 @@ namespace dspark {
  *   magnitude about A*fftSize/2 (times the window's coherent gain).
  * - The callback runs once per channel per hop, in channel order. It is
  *   invoked inside a noexcept audio path and must not throw.
+ * - A processing that reads one channel by another uses the overload with
+ *   two callbacks: it sees every channel's spectrum of a hop before the
+ *   first of them is processed.
  *
  * Channels beyond the prepared channel count pass through dry. The first
  * fftSize output samples after prepare()/reset() are the windowed ramp-in
@@ -140,6 +143,8 @@ public:
         outputAccum_.resize(static_cast<std::size_t>(nCh));
         inputPos_.assign(static_cast<std::size_t>(nCh), 0);
         outputReadPos_.assign(static_cast<std::size_t>(nCh), 0);
+        spectra_.assign(static_cast<std::size_t>(nCh),
+                        std::vector<T>(static_cast<std::size_t>(fftSize_ + 2), T(0)));
 
         // The overlap-add accumulator holds twice the FFT size (also pow2).
         accumMask_ = (fftSize_ * 2) - 1;
@@ -177,6 +182,56 @@ public:
      */
     template <typename Func>
     void processBlock(AudioBufferView<T> buffer, Func&& processFunc) noexcept
+    {
+        processHops(buffer, [&](int nCh) noexcept
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                analyse(ch, fftOut_.data());
+                processFunc(fftOut_.data(), numBins_);
+                synthesise(ch, fftOut_.data());
+            }
+        });
+    }
+
+    /**
+     * @brief Processes a block with every channel of a hop analysed before
+     *        the first is processed, for a processing that reads one channel
+     *        by another. The same output as the overload with one callback
+     *        for the same modification, at the same latency.
+     *
+     * @tparam Observe `void(int channel, const T* freqData, int numBins)`,
+     *                 run for every channel of the hop first. Must not throw.
+     * @tparam Func    `void(int channel, T* freqData, int numBins)`, run for
+     *                 every channel after that. Must not throw.
+     * @param buffer      Audio block to process in-place.
+     * @param observe     What reads the spectra.
+     * @param processFunc What modifies them.
+     */
+    template <typename Observe, typename Func>
+    void processBlock(AudioBufferView<T> buffer, Observe&& observe, Func&& processFunc) noexcept
+    {
+        processHops(buffer, [&](int nCh) noexcept
+        {
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* spectrum = spectra_[static_cast<std::size_t>(ch)].data();
+                analyse(ch, spectrum);
+                observe(ch, static_cast<const T*>(spectrum), numBins_);
+            }
+            for (int ch = 0; ch < nCh; ++ch)
+            {
+                T* spectrum = spectra_[static_cast<std::size_t>(ch)].data();
+                processFunc(ch, spectrum, numBins_);
+                synthesise(ch, spectrum);
+            }
+        });
+    }
+
+private:
+    /** @brief The stream: rings in, accumulators out, a hop at each boundary. */
+    template <typename Hop>
+    void processHops(AudioBufferView<T> buffer, Hop&& hop) noexcept
     {
         if (!prepared_) return;
         DenormalGuard guard;
@@ -236,14 +291,14 @@ public:
             if (hopCounter_ >= hopSize_)
             {
                 hopCounter_ = 0;
-                for (int ch = 0; ch < nCh; ++ch)
-                    processHop(ch, processFunc);
+                hop(nCh);
             }
 
             i += chunk;
         }
     }
 
+public:
     // -- Queries -------------------------------------------------------------
 
     /**
@@ -268,15 +323,14 @@ public:
 
 private:
     /**
-     * @brief Processes a single channel STFT overlap-add iteration.
+     * @brief The windowed spectrum of a channel's newest frame.
      *
      * Called at a hop boundary, after the boundary chunk has been pushed
      * and drained: inputPos_ is the oldest ring sample (ring size equals
      * the frame size) and outputReadPos_ is the accumulator slot of the
      * next output sample, which anchors the frame in stream time.
      */
-    template <typename Func>
-    void processHop(int ch, Func& processFunc) noexcept
+    void analyse(int ch, T* spectrum) noexcept
     {
         // 1. Copy from ring buffer with the analysis window, as two
         //    contiguous multiply spans (auto-vectorizable).
@@ -290,15 +344,17 @@ private:
             fftIn_[static_cast<std::size_t>(k)] = ring[k - head] * win[k];
 
         // 2. Forward FFT
-        fft_->forward(fftIn_.data(), fftOut_.data());
+        fft_->forward(fftIn_.data(), spectrum);
+    }
 
-        // 3. User callback (inlined directly here)
-        processFunc(fftOut_.data(), numBins_);
-
+    /** @brief A channel's spectrum back into its accumulator. */
+    void synthesise(int ch, T* spectrum) noexcept
+    {
+        const T* win = window_.data();
         // 4. Inverse FFT (FFTReal::inverse already applies the 1/N
         //    normalization, so the analysis->synthesis round-trip is unity
         //    before windowing).
-        fft_->inverse(fftOut_.data(), fftResult_.data());
+        fft_->inverse(spectrum, fftResult_.data());
 
         // 5. Synthesis window and overlap-add, two contiguous spans.
         T* acc = outputAccum_[static_cast<std::size_t>(ch)].data();
@@ -361,6 +417,7 @@ private:
     std::vector<std::vector<T>> outputAccum_;
     std::vector<int> inputPos_;
     std::vector<int> outputReadPos_;
+    std::vector<std::vector<T>> spectra_; ///< Each channel's hop, for the overload with two callbacks.
     int hopCounter_ = 0;
 
     // Shared work buffers for sequential channel processing

@@ -360,6 +360,8 @@ public:
         trPost_.assign(channels, {});
         trMean_.assign(channels, 0.0);
         asymMean_.assign(channels, 0.0);
+        recordHeld_.assign(channels, 0.0);
+        recordFall_ = std::exp(-1.0 / (kRecordPeakSeconds * sampleRate_ * static_cast<double>(std::max(1, osFactor_))));
         wet_.assign(channels, 0.0);
         headContour_.assign(channels, {});
         recNet_.assign(channels, {});
@@ -509,6 +511,10 @@ public:
         hSm_ = hScale_;   // no fade-in on start; a running calibration continues
         mSm_ = mScale_;
         bSm_ = biasAmp_;
+        std::fill(recordHeld_.begin(), recordHeld_.end(), 0.0);
+        alignHpX_.fill(0.0);
+        alignHpY_.fill(0.0);
+        for (auto& p : recordPeak_) p.store(T(0), std::memory_order_relaxed);
         if (oversampler_) oversampler_->reset();
     }
 
@@ -843,6 +849,38 @@ public:
     /** @brief The trim of the record emphasis in dB (setRecordEmphasis()). */
     [[nodiscard]] T getRecordEmphasis() const noexcept { return recordEmphasis_.load(std::memory_order_relaxed); }
 
+    /**
+     * @brief The record level's peak, the overload lamp before the tape: what
+     *        drives the curve, read at the internal rate (so it sees the
+     *        peaks between samples), 1 for a full-scale signal at nominal
+     *        drive and operating level, falling with a 300 ms time constant.
+     *        Any thread (relaxed; updated once per block).
+     * @param channel Channel index (out-of-range returns 0).
+     */
+    [[nodiscard]] T getRecordPeak(int channel) const noexcept
+    {
+        if (channel < 0 || channel >= kMaxRecordPeaks) return T(0);
+        return recordPeak_[static_cast<size_t>(channel)].load(std::memory_order_relaxed);
+    }
+    /**
+     * @brief How far the channels' alignment strays, 0 to 1 (0, the default:
+     *        every channel the same, to the bit). Each channel takes its own
+     *        fixed deviation, the same at every run: up to 8 % of bias, up to
+     *        0.75 dB of playback treble (a shelf from 6 kHz) and 0.25 dB of
+     *        level at 1, as no two channels of a machine are aligned alike.
+     *        Magnitudes only: the channels keep their timing, so a mono sum
+     *        does not comb. Thread-safe; non-finite values are ignored.
+     */
+    void setAlignmentTolerance(T amount) noexcept
+    {
+        if (std::isfinite(amount)) alignTolerance_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+    /** @return How far the channels' alignment strays. */
+    [[nodiscard]] T getAlignmentTolerance() const noexcept { return alignTolerance_.load(std::memory_order_relaxed); }
+
+    /** @brief The record level's peak in decibels (floored at -100). */
+    [[nodiscard]] T getRecordPeakDb(int channel) const noexcept { return gainToDecibels(getRecordPeak(channel)); }
+
     /** @brief Tape formulation (see Formulation). Out-of-range values are clamped. */
     void setFormulation(Formulation f) noexcept
     {
@@ -950,6 +988,7 @@ public:
         w.write("alignHf", static_cast<float>(alignHf_.load(std::memory_order_relaxed)));
         w.write("alignLf", static_cast<float>(alignLf_.load(std::memory_order_relaxed)));
         w.write("recordEmphasis", static_cast<float>(recordEmphasis_.load(std::memory_order_relaxed)));
+        w.write("alignTolerance", static_cast<float>(getAlignmentTolerance()));
         w.write("formulation", formulation_.load(std::memory_order_relaxed));
         w.write("trackFormat", trackFormat_.load(std::memory_order_relaxed));
         w.write("calibrationLevel", static_cast<float>(calLevel_.load(std::memory_order_relaxed)));
@@ -980,6 +1019,7 @@ public:
         setElectronics(static_cast<Electronics>(r.read("electronics", 0)));
         setAlignment(static_cast<T>(r.read("alignHf", 0.0f)), static_cast<T>(r.read("alignLf", 0.0f)));
         setRecordEmphasis(static_cast<T>(r.read("recordEmphasis", 0.0f)));
+        setAlignmentTolerance(static_cast<T>(r.read("alignTolerance", 0.0f)));
         setFormulation(static_cast<Formulation>(r.read("formulation", 0)));
         setTrackFormat(static_cast<TrackFormat>(r.read("trackFormat", 0)));
         setCalibrationLevel(static_cast<T>(r.read("calibrationLevel", 0.0f)));
@@ -1190,6 +1230,7 @@ private:
                 bRat = std::pow(bEnd / bSm_, inv);
             }
             const bool ramping = hRat != 1.0 || mRat != 1.0 || bRat != 1.0;
+            const bool alignOn = updateAlignment(nCh);
             const bool asymActive = asym_.active();
             LinearRamp asymAfter = asym_;
             for (int ch = 0; ch < nCh; ++ch)
@@ -1204,6 +1245,8 @@ private:
                 LinearRamp asym = asym_;
                 double inScale = hSm_, mS = mSm_, B = bSm_;
                 int phase = phaseStart;
+                double held = recordHeld_[static_cast<size_t>(ch)];
+                const double biasTrim = alignOn && ch < kMaxAligned ? alignBias_[static_cast<size_t>(ch)] : 1.0;
                 for (int i = 0; i < osN; ++i)
                 {
                     if (ramping)
@@ -1222,15 +1265,16 @@ private:
                         xs += asym.next() * kAsymmetryShare * (square - mean);
                     }
                     const double x = inScale * xs;
+                    held = std::max(std::abs(x), held * recordFall_);
                     double pair;
                     if (steps_ > 1)
                     {
-                        pair = twoSteps(stepped, hp, hn, x, B, phase);
+                        pair = twoSteps(stepped, hp, hn, x, alignOn ? B * biasTrim : B, phase);
                         phase = (phase + 2) & 7;
                     }
                     else
                     {
-                        const double c = carrier(B, biasNominal_, phase);
+                        const double c = carrier(alignOn ? B * biasTrim : B, biasNominal_, phase);
                         phase = (phase + 1) & 7;
                         const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
                         const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
@@ -1241,6 +1285,10 @@ private:
                     d[i] = static_cast<T>(out);
                 }
                 asymAfter = asym;
+                if (!std::isfinite(held)) held = 0.0;
+                recordHeld_[static_cast<size_t>(ch)] = held;
+                if (ch < kMaxRecordPeaks)
+                    recordPeak_[static_cast<size_t>(ch)].store(static_cast<T>(held / kRecordFullScale), std::memory_order_relaxed);
             }
             if (nCh > 0) asym_ = asymAfter;
             if (circuit)
@@ -1351,6 +1399,16 @@ private:
                             playHF_[static_cast<size_t>(ch)].process(static_cast<double>(w))));
                 // The reproduce side of the emphasis trim (the tape's hiss crosses it too).
                 w = static_cast<T>(playTrim_[static_cast<size_t>(ch)].process(static_cast<double>(w)));
+                if (alignActive_)
+                {
+                    // The channel's own treble (a first-order shelf) and level.
+                    const auto c = static_cast<size_t>(ch);
+                    const double xin = static_cast<double>(w);
+                    const double hp = alignHpA_ * (alignHpY_[c] + xin - alignHpX_[c]);
+                    alignHpX_[c] = xin;
+                    alignHpY_[c] = hp;
+                    w = static_cast<T>(alignLevel_[c] * (xin + alignShelf_[c] * hp));
+                }
 
                 // Over-bias self-erasure: wider recording zone partially
                 // erases short wavelengths (first-order low-pass engaged above
@@ -2366,6 +2424,55 @@ private:
     int dryPos_ = 0;
 
     double hScale_ = 1.0, mScale_ = 1.0;   ///< Calibrated targets.
+    // The channels' alignment (setAlignmentTolerance()).
+    static constexpr int kMaxAligned = 16;
+    std::atomic<T> alignTolerance_ { T(0) };
+    double alignFor_ = 0.0, alignHpA_ = 0.0;
+    bool alignActive_ = false;
+    std::array<double, kMaxAligned> alignBias_ {}, alignShelf_ {}, alignLevel_ {}, alignHpX_ {}, alignHpY_ {};
+
+    /// A fixed value in [-1, 1) for a channel and a quantity.
+    [[nodiscard]] static double alignDraw(int ch, int quantity) noexcept
+    {
+        uint64_t x = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(ch * 3 + quantity + 1);
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        x ^= x >> 31;
+        return static_cast<double>(x >> 11) * (2.0 / 9007199254740992.0) - 1.0;
+    }
+
+    /// The trims of the tolerance published (once per block); whether any applies.
+    bool updateAlignment(int channels) noexcept
+    {
+        const double tol = static_cast<double>(alignTolerance_.load(std::memory_order_relaxed));
+        if (tol != alignFor_)
+        {
+            alignFor_ = tol;
+            alignHpA_ = std::exp(-2.0 * 3.141592653589793 * kAlignShelfHz / sampleRate_);
+            for (int ch = 0; ch < kMaxAligned; ++ch)
+            {
+                const auto c = static_cast<size_t>(ch);
+                alignBias_[c] = 1.0 + kAlignBias * tol * alignDraw(ch, 0);
+                alignShelf_[c] = std::pow(10.0, kAlignShelfDb * tol * alignDraw(ch, 1) / 20.0) - 1.0;
+                alignLevel_[c] = std::pow(10.0, kAlignLevelDb * tol * alignDraw(ch, 2) / 20.0);
+            }
+        }
+        (void)channels;
+        alignActive_ = tol > 0.0;
+        return alignActive_;
+    }
+    static constexpr double kAlignBias = 0.08;
+    static constexpr double kAlignShelfDb = 0.75;
+    static constexpr double kAlignShelfHz = 6000.0;
+    static constexpr double kAlignLevelDb = 0.25;
+
+    // The record level's peak (getRecordPeak()).
+    static constexpr int kMaxRecordPeaks = 16;
+    static constexpr double kRecordPeakSeconds = 0.3;
+    static constexpr double kRecordFullScale = 1.2 * 2.2e4;   ///< The field of a full-scale signal at nominal drive.
+    std::vector<double> recordHeld_;
+    double recordFall_ = 0.9999;
+    std::array<std::atomic<T>, kMaxRecordPeaks> recordPeak_ {};
     double biasAmp_ = 3.0 * 2.2e4;   ///< Carrier amplitude target in H units.
     double hSm_ = 1.0, mSm_ = 1.0, bSm_ = 3.0 * 2.2e4;   ///< Ramped values (audio thread).
     bool overBiasOn_ = false;

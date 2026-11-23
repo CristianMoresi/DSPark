@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -5403,4 +5404,125 @@ DSPARK_TEST(KeyEqualizer_loudness_compensation_keeps_pink_noise_as_loud)
     other->setLoudnessCompensation(false);
     (void)run(other.get(), &b);
     EXPECT_TRUE(a == b);
+}
+
+namespace {
+// The digital polynomials of a fifth-order Butterworth low-pass at `hz`
+// (its denominator in s / wc), through the bilinear transform of polynomials.
+void butterworth5(double hz, double fs, double* b, double* a)
+{
+    const double wc = 2.0 * 3.14159265358979323846 * hz;
+    const double proto[6] = { 1.0, 3.2360679774997898, 5.2360679774997898, 5.2360679774997898, 3.2360679774997898, 1.0 };
+    double den[6], num[6] = { 1.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    for (int j = 0; j < 6; ++j) den[j] = proto[j] / std::pow(wc, j);
+    EXPECT_TRUE(FilterDesign::bilinearPolynomial(num, den, 5, fs, hz, b, a));
+}
+}
+
+// A fifth-order network as one normalized ladder: its output is a direct
+// form's of the same polynomials to better than -120 dB, its response the
+// analog prototype's at the prewarped frequency, and with its corner moved
+// at audio rate it stays bounded.
+DSPARK_TEST(NormalizedLadderN_fifth_order_network_from_its_polynomials)
+{
+    const double fs = 48000.0;
+    double b[6], a[6];
+    butterworth5(2000.0, fs, b, a);
+    NormalizedLadderN<double, 5, 1> ladder;
+    EXPECT_TRUE(ladder.setCoeffs(b, a));
+
+    // Against a direct form (transposed) of the same polynomials.
+    std::mt19937 rng(5);
+    std::normal_distribution<double> g(0.0, 0.3);
+    double z[5] = {};
+    double err = 0.0, sig = 0.0;
+    for (int i = 0; i < 48000; ++i)
+    {
+        const double x = g(rng);
+        const double y = b[0] * x + z[0];
+        for (int k = 0; k < 4; ++k) z[k] = b[k + 1] * x - a[k + 1] * y + z[k + 1];
+        z[4] = b[5] * x - a[5] * y;
+        const double l = ladder.processSample(x, 0);
+        err += (l - y) * (l - y);
+        sig += y * y;
+    }
+    std::printf("    order-5 ladder against a direct form: %.1f dB%c", 10.0 * std::log10(err / sig), 10);
+    EXPECT_LT(10.0 * std::log10(err / sig), -120.0);
+
+    // The response: |H(e^jw)| = |Ha(j K tan(w / 2))|, -3.01 dB at the corner.
+    for (const double hz : { 500.0, 2000.0, 6000.0 })
+    {
+        NormalizedLadderN<double, 5, 1> l;
+        (void)l.setCoeffs(b, a);
+        double e = 0.0;
+        for (int i = 0; i < 96000; ++i)
+        {
+            const double y = l.processSample(std::sin(2.0 * 3.14159265358979323846 * hz * i / fs), 0);
+            if (i >= 48000) e += y * y;
+        }
+        const double got = 10.0 * std::log10(e / 24000.0);
+        const double analogHz = 2000.0 * std::tan(3.14159265358979323846 * hz / fs) / std::tan(3.14159265358979323846 * 2000.0 / fs);
+        const double want = -10.0 * std::log10(1.0 + std::pow(analogHz / 2000.0, 10.0));
+        EXPECT_NEAR(got, want, 0.01);
+    }
+
+    // The corner swept from 300 Hz to 6 kHz by a 30 Hz sine, designed every
+    // 8 samples and ramped between: bounded, finite.
+    NormalizedLadderN<double, 5, 1> swept;
+    (void)swept.setCoeffs(b, a);
+    double worst = 0.0;
+    for (int i = 0; i < 96000; ++i)
+    {
+        if (i % 8 == 0)
+        {
+            const double hz = 300.0 * std::pow(20.0, 0.5 + 0.5 * std::sin(2.0 * 3.14159265358979323846 * 30.0 * i / fs));
+            double bb[6], aa[6];
+            butterworth5(hz, fs, bb, aa);
+            EXPECT_TRUE(swept.rampCoeffs(bb, aa, 8));
+        }
+        const double y = swept.processSample(g(rng), 0);
+        swept.advanceRamp(1);
+        worst = std::max(worst, std::abs(y));
+    }
+    EXPECT_TRUE(std::isfinite(worst));
+    EXPECT_LT(worst, 3.0);
+
+    // A block of three channels (a pair in the lanes of one register, one
+    // alone) with a ramp landing inside it: what each sample alone gives.
+    {
+        double bb[6], aa[6];
+        butterworth5(700.0, fs, bb, aa);
+        NormalizedLadderN<double, 5, 3> block;
+        NormalizedLadderN<double, 5, 3> alone;
+        (void)block.setCoeffs(b, a);
+        (void)alone.setCoeffs(b, a);
+        std::vector<double> data[3];
+        for (auto& d : data)
+        {
+            d.resize(512);
+            for (auto& v : d) v = g(rng);
+        }
+        std::vector<double> want[3] = { data[0], data[1], data[2] };
+        EXPECT_TRUE(block.rampCoeffs(bb, aa, 300));
+        double* p[3] = { data[0].data(), data[1].data(), data[2].data() };
+        block.processBlock(AudioBufferView<double>(p, 3, 512));
+        EXPECT_FALSE(block.isRamping());
+        double gap = 0.0;
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            (void)alone.setCoeffs(b, a);
+            EXPECT_TRUE(alone.rampCoeffs(bb, aa, 300));
+            for (int i = 0; i < 512; ++i)
+            {
+                alone.advanceRamp(1);
+                want[ch][static_cast<size_t>(i)] = alone.processSample(want[ch][static_cast<size_t>(i)], ch);
+                gap = std::max(gap, std::abs(want[ch][static_cast<size_t>(i)] - data[ch][static_cast<size_t>(i)]));
+            }
+        }
+        EXPECT_LT(gap, 1e-12);
+    }
+
+    // An unstable denominator is refused.
+    const double bad[6] = { 1.0, 0.0, 0.0, 0.0, 0.0, 1.5 };
+    EXPECT_FALSE(ladder.setCoeffs(b, bad));
 }

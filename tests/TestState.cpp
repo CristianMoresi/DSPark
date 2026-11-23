@@ -319,7 +319,7 @@ DSPARK_TEST(State_roundtrip_new_effects)
         d.setReduction(24.0f); d.setThreshold(3.0f);
     })));
     EXPECT_TRUE((roundTrip<SpectralDenoiser<float>>([](auto& d) {
-        d.setSpectralSmoothing(0.4f); d.setGainRelease(120.0f); d.setFilterMode(true); d.setLink(0.5f);
+        d.setDetail(0.25f); d.setGainRelease(120.0f); d.setFilterMode(true); d.setLink(0.5f);
         KeyEqualizer<float, 2>::Band b;
         b.shape = KeyEqualizer<float, 2>::Shape::Bell; b.frequency = 3000.0f; b.gainDb = 6.0f;
         d.setSensitivityBand(0, b);
@@ -340,8 +340,9 @@ DSPARK_TEST(State_roundtrip_new_effects)
     EXPECT_TRUE((roundTrip<SpectralDynamicEQ<float>>([](auto& e) {
         SpectralDynamicEQ<float>::Band b;
         b.shape = SpectralDynamicEQ<float>::Shape::HighShelf; b.frequency = 6000.0f; b.threshold = -9.0f;
-        b.ratio = 6.0f; b.range = -8.0f; b.attack = 3.0f; b.release = 90.0f; b.cells = 48;
+        b.ratio = 6.0f; b.range = -8.0f; b.attack = 3.0f; b.release = 90.0f;
         e.setBand(3, b);
+        e.setDetail(0.2f);
     })));
 }
 

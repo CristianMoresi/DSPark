@@ -2230,6 +2230,45 @@ DSPARK_TEST(SpectralProcessor_channel_contract)
         EXPECT_TRUE(sb.ch(1)[i] == ref[static_cast<size_t>(i)]);
 }
 
+// The overload with two callbacks: every channel of a hop is observed before
+// the first is processed, and the same change gives the same output.
+DSPARK_TEST(SpectralProcessor_two_callbacks_see_the_pair_first)
+{
+    SpectralProcessor<float> one, two;
+    one.prepare(spec(48000.0, 256, 2), 1024, 256);
+    two.prepare(spec(48000.0, 256, 2), 1024, 256);
+    std::vector<float> al(8192), ar(8192);
+    for (size_t i = 0; i < al.size(); ++i)
+    {
+        al[i] = 0.4f * std::sin(0.031f * static_cast<float>(i)) + 0.1f * std::sin(1.7f * static_cast<float>(i));
+        ar[i] = 0.3f * std::sin(0.43f * static_cast<float>(i));
+    }
+    std::vector<float> bl = al, br = ar;
+    const auto shape = [](float* bins, int count) {
+        for (int k = 0; k < count; ++k)
+        {
+            const float g = 1.0f / (1.0f + 0.01f * static_cast<float>(k));
+            bins[2 * k] *= g;
+            bins[2 * k + 1] *= g;
+        }
+    };
+    int step = 0, wrong = 0;   // of a hop: observe 0, observe 1, process 0, process 1
+    for (size_t off = 0; off + 256 <= al.size(); off += 256)
+    {
+        float* a[2] = { al.data() + off, ar.data() + off };
+        float* b[2] = { bl.data() + off, br.data() + off };
+        one.processBlock(AudioBufferView<float>(a, 2, 256), [&](float* bins, int count) { shape(bins, count); });
+        two.processBlock(
+            AudioBufferView<float>(b, 2, 256),
+            [&](int ch, const float*, int) { if (step % 4 != ch) ++wrong; ++step; },
+            [&](int ch, float* bins, int count) { if (step % 4 != 2 + ch) ++wrong; ++step; shape(bins, count); });
+    }
+    EXPECT_GT(step, 0);
+    EXPECT_EQ(wrong, 0);
+    EXPECT_TRUE(al == bl);
+    EXPECT_TRUE(ar == br);
+}
+
 // ============================================================================
 // ProcessorChain - Bypass
 // ============================================================================
@@ -8463,7 +8502,7 @@ DSPARK_TEST(TonalBalance_trims_a_peak_and_keeps_the_loudness)
     tb->prepare(spec(48000.0, 256, 2));
     const auto out = l13Run(*tb, peaked, peaked);
     int at3k = 0;
-    for (int b = 0; b < tb->getNumBands(); ++b)
+    for (int b = 0; b < TonalBalance<float>::kBands; ++b)
         if (std::abs(tb->getBandCentre(b) - 3000.0) < std::abs(tb->getBandCentre(at3k) - 3000.0)) at3k = b;
     EXPECT_LT(static_cast<double>(tb->getCorrection(at3k)), -1.0);
     const int lat = tb->getLatency();
@@ -8516,7 +8555,7 @@ DSPARK_TEST(TonalBalance_leaves_the_ends_alone)
             tb->prepare(spec(48000.0, 256, 2));
             (void)l13Run(*tb, x, x);
             double lowEnd = 0.0, highEnd = 0.0;
-            for (int b = 0; b < tb->getNumBands(); ++b)
+            for (int b = 0; b < TonalBalance<float>::kBands; ++b)
             {
                 const double hz = tb->getBandCentre(b), c = static_cast<double>(tb->getCorrection(b));
                 if (hz < 60.0) lowEnd = std::max(lowEnd, std::abs(c));
@@ -8545,7 +8584,7 @@ DSPARK_TEST(TonalBalance_tilt_tilts_the_curve)
         tb->prepare(spec(48000.0, 256, 2));
         (void)l13Run(*tb, x, x);
         int lo = 0, hi = 0;
-        for (int b = 0; b < tb->getNumBands(); ++b)
+        for (int b = 0; b < TonalBalance<float>::kBands; ++b)
         {
             if (std::abs(std::log(tb->getBandCentre(b) / 200.0)) < std::abs(std::log(tb->getBandCentre(lo) / 200.0))) lo = b;
             if (std::abs(std::log(tb->getBandCentre(b) / 5000.0)) < std::abs(std::log(tb->getBandCentre(hi) / 5000.0))) hi = b;
@@ -8627,16 +8666,16 @@ DSPARK_TEST(ResonanceSuppressor_display_shows_what_it_finds_and_takes_out)
     EXPECT_EQ(focus->getDisplayExcess(0, line), 0.0f);
 }
 
-// New: spectral dynamics. Inside one bell, the cell with the loud tone is
+// New: spectral dynamics. Inside one bell, the frequency with the loud tone is
 // reduced and a quiet frequency of the same bell is left nearly alone.
-DSPARK_TEST(SpectralDynamicEQ_acts_cell_by_cell)
+DSPARK_TEST(SpectralDynamicEQ_acts_frequency_by_frequency)
 {
     using S = SpectralDynamicEQ<float>;
     const size_t n = 48000 * 3;
     const std::vector<float> in = l13Add(l13Add(l13Noise(n, 0.01f, 11u), 2500.0, 0.3), 1500.0, 0.01);
     auto eq = std::make_unique<S>();
     S::Band b;
-    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 0.7f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 0.7f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f;
     eq->setBand(0, b);
     eq->prepare(spec(48000.0, 256, 2));
     const auto out = l13Run(*eq, in, in);
@@ -8646,10 +8685,13 @@ DSPARK_TEST(SpectralDynamicEQ_acts_cell_by_cell)
     EXPECT_GT(l13Line(out.first, 1500.0, from, len) - l13Line(in, 1500.0, from - lat, len), -1.5);
     const S::Band back = eq->getBand(0);
     EXPECT_TRUE(back.shape == S::Shape::Bell);
-    EXPECT_EQ(back.cells, 32);
-    b.cells = 999;
-    eq->setBand(1, b);
-    EXPECT_EQ(eq->getBand(1).cells, S::kMaxCells);
+    EXPECT_NEAR(back.q, 0.7f, 1e-6f);
+    eq->setDetail(3.0f);
+    EXPECT_EQ(eq->getDetail(), 1.0f);
+    eq->setDetail(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(eq->getDetail(), 1.0f);
+    eq->setDetail(0.0f);
+    EXPECT_NEAR(eq->getDetail(), 1.0f / 24.0f, 1e-6f);
 }
 
 // New: the display curve of the spectral dynamic equalizer: the last frame's
@@ -8665,7 +8707,7 @@ DSPARK_TEST(SpectralDynamicEQ_display_shows_the_gain_of_the_frame)
     const std::vector<float> in = l13Add(l13Add(l13Noise(n, 0.01f, 11u), 2500.0, 0.3), 1500.0, 0.01);
     auto eq = std::make_unique<S>();
     S::Band b;
-    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 0.7f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 0.7f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f;
     eq->setBand(0, b);
     eq->prepare(spec(48000.0, 256, 2));
     (void)l13Run(*eq, in, in);
@@ -8683,14 +8725,14 @@ DSPARK_TEST(SpectralDynamicEQ_display_shows_the_gain_of_the_frame)
 // there comes down while a quiet one at 2.2 kHz, a sixth of an octave away,
 // is left where it was (cells spread evenly over the whole skirt took it
 // down 4 dB with 32 cells).
-DSPARK_TEST(SpectralDynamicEQ_cells_resolve_close_tones)
+DSPARK_TEST(SpectralDynamicEQ_resolves_close_tones)
 {
     using S = SpectralDynamicEQ<float>;
     const size_t n = 48000 * 3;
     const std::vector<float> in = l13Add(l13Add(l13Noise(n, 0.01f, 11u), 2500.0, 0.3), 2200.0, 0.01);
     auto eq = std::make_unique<S>();
     S::Band b;
-    b.shape = S::Shape::Bell; b.frequency = 2500.0f; b.q = 1.0f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    b.shape = S::Shape::Bell; b.frequency = 2500.0f; b.q = 1.0f; b.threshold = -12.0f; b.ratio = 4.0f; b.range = -12.0f;
     eq->setBand(0, b);
     eq->prepare(spec(48000.0, 256, 2));
     const auto out = l13Run(*eq, in, in);
@@ -8721,7 +8763,7 @@ DSPARK_TEST(SpectralDynamicEQ_an_edited_band_keeps_its_action_by_frequency)
     const std::vector<float> rest(all.begin() + static_cast<std::ptrdiff_t>(n), all.end());
     auto eq = std::make_unique<S>();
     S::Band b;
-    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 2.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 32;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 2.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f;
     eq->setBand(0, b);
     eq->prepare(spec(48000.0, 256, 2));
     (void)l13Run(*eq, head, head);
@@ -8742,7 +8784,7 @@ DSPARK_TEST(SpectralDynamicEQ_an_edited_band_keeps_its_action_by_frequency)
 // with a slow vibrato of 300 cents either way across the borders of a bell
 // of 8 cells keeps its reduction from one 10 ms window to the next within
 // 0.6 dB (1.6 dB with cells that did not overlap).
-DSPARK_TEST(SpectralDynamicEQ_overlapping_cells_hold_a_moving_partial)
+DSPARK_TEST(SpectralDynamicEQ_holds_a_moving_partial)
 {
     using S = SpectralDynamicEQ<float>;
     const size_t n = 48000 * 5;
@@ -8756,7 +8798,7 @@ DSPARK_TEST(SpectralDynamicEQ_overlapping_cells_hold_a_moving_partial)
     }
     auto eq = std::make_unique<S>();
     S::Band b;
-    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 1.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f; b.cells = 8;
+    b.shape = S::Shape::Bell; b.frequency = 2000.0f; b.q = 1.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f;
     eq->setBand(0, b);
     eq->prepare(spec(48000.0, 256, 2));
     const auto out = l13Run(*eq, in, in);
@@ -8791,7 +8833,7 @@ DSPARK_TEST(SpectralDenoiser_options_removal_listen_and_filter_mode)
     auto plain = std::make_unique<SpectralDenoiser<float>>();
     const auto a = learnThen(*plain);
     auto smooth = std::make_unique<SpectralDenoiser<float>>();
-    smooth->setSpectralSmoothing(0.5f);
+    smooth->setDetail(1.0f / 6.0f);
     smooth->setGainRelease(100.0f);
     const auto b = learnThen(*smooth);
     auto deltaD = std::make_unique<SpectralDenoiser<float>>();
@@ -9018,10 +9060,6 @@ DSPARK_TEST(SpectralDenoiser_partial_link_treats_both_channels_alike)
     EXPECT_GT(linked, alone + 1.0);
 }
 
-// Defect: the bank's solution was refined one hop in eight and left plain on
-// the other seven, so on a steady programme the response stepped between two
-// curves with a period of eight hops. The hops in between now carry the
-// correction the refinement found.
 DSPARK_TEST(TonalBalance_response_does_not_step_every_eight_hops)
 {
     auto tb = std::make_unique<TonalBalance<float>>();
@@ -9062,6 +9100,40 @@ DSPARK_TEST(TonalBalance_response_does_not_step_every_eight_hops)
     EXPECT_LT(worst, 0.01);
 }
 
+// Defect: the response stepped between two curves with a period of eight
+// hops. On a steady programme it stands still, drawing after drawing.
+DSPARK_TEST(TonalBalance_response_stands_still_on_a_steady_programme)
+{
+    auto tb = std::make_unique<TonalBalance<float>>();
+    tb->setBalance(1.0f);
+    tb->setRange(12.0f);
+    tb->setFillDips(0.0f); tb->setTrimPeaks(0.0f);
+    tb->prepare(spec(48000.0, 128, 2));
+    const size_t n = 128 * 3000;
+    std::vector<float> l = m4Partials(n, -4.5), r = l;
+    const double probes[3] = { 1000.0, 4000.0, 9000.0 };
+    std::array<double, 3> last {};
+    double worst = 0.0, moved = 0.0;
+    bool first = true;
+    for (size_t off = 0; off < n; off += 128)
+    {
+        float* ch[2] = { l.data() + off, r.data() + off };
+        tb->processBlock(AudioBufferView<float>(ch, 2, 128));
+        if (off + 128 * 256 < n) continue;
+        for (size_t k = 0; k < 3; ++k)
+        {
+            const double v = tb->getResponse(probes[k]);
+            if (!first) worst = std::max(worst, std::abs(v - last[k]));
+            last[k] = v;
+            moved = std::max(moved, std::abs(v));
+        }
+        first = false;
+    }
+    std::printf("  [tb steady] from one drawing to the next %.4f dB apart at most; the response reaches %.2f dB\n", worst, moved);
+    EXPECT_GT(moved, 2.5);
+    EXPECT_LT(worst, 0.01);
+}
+
 // Defect: the cross term of the stereo covariance kept only its real part.
 // With the right channel a delayed copy of the left, the real part turns with
 // frequency (the cosine of the delay's phase) and the dominant power took a
@@ -9079,15 +9151,15 @@ DSPARK_TEST(TonalBalance_reads_a_delayed_channel_as_one_source)
         tb->setBalance(0.0f); tb->setFillDips(1.0f); tb->setTrimPeaks(1.0f); tb->setRange(12.0f);
         tb->prepare(spec(48000.0, 256, 2));
         (void)l13Run(*tb, left, right);
-        std::array<double, TonalBalance<float>::kMaxBands> c {};
-        for (int b = 0; b < tb->getNumBands(); ++b) c[static_cast<size_t>(b)] = static_cast<double>(tb->getCorrection(b));
+        std::array<double, TonalBalance<float>::kBands> c {};
+        for (int b = 0; b < TonalBalance<float>::kBands; ++b) c[static_cast<size_t>(b)] = static_cast<double>(tb->getCorrection(b));
         return c;
     };
     const auto equal = corrections(left), delayed = corrections(late);
     auto probe = std::make_unique<TonalBalance<float>>();
     probe->prepare(spec(48000.0, 256, 2));
     double worst = 0.0;
-    for (int b = 0; b < probe->getNumBands(); ++b)
+    for (int b = 0; b < TonalBalance<float>::kBands; ++b)
     {
         const double hz = probe->getBandCentre(b);
         if (hz < 100.0 || hz > 2000.0) continue;                           // where a band is narrower than the comb
@@ -9126,7 +9198,7 @@ DSPARK_TEST(TonalBalance_keeps_the_loudness_within_a_narrow_range)
             if (off < n / 2) continue;
             worst = std::max(worst, std::abs(static_cast<double>(tb->getLoudnessChange())));
         }
-        for (int b = 0; b < tb->getNumBands(); ++b) deepest = std::max(deepest, std::abs(static_cast<double>(tb->getCorrection(b))));
+        for (int b = 0; b < TonalBalance<float>::kBands; ++b) deepest = std::max(deepest, std::abs(static_cast<double>(tb->getCorrection(b))));
         std::printf("  [loudness] %.0f Hz to %.0f Hz, range %.0f dB: total loudness moved %.4f dB at most; largest correction %.2f dB\n",
                     static_cast<double>(c.lo), static_cast<double>(c.hi), static_cast<double>(c.range), worst, deepest);
         EXPECT_LT(worst, 0.002);
@@ -9433,11 +9505,9 @@ DSPARK_TEST(ResonanceSuppressor_key_that_is_the_programme_and_new_controls)
     EXPECT_NEAR(static_cast<double>(b.getQuietLevel()), -200.0, 1e-6);
 }
 
-// New: setEnvelopePasses() and setWidthTaper(). Two passes keep the width of
-// the envelope's smoothing and lose its tails: a wide rise of the spectrum is
-// read as before, and a line on top of it stands a little further out. The
-// taper narrows the smoothing above its corner; the line is still taken.
-DSPARK_TEST(ResonanceSuppressor_envelope_passes_and_taper)
+// New: a wide rise of the spectrum is not a resonance, whatever the taper of
+// the neighbours' reach, and a line on top of it still is one.
+DSPARK_TEST(ResonanceSuppressor_leaves_a_wide_rise_and_takes_the_line_on_it)
 {
     const size_t n = 48000 * 3;
     // White noise through a bell of +10 dB an octave wide at 6 kHz.
@@ -9455,12 +9525,11 @@ DSPARK_TEST(ResonanceSuppressor_envelope_passes_and_taper)
     }
     const std::vector<float> lined = l13Add(wide, 6000.0, 0.1);
     // What the rise loses around the line (4.5 and 8 kHz), and the line.
-    const auto taken = [&](int passes, float exponent, double& rise, double& line) {
+    const auto taken = [&](float exponent, double& rise, double& line) {
         const auto setup = [=](Rs8& rs) {
             rs.setThreshold(1.0f);
             rs.setStrength(1.0f);
             rs.setRange(48.0f);
-            rs.setEnvelopePasses(passes);
             rs.setWidthTaper(2000.0f, exponent);
         };
         auto rs = std::make_unique<Rs8>();
@@ -9469,14 +9538,14 @@ DSPARK_TEST(ResonanceSuppressor_envelope_passes_and_taper)
         rise = 0.5 * (m4ReductionAt(*rs, wide, wide, 0, 4500.0) + m4ReductionAt(*rs, wide, wide, 0, 8000.0));
         line = m8LineChange(setup, lined, 6000.0);
     };
-    double rise1 = 0.0, line1 = 0.0, rise2 = 0.0, line2 = 0.0, riseTaper = 0.0, lineTaper = 0.0;
-    taken(1, 0.0f, rise1, line1);
-    taken(2, 0.0f, rise2, line2);
-    taken(2, 0.5f, riseTaper, lineTaper);
-    std::printf("  [suppressor] a wide rise and a line on it: one pass %.2f and %.2f dB; two passes %.2f and %.2f; two and a taper of 0.5 %.2f and %.2f\n",
-                rise1, line1, rise2, line2, riseTaper, lineTaper);
-    EXPECT_NEAR(rise2, rise1, 0.3);
-    EXPECT_LT(line2, line1);
+    double rise = 0.0, line = 0.0, riseTaper = 0.0, lineTaper = 0.0;
+    taken(0.0f, rise, line);
+    taken(0.5f, riseTaper, lineTaper);
+    std::printf("  [suppressor] a wide rise and a line on it: %.2f and %.2f dB; with a taper of 0.5 %.2f and %.2f\n",
+                rise, line, riseTaper, lineTaper);
+    EXPECT_GT(rise, -0.5);
+    EXPECT_GT(riseTaper, -0.5);
+    EXPECT_LT(line, -6.0);
     EXPECT_LT(lineTaper, -6.0);
 }
 
@@ -9504,13 +9573,11 @@ DSPARK_TEST(ResonanceSuppressor_removal_is_heard_in_one_band)
     a.setRemovalBand(3000.0f, 500.0f);
     EXPECT_NEAR(static_cast<double>(a.getRemovalBandLow()), 500.0, 1e-3);
     EXPECT_NEAR(static_cast<double>(a.getRemovalBandHigh()), 3000.0, 1e-3);
-    a.setEnvelopePasses(7);
     a.setWidthTaper(50.0f, 9.0f);
     a.setShortKernel(true);
     const auto blob = a.getState();
     Rs8 b;
     EXPECT_TRUE(b.setState(blob.data(), blob.size()));
-    EXPECT_EQ(b.getEnvelopePasses(), 2);
     EXPECT_NEAR(static_cast<double>(b.getWidthTaperCorner()), 200.0, 1e-3);
     EXPECT_NEAR(static_cast<double>(b.getWidthTaperExponent()), 2.0, 1e-6);
     EXPECT_TRUE(b.getShortKernel());
@@ -9583,7 +9650,7 @@ DSPARK_TEST(TonalBalance_range_knee_rounds_the_limit)
     {
         Tb9 probe;
         probe.prepare(spec(48000.0, 256, 2));
-        for (int b = 1; b < probe.getNumBands(); ++b)
+        for (int b = 1; b < Tb9::kBands; ++b)
             if (std::abs(probe.getBandCentre(b) - 2000.0) < std::abs(probe.getBandCentre(band) - 2000.0)) band = b;
     }
     const auto sweep = [&](float knee, double& bend, double& top) {
@@ -9639,17 +9706,14 @@ DSPARK_TEST(TonalBalance_leaves_an_even_programme_alone_at_any_level)
     const size_t n = 48000 * 3;
     // Eight tones of random frequency and phase in each band, the same power in every band.
     Tb9 probe;
-    probe.setDetail(Tb9::Detail::Auditory);
     probe.prepare(spec(48000.0, 256, 2));
-    const int barkBands = probe.getNumBands();
-    const double innerLo = probe.getBandCentre(6) * 0.999999, innerHi = probe.getBandCentre(barkBands - 7) * 1.000001;
     std::vector<float> even(n, 0.0f);
     uint32_t seed = 77u;
     const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return static_cast<double>(seed >> 8) / 16777216.0; };
-    for (int b = 0; b < barkBands; ++b)
+    for (int b = 0; b < Tb9::kBands; ++b)
     {
         const double lo = b > 0 ? std::sqrt(probe.getBandCentre(b - 1) * probe.getBandCentre(b)) : probe.getBandCentre(0) * 0.9;
-        const double hi = b + 1 < barkBands ? std::sqrt(probe.getBandCentre(b) * probe.getBandCentre(b + 1)) : probe.getBandCentre(b) * 1.05;
+        const double hi = b + 1 < Tb9::kBands ? std::sqrt(probe.getBandCentre(b) * probe.getBandCentre(b + 1)) : probe.getBandCentre(b) * 1.05;
         for (int t = 0; t < 8; ++t)
         {
             const double hz = lo + (hi - lo) * next(), phase = 6.283185307179586 * next();
@@ -9660,23 +9724,18 @@ DSPARK_TEST(TonalBalance_leaves_an_even_programme_alone_at_any_level)
     double rms = 0.0;
     for (float x : even) rms += static_cast<double>(x) * x;
     rms = std::sqrt(rms / static_cast<double>(n));
-    for (const bool detail : { false, true })
     for (const double dbfs : { -50.0, -30.0, -10.0 })
     {
         const float gain = static_cast<float>(std::pow(10.0, dbfs / 20.0) / rms);
         std::vector<float> x = even;
         for (auto& s : x) s *= gain;
-        const auto tb = m9Balance([detail](Tb9& t) {
-            t.setBalance(1.0f); t.setFrequencyRange(20.0f, 20000.0f); t.setReference(Tb9::Reference::EvenPower);
-            t.setDetail(detail ? Tb9::Detail::Fine : Tb9::Detail::Auditory);
-            if (detail) { t.setFillDips(0.0f); t.setTrimPeaks(0.0f); }
-        }, x);
+        const auto tb = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setFrequencyRange(20.0f, 20000.0f); t.setReference(Tb9::Reference::EvenPower); }, x);
         double worst = 0.0, inner = 0.0;
-        for (int b = 0; b < tb->getNumBands(); ++b)
+        for (int b = 0; b < Tb9::kBands; ++b)
         {
             const double c = std::abs(static_cast<double>(tb->getCorrection(b)));
             worst = std::max(worst, c);
-            if (tb->getBandCentre(b) >= innerLo && tb->getBandCentre(b) <= innerHi) inner = std::max(inner, c);
+            if (b >= 6 && b < Tb9::kBands - 6) inner = std::max(inner, c);
         }
         std::printf("  [balance] the same power in every band at %.0f dBFS: the largest correction %.2f dB (%.2f away from the ends)\n", dbfs, worst, inner);
         EXPECT_LT(worst, 0.5);
@@ -9722,7 +9781,7 @@ DSPARK_TEST(TonalBalance_does_not_raise_what_is_masked)
     const auto raisedOver8k = [&](float floorDb) {
         const auto tb = m9Balance([=](Tb9& t) { t.setBalance(1.0f); t.setFillDips(1.0f); t.setFloor(floorDb); }, x);
         double top = 0.0;
-        for (int b = 0; b < tb->getNumBands(); ++b)
+        for (int b = 0; b < Tb9::kBands; ++b)
             if (tb->getBandCentre(b) > 8000.0) top = std::max(top, static_cast<double>(tb->getCorrection(b)));
         return top;
     };
@@ -9756,7 +9815,7 @@ DSPARK_TEST(TonalBalance_listening_compensation_raises_the_ends)
     };
     const auto at = [](const Tb9& t, double hz) {
         int band = 0;
-        for (int b = 1; b < t.getNumBands(); ++b)
+        for (int b = 1; b < Tb9::kBands; ++b)
             if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
         return static_cast<double>(t.getCorrection(band));
     };
@@ -9798,7 +9857,7 @@ DSPARK_TEST(TonalBalance_common_response_moves_the_bands_together)
     }
     const auto bandAt = [](const Tb9& t, double hz) {
         int band = 0;
-        for (int b = 1; b < t.getNumBands(); ++b)
+        for (int b = 1; b < Tb9::kBands; ++b)
             if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
         return band;
     };
@@ -9843,7 +9902,7 @@ DSPARK_TEST(TonalBalance_local_slope_asks_less_of_a_quiet_end)
     for (auto& s : quiet) s *= 0.01f;
     const auto at = [](const Tb9& t, double hz) {
         int band = 0;
-        for (int b = 1; b < t.getNumBands(); ++b)
+        for (int b = 1; b < Tb9::kBands; ++b)
             if (std::abs(t.getBandCentre(b) - hz) < std::abs(t.getBandCentre(band) - hz)) band = b;
         return static_cast<double>(t.getCorrection(band));
     };
@@ -9873,9 +9932,19 @@ DSPARK_TEST(TonalBalance_local_slope_asks_less_of_a_quiet_end)
     EXPECT_TRUE(b.getLocalSlope());
 }
 
-// New: Quality::Render. Half the hop and the bank refined at every hop: its
-// response lands closer to the corrections asked; the latency is the same,
-// and a render the processor is told of takes that quality by itself.
+// The filter plays the balance it is asked for: with no detail in it, the
+// response at the centre of a band is that band's correction.
+DSPARK_TEST(TonalBalance_plays_the_balance_it_asks_for)
+{
+    const std::vector<float> x = l13Add(l13MixLike(48000 * 3, 91u), 3000.0, 0.15);
+    const auto tb = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setFillDips(0.0f); t.setTrimPeaks(0.0f); t.setRange(12.0f); }, x);
+    double worst = 0.0;
+    for (int b = 4; b < Tb9::kBands - 4; ++b)
+        worst = std::max(worst, std::abs(tb->getResponse(tb->getBandCentre(b)) - static_cast<double>(tb->getCorrection(b))));
+    std::printf("  [balance] the filter misses the balance asked by %.3f dB at most\n", worst);
+    EXPECT_LT(worst, 0.05);
+}
+
 DSPARK_TEST(TonalBalance_render_quality_lands_closer)
 {
     const std::vector<float> x = l13Add(l13MixLike(48000 * 3, 91u), 3000.0, 0.15);
@@ -9883,7 +9952,7 @@ DSPARK_TEST(TonalBalance_render_quality_lands_closer)
         const auto tb = m9Balance([=](Tb9& t) { t.setQuality(q); t.setBalance(1.0f); t.setTrimPeaks(1.0f); t.setRange(12.0f); }, x);
         latency = tb->getLatency();
         double worst = 0.0;
-        for (int b = 4; b < tb->getNumBands() - 4; ++b)
+        for (int b = 4; b < Tb9::kBands - 4; ++b)
             worst = std::max(worst, std::abs(tb->getResponse(tb->getBandCentre(b)) - static_cast<double>(tb->getCorrection(b))));
         return worst;
     };
@@ -9891,6 +9960,41 @@ DSPARK_TEST(TonalBalance_render_quality_lands_closer)
     const double realtime = missed(Tb9::Quality::Realtime, latencyRealtime), render = missed(Tb9::Quality::Render, latencyRender);
     std::printf("  [balance] the bank misses the corrections asked by %.3f dB in real time and %.3f dB at the render quality\n", realtime, render);
     EXPECT_LT(render, realtime);
+    EXPECT_EQ(latencyRender, latencyRealtime);
+    Tb9 a;
+    a.setOfflineRendering(true);
+    a.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(a.getQualityInUse() == Tb9::Quality::Realtime);
+    a.setQualityFollowsRender(true);
+    a.prepare(spec(48000.0, 256, 2));
+    EXPECT_TRUE(a.getQualityInUse() == Tb9::Quality::Render);
+    a.setQuality(static_cast<Tb9::Quality>(7));
+    const auto blob = a.getState();
+    Tb9 b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_TRUE(b.getQualityFollowsRender());
+    EXPECT_TRUE(b.getQuality() == Tb9::Quality::Realtime);
+}
+
+// New: Quality::Render. The two readings run more often: the same curve and
+// the same latency, and a render the processor is told of takes that
+// quality by itself.
+DSPARK_TEST(TonalBalance_render_quality_lands_on_the_same_curve)
+{
+    const std::vector<float> x = l13Add(l13MixLike(48000 * 3, 91u), 3000.0, 0.15);
+    const auto curve = [&](Tb9::Quality q, int& latency) {
+        const auto tb = m9Balance([=](Tb9& t) { t.setQuality(q); t.setBalance(1.0f); t.setTrimPeaks(1.0f); t.setRange(12.0f); }, x);
+        latency = tb->getLatency();
+        std::vector<double> played;
+        for (int i = 0; i < Tb9::kDisplayPoints; ++i) played.push_back(static_cast<double>(tb->getDisplayCorrection(i)));
+        return played;
+    };
+    int latencyRealtime = 0, latencyRender = 0;
+    const auto realtime = curve(Tb9::Quality::Realtime, latencyRealtime), render = curve(Tb9::Quality::Render, latencyRender);
+    double apart = 0.0;
+    for (size_t i = 0; i < realtime.size(); ++i) apart = std::max(apart, std::abs(realtime[i] - render[i]));
+    std::printf("  [balance] real time and the render quality stand %.3f dB apart at most\n", apart);
+    EXPECT_LT(apart, 0.5);
     EXPECT_EQ(latencyRender, latencyRealtime);
     Tb9 a;
     a.setOfflineRendering(true);
@@ -9917,7 +10021,7 @@ DSPARK_TEST(TonalBalance_time_focus_reads_the_top_sooner)
     const auto plain = m9Balance([](Tb9& t) { t.setBalance(1.0f); }, steady);
     const auto focused = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setTimeFocus(true); }, steady);
     double apart = 0.0;
-    for (int b = 4; b < plain->getNumBands() - 4; ++b)
+    for (int b = 4; b < Tb9::kBands - 4; ++b)
         apart = std::max(apart, std::abs(static_cast<double>(plain->getCorrection(b)) - static_cast<double>(focused->getCorrection(b))));
 
     const size_t n = 48000 * 4, turn = 48000 * 2;
@@ -9935,7 +10039,7 @@ DSPARK_TEST(TonalBalance_time_focus_reads_the_top_sooner)
         tb->setTimeFocus(focus);
         tb->prepare(spec(48000.0, 64, 2));
         int band = 0;
-        for (int b = 1; b < tb->getNumBands(); ++b)
+        for (int b = 1; b < Tb9::kBands; ++b)
             if (std::abs(tb->getBandCentre(b) - 8000.0) < std::abs(tb->getBandCentre(band) - 8000.0)) band = b;
         std::vector<float> l = x, r = x;
         std::vector<double> track;
@@ -10016,53 +10120,85 @@ M9Action m9Action(P& p, const std::vector<float>& x, Read&& read, double mark)
 
 } // namespace
 
-// New: ResonanceSuppressor::setTimeFocus(). The spectrum is read through a
-// window that shortens as frequency rises.
-DSPARK_TEST(ResonanceSuppressor_time_focus_reads_the_top_through_a_shorter_window)
+// Was a switch (a window that shortens as frequency rises) and is now what
+// the detector is: a held line is read in the low end as at the top (with
+// the foundation guard open, a lone low line being a foundation), and a
+// short burst at the top is over before it counts.
+DSPARK_TEST(ResonanceSuppressor_reads_each_end_through_its_own_window)
 {
     const std::vector<float> white = l13Noise(48000 * 3, 0.1f, 7u);
-    const auto level = [&](bool focus) {
-        auto rs = std::make_unique<Rs8>();
-        rs->setTimeFocus(focus);
-        rs->prepare(spec(48000.0, 256, 2));
-        const size_t late = static_cast<size_t>(rs->getLatency());
-        const auto out = l13Run(*rs, white, white);
-        return l13RmsDb(out.first, white.size() / 2, white.size()) - l13RmsDb(white, white.size() / 2 - late, white.size() - late);
-    };
-    const double noisePlain = level(false), noiseFocus = level(true);
-    double line[3][2] = {};
-    const double at[3] = { 200.0, 2000.0, 8000.0 };
-    for (int i = 0; i < 3; ++i)
-    {
-        const std::vector<float> rung = l13Add(white, at[i], 0.2);
-        line[i][0] = m8LineChange([](Rs8&) {}, rung, at[i]);
-        line[i][1] = m8LineChange([](Rs8& rs) { rs.setTimeFocus(true); }, rung, at[i]);
-    }
+    double line[4] = {};
+    const double at[4] = { 60.0, 200.0, 2000.0, 8000.0 };
+    for (int i = 0; i < 4; ++i) line[i] = m8LineChange([](Rs8& rs) { rs.setFoundationGuard(0.0f); }, l13Add(white, at[i], 0.2), at[i]);
     const std::vector<float> burst = m9Burst(48000 * 2, 8000.0, 10.0);
-    M9Action act[2];
-    for (const int kind : { 0, 1 })
+    auto rs = std::make_unique<Rs8>();
+    rs->prepare(spec(48000.0, 64, 2));
+    const M9Action act = m9Action(*rs, burst, [&] { return rs->getPeakReduction(); }, 3.0);
+    std::printf("  [suppressor] a line at 60 Hz %.2f, 200 Hz %.2f, 2 kHz %.2f, 8 kHz %.2f dB; a burst of 10 ms at 8 kHz: past 3 dB for %.1f ms from %.1f ms before it comes out (most %.1f dB)\n",
+                line[0], line[1], line[2], line[3], act.span, act.ahead, act.most);
+    for (const double taken : line)
     {
-        auto rs = std::make_unique<Rs8>();
-        rs->setTimeFocus(kind == 1);
-        rs->prepare(spec(48000.0, 64, 2));
-        act[kind] = m9Action(*rs, burst, [&] { return rs->getPeakReduction(); }, 3.0);
+        EXPECT_LT(taken, -6.0);
+        EXPECT_GT(taken, -9.5); // the range is 9 dB, in the audio too
     }
-    std::printf("  [suppressor] focus: a white noise %.2f dB, %.2f with it; a line at 200 Hz %.2f / %.2f, at 2 kHz %.2f / %.2f, at 8 kHz %.2f / %.2f dB; a burst of 10 ms at 8 kHz: past 3 dB for %.1f ms from %.1f ms before it comes out (most %.1f dB), %.1f ms from %.1f before (most %.1f) with it\n",
-                noisePlain, noiseFocus, line[0][0], line[0][1], line[1][0], line[1][1], line[2][0], line[2][1],
-                act[0].span, act[0].ahead, act[0].most, act[1].span, act[1].ahead, act[1].most);
-    // The grain of a noise is left alone, a held line is still reduced, and
-    // what a burst sets off lasts less and starts later.
-    EXPECT_GT(noiseFocus, noisePlain + 0.1);
-    EXPECT_LT(line[1][1], -3.0);
-    EXPECT_LT(line[2][1], -3.0);
-    EXPECT_LT(act[1].span, 0.75 * act[0].span);
-    EXPECT_LT(act[1].ahead, act[0].ahead - 20.0);
-    Rs8 a;
-    a.setTimeFocus(true);
-    const auto blob = a.getState();
-    Rs8 b;
-    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
-    EXPECT_TRUE(b.getTimeFocus());
+    EXPECT_LT(std::abs(act.most), 3.0);
+}
+
+// A burst of 10 ms at the top is caught as deep as the first engine caught
+// it and as early, and a held tone is cut the same. Measured
+// with this case on the first engine: 55 ms from 19.7 ms ahead, 11.8 dB
+// deep (with its focus on, 35 ms from 9.7 ms ahead, 5.2 dB deep).
+DSPARK_TEST(SpectralDynamicEQ_catches_a_burst_as_deep_as_the_first_engine)
+{
+    using S = SpectralDynamicEQ<float>;
+    const auto make = [](int block) {
+        auto eq = std::make_unique<S>();
+        S::Band b;
+        b.shape = S::Shape::Bell; b.frequency = 8000.0f; b.q = 1.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f;
+        b.attack = 1.0f; b.release = 20.0f;
+        eq->setBand(0, b);
+        eq->prepare(spec(48000.0, block, 2));
+        return eq;
+    };
+    const std::vector<float> steady = l13Add(l13Noise(48000 * 3, 0.02f, 9u), 8000.0, 0.25);
+    // The band's threshold hangs from its recent peak: an earlier burst sets it,
+    // so the noise between the two is left alone.
+    const std::vector<float> burst = m9Burst(48000 * 2, 8000.0, 10.0, true);
+    auto eq = make(256);
+    const size_t late = static_cast<size_t>(eq->getLatency());
+    const auto out = l13Run(*eq, steady, steady);
+    const double held = l13Line(out.first, 8000.0, steady.size() / 2, steady.size() / 2) - l13Line(steady, 8000.0, steady.size() / 2 - late, steady.size() / 2);
+    // In the audio: the burst as a key, and a held tone at 8 kHz that shows the gain, ms by ms.
+    auto quick = make(64);
+    const std::vector<float> tone = l13Add(std::vector<float>(burst.size(), 0.0f), 8000.0, 0.25);
+    std::vector<float> l = tone, r = tone, key = burst;
+    for (size_t off = 0; off + 64 <= tone.size(); off += 64)
+    {
+        float* ch[2] = { l.data() + off, r.data() + off };
+        float* k[2] = { key.data() + off, key.data() + off };
+        quick->processBlock(AudioBufferView<float>(ch, 2, 64), AudioBufferView<float>(k, 2, 64));
+    }
+    M9Action act;
+    const size_t out0 = burst.size() * 3 / 4 + static_cast<size_t>(quick->getLatency());
+    const double whole = l13RmsDb(tone, 0, 48000);
+    double first = -1.0;
+    for (size_t at = tone.size() / 2; at + 64 + 48 <= tone.size(); at += 48)
+    {
+        const double cut = whole - l13RmsDb(l, at, at + 48);
+        act.most = std::max(act.most, cut);
+        if (cut <= 1.0) continue;
+        act.span += 1.0;
+        if (first < 0.0) first = static_cast<double>(at);
+    }
+    act.ahead = first < 0.0 ? 0.0 : (static_cast<double>(out0) - first) / 48.0;
+    std::printf("  [spectral dynamic eq] a held tone at 8 kHz %.2f dB; a burst of 10 ms, in the audio: past 1 dB for %.1f ms from %.1f ms before it comes out (most %.1f dB)\n",
+                held, act.span, act.ahead, act.most);
+    // No shallower, no earlier and no longer than the first engine (a new
+    // move is held for the three curves that play it in full, and no longer).
+    EXPECT_LT(held, -10.0);
+    EXPECT_GT(act.most, 11.8);
+    EXPECT_LT(act.ahead, 19.8);
+    EXPECT_LT(act.span, 55.0);
 }
 
 // New: SpectralDynamicEQ::setTimeFocus(). The levels are read through a
@@ -10074,8 +10210,9 @@ DSPARK_TEST(SpectralDynamicEQ_time_focus_reads_the_top_through_a_shorter_window)
         auto eq = std::make_unique<S>();
         S::Band b;
         b.shape = S::Shape::Bell; b.frequency = 8000.0f; b.q = 1.0f; b.threshold = -20.0f; b.ratio = 4.0f; b.range = -12.0f;
-        b.attack = 1.0f; b.release = 20.0f; b.cells = 8;
+        b.attack = 1.0f; b.release = 20.0f;
         eq->setBand(0, b);
+        eq->setDetail(0.347f); // the eight cells of a Q of 1, as a first state converts them
         eq->setTimeFocus(focus);
         eq->prepare(spec(48000.0, block, 2));
         return eq;
@@ -10148,57 +10285,69 @@ double tbCorrectionAt(const TonalBalance<float>& tb, double hz)
 
 } // namespace
 
-// The bands of each detail: how many, and how wide in the low end. A third of
-// a critical band is some 30 Hz there whatever the frequency; with Fine no
-// band is wider than a sixth of an octave and with Finest than a twelfth.
-// The latency does not depend on it.
-DSPARK_TEST(TonalBalance_detail_lays_more_bands_in_the_low_end)
+// Defect: on the detail engine TonalBalance handed its output back 2048
+// samples late at 48 kHz and at 8 kHz alike. It is no later than the broad
+// engine was (its latencies, rate by rate) at any rate.
+DSPARK_TEST(TonalBalance_is_no_later_than_the_broad_engine)
+{
+    const std::pair<double, int> was[] = {
+        { 8000.0, 193 }, { 16000.0, 193 }, { 22050.0, 387 }, { 32000.0, 387 }, { 44100.0, 776 }, { 48000.0, 776 },
+        { 88200.0, 1552 }, { 96000.0, 1552 }, { 176400.0, 3106 }, { 192000.0, 3106 }, { 384000.0, 6213 } };
+    for (const auto& [rate, samples] : was)
+    {
+        auto p = std::make_unique<TonalBalance<float>>();
+        p->prepare(spec(rate, 512, 2));
+        std::printf("  [balance] %.0f Hz: %d samples late, the broad engine %d\n", rate, p->getLatency(), samples);
+        EXPECT_GT(p->getLatency(), 0);
+        EXPECT_LT(p->getLatency(), samples + 1);
+    }
+}
+
+// One detail over the whole band, continuous, live: no prepare, the same
+// latency, the model's 72 bands whatever it is.
+DSPARK_TEST(TonalBalance_detail_is_one_live_control)
 {
     using TB = TonalBalance<float>;
-    struct Case { TB::Detail detail; int bands; double widestOctaves; int under100; };
-    const Case cases[] = { { TB::Detail::Auditory, 72, 1.0, 3 }, { TB::Detail::Fine, 87, 1.0 / 6.0, 14 },
-                           { TB::Detail::Finest, 122, 1.0 / 12.0, 28 } };
-    int latency = -1;
-    for (const auto& c : cases)
-    {
-        auto tb = std::make_unique<TB>();
-        tb->setDetail(c.detail);
-        tb->prepare(spec(48000.0, 256, 2));
-        EXPECT_TRUE(tb->getDetailInUse() == c.detail);
-        const int bands = tb->getNumBands();
-        double widest = 0.0;
-        int low = 0;
-        for (int b = 1; b < bands; ++b)
-        {
-            widest = std::max(widest, std::log2(tb->getBandCentre(b) / tb->getBandCentre(b - 1)));
-            EXPECT_GT(tb->getBandCentre(b), tb->getBandCentre(b - 1));
-        }
-        for (int b = 0; b < bands; ++b)
-            if (tb->getBandCentre(b) < 100.0) ++low;
-        std::printf("  [tb detail] %d: %d bands, %d of them under 100 Hz, the widest step %.4f of an octave, from %.1f to %.1f Hz, latency %d\n",
-                    static_cast<int>(c.detail), bands, low, widest, tb->getBandCentre(0), tb->getBandCentre(bands - 1), tb->getLatency());
-        EXPECT_NEAR(bands, c.bands, 2);
-        EXPECT_NEAR(tb->getBandCentre(0), 20.0, 1e-6);
-        EXPECT_NEAR(tb->getBandCentre(bands - 1), 20000.0, 1e-3);
-        if (c.detail != TB::Detail::Auditory) EXPECT_LT(widest, c.widestOctaves * 1.02);
-        EXPECT_NEAR(low, c.under100, 1);
-        if (latency < 0) latency = tb->getLatency();
-        EXPECT_EQ(tb->getLatency(), latency);
-    }
-    // The default is Fine, and a value out of range reads as it.
     TB fresh;
-    EXPECT_TRUE(fresh.getDetail() == TB::Detail::Fine);
-    fresh.setDetail(static_cast<TB::Detail>(9));
-    EXPECT_TRUE(fresh.getDetail() == TB::Detail::Fine);
+    EXPECT_NEAR(fresh.getDetail(), 1.0f / 4.0f, 1e-6f);
+    fresh.setDetail(9.0f);
+    EXPECT_EQ(fresh.getDetail(), 1.0f);
+    fresh.setDetail(0.0f);
+    EXPECT_NEAR(fresh.getDetail(), 1.0f / 24.0f, 1e-6f);
+    fresh.setDetail(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(fresh.getDetail(), 1.0f / 24.0f, 1e-6f);
     fresh.setContrastKnee(std::numeric_limits<float>::quiet_NaN());
-    EXPECT_NEAR(fresh.getContrastKnee(), 1.5f, 0.0f);
+    EXPECT_NEAR(fresh.getContrastKnee(), 3.0f, 0.0f);
+
+    const std::vector<float> in = tbShapedLows(48000 * 8, 7u);
+    auto tb = std::make_unique<TB>();
+    tb->setBalance(0.0f); tb->setFillDips(1.0f); tb->setTrimPeaks(1.0f); tb->setRange(12.0f); tb->setDetail(1.0f);
+    tb->prepare(spec(48000.0, 256, 2));
+    const auto hole = [&] { return tb->getResponse(70.0) - 0.5 * (tb->getResponse(45.0) + tb->getResponse(120.0)); };
+    (void)l13Run(*tb, in, in);
+    const double wide = hole();
+    const int latency = tb->getLatency();
+    tb->setDetail(1.0f / 12.0f);
+    (void)l13Run(*tb, in, in);
+    const double fine = hole();
+    std::printf("  [tb detail] the hole over the lumps: %.2f dB an octave wide, %.2f at a twelfth, set while playing\n", wide, fine);
+    EXPECT_GT(fine, wide + 2.0);
+    EXPECT_EQ(tb->getLatency(), latency);
+    EXPECT_EQ(latency, 774);
+    EXPECT_EQ(tb->getNumBands(), 72);
+
+    StateWriter first(stateId("TBAL"), 1);
+    first.write("detail", static_cast<int32_t>(2));
+    const auto blob = first.blob();
+    EXPECT_TRUE(fresh.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(fresh.getDetail(), 1.0f / 12.0f, 1e-6f);
 }
 
 // A low end with a lump at 45 Hz, a hole at 70 Hz and a lump at 120 Hz. On
 // the ear's scale the three fall in neighbouring bands 30 Hz wide read
 // through a transform that cannot tell them apart, and the correction is one
 // broad cut. With the detail the hole is cut less than the lumps (or
-// raised), in the corrections and in what the bank plays.
+// raised), in the corrections and in what the filter plays.
 DSPARK_TEST(TonalBalance_follows_the_shape_of_the_low_end)
 {
     using TB = TonalBalance<float>;
@@ -10206,7 +10355,7 @@ DSPARK_TEST(TonalBalance_follows_the_shape_of_the_low_end)
     const std::vector<float> programme = tbShapedLows(n, 7u);
     double contrast[3] = {};
     int at = 0;
-    for (const auto detail : { TB::Detail::Auditory, TB::Detail::Fine, TB::Detail::Finest })
+    for (const float detail : { 1.0f, 1.0f / 6.0f, 1.0f / 12.0f })
     {
         auto tb = std::make_unique<TB>();
         tb->setDetail(detail);
@@ -10215,17 +10364,17 @@ DSPARK_TEST(TonalBalance_follows_the_shape_of_the_low_end)
         (void)l13Run(*tb, programme, programme);
         const double c45 = tbCorrectionAt(*tb, 45.0), c70 = tbCorrectionAt(*tb, 70.0), c120 = tbCorrectionAt(*tb, 120.0);
         const double r45 = tb->getResponse(45.0), r70 = tb->getResponse(70.0), r120 = tb->getResponse(120.0);
-        std::printf("  [tb lows] detail %d: corrections at 45 / 70 / 120 Hz %.2f / %.2f / %.2f dB; the bank plays %.2f / %.2f / %.2f dB; loudness change %.3f dB\n",
-                    static_cast<int>(detail), c45, c70, c120, r45, r70, r120, static_cast<double>(tb->getLoudnessChange()));
-        std::printf("  [tb lows] detail %d curve:", static_cast<int>(detail));
-        for (int b = 0; b < tb->getNumBands() && tb->getBandCentre(b) < 400.0; ++b)
-            std::printf(" %.0f:%.1f", tb->getBandCentre(b), static_cast<double>(tb->getCorrection(b)));
+        std::printf("  [tb lows] detail %.3f: corrections at 45 / 70 / 120 Hz %.2f / %.2f / %.2f dB; the filter plays %.2f / %.2f / %.2f dB; loudness change %.3f dB\n",
+                    static_cast<double>(detail), c45, c70, c120, r45, r70, r120, static_cast<double>(tb->getLoudnessChange()));
+        std::printf("  [tb lows] detail %.3f curve:", static_cast<double>(detail));
+        for (double hz = 30.0; hz < 400.0; hz *= 1.189207115002721)
+            std::printf(" %.0f:%.1f", hz, tb->getResponse(hz));
         std::printf("\n");
         contrast[at++] = r70 - 0.5 * (r45 + r120);
         EXPECT_NEAR(static_cast<double>(tb->getLoudnessChange()), 0.0, 0.2);
     }
     // How much less the hole is cut than the two lumps around it.
-    std::printf("  [tb lows] the hole against the lumps, in what the bank plays: %.2f dB auditory, %.2f fine, %.2f finest\n",
+    std::printf("  [tb lows] the hole against the lumps, in what the filter plays: %.2f dB an octave wide, %.2f at a sixth, %.2f at a twelfth\n",
                 contrast[0], contrast[1], contrast[2]);
     EXPECT_GT(contrast[1], contrast[0] + 1.0);
     EXPECT_GT(contrast[2], contrast[0] + 1.0);
@@ -10236,16 +10385,14 @@ DSPARK_TEST(TonalBalance_follows_the_shape_of_the_low_end)
     full->setBalance(0.0f); full->setFillDips(1.0f); full->setTrimPeaks(1.0f); full->setContrastKnee(0.1f); full->setRange(12.0f);
     full->prepare(spec(48000.0, 256, 2));
     (void)l13Run(*full, programme, programme);
-    std::printf("  [tb lows] dips and peaks at full, fine: the bank plays %.2f / %.2f / %.2f dB at 45 / 70 / 120 Hz\n",
+    std::printf("  [tb lows] dips and peaks at full, a sixth: the filter plays %.2f / %.2f / %.2f dB at 45 / 70 / 120 Hz\n",
                 full->getResponse(45.0), full->getResponse(70.0), full->getResponse(120.0));
     EXPECT_GT(full->getResponse(70.0) - 0.5 * (full->getResponse(45.0) + full->getResponse(120.0)), 4.0);
 }
 
 // The detail does not change what the ear's model says of a programme with
-// no shape: pinkish noise takes the same broad correction with the three
-// details (the bands of the low end are narrower, the loudness they stand
-// for is that of the third of a Bark around each), and a programme at rest
-// stays at rest.
+// no shape: pinkish noise takes the same broad correction from an octave to
+// a 24th, and a programme at rest stays at rest.
 DSPARK_TEST(TonalBalance_detail_keeps_the_broad_balance)
 {
     using TB = TonalBalance<float>;
@@ -10254,14 +10401,14 @@ DSPARK_TEST(TonalBalance_detail_keeps_the_broad_balance)
     const double probes[] = { 60.0, 150.0, 400.0, 1000.0, 3000.0, 8000.0 };
     double seen[3][6] = {};
     int at = 0;
-    for (const auto detail : { TB::Detail::Auditory, TB::Detail::Fine, TB::Detail::Finest })
+    for (const float detail : { 1.0f, 1.0f / 6.0f, 1.0f / 24.0f })
     {
         auto tb = std::make_unique<TB>();
         tb->setDetail(detail);
         tb->setFillDips(0.0f); tb->setTrimPeaks(0.0f);
         tb->prepare(spec(48000.0, 256, 2));
         (void)l13Run(*tb, programme, programme);
-        std::printf("  [tb broad] detail %d:", static_cast<int>(detail));
+        std::printf("  [tb broad] detail %.3f:", static_cast<double>(detail));
         for (int k = 0; k < 6; ++k)
         {
             seen[at][k] = tb->getResponse(probes[k]);
@@ -10342,7 +10489,7 @@ DSPARK_TEST(TonalBalance_does_not_play_one_broad_cut_over_a_shaped_low_end)
 
 // The other side of the fix: a low end with nothing in it to fix is left
 // alone. Pink noise is even per octave, which is what the long look reads
-// against: with the balance off, neither detail follows its ripple.
+// against: with the balance off, no detail follows its ripple, at any frequency.
 DSPARK_TEST(TonalBalance_detail_leaves_pink_noise_alone)
 {
     const size_t n = 48000 * 8;
@@ -10355,16 +10502,16 @@ DSPARK_TEST(TonalBalance_detail_leaves_pink_noise_alone)
         b3 = 0.8665 * b3 + w * 0.3104856; b4 = 0.55 * b4 + w * 0.5329522;
         s = static_cast<float>(0.04 * (b0 + b1 + b2 + b3 + b4 + w * 0.5362));
     }
-    for (const auto detail : { Tb9::Detail::Fine, Tb9::Detail::Finest })
+    for (const float detail : { 1.0f, 1.0f / 3.0f, 1.0f / 6.0f, 1.0f / 12.0f, 1.0f / 24.0f })
     {
         const auto tb = m9Balance([detail](Tb9& t) { t.setBalance(0.0f); t.setDetail(detail); }, pink);
         double worst = 0.0, at = 0.0;
-        for (int b = 0; b < tb->getNumBands(); ++b)
+        for (int i = 0; i < Tb9::kDisplayPoints; ++i)
         {
-            const double hz = tb->getBandCentre(b), c = std::abs(static_cast<double>(tb->getCorrection(b)));
-            if (hz < 1000.0 && c > worst) { worst = c; at = hz; }
+            const double c = std::abs(static_cast<double>(tb->getDisplayCorrection(i)));
+            if (c > worst) { worst = c; at = Tb9::getDisplayFrequency(i); }
         }
-        std::printf("  [tb pink] detail %d: the largest correction under 1 kHz is %.2f dB, at %.0f Hz\n", static_cast<int>(detail), worst, at);
+        std::printf("  [tb pink] detail %.3f: the largest correction at any frequency is %.2f dB, at %.0f Hz\n", static_cast<double>(detail), worst, at);
         EXPECT_LT(worst, 0.6);
     }
 }
@@ -10410,7 +10557,6 @@ DSPARK_TEST(TonalBalance_detail_works_at_every_rate)
             std::printf("  [tb rates] %.0f Hz, %d channel(s): %d bands, the hole over the lumps %.2f dB\n", rate, channels, tb->getNumBands(), hole);
             EXPECT_TRUE(finite);
             EXPECT_GT(tb->getNumBands(), 2);
-            EXPECT_TRUE(tb->getNumBands() <= TonalBalance<float>::kMaxBands);
             if (rate >= 44100.0) EXPECT_GT(hole, 0.8);
         }
 }
@@ -10470,4 +10616,957 @@ DSPARK_TEST(AlgoReverb_wet_equalizer_glides_the_same_at_any_block_size)
     const double still = apart(false), moving = apart(true);
     std::printf("  [wet eq] blocks of 64 and 1024 stand %.2e apart with the band still and %.2e with it on the move\n", still, moving);
     EXPECT_LT(moving, 2.0 * still + 1e-5);
+}
+
+namespace {
+
+constexpr double kDetailPi = 3.14159265358979323846;
+constexpr int kDetailLook = 65536;
+
+std::vector<float> detailNoise(size_t n, double amp, uint32_t seed)
+{
+    std::vector<float> x(n);
+    for (auto& s : x)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        s = static_cast<float>(amp * static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0);
+    }
+    return x;
+}
+
+struct DetailRead
+{
+    double audio = 0.0;   // gaps less lines in the audio that came out
+    double drawn = 0.0;   // the same in the curve given to a display
+    double middle = 0.0;  // played at the middle line
+    double middleDrawn = 0.0;
+    double beside = 0.0;  // played at the lines next to it, the one moved most
+};
+
+// A key with five lines twice `octaves` apart and impulses further apart
+// than the response through the filter that key asks for: what that filter
+// played at the lines and at the gaps between them, and what it draws there.
+template <class P, class Drawn>
+DetailRead detailThroughKey(P& p, double centre, double octaves, Drawn&& drawn, double middleTimes = 1.0)
+{
+    const size_t n = 48000 * 8;
+    std::vector<float> key = detailNoise(n, 0.004, 7u), out(n, 0.0f);
+    const size_t look = static_cast<size_t>(kDetailLook), lead = 1024;
+    std::vector<size_t> impulses;
+    for (size_t at = n / 2; at + 2 * look <= n; at += look) impulses.push_back(at);
+    for (const size_t at : impulses) out[at] = 1.0f;
+    for (int j = -2; j <= 2; ++j)
+    {
+        const double hz = centre * std::pow(2.0, 2.0 * j * octaves);
+        if (hz < 20.0 || hz > 19000.0) continue;
+        for (size_t i = 0; i < n; ++i)
+            key[i] += static_cast<float>(0.07 * (j == 0 ? middleTimes : 1.0)
+                                         * std::sin(2.0 * kDetailPi * hz * static_cast<double>(i) / 48000.0 + 1.3 * j));
+    }
+    p.prepare(spec(48000.0, 512, 1));
+    // The curve drawn while each impulse is in the filter: the gains follow
+    // the noise of the key, so the end of the key has another curve.
+    std::array<double, 5> then {};
+    size_t next = 0;
+    for (size_t off = 0; off < n; off += 512)
+    {
+        if (next < impulses.size() && off >= impulses[next] + lead)
+        {
+            for (size_t s = 0; s < then.size(); ++s)
+                then[s] += static_cast<double>(drawn(p, centre * std::pow(2.0, (static_cast<double>(s) - 2.0) * octaves)))
+                         / static_cast<double>(impulses.size());
+            ++next;
+        }
+        float* x[1] = { out.data() + off };
+        float* k[1] = { key.data() + off };
+        const int m = static_cast<int>(std::min<size_t>(512, n - off));
+        p.processBlock(AudioBufferView<float>(x, 1, m), AudioBufferView<float>(k, 1, m));
+    }
+
+    // Twice padded: the response is read every 0.37 Hz.
+    const size_t late = static_cast<size_t>(p.getLatency()), bins = look + 1;
+    FFTReal<double> fft(2 * look);
+    std::vector<double> response(2 * look), spectrum(2 * look + 2), came(bins);
+    for (const size_t at : impulses)
+    {
+        for (size_t i = 0; i < look; ++i) response[i] = out[at + late + i - lead];
+        fft.forward(response.data(), spectrum.data());
+        for (size_t k = 0; k < bins; ++k) came[k] += spectrum[2 * k] * spectrum[2 * k] + spectrum[2 * k + 1] * spectrum[2 * k + 1];
+    }
+    const auto played = [&](double hz) {
+        const double at = hz * static_cast<double>(2 * look) / 48000.0;
+        const auto k = static_cast<size_t>(at);
+        const auto level = [&](size_t j) { return 10.0 * std::log10(came[j] / static_cast<double>(impulses.size()) + 1e-30); };
+        return level(k) + (at - static_cast<double>(k)) * (level(k + 1) - level(k));
+    };
+    const auto apart = [&](auto&& read) {
+        const auto at = [&](double steps) { return static_cast<double>(read(centre * std::pow(2.0, steps * octaves))); };
+        return 0.5 * (at(-1.0) + at(1.0)) - (at(-2.0) + at(0.0) + at(2.0)) / 3.0;
+    };
+    const double below = played(centre * std::pow(2.0, -2.0 * octaves)), above = played(centre * std::pow(2.0, 2.0 * octaves));
+    const double drawnApart = 0.5 * (then[1] + then[3]) - (then[0] + then[2] + then[4]) / 3.0;
+    return { apart(played), drawnApart, played(centre), then[2],
+             std::abs(below) > std::abs(above) ? below : above };
+}
+
+// What a display draws at a frequency: the library's own reading between its points.
+template <class ValueAt>
+double detailDrawn(int points, ValueAt&& valueAt, double hz)
+{
+    if (points != SpectralReadout<float>::kPoints) return 1e9;
+    return SpectralReadout<float>::between(hz, valueAt);
+}
+
+// The separations every spectral effect owes: a sixth of an octave from
+// 50 Hz up, a twelfth from 100 Hz up.
+struct DetailCase
+{
+    double hz, octaves;
+};
+constexpr DetailCase kDetailCases[] = {
+    { 50.0, 1.0 / 6.0 },    { 100.0, 1.0 / 6.0 },   { 200.0, 1.0 / 6.0 },   { 500.0, 1.0 / 6.0 },
+    { 1000.0, 1.0 / 6.0 },  { 4000.0, 1.0 / 6.0 },  { 10000.0, 1.0 / 6.0 }, { 100.0, 1.0 / 12.0 },
+    { 200.0, 1.0 / 12.0 },  { 500.0, 1.0 / 12.0 },  { 1000.0, 1.0 / 12.0 }, { 4000.0, 1.0 / 12.0 },
+    { 10000.0, 1.0 / 12.0 },
+};
+
+} // namespace
+
+// Defect: one window of 2048 samples and a kernel as short. Under 500 Hz the
+// bands could not tell a line from the gap next to it (-0.5 dB of the 11.4
+// asked at 50 and at 100 Hz, a sixth of an octave), and the curve drawn lost
+// what the audio did have at the top (1.1 dB drawn of 11.1 played at 4 kHz).
+DSPARK_TEST(SpectralDynamicEQ_resolves_the_detail_at_every_frequency)
+{
+    using P = SpectralDynamicEQ<float>;
+    for (const DetailCase c : kDetailCases)
+    {
+        auto p = std::make_unique<P>();
+        P::Band band;
+        band.shape = P::Shape::Bell;
+        band.frequency = static_cast<float>(c.hz);
+        band.q = 0.5f;
+        band.threshold = -12.0f;
+        band.ratio = 20.0f;
+        band.range = -12.0f;
+        p->setBand(0, band);
+        p->setDetail(static_cast<float>(c.octaves));
+        const DetailRead r = detailThroughKey(*p, c.hz, c.octaves, [](const P& e, double hz) {
+            return detailDrawn(P::kDisplayPoints, [&](int i) { return static_cast<double>(e.getDisplayGain(i)); }, hz);
+        });
+        std::printf("  [detail] dynamic eq %5.0f Hz 1/%.0f oct: %.2f dB played, %.2f drawn\n", c.hz, 1.0 / c.octaves, r.audio, r.drawn);
+        EXPECT_GT(r.audio, 0.7 * 11.4);
+        EXPECT_NEAR(r.drawn, r.audio, 0.5);
+    }
+    // A 24th from 200 Hz, and the detail an octave wide: one broad shape.
+    for (const double hz : { 200.0, 500.0, 1000.0, 2000.0, 4000.0, 10000.0 })
+    {
+        const auto make = [hz](double detail) {
+            auto p = std::make_unique<P>();
+            P::Band band;
+            band.shape = P::Shape::Bell;
+            band.frequency = static_cast<float>(hz);
+            band.q = 0.5f;
+            band.threshold = -12.0f;
+            band.ratio = 20.0f;
+            band.range = -12.0f;
+            p->setBand(0, band);
+            p->setDetail(static_cast<float>(detail));
+            return p;
+        };
+        const auto drawn = [](const P& e, double at) {
+            return detailDrawn(P::kDisplayPoints, [&](int i) { return static_cast<double>(e.getDisplayGain(i)); }, at);
+        };
+        auto fine = make(1.0 / 24.0), wide = make(1.0);
+        const DetailRead f = detailThroughKey(*fine, hz, 1.0 / 24.0, drawn), w = detailThroughKey(*wide, hz, 1.0 / 12.0, drawn);
+        std::printf("  [detail] dynamic eq %5.0f Hz 1/24 oct: %.2f dB played, %.2f drawn; an octave wide on 1/12: %.2f, %.2f\n",
+                    hz, f.audio, f.drawn, w.audio, w.drawn);
+        EXPECT_GT(f.audio, 0.5 * 11.4);
+        EXPECT_NEAR(f.drawn, f.audio, 0.5);
+        EXPECT_LT(std::abs(w.audio), 2.0);
+    }
+}
+
+// Defect: the bank of bells had half an octave of width in the low end and
+// no detail over 500 Hz: a twelfth of an octave was nowhere in the audio,
+// and a sixth only from 100 to 500 Hz.
+DSPARK_TEST(TonalBalance_resolves_the_detail_at_every_frequency)
+{
+    using P = TonalBalance<float>;
+    for (const DetailCase c : kDetailCases)
+    {
+        auto p = std::make_unique<P>();
+        p->setFrequencyRange(20.0f, 20000.0f);
+        p->setBalance(0.0f);
+        p->setFillDips(1.0f);
+        p->setTrimPeaks(1.0f);
+        p->setRange(12.0f);
+        p->setContrastKnee(0.1f);
+        p->setKnee(0.1f);
+        p->setDetail(static_cast<float>(c.octaves));
+        const auto drawn = [](const P& e, double hz) {
+            return detailDrawn(P::kDisplayPoints, [&](int i) { return static_cast<double>(e.getDisplayCorrection(i)); }, hz);
+        };
+        const DetailRead r = detailThroughKey(*p, c.hz, c.octaves, drawn);
+        std::printf("  [detail] tonal balance %5.0f Hz 1/%.0f oct: %.2f dB played, %.2f drawn\n", c.hz, 1.0 / c.octaves, r.audio, r.drawn);
+        EXPECT_GT(r.audio, 0.7 * 11.4);
+        EXPECT_NEAR(r.drawn, r.audio, 0.5);
+    }
+    // A 24th from 200 Hz, and the detail an octave wide: one broad shape.
+    for (const double hz : { 200.0, 500.0, 1000.0, 2000.0, 4000.0, 10000.0 })
+    {
+        const auto make = [](double detail) {
+            auto p = std::make_unique<P>();
+            p->setFrequencyRange(20.0f, 20000.0f);
+            p->setBalance(0.0f);
+            p->setFillDips(1.0f);
+            p->setTrimPeaks(1.0f);
+            p->setRange(12.0f);
+            p->setContrastKnee(0.1f);
+            p->setKnee(0.1f);
+            p->setDetail(static_cast<float>(detail));
+            return p;
+        };
+        const auto drawn = [](const P& e, double at) {
+            return detailDrawn(P::kDisplayPoints, [&](int i) { return static_cast<double>(e.getDisplayCorrection(i)); }, at);
+        };
+        auto fine = make(1.0 / 24.0), wide = make(1.0);
+        const DetailRead f = detailThroughKey(*fine, hz, 1.0 / 24.0, drawn), w = detailThroughKey(*wide, hz, 1.0 / 12.0, drawn);
+        std::printf("  [detail] tonal balance %5.0f Hz 1/24 oct: %.2f dB played, %.2f drawn; an octave wide on 1/12: %.2f, %.2f\n",
+                    hz, f.audio, f.drawn, w.audio, w.drawn);
+        EXPECT_GT(f.audio, 0.5 * 11.4);
+        EXPECT_NEAR(f.drawn, f.audio, 0.5);
+        EXPECT_LT(std::abs(w.audio), 2.0);
+    }
+}
+
+// Defect: with a fine detail the space between the partials of a note read
+// as a dip and was raised with the noise in it. What is narrower than a
+// sixth of an octave between two partials is not a hole in the tone.
+DSPARK_TEST(TonalBalance_does_not_raise_the_space_between_partials)
+{
+    using P = TonalBalance<float>;
+    const size_t n = 48000 * 6;
+    std::vector<float> l = detailNoise(n, 0.004, 23u);
+    for (int k = 1; k <= 40; ++k)
+        for (size_t i = 0; i < n; ++i)
+            l[i] += static_cast<float>(0.05 / std::sqrt(static_cast<double>(k))
+                                       * std::sin(2.0 * kDetailPi * 110.0 * k * static_cast<double>(i) / 48000.0 + 0.4 * k * k));
+    for (const float detail : { 1.0f / 24.0f, 1.0f / 12.0f })
+    {
+        auto p = std::make_unique<P>();
+        p->setBalance(0.0f);
+        p->setFillDips(1.0f);
+        p->setTrimPeaks(0.0f);
+        p->setRange(12.0f);
+        p->setDetail(detail);
+        p->prepare(spec(48000.0, 512, 1));
+        std::vector<float> x = l;
+        for (size_t off = 0; off + 512 <= n; off += 512)
+        {
+            float* ch[1] = { x.data() + off };
+            p->processBlock(AudioBufferView<float>(ch, 1, 512));
+        }
+        double worst = 0.0;
+        for (int k = 10; k < 36; ++k) worst = std::max(worst, p->getResponse(110.0 * (k + 0.5)));
+        std::printf("  [tb partials] detail %.3f: the space between partials raised %.2f dB at most\n", static_cast<double>(detail), worst);
+        EXPECT_LT(worst, 1.0);
+    }
+}
+
+// Defect: the search for the offset that keeps the loudness stopped where a
+// step had left every band at the range (no slope there), and kept it: on
+// low hits between silences the whole curve jumped to +6 dB and the loudness
+// it keeps was 1.15 dB up.
+DSPARK_TEST(TonalBalance_keeps_the_loudness_of_hits_between_silences)
+{
+    using P = TonalBalance<float>;
+    const size_t n = 48000 * 8;
+    const std::vector<float> noise = detailNoise(n, 1.0, 43u);
+    std::vector<float> in(n, 0.0f);
+    double low = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i % 24000) / 48000.0;
+        low += 0.012 * (noise[i] - low);
+        if (t < 0.3) in[i] = static_cast<float>(std::exp(-12.0 * t) * (0.3 * std::sin(2.0 * kDetailPi * 47.0 * t) + 0.5 * low));
+    }
+    for (const float detail : { 1.0f, 1.0f / 6.0f })
+    {
+        auto p = std::make_unique<P>();
+        p->setDetail(detail);
+        p->prepare(spec(48000.0, 256, 1));
+        std::vector<float> x = in;
+        double worst = 0.0;
+        for (size_t off = 0; off + 256 <= n; off += 256)
+        {
+            float* ch[1] = { x.data() + off };
+            p->processBlock(AudioBufferView<float>(ch, 1, 256));
+            if (off >= 48000) worst = std::max(worst, static_cast<double>(std::abs(p->getLoudnessChange())));
+        }
+        std::printf("  [tb hits] detail %.3f: the loudness moved %.4f dB at most\n", static_cast<double>(detail), worst);
+        EXPECT_LT(worst, 0.01);
+    }
+}
+
+namespace {
+
+struct DenoiseRead
+{
+    double gaps = 0.0, lines = 0.0, drawnGaps = 0.0;
+};
+
+// Noise learned for three seconds, then five lines twice `apart` octaves apart in it.
+DenoiseRead denoiseLines(float detail, double centre, double apart)
+{
+    using P = SpectralDenoiser<float>;
+    constexpr size_t look = 65536, learn = 48000 * 3;
+    const size_t at = learn + 48000, n = at + look + 4096;
+    auto p = std::make_unique<P>();
+    p->prepare(spec(48000.0, 512, 1));   // the detail moves after: the profile holds
+    std::vector<float> x = detailNoise(n, 0.004, 29u);
+    for (int j = -2; j <= 2; ++j)
+    {
+        const double hz = centre * std::pow(2.0, 2.0 * j * apart);
+        for (size_t i = learn; i < n; ++i)
+            x[i] += static_cast<float>(0.07 * std::sin(2.0 * kDetailPi * hz * static_cast<double>(i) / 48000.0 + 1.3 * j));
+    }
+    std::vector<float> y = x;
+    DenoiseRead r;
+    int drawings = 0;
+    for (size_t off = 0; off + 512 <= n; off += 512)
+    {
+        p->setLearning(off < learn);
+        if (off >= learn) p->setDetail(detail);
+        float* ch[1] = { y.data() + off };
+        p->processBlock(AudioBufferView<float>(ch, 1, 512));
+        if (off < at || off >= at + look) continue;
+        ++drawings;
+        for (const double s : { -1.0, 1.0 })
+            r.drawnGaps += 0.5 * detailDrawn(P::kDisplayPoints, [&](int i) { return static_cast<double>(p->getDisplayGain(i)); },
+                                             centre * std::pow(2.0, s * apart));
+    }
+    r.drawnGaps /= std::max(1, drawings);
+    FFTReal<double> fft(look);
+    std::vector<double> t(look), in(look + 2), out(look + 2);
+    for (int side = 0; side < 2; ++side)
+    {
+        for (size_t i = 0; i < look; ++i)
+        {
+            // Blackman-Harris: no line leaks into a gap.
+            const double a = 2.0 * kDetailPi * static_cast<double>(i) / static_cast<double>(look);
+            const double w = 0.35875 - 0.48829 * std::cos(a) + 0.14128 * std::cos(2.0 * a) - 0.01168 * std::cos(3.0 * a);
+            t[i] = w * static_cast<double>(side ? y[at + static_cast<size_t>(p->getLatency()) + i] : x[at + i]);
+        }
+        fft.forward(t.data(), side ? out.data() : in.data());
+    }
+    const auto gain = [&](double hz, int half) {
+        const int middle = static_cast<int>(std::lround(hz * static_cast<double>(look) / 48000.0));
+        double a = 0.0, b = 0.0;
+        for (int k = middle - half; k <= middle + half; ++k)
+        {
+            const auto u = static_cast<size_t>(2 * k);
+            a += in[u] * in[u] + in[u + 1] * in[u + 1];
+            b += out[u] * out[u] + out[u + 1] * out[u + 1];
+        }
+        return 10.0 * std::log10(b / a);
+    };
+    r.lines = (gain(centre * std::pow(2.0, -2.0 * apart), 5) + gain(centre, 5) + gain(centre * std::pow(2.0, 2.0 * apart), 5)) / 3.0;
+    r.gaps = 0.5 * (gain(centre * std::pow(2.0, -apart), 20) + gain(centre * std::pow(2.0, apart), 20));
+    return r;
+}
+
+} // namespace
+
+// Defect: the smoothing was in bins and over the gains, so it took up to
+// 2.6 dB off the lines and left the noise in the gaps. The detail is the
+// band, in octaves, both are read in: what stands in the noise stays whole,
+// and a detail wider than the gaps leaves what lies in them alone.
+DSPARK_TEST(SpectralDenoiser_detail_is_a_band_in_octaves)
+{
+    EXPECT_EQ(SpectralDenoiser<float>().getDetail(), 0.0f);
+    struct Case { double hz, apart; float detail; };
+    for (const Case c : { Case { 4000.0, 1.0 / 6, 0.0f }, Case { 4000.0, 1.0 / 6, 1.0f / 6 }, Case { 10000.0, 1.0 / 12, 1.0f / 12 },
+                          Case { 10000.0, 1.0 / 24, 0.0f }, Case { 10000.0, 1.0 / 24, 1.0f / 24 } })
+    {
+        const DenoiseRead r = denoiseLines(c.detail, c.hz, c.apart);
+        std::printf("  [detail] denoiser %5.0f Hz 1/%.0f oct at detail %.3f: gaps %.2f dB (drawn %.2f), lines %.2f\n",
+                    c.hz, 1.0 / c.apart, static_cast<double>(c.detail), r.gaps, r.drawnGaps, r.lines);
+        EXPECT_LT(r.gaps, -0.7 * 18.0);
+        EXPECT_GT(r.lines, -0.1);
+        // At a 24th the lines stand twelve bins from the gap and their moving
+        // gains leave products there, which a gain curve does not show.
+        if (c.apart > 1.0 / 20) EXPECT_NEAR(r.drawnGaps, r.gaps, 0.5);
+    }
+    const DenoiseRead wide = denoiseLines(1.0f, 10000.0, 1.0 / 24);
+    std::printf("  [detail] denoiser an octave wide on 1/24: gaps %.2f dB, lines %.2f\n", wide.gaps, wide.lines);
+    EXPECT_GT(wide.gaps, -2.0);
+    EXPECT_GT(wide.lines, -0.1);
+
+    SpectralDenoiser<float> d;
+    StateWriter sharp(stateId("DNSE"), 1);
+    sharp.write("smoothing", 0.0f);
+    d.setDetail(0.5f);
+    EXPECT_TRUE(d.setState(sharp.blob().data(), sharp.blob().size()));
+    EXPECT_EQ(d.getDetail(), 0.0f);
+    StateWriter smooth(stateId("DNSE"), 1);
+    smooth.write("smoothing", 0.7f);
+    EXPECT_TRUE(d.setState(smooth.blob().data(), smooth.blob().size()));
+    EXPECT_NEAR(d.getDetail(), 0.398f, 0.005f);   // 320 Hz at 1 kHz
+}
+
+// Defect: with a transform longer than the rate's own the frames stayed a
+// quarter of it apart, and gains that differ from bin to bin left images of
+// the lines between the lines: at 8192 the gap between two lines a sixth of
+// an octave apart at 400 Hz came out 9.1 dB over the noise that went in.
+DSPARK_TEST(SpectralDenoiser_long_transform_adds_no_images_between_held_lines)
+{
+    constexpr size_t learn = 48000 * 6, n = learn + 48000 * 10, window = 48000 * 8;
+    constexpr double twoPi = 6.283185307179586476925, at = 400.0;
+    std::vector<float> noise(n);
+    uint32_t seed = 7u;
+    for (auto& v : noise)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        v = static_cast<float>(0.01 * static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0);
+    }
+    std::vector<float> x = noise;
+    const double low = at * std::exp2(-1.0 / 12.0), high = at * std::exp2(1.0 / 12.0);
+    for (size_t i = learn; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        x[i] += static_cast<float>(0.1 * std::sin(twoPi * low * t) + 0.1 * std::sin(twoPi * high * t));
+    }
+    auto p = std::make_unique<SpectralDenoiser<float>>();
+    p->prepare(spec(48000.0, 512, 1), 8192);
+    p->setLearning(true);
+    for (size_t off = 0; off < n; off += 512)
+    {
+        if (off >= learn - 512 && off < learn) p->setLearning(false);
+        float* ch[1] = { x.data() + off };
+        p->processBlock(AudioBufferView<float>(ch, 1, static_cast<int>(std::min<size_t>(512, n - off))));
+    }
+    // The power within half a hertz of the middle of the gap.
+    const auto around = [&](const std::vector<float>& y) {
+        const size_t from = n - window;
+        double sum = 0.0;
+        for (int k = -4; k <= 4; ++k)
+        {
+            const double w = twoPi * (at + k / 8.0) / 48000.0;
+            double re = 0.0, im = 0.0;
+            for (size_t i = 0; i < window; ++i)
+            {
+                const double h = 0.5 - 0.5 * std::cos(twoPi * static_cast<double>(i) / static_cast<double>(window));
+                re += h * static_cast<double>(y[from + i]) * std::cos(w * static_cast<double>(i));
+                im += h * static_cast<double>(y[from + i]) * std::sin(w * static_cast<double>(i));
+            }
+            sum += re * re + im * im;
+        }
+        return sum;
+    };
+    const double left = 10.0 * std::log10(around(x) / around(noise));
+    std::printf("  [denoiser] 8192, the gap between two lines at 400 Hz: %+.2f dB against the noise that went in\n", left);
+    EXPECT_LT(left, 0.5);
+}
+
+// Defect: the filter mode turned the phase of what it kept with every gain
+// that moved: a steady line at 50 Hz came out with products at -26 dBc (the
+// default path -59), programmes 7 dB further from the clean one and their
+// attacks softer. It is the default path, and what is spread ahead of an
+// attack stays within one short frame.
+DSPARK_TEST(SpectralDenoiser_filter_mode_is_as_clean_and_spreads_within_a_short_frame)
+{
+    const size_t learn = 48000 * 3, n = learn + 48000 * 4;
+    struct Out { std::vector<float> y; size_t late = 0; };
+    const auto render = [&](const std::vector<float>& x, bool filter, int block) {
+        auto d = std::make_unique<SpectralDenoiser<float>>();
+        d->setFilterMode(filter);
+        d->prepare(spec(48000.0, block, 1));
+        Out o;
+        o.y = x;
+        o.late = static_cast<size_t>(d->getLatency());
+        for (size_t off = 0; off < x.size();)
+        {
+            // Learning ends at the same sample whatever the blocks.
+            const size_t until = off < learn ? learn : x.size(), count = std::min(static_cast<size_t>(block), until - off);
+            d->setLearning(off < learn);
+            float* ch[1] = { o.y.data() + off };
+            d->processBlock(AudioBufferView<float>(ch, 1, static_cast<int>(count)));
+            off += count;
+        }
+        return o;
+    };
+    // How far the output is from the clean programme, over some stretches.
+    const auto error = [&](const Out& o, const std::vector<float>& clean, const std::vector<std::pair<size_t, size_t>>& where) {
+        double e = 0.0, c = 0.0;
+        for (const auto& w : where)
+            for (size_t i = w.first; i < w.second; ++i)
+            {
+                const double d = static_cast<double>(o.y[i + o.late]) - clean[i];
+                e += d * d;
+                c += static_cast<double>(clean[i]) * clean[i];
+            }
+        return 10.0 * std::log10(e / c);
+    };
+    const std::vector<float> bed = detailNoise(n, 0.004, 13u);
+
+    // Held lines, in the low end and at 1 kHz.
+    for (const int kind : { 0, 1, 2 })
+    {
+        std::vector<float> clean(n, 0.0f);
+        for (size_t i = learn; i < n; ++i)
+        {
+            const double t = static_cast<double>(i) / 48000.0;
+            double v = 0.0;
+            if (kind == 0) v = std::sin(2.0 * kDetailPi * 50.0 * t);
+            else
+                for (int j = -2; j <= 2; ++j)
+                    v += std::sin(2.0 * kDetailPi * (kind == 1 ? 50.0 : 1000.0) * std::exp2(j / 3.0) * t + 1.3 * j);
+            clean[i] = static_cast<float>(0.07 * v);
+        }
+        std::vector<float> x = bed;
+        for (size_t i = 0; i < n; ++i) x[i] += clean[i];
+        const std::vector<std::pair<size_t, size_t>> held { { learn + 48000, n - 8192 } };
+        const double plain = error(render(x, false, 512), clean, held), filtered = error(render(x, true, 512), clean, held);
+        std::printf("  [denoiser] held lines, kind %d: the error %.2f dB, %.2f in filter mode\n", kind, plain, filtered);
+        EXPECT_LT(filtered, plain + 0.5);
+    }
+
+    // Hits in the noise: the first 20 ms of each.
+    {
+        std::vector<float> clean(n, 0.0f);
+        const std::vector<float> grain = detailNoise(n, 0.2, 91u);
+        std::vector<std::pair<size_t, size_t>> starts;
+        for (size_t at = learn + 12000; at + 24000 < n; at += 24000)
+        {
+            for (size_t i = 0; i < 9600; ++i) clean[at + i] = static_cast<float>(grain[at + i] * std::exp(-static_cast<double>(i) / 1400.0));
+            starts.emplace_back(at, at + 960);
+        }
+        std::vector<float> x = bed;
+        for (size_t i = 0; i < n; ++i) x[i] += clean[i];
+        const double plain = error(render(x, false, 512), clean, starts), filtered = error(render(x, true, 512), clean, starts);
+        std::printf("  [denoiser] attacks: the error %.2f dB, %.2f in filter mode\n", plain, filtered);
+        EXPECT_LT(filtered, plain + 0.05);
+        // And the output does not hang on the blocks.
+        const Out whole = render(x, true, 512), cut = render(x, true, 37);
+        size_t differing = 0;
+        for (size_t i = 0; i < n; ++i) differing += whole.y[i] != cut.y[i] ? 1u : 0u;
+        EXPECT_EQ(differing, static_cast<size_t>(0));
+    }
+
+    // After learning, hits out of digital silence: what comes before them.
+    {
+        std::vector<float> x(n, 0.0f);
+        std::copy(bed.begin(), bed.begin() + static_cast<std::ptrdiff_t>(learn), x.begin());
+        for (size_t at = learn + 24000, hit = 0; at + 12000 < n; at += 24000, ++hit)
+        {
+            const double hz[] = { 220.0, 1000.0, 5000.0 };
+            for (size_t i = 0; i < 4800; ++i)
+                x[at + i] = static_cast<float>(0.1 * std::exp(-static_cast<double>(i) / 1500.0)
+                                               * std::sin(2.0 * kDetailPi * hz[hit % 3] * static_cast<double>(i) / 48000.0 + 1.0));
+        }
+        const auto ahead = [&](const Out& o) {
+            double worst = -300.0;
+            for (size_t at = learn + 24000; at + 12000 < n; at += 24000)
+            {
+                double before = 0.0, hit = 0.0;
+                // From 6 ms ahead of it: a short frame is 5.3 ms.
+                for (size_t i = at - 2400; i < at - 288; ++i) before += static_cast<double>(o.y[i + o.late]) * o.y[i + o.late];
+                for (size_t i = at; i < at + 960; ++i) hit += static_cast<double>(o.y[i + o.late]) * o.y[i + o.late];
+                worst = std::max(worst, 10.0 * std::log10((before + 1e-30) / hit));
+            }
+            return worst;
+        };
+        const double plain = ahead(render(x, false, 512)), filtered = ahead(render(x, true, 512));
+        std::printf("  [denoiser] ahead of a hit: %.1f dB, %.1f in filter mode\n", plain, filtered);
+        EXPECT_LT(filtered, -90.0);
+    }
+}
+
+// Defect: the same window and kernel: in the low end a resonance could not be
+// told from the partials next to it (0.03 dB taken at 50 Hz, 0.13 at 100).
+// Of five lines the middle one stands 12 dB over the others: it is taken,
+// and the four that are like each other are not resonances and stay.
+DSPARK_TEST(ResonanceSuppressor_resolves_a_resonance_among_close_partials)
+{
+    using P = ResonanceSuppressor<float>;
+    for (const DetailCase c : kDetailCases)
+    {
+        auto p = std::make_unique<P>();
+        const DetailRead r = detailThroughKey(*p, c.hz, c.octaves, [](const P& e, double hz) {
+            return detailDrawn(P::kDisplayPoints, [&](int i) { return static_cast<double>(e.getDisplayReduction(0, i)); }, hz);
+        }, 4.0);
+        std::printf("  [detail] suppressor %5.0f Hz 1/%.0f oct: the resonance %.2f dB (drawn %.2f), the partials beside it %.2f\n",
+                    c.hz, 1.0 / c.octaves, r.middle, r.middleDrawn, r.beside);
+        EXPECT_LT(r.middle, -4.0);
+        EXPECT_GT(r.beside, -0.5);
+        EXPECT_NEAR(r.middleDrawn, r.middle, 0.5);
+    }
+}
+
+namespace {
+
+// A series of partials of a fundamental up to 12 kHz, its amplitudes given by a shape.
+template <class Shape>
+std::vector<float> detailSeries(size_t n, double fundamental, Shape&& shape)
+{
+    std::vector<float> x = detailNoise(n, 0.0005, 17u);
+    for (int k = 1; fundamental * k <= 12000.0; ++k)
+    {
+        const double hz = fundamental * k, amp = shape(k, hz);
+        for (size_t i = 0; i < n; ++i)
+            x[i] += static_cast<float>(amp * std::sin(2.0 * kDetailPi * hz * static_cast<double>(i) / 48000.0 + 1.7 * k * k));
+    }
+    return x;
+}
+
+// What an untouched suppressor does to each partial, in dB (whole cycles over the last second).
+std::vector<double> detailPartials(const std::vector<float>& in, double fundamental)
+{
+    auto rs = std::make_unique<ResonanceSuppressor<float>>();
+    rs->prepare(spec(48000.0, 256, 2));
+    const auto out = l13Run(*rs, in, in).first;
+    const size_t late = static_cast<size_t>(rs->getLatency()), len = 48000, from = in.size() - len;
+    std::vector<double> change;
+    for (int k = 1; fundamental * k <= 12000.0; ++k)
+        change.push_back(l13Line(out, fundamental * k, from, len) - l13Line(in, fundamental * k, from - late, len));
+    return change;
+}
+
+} // namespace
+
+// Defect: with nothing set every partial of any series was a resonance (five
+// equal lines lost 11.7 dB) and so was the grain of any noise.
+DSPARK_TEST(ResonanceSuppressor_leaves_what_is_not_a_resonance_alone)
+{
+    const size_t n = 48000 * 4;
+    const auto loss = [](const std::vector<float>& in) {
+        auto rs = std::make_unique<ResonanceSuppressor<float>>();
+        rs->prepare(spec(48000.0, 256, 2));
+        const auto out = l13Run(*rs, in, in).first;
+        const size_t late = static_cast<size_t>(rs->getLatency()), from = in.size() / 2;
+        return l13RmsDb(in, from - late, in.size() - late) - l13RmsDb(out, from, in.size());
+    };
+    const double white = loss(l13Noise(n, 0.2f, 21u)), pink = loss(l13Pinkish(n, 22u));
+    std::printf("  [default] white noise loses %.3f dB, pink %.3f\n", white, pink);
+    EXPECT_LT(white, 0.2);
+    EXPECT_LT(pink, 0.2);
+
+    const auto formant = [](double hz, double centre, double width) { return std::exp(-(hz - centre) * (hz - centre) / (width * width)); };
+    for (const double fundamental : { 55.0, 110.0, 440.0 })
+        for (const int kind : { 0, 1, 2 })
+        {
+            const std::vector<float> in = detailSeries(n, fundamental, [&](int k, double hz) {
+                if (kind == 0) return 0.004;                                  // all alike
+                if (kind == 1) return 0.1 / k;                                // a sawtooth
+                return (0.02 + 0.12 * formant(hz, 700.0, 250.0) + 0.06 * formant(hz, 1200.0, 300.0)
+                        + 0.03 * formant(hz, 2600.0, 500.0)) / std::sqrt(static_cast<double>(k));   // a vowel
+            });
+            double most = 0.0;
+            for (const double change : detailPartials(in, fundamental)) most = std::max(most, std::abs(change));
+            std::printf("  [default] series of %.0f Hz, kind %d: a partial moves %.2f dB at most\n", fundamental, kind, most);
+            EXPECT_LT(most, 0.5);
+        }
+
+    // A drum: bursts of noise that die in some tens of milliseconds, over a little pink.
+    std::vector<float> drum = l13Pinkish(n, 24u);
+    for (auto& s : drum) s *= 0.02f;
+    const std::vector<float> grain = l13Noise(n, 0.5f, 25u);
+    for (size_t i = 0; i < n; ++i) drum[i] += static_cast<float>(grain[i] * std::exp(-static_cast<double>(i % 24000) / 1400.0));
+    auto rs = std::make_unique<ResonanceSuppressor<float>>();
+    rs->prepare(spec(48000.0, 256, 2));
+    const auto out = l13Run(*rs, drum, drum).first;
+    const size_t late = static_cast<size_t>(rs->getLatency()), hit = 24000 * 6;
+    const double attack = l13RmsDb(drum, hit, hit + 480) - l13RmsDb(out, hit + late, hit + late + 480);
+    std::printf("  [default] the first 10 ms of a drum lose %.2f dB\n", attack);
+    EXPECT_LT(attack, 0.5);
+}
+
+// The other side of the same defaults: what does stand out is still taken.
+DSPARK_TEST(ResonanceSuppressor_takes_the_partial_that_stands_out)
+{
+    const size_t n = 48000 * 4;
+    for (const double fundamental : { 110.0, 440.0 })
+    {
+        const int loud = 8;
+        const std::vector<float> in = detailSeries(n, fundamental, [&](int k, double) { return k == loud ? 0.02 : 0.004; });
+        const std::vector<double> change = detailPartials(in, fundamental);
+        double others = 0.0;
+        for (size_t i = 0; i < change.size(); ++i)
+            if (static_cast<int>(i) + 1 != loud) others = std::max(others, std::abs(change[i]));
+        const double taken = change[static_cast<size_t>(loud - 1)];
+        std::printf("  [default] series of %.0f Hz: the partial 14 dB over moves %.2f dB, the others %.2f at most\n", fundamental, taken, others);
+        EXPECT_LT(taken, -4.0);
+        EXPECT_LT(others, 0.5);
+    }
+}
+
+// Defect (the same defaults): the fundamental of a note, louder than its
+// harmonics and with nothing under it, was cut like a resonance.
+DSPARK_TEST(ResonanceSuppressor_leaves_the_fundamental_of_a_note)
+{
+    for (const double fundamental : { 55.0, 98.0, 220.0, 660.0 })
+    {
+        const std::vector<float> note = detailSeries(48000 * 4, fundamental, [](int k, double) {
+            return k == 1 ? 0.2 : 0.04 / static_cast<double>((k - 1) * (k - 1));
+        });
+        const double change = detailPartials(note, fundamental).front();
+        std::printf("  [default] a note of %.0f Hz, its fundamental 14 dB over the next: %.2f dB\n", fundamental, change);
+        EXPECT_GT(change, -0.5);
+    }
+}
+
+// Defect: the loss was in the low end, and the plan's partial is 10 dB over
+// its series: that is taken by 4 dB with nothing set, and the detail wide
+// open no longer tells it from the series.
+DSPARK_TEST(ResonanceSuppressor_detail_rules_what_is_found)
+{
+    const std::vector<float> in = detailSeries(48000 * 4, 110.0, [](int k, double) { return k == 8 ? 0.01265 : 0.004; });
+    const auto moved = [&](float detail) {
+        auto rs = std::make_unique<ResonanceSuppressor<float>>();
+        rs->setDetail(detail);
+        rs->prepare(spec(48000.0, 256, 2));
+        const auto out = l13Run(*rs, in, in).first;
+        const size_t late = static_cast<size_t>(rs->getLatency()), from = in.size() - 48000;
+        return l13Line(out, 880.0, from, 48000) - l13Line(in, 880.0, from - late, 48000);
+    };
+    const double fine = moved(1.0f / 24.0f), normal = moved(1.0f / 12.0f), wide = moved(1.0f);
+    std::printf("  [detail] the partial 10 dB over its series: %.2f dB at 1/24, %.2f at 1/12, %.2f an octave wide\n", fine, normal, wide);
+    EXPECT_LT(fine, -3.9);
+    EXPECT_LT(normal, -3.9);
+    EXPECT_GT(wide, -1.0);
+}
+
+// Defect: Deep took less than Smooth where it mattered. It is the finer and
+// the stronger of the two, over the whole band: whatever Smooth takes it
+// takes at least as deep (half as deep again), in half the width, and of
+// two resonances closer than the detail it takes both.
+DSPARK_TEST(ResonanceSuppressor_deep_is_finer_and_stronger)
+{
+    using P = ResonanceSuppressor<float>;
+    const size_t n = 48000 * 6, len = 96000, from = 144000;
+    struct Found { double change = 0.0; int width = 0; };
+    const auto taken = [&](const std::vector<float>& in, double hz, bool deep) {
+        auto p = std::make_unique<P>();
+        if (deep) p->setMode(P::Mode::Deep);
+        p->prepare(spec(48000.0, 512, 2));
+        const std::vector<float> out = l13Run(*p, in, in).first;
+        const size_t late = static_cast<size_t>(p->getLatency());
+        Found r;
+        r.change = l13Line(out, hz, from, len) - l13Line(in, hz, from - late, len);
+        const int centre = static_cast<int>(std::lround((P::kDisplayPoints - 1) * std::log(hz / 20.0) / std::log(1000.0)));
+        double most = 0.0;
+        for (int i = centre - 4; i <= centre + 4; ++i) most = std::min(most, static_cast<double>(p->getDisplayReduction(0, i)));
+        for (int i = std::max(0, centre - 80); i <= std::min(P::kDisplayPoints - 1, centre + 80); ++i)
+            if (p->getDisplayReduction(0, i) < 0.5 * most) ++r.width;
+        return r;
+    };
+
+    // A line alone in a noise, from the low end to the top.
+    const std::vector<float> bed = detailNoise(n, 0.02, 51u);
+    for (const double hz : { 60.0, 90.0, 120.0, 150.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0, 8000.0, 12000.0 })
+    {
+        const std::vector<float> in = l13Add(bed, hz, 0.2);
+        const Found smooth = taken(in, hz, false), deep = taken(in, hz, true);
+        std::printf("  [deep] a line at %.0f Hz: %.2f dB, %.2f in Deep; %d points wide, %d in Deep\n", hz, smooth.change, deep.change, smooth.width, deep.width);
+        EXPECT_LT(deep.change, smooth.change + 0.05);
+        if (smooth.change < -2.0) EXPECT_LT(deep.change, 1.3 * smooth.change);
+        if (hz >= 500.0) EXPECT_LT(deep.width, 0.8 * smooth.width);
+    }
+
+    // The partial that stands out of its series.
+    for (const double fundamental : { 110.0, 440.0 })
+    {
+        const std::vector<float> in = detailSeries(n, fundamental, [](int k, double) { return k == 8 ? 0.02 : 0.004; });
+        const double smooth = taken(in, 8.0 * fundamental, false).change, deep = taken(in, 8.0 * fundamental, true).change;
+        std::printf("  [deep] the partial that stands out, %.0f Hz: %.2f dB, %.2f in Deep\n", 8.0 * fundamental, smooth, deep);
+        EXPECT_LT(deep, 1.3 * smooth);
+    }
+
+    // A resonance of the low end over a bass note.
+    {
+        const std::vector<float> in = l13Add(detailSeries(n, 55.0, [](int k, double) { return k <= 8 ? 0.2 * std::pow(static_cast<double>(k), -1.5) : 0.0; }), 120.0, 0.7);
+        const double smooth = taken(in, 120.0, false).change, deep = taken(in, 120.0, true).change;
+        std::printf("  [deep] a resonance at 120 Hz over a bass note: %.2f dB, %.2f in Deep\n", smooth, deep);
+        EXPECT_LT(deep, 1.3 * smooth);
+    }
+
+    // What rings and dies, struck once a second.
+    for (const double hz : { 150.0, 600.0, 3000.0 })
+    {
+        std::vector<float> in = bed;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double since = static_cast<double>(i % 48000) / 48000.0;
+            in[i] += static_cast<float>(0.4 * std::exp(-since / 0.3) * std::sin(2.0 * kDetailPi * hz * static_cast<double>(i) / 48000.0));
+        }
+        const double smooth = taken(in, hz, false).change, deep = taken(in, hz, true).change;
+        std::printf("  [deep] a ring at %.0f Hz: %.2f dB, %.2f in Deep\n", hz, smooth, deep);
+        EXPECT_LT(deep, smooth + 0.05);
+    }
+
+    // Two resonances a sixteenth of an octave apart, the detail being a twelfth.
+    for (const double hz : { 1000.0, 4000.0 })
+    {
+        const double beside = hz * std::exp2(1.0 / 16.0);
+        const std::vector<float> in = l13Add(l13Add(bed, hz, 0.2), beside, 0.17);
+        const double first = taken(in, hz, true).change, second = taken(in, beside, true).change;
+        std::printf("  [deep] two resonances at %.0f and %.0f Hz: %.2f and %.2f dB in Deep\n", hz, beside, first, second);
+        EXPECT_LT(first, -6.0);
+        EXPECT_LT(second, -6.0);
+    }
+}
+
+// Defect: a sub bass, one sine with no harmonic and the loudest of the
+// programme, lost 5.3 dB on average in a recording. What carries the
+// programme from under everything else is a note and no resonance, in
+// either mode; who wants it taken opens the guard.
+DSPARK_TEST(ResonanceSuppressor_leaves_the_sub_that_carries_the_programme)
+{
+    using P = ResonanceSuppressor<float>;
+    const size_t n = 48000 * 6;
+    std::vector<float> in = detailNoise(n, 0.002, 37u);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        in[i] += static_cast<float>(0.3 * std::sin(2.0 * kDetailPi * 55.0 * t));
+        for (int k = 1; k <= 5; ++k)
+            in[i] += static_cast<float>(0.02 / k * std::sin(2.0 * kDetailPi * 440.0 * k * t));
+    }
+    for (const int kind : { 0, 1, 2 })
+    {
+        auto p = std::make_unique<P>();
+        if (kind == 1) p->setMode(P::Mode::Deep);
+        if (kind == 2) p->setFoundationGuard(0.0f);
+        p->prepare(spec(48000.0, 512, 1));
+        std::vector<float> out = in;
+        for (size_t off = 0; off + 512 <= n; off += 512)
+        {
+            float* ch[1] = { out.data() + off };
+            p->processBlock(AudioBufferView<float>(ch, 1, 512));
+        }
+        const auto level = [&](const std::vector<float>& x, size_t from) {
+            double s = 0.0, c = 0.0;
+            for (size_t i = 0; i < 96000; ++i)
+            {
+                const double w = 2.0 * kDetailPi * 55.0 * static_cast<double>(i) / 48000.0;
+                s += x[from + i] * std::sin(w);
+                c += x[from + i] * std::cos(w);
+            }
+            return 10.0 * std::log10(s * s + c * c);
+        };
+        const double cut = level(out, 144000) - level(in, 144000 - static_cast<size_t>(p->getLatency()));
+        std::printf("  [sub] %s: %.2f dB at 55 Hz\n", kind == 0 ? "as it comes" : (kind == 1 ? "Deep" : "with the guard open"), cut);
+        if (kind == 2) EXPECT_LT(cut, -4.0);
+        else EXPECT_GT(cut, -0.5);
+    }
+}
+
+// The guard of the sub is a setting like the others: whole by default, held
+// within 0 and 1, in the state, and not moved by what is not a number.
+DSPARK_TEST(ResonanceSuppressor_foundation_guard_is_in_the_state)
+{
+    ResonanceSuppressor<float> a, b;
+    EXPECT_EQ(a.getFoundationGuard(), 1.0f);
+    a.setFoundationGuard(0.35f);
+    a.setFoundationGuard(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(a.getFoundationGuard(), 0.35f);
+    const auto blob = a.getState();
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getFoundationGuard(), 0.35f);
+    a.setFoundationGuard(7.0f);
+    EXPECT_EQ(a.getFoundationGuard(), 1.0f);
+    a.setFoundationGuard(-7.0f);
+    EXPECT_EQ(a.getFoundationGuard(), 0.0f);
+}
+
+// And the other side of that rule: a resonance of the low end with the
+// programme under it is taken as it comes, the note under it left.
+DSPARK_TEST(ResonanceSuppressor_takes_a_low_resonance_over_a_bass_note)
+{
+    using P = ResonanceSuppressor<float>;
+    const size_t n = 48000 * 6;
+    std::vector<float> in = detailNoise(n, 0.002, 41u);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double t = static_cast<double>(i) / 48000.0;
+        for (int k = 1; k <= 8; ++k)
+            in[i] += static_cast<float>(0.2 * std::pow(static_cast<double>(k), -1.5) * std::sin(2.0 * kDetailPi * 55.0 * k * t + 0.4 * k * k));
+        // 11 dB over the note, and no harmonic of it on the note's own partials.
+        in[i] += static_cast<float>(0.7 * std::sin(2.0 * kDetailPi * 120.0 * t));
+    }
+    auto p = std::make_unique<P>();
+    p->prepare(spec(48000.0, 512, 1));
+    std::vector<float> out = in;
+    for (size_t off = 0; off + 512 <= n; off += 512)
+    {
+        float* ch[1] = { out.data() + off };
+        p->processBlock(AudioBufferView<float>(ch, 1, 512));
+    }
+    const auto change = [&](double hz) {
+        const auto power = [&](const std::vector<float>& x, size_t from) {
+            double s = 0.0, c = 0.0;
+            for (size_t i = 0; i < 96000; ++i)
+            {
+                const double w = 2.0 * kDetailPi * hz * static_cast<double>(i) / 48000.0;
+                s += x[from + i] * std::sin(w);
+                c += x[from + i] * std::cos(w);
+            }
+            return s * s + c * c;
+        };
+        return 10.0 * std::log10(power(out, 144000) / power(in, 144000 - static_cast<size_t>(p->getLatency())));
+    };
+    const double ring = change(120.0), note = change(55.0);
+    std::printf("  [sub] a resonance over a bass note: %.2f dB, the note %.2f\n", ring, note);
+    EXPECT_LT(ring, -4.0);
+    EXPECT_GT(note, -0.5);
+}
+
+// Defect (the same defaults): in a mix a bass shows one harmonic of its
+// several, and its fundamental was cut as a resonance.
+DSPARK_TEST(ResonanceSuppressor_leaves_a_bass_note_with_one_harmonic_showing)
+{
+    const size_t n = 48000 * 4;
+    const std::vector<float> bed = l13Pinkish(n, 41u);
+    for (const double fundamental : { 41.0, 55.0, 82.0 })
+        for (const int harmonic : { 2, 3 })
+        {
+            std::vector<float> in = detailSeries(n, fundamental, [&](int k, double) { return k == 1 ? 0.2 : (k == harmonic ? 0.035 : 0.0); });
+            for (size_t i = 0; i < n; ++i) in[i] += 0.01f * bed[i];
+            const double change = detailPartials(in, fundamental).front();
+            std::printf("  [default] a bass at %.0f Hz with only its harmonic %d: the fundamental %.2f dB\n", fundamental, harmonic, change);
+            EXPECT_GT(change, -0.5);
+        }
+}
+
+// The detail replaced the cells and the suppressor's scale moved: the states
+// saved by the first versions are converted, not misread.
+DSPARK_TEST(Spectral_first_states_are_converted)
+{
+    {
+        StateWriter w(stateId("RSUP"), 1);
+        w.write("threshold", 3.0f);
+        w.write("strength", 0.7f);
+        w.write("range", 12.0f);
+        const auto blob = w.blob();
+        ResonanceSuppressor<float> rs;
+        EXPECT_TRUE(rs.setState(blob.data(), blob.size()));
+        EXPECT_NEAR(rs.getThreshold(), 5.0f, 1e-5f);
+        EXPECT_NEAR(rs.getStrength(), 1.0f, 1e-5f);
+        EXPECT_NEAR(rs.getRange(), 12.0f, 1e-5f);
+        EXPECT_NEAR(rs.getDetail(), 1.0f / 12.0f, 1e-5f);
+        EXPECT_EQ(rs.getPersistence(), 0.0f);
+    }
+    const auto detailOf = [](float q, int cells) {
+        StateWriter w(stateId("SDEQ"), 1);
+        w.write("b0.shape", static_cast<int32_t>(1));
+        w.write("b0.q", q);
+        w.write("b0.cells", static_cast<int32_t>(cells));
+        const auto blob = w.blob();
+        SpectralDynamicEQ<float> eq;
+        return eq.setState(blob.data(), blob.size()) ? eq.getDetail() : -1.0f;
+    };
+    EXPECT_NEAR(detailOf(1.0f, 32), 1.0f / 12.0f, 0.006f);
+    EXPECT_NEAR(detailOf(1.0f, 128), 1.0f / 24.0f, 1e-5f);
+    EXPECT_EQ(detailOf(0.3f, 1), 1.0f);
 }

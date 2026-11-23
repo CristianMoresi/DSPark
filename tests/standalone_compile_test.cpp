@@ -48,6 +48,8 @@ void instantiate()
     [[maybe_unused]] AuditoryBands<T> auditoryBands;
     [[maybe_unused]] SpectralEnvelope<T> spectralEnvelope;
     [[maybe_unused]] SpectralFilter<T> spectralFilter;
+    [[maybe_unused]] DetailAnalysis<T> detailAnalysis;
+    [[maybe_unused]] DetailFilter<T> detailFilter;
     [[maybe_unused]] LaneCascade<T, 8> laneCascade;
     [[maybe_unused]] GraphicBank<T, 8> graphicBank;
     [[maybe_unused]] CabinetModel<T> cabinetModel;

@@ -12,6 +12,8 @@
 #include "../Core/Resampler.h"
 #include "../Core/AuditoryBands.h"
 #include "../Core/SpectralEnvelope.h"
+#include "../Core/DetailAnalysis.h"
+#include "../Core/DetailFilter.h"
 #include "../Core/SpectralFilter.h"
 
 #include <algorithm>
@@ -3045,8 +3047,8 @@ DSPARK_TEST(SpectralFilter_delay_scale_minimum_phase_removal_and_key)
 
 // New: the readout of a per-bin curve. A notch one bin wide shows at the
 // point that covers it, its sign kept; the points span 20 Hz to 20 kHz; a
-// point narrower than a bin takes the nearest bin; a frame of the wrong
-// size or channel changes nothing.
+// point with no bin in it reads between the two around it; a frame of the
+// wrong size or channel changes nothing.
 DSPARK_TEST(SpectralReadout_keeps_the_largest_magnitude_between_points)
 {
     using R = SpectralReadout<float>;
@@ -3389,4 +3391,566 @@ DSPARK_TEST(AuditoryBands_detailed_layout_and_a_second_spectrum)
     // The total loudness is the integral over Bark whatever the layout.
     std::vector<double> flat(static_cast<size_t>(fine.getNumBands()), 2.0), flatPlain(72, 2.0);
     EXPECT_NEAR(fine.totalLoudness(flat.data()), plain.totalLoudness(flatPlain.data()), 1e-9);
+}
+
+// Defect: where no bin fell between two points of the display the nearest
+// one was held, so the low end was drawn as a staircase; and 128 points
+// cannot draw a twelfth of an octave.
+DSPARK_TEST(SpectralReadout_draws_between_bins_without_steps)
+{
+    using R = SpectralReadout<float>;
+    auto r = std::make_unique<R>();
+    const double binHz = 48000.0 / 4096.0;
+    const int bins = 2049;
+    r->prepare(binHz, bins);
+    std::vector<double> ramp(static_cast<size_t>(bins));
+    for (int k = 0; k < bins; ++k) ramp[static_cast<size_t>(k)] = 0.01 * static_cast<double>(k) * binHz;
+    r->publish(0, ramp.data(), bins);
+    int repeated = 0;
+    double worst = 0.0;
+    for (int i = 0; i < R::kPoints; ++i)
+    {
+        const double hz = R::frequency(i);
+        if (hz > 200.0) break;
+        if (i > 0 && r->value(0, i) == r->value(0, i - 1)) ++repeated;
+        worst = std::max(worst, std::abs(static_cast<double>(r->value(0, i)) - 0.01 * hz));
+    }
+    const double pointsPerOctave = static_cast<double>(R::kPoints - 1) / std::log2(1000.0);
+    std::printf("  [readout] %d points repeat the one before under 200 Hz, %.3f off the curve, %.1f points an octave\n", repeated, worst, pointsPerOctave);
+    EXPECT_EQ(repeated, 0);
+    EXPECT_LT(worst, 0.02);
+    EXPECT_GT(pointsPerOctave, 96.0);
+}
+
+namespace {
+
+constexpr double kDfPi = 3.14159265358979323846;
+
+template <class Curve>
+std::vector<float> dfRun(DetailFilter<float>& f, std::vector<float> x, int block, Curve&& curve)
+{
+    for (size_t off = 0; off < x.size(); off += static_cast<size_t>(block))
+    {
+        float* ch[1] = { x.data() + off };
+        f.processBlock(AudioBufferView<float>(ch, 1, static_cast<int>(std::min(static_cast<size_t>(block), x.size() - off))),
+                       [&](int, float* db) noexcept { curve(db); });
+    }
+    return x;
+}
+
+std::vector<float> dfNoise(size_t n, uint32_t seed)
+{
+    std::vector<float> x(n);
+    for (auto& s : x)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        s = static_cast<float>(0.3 * static_cast<double>(static_cast<int32_t>(seed)) / 2147483648.0);
+    }
+    return x;
+}
+
+} // namespace
+
+// New: DetailFilter. A flat curve is the programme, late by the latency it
+// reports, at every rate; what it lets hear as removed is then silence, and
+// with a curve it is the programme less the output.
+DSPARK_TEST(DetailFilter_flat_curve_is_the_programme_late_by_its_latency)
+{
+    for (const double rate : { 8000.0, 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
+    {
+        auto f = std::make_unique<DetailFilter<float>>();
+        f->prepare(AudioSpec { rate, 256, 1 });
+        const int expected = rate > 176000.0 ? 8192 : (rate > 88000.0 ? 4096 : 2048);
+        EXPECT_EQ(f->getLatency(), expected);
+        const std::vector<float> in = dfNoise(40000, 3u);
+        const std::vector<float> out = dfRun(*f, in, 256, [](float* db) { std::fill_n(db, DetailFilter<float>::kPoints, 0.0f); });
+        double worst = 0.0;
+        const size_t late = static_cast<size_t>(f->getLatency());
+        for (size_t i = late; i < in.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(out[i]) - in[i - late]));
+        std::printf("  [detail filter] %.0f Hz: latency %d, a flat curve %.2e from the programme\n", rate, f->getLatency(), worst);
+        EXPECT_LT(worst, 2e-6);
+    }
+    const auto wavy = [](float* db) {
+        for (int i = 0; i < DetailFilter<float>::kPoints; ++i) db[i] = static_cast<float>(-6.0 + 6.0 * std::sin(0.07 * i));
+    };
+    const std::vector<float> in = dfNoise(48000, 5u);
+    auto a = std::make_unique<DetailFilter<float>>(), b = std::make_unique<DetailFilter<float>>();
+    b->setRemovalListen(true);
+    a->prepare(AudioSpec { 48000.0, 256, 1 });
+    b->prepare(AudioSpec { 48000.0, 256, 1 });
+    const std::vector<float> kept = dfRun(*a, in, 256, wavy), taken = dfRun(*b, in, 256, wavy);
+    double worst = 0.0;
+    for (size_t i = 2048; i < in.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(kept[i] + taken[i]) - in[i - 2048]));
+    EXPECT_LT(worst, 1e-5);
+}
+
+// DetailLatency::Block: at every rate a flat curve is the programme late by
+// getLatency(), kept and taken out add up to it, whatever the blocks.
+DSPARK_TEST(DetailFilter_by_the_block_is_exact_and_late_by_its_latency)
+{
+    using Filter = DetailFilter<float, DetailLatency::Block>;
+    const auto run = [](Filter& f, std::vector<float> x, int block, double depth) {
+        for (size_t off = 0; off < x.size(); off += static_cast<size_t>(block))
+        {
+            float* ch[1] = { x.data() + off };
+            const int count = static_cast<int>(std::min(x.size() - off, static_cast<size_t>(block)));
+            int hops = 0;
+            f.processBlock(AudioBufferView<float>(ch, 1, count), [&](int, float* db) {
+                ++hops;
+                for (int i = 0; i < Filter::kPoints; ++i) db[i] = static_cast<float>(depth * std::sin(0.07 * i));
+            });
+        }
+        return x;
+    };
+    for (const double rate : { 8000.0, 16000.0, 22050.0, 32000.0, 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0, 384000.0 })
+    {
+        auto f = std::make_unique<Filter>();
+        f->prepare(AudioSpec { rate, 256, 1 });
+        const std::vector<float> in = dfNoise(30000, 3u);
+        const auto late = static_cast<size_t>(f->getLatency());
+        const std::vector<float> flat = run(*f, in, 256, 0.0);
+        double worst = 0.0;
+        for (size_t i = late; i < in.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(flat[i]) - in[i - late]));
+        EXPECT_LT(worst, 2e-6);
+
+        auto kept = std::make_unique<Filter>(), taken = std::make_unique<Filter>(), small = std::make_unique<Filter>();
+        taken->setRemovalListen(true);
+        for (auto* p : { kept.get(), taken.get(), small.get() }) p->prepare(AudioSpec { rate, 256, 1 });
+        const std::vector<float> a = run(*kept, in, 256, 6.0), b = run(*taken, in, 256, 6.0), c = run(*small, in, 37, 6.0);
+        worst = 0.0;
+        for (size_t i = late; i < in.size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(a[i] + b[i]) - in[i - late]));
+        EXPECT_LT(worst, 1e-5);
+        EXPECT_TRUE(a == c);
+    }
+}
+
+// New: the output does not depend on how the stream is cut, with a curve on the move.
+DSPARK_TEST(DetailFilter_does_not_depend_on_the_block_size)
+{
+    const auto render = [](int block) {
+        auto f = std::make_unique<DetailFilter<float>>();
+        f->prepare(AudioSpec { 48000.0, 512, 1 });
+        int hop = 0;
+        return dfRun(*f, dfNoise(48000, 7u), block, [&hop](float* db) {
+            ++hop;
+            for (int i = 0; i < DetailFilter<float>::kPoints; ++i) db[i] = static_cast<float>(5.0 * std::sin(0.05 * i + 0.4 * hop));
+        });
+    };
+    const std::vector<float> whole = render(512);
+    EXPECT_TRUE(render(37) == whole);
+    EXPECT_TRUE(render(1) == whole);
+}
+
+// New: asked 12 dB between lines and the gaps next to them, the filter plays
+// a sixth of an octave from 50 Hz, a twelfth from 100 Hz and a 24th from 200 Hz.
+DSPARK_TEST(DetailFilter_plays_the_detail_at_every_frequency)
+{
+    using F = DetailFilter<float>;
+    constexpr size_t look = 65536, at = 16384;
+    struct Case { double hz, parts, least; };
+    std::vector<Case> cases { { 50.0, 6.0, 0.7 } };
+    for (const double hz : { 100.0, 200.0, 350.0, 500.0, 700.0, 850.0, 1000.0, 1400.0, 4000.0, 10000.0 })
+    {
+        cases.push_back({ hz, 6.0, 0.7 });
+        cases.push_back({ hz, 12.0, 0.7 });
+        if (hz >= 200.0) cases.push_back({ hz, 24.0, 0.5 });
+    }
+    for (const Case& c : cases)
+    {
+        auto f = std::make_unique<F>();
+        f->prepare(AudioSpec { 48000.0, 512, 1 });
+        std::array<float, static_cast<size_t>(F::kPoints)> asked {};
+        for (int i = 0; i < F::kPoints; ++i)
+        {
+            const double away = std::log2(F::frequency(i) / c.hz) * c.parts;
+            if (std::abs(away) <= 5.0) asked[static_cast<size_t>(i)] = static_cast<float>(-6.0 - 6.0 * std::cos(kDfPi * away));
+        }
+        std::vector<float> impulse(at + look + 4096, 0.0f);
+        impulse[at] = 1.0f;
+        const std::vector<float> out = dfRun(*f, impulse, 512, [&](float* db) { std::copy(asked.begin(), asked.end(), db); });
+        FFTReal<double> fft(look);
+        std::vector<double> h(look), spectrum(look + 2);
+        for (size_t i = 0; i < look; ++i) h[i] = out[at + static_cast<size_t>(f->getLatency()) - 1024 + i];
+        fft.forward(h.data(), spectrum.data());
+        const auto played = [&](double steps) {
+            const double hz = c.hz * std::pow(2.0, steps / c.parts), bin = hz * static_cast<double>(look) / 48000.0;
+            const auto k = static_cast<size_t>(bin);
+            const auto level = [&](size_t n) {
+                return 10.0 * std::log10(spectrum[2 * n] * spectrum[2 * n] + spectrum[2 * n + 1] * spectrum[2 * n + 1] + 1e-30);
+            };
+            return level(k) + (bin - static_cast<double>(k)) * (level(k + 1) - level(k));
+        };
+        const double apart = 0.5 * (played(-1.0) + played(1.0)) - (played(-2.0) + played(0.0) + played(2.0)) / 3.0;
+        std::printf("  [detail filter] %5.0f Hz 1/%2.0f oct: plays %6.2f dB of 12\n", c.hz, c.parts, apart);
+        EXPECT_GT(apart, 12.0 * c.least);
+    }
+}
+
+// New: the low part leaves no images of the programme and no aliases of the
+// top, under cuts and boosts of everything it plays, and plays those levels.
+DSPARK_TEST(DetailFilter_low_part_leaves_no_images)
+{
+    using F = DetailFilter<float>;
+    for (const double amount : { -24.0, -12.0, 18.0 })
+        for (const double hz : { 100.0, 300.0, 700.0, 1200.0, 2000.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 4000.0, 5000.0, 5400.0, 5800.0, 11600.0 })
+        {
+            const auto asked = [amount](double at) { return amount * std::clamp(std::log2(900.0 / at), 0.0, 1.0); };
+            auto f = std::make_unique<F>();
+            f->prepare(AudioSpec { 48000.0, 512, 1 });
+            std::vector<float> x(72000);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(0.1 * std::sin(2.0 * kDfPi * hz * static_cast<double>(i) / 48000.0));
+            const std::vector<float> out = dfRun(*f, x, 512, [&](float* db) {
+                for (int i = 0; i < F::kPoints; ++i) db[i] = static_cast<float>(asked(F::frequency(i)));
+            });
+            const auto line = [&](double at) {
+                double re = 0.0, im = 0.0;
+                for (size_t i = out.size() - 24000; i < out.size(); ++i)
+                {
+                    re += out[i] * std::cos(2.0 * kDfPi * at * static_cast<double>(i) / 48000.0);
+                    im += out[i] * std::sin(2.0 * kDfPi * at * static_cast<double>(i) / 48000.0);
+                }
+                return 20.0 * std::log10(2.0 * std::sqrt(re * re + im * im) / 24000.0 / 0.1 + 1e-15);
+            };
+            double image = -300.0;
+            for (const double slow : { 6000.0, 12000.0, 18000.0 })
+                for (const double at : { std::abs(slow - hz), slow + hz })
+                    if (at > 20.0 && std::abs(at - hz) > 1.0) image = std::max(image, line(at));
+            const double error = line(hz) - asked(hz);
+            std::printf("  [detail filter] %+.0f dB below 900 at %5.0f Hz: off by %+.3f dB, images %.1f dBc\n", amount, hz, error, image);
+            EXPECT_NEAR(error, 0.0, hz < 1000.0 ? 0.5 : 0.1);
+            EXPECT_LT(image, -80.0);
+        }
+}
+
+// New: a move of the curve reaches the low and the high part at the same
+// instant of the programme, and the feed has given the whole hop by then.
+DSPARK_TEST(DetailFilter_moves_both_parts_at_once)
+{
+    using F = DetailFilter<float>;
+    const auto crossing = [](double hz) {
+        auto f = std::make_unique<F>();
+        f->prepare(AudioSpec { 48000.0, 512, 1 });
+        std::vector<float> x(96000);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>(std::sin(2.0 * kDfPi * hz * static_cast<double>(i) / 48000.0));
+        int given = 0;
+        bool whole = true;
+        for (size_t off = 0; off < x.size(); off += 375)
+        {
+            float* ch[1] = { x.data() + off };
+            f->processBlock(AudioBufferView<float>(ch, 1, 375),
+                            [&](int, int count) noexcept { given += count; },
+                            [&](int, float* db) noexcept {
+                                whole = whole && given % f->getHopSize() == 0;
+                                std::fill_n(db, F::kPoints, given > 48000 ? -12.0f : 0.0f);
+                            });
+        }
+        for (size_t at = 44000; at + 480 < x.size(); at += 8)
+        {
+            double re = 0.0, im = 0.0;
+            for (size_t i = at; i < at + 480; ++i)
+            {
+                re += x[i] * std::cos(2.0 * kDfPi * hz * static_cast<double>(i) / 48000.0);
+                im += x[i] * std::sin(2.0 * kDfPi * hz * static_cast<double>(i) / 48000.0);
+            }
+            if (std::sqrt(re * re + im * im) < 120.0) return whole ? static_cast<int>(at) : -1;
+        }
+        return -2;
+    };
+    const int low = crossing(100.0), high = crossing(5000.0);
+    std::printf("  [detail filter] a move of -12 dB crosses its half at %d samples at 100 Hz, %d at 5 kHz\n", low, high);
+    EXPECT_GT(low, 0);
+    EXPECT_GT(high, 0);
+    EXPECT_LT(std::abs(low - high), 384);
+}
+
+namespace {
+
+using DaPower = std::array<float, static_cast<size_t>(DetailAnalysis<float>::kPoints)>;
+
+DaPower daRead(double rate, double width, const std::vector<float>& x, int chunk = 256)
+{
+    auto a = std::make_unique<DetailAnalysis<float>>();
+    a->setWidth(width);
+    a->prepare(AudioSpec { rate, 512, 1 });
+    const int hop = rate > 176000.0 ? 1024 : (rate > 88000.0 ? 512 : 256);
+    int held = 0;
+    for (size_t at = 0; at < x.size();)
+    {
+        const int n = std::min({ chunk, hop - held, static_cast<int>(x.size() - at) });
+        a->feed(0, x.data() + at, n);
+        at += static_cast<size_t>(n);
+        held += n;
+        if (held == hop)
+        {
+            held = 0;
+            a->update(1);
+        }
+    }
+    DaPower p {};
+    a->read(0, p.data());
+    return p;
+}
+
+double daAt(const DaPower& p, double hz)
+{
+    const double last = static_cast<double>(p.size() - 1);
+    const double u = std::clamp(last * std::log(hz / 20.0) / std::log(1000.0), 0.0, last);
+    const auto a = std::min(static_cast<size_t>(u), p.size() - 2);
+    const double v = p[a] + (u - static_cast<double>(a)) * (p[a + 1] - p[a]);
+    return 10.0 * std::log10(v + 1e-30);
+}
+
+void daAdd(std::vector<float>& x, double rate, double hz, double amp, double phase = 0.0)
+{
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] += static_cast<float>(amp * std::sin(2.0 * kDfPi * hz * static_cast<double>(i) / rate + phase));
+}
+
+} // namespace
+
+// New: DetailAnalysis. A line reads its level whatever the frequency, the
+// width and the rate, so a threshold in dB means the same everywhere.
+DSPARK_TEST(DetailAnalysis_line_reads_its_level)
+{
+    for (const double rate : { 22050.0, 44100.0, 48000.0, 96000.0, 192000.0 })
+    {
+        double worst = 0.0, worstHz = 0.0, worstWidth = 0.0;
+        for (const double width : { 1.0, 1.0 / 3.0, 1.0 / 12.0, 1.0 / 24.0 })
+            for (const double hz : { 50.0, 97.3, 203.0, 433.0, 997.0, 2311.0, 4001.0, 7919.0, 15013.0, 18500.0 })
+            {
+                if (hz > 0.4 * rate) continue;
+                std::vector<float> x(static_cast<size_t>(0.75 * rate));
+                daAdd(x, rate, hz, 0.1);
+                const double off = daAt(daRead(rate, width, x), hz) + 20.0;
+                if (std::abs(off) > std::abs(worst)) { worst = off; worstHz = hz; worstWidth = width; }
+            }
+        std::printf("  [detail analysis] %.0f Hz: a line at -20 dB off by %+.2f dB at worst (%.0f Hz, 1/%.0f oct)\n", rate, worst, worstHz, 1.0 / worstWidth);
+        EXPECT_LT(std::abs(worst), 1.0);
+    }
+}
+
+// New: five lines two widths apart and the gaps between them, a sixth of an
+// octave from 50 Hz, a twelfth from 100 Hz, a 24th from 200 Hz; an octave
+// wide, the same lines are one broad shape.
+DSPARK_TEST(DetailAnalysis_tells_the_detail_apart)
+{
+    struct Case { double hz, parts; };
+    std::vector<Case> cases { { 50.0, 6.0 } };
+    for (const double hz : { 100.0, 200.0, 350.0, 500.0, 700.0, 1000.0, 1400.0, 2500.0, 4000.0, 10000.0 })
+    {
+        cases.push_back({ hz, 6.0 });
+        cases.push_back({ hz, 12.0 });
+        if (hz >= 200.0) cases.push_back({ hz, 24.0 });
+    }
+    for (const Case& c : cases)
+    {
+        std::vector<float> x(48000);
+        for (int j = -2; j <= 2; ++j) daAdd(x, 48000.0, c.hz * std::exp2(2.0 * j / c.parts), 0.1, 1.3 * j);
+        const auto apart = [&](const DaPower& p) {
+            const auto at = [&](double steps) { return daAt(p, c.hz * std::exp2(steps / c.parts)); };
+            return (at(-2.0) + at(0.0) + at(2.0)) / 3.0 - 0.5 * (at(-1.0) + at(1.0));
+        };
+        const double fine = apart(daRead(48000.0, 1.0 / c.parts, x)), wide = apart(daRead(48000.0, 1.0, x));
+        std::printf("  [detail analysis] %5.0f Hz 1/%2.0f oct: lines %5.1f dB over the gaps, %4.1f an octave wide\n", c.hz, c.parts, fine, wide);
+        EXPECT_GT(fine, 12.0);
+        EXPECT_LT(wide, 3.0);
+    }
+}
+
+// New: the top follows an onset in milliseconds at the finest width, and
+// nothing above the levels' bands folds into the low end.
+DSPARK_TEST(DetailAnalysis_top_is_quick_and_does_not_fold)
+{
+    std::vector<float> x(50304);
+    for (size_t i = 48000; i < x.size(); ++i) x[i] = static_cast<float>(0.1 * std::sin(2.0 * kDfPi * 10000.0 * static_cast<double>(i) / 48000.0));
+    const double onset = daAt(daRead(48000.0, 1.0 / 24.0, x), 10000.0) + 20.0;
+    std::printf("  [detail analysis] 48 ms into a tone at 10 kHz: %+.2f dB from its level\n", onset);
+    EXPECT_LT(std::abs(onset), 1.0);
+
+    double folded = -300.0;
+    for (const double hz : { 2900.0, 5900.0, 6100.0, 11800.0, 12200.0, 17900.0, 18100.0 })
+    {
+        std::vector<float> tone(48000);
+        daAdd(tone, 48000.0, hz, 1.0);
+        const DaPower p = daRead(48000.0, 1.0 / 24.0, tone);
+        for (const double at : { 40.0, 70.0, 100.0, 140.0, 200.0, 300.0, 420.0, 600.0, 850.0 })
+            folded = std::max(folded, daAt(p, at));
+    }
+    std::printf("  [detail analysis] full-scale tones up high read %.1f dB under 900 Hz\n", folded);
+    EXPECT_LT(folded, -80.0);
+}
+
+// New: the reading does not depend on how the stream is fed.
+DSPARK_TEST(DetailAnalysis_does_not_depend_on_how_it_is_fed)
+{
+    const std::vector<float> x = dfNoise(24000, 11u);
+    const DaPower whole = daRead(48000.0, 1.0 / 12.0, x, 256);
+    EXPECT_TRUE(daRead(48000.0, 1.0 / 12.0, x, 37) == whole);
+    EXPECT_TRUE(daRead(48000.0, 1.0 / 12.0, x, 1) == whole);
+}
+
+// New: a level asked of the whole band is played in the whole band, the
+// crossover and the decimator's transition included, at both usual rates.
+DSPARK_TEST(DetailFilter_plays_a_level_at_every_frequency)
+{
+    using F = DetailFilter<float>;
+    constexpr size_t look = 65536, at = 16384;
+    for (const double rate : { 44100.0, 48000.0 })
+        for (const double asked : { -24.0, -6.0, 12.0 })
+        {
+            auto f = std::make_unique<F>();
+            f->prepare(AudioSpec { rate, 512, 1 });
+            std::vector<float> x(at + look + 4096, 0.0f);
+            x[at] = 1.0f;
+            const std::vector<float> out = dfRun(*f, x, 512, [&](float* db) { std::fill_n(db, F::kPoints, static_cast<float>(asked)); });
+            FFTReal<double> fft(look);
+            std::vector<double> h(look), spectrum(look + 2);
+            for (size_t i = 0; i < look; ++i) h[i] = out[at + static_cast<size_t>(f->getLatency()) - 1024 + i];
+            fft.forward(h.data(), spectrum.data());
+            double worst = 0.0, worstHz = 0.0;
+            for (size_t k = 28; k < look / 2; ++k)
+            {
+                const double hz = static_cast<double>(k) * rate / static_cast<double>(look);
+                if (hz > 20000.0) break;
+                const double off = 10.0 * std::log10(spectrum[2 * k] * spectrum[2 * k] + spectrum[2 * k + 1] * spectrum[2 * k + 1] + 1e-30) - asked;
+                if (std::abs(off) > std::abs(worst)) { worst = off; worstHz = hz; }
+            }
+            std::printf("  [detail filter] %+.0f dB everywhere at %.0f Hz: off by %+.3f dB at worst (%.0f Hz)\n", asked, rate, worst, worstHz);
+            EXPECT_LT(std::abs(worst), 0.1);
+        }
+}
+
+// New: nothing is heard ahead of an attack: whatever the curve, what comes
+// out more than a millisecond before an impulse is 80 dB under it.
+DSPARK_TEST(DetailFilter_does_not_ring_ahead_of_an_attack)
+{
+    using F = DetailFilter<float>;
+    const auto check = [](const char* name, auto&& asked) {
+        constexpr size_t at = 16384;
+        auto f = std::make_unique<F>();
+        f->prepare(AudioSpec { 48000.0, 512, 1 });
+        std::vector<float> x(at + 32768, 0.0f);
+        x[at] = 1.0f;
+        const std::vector<float> out = dfRun(*f, x, 512, [&](float* db) {
+            for (int i = 0; i < F::kPoints; ++i) db[i] = static_cast<float>(asked(F::frequency(i)));
+        });
+        const size_t event = at + static_cast<size_t>(f->getLatency());
+        double all = 0.0, ahead = 0.0;
+        for (size_t i = 0; i < out.size(); ++i)
+        {
+            const double e = static_cast<double>(out[i]) * out[i];
+            all += e;
+            if (i + 48 < event) ahead += e;
+        }
+        const double db = 10.0 * std::log10(ahead / all + 1e-30);
+        std::printf("  [detail filter] %-28s %.1f dB over a millisecond ahead\n", name, db);
+        EXPECT_LT(db, -80.0);
+    };
+    check("-24 everywhere", [](double) { return -24.0; });
+    check("+12 everywhere", [](double) { return 12.0; });
+    check("-24 under 900", [](double hz) { return -24.0 * std::clamp(std::log2(900.0 / hz), 0.0, 1.0); });
+    check("comb of 12, 1/12 oct", [](double hz) { return -6.0 - 6.0 * std::cos(kDfPi * std::log2(hz / 100.0) * 12.0); });
+    for (const double centre : { 100.0, 300.0, 1000.0, 1500.0 })
+        check("notch of 12, 1/12 oct", [centre](double hz) {
+            const double u = std::log2(hz / centre) * 12.0;
+            return -12.0 * std::exp(-u * u);
+        });
+}
+
+// New: setShortKernel(). The kernels of the high part are cut to its window
+// and tapered over their whole length: a cut at the top rings for a shorter
+// time after the event (the energy of the response half a window after its
+// peak falls by 11 to 14 dB) and keeps its depth.
+DSPARK_TEST(DetailFilter_short_kernel_rings_for_less_time)
+{
+    using F = DetailFilter<float>;
+    for (const double half : { 0.02, 0.07 })
+    {
+        // A cut of 24 dB, `half` an octave to each side of 3 kHz.
+        const auto cut = [half](float* db) {
+            for (int i = 0; i < F::kPoints; ++i) db[i] = std::abs(std::log2(F::frequency(i) / 3000.0)) <= half ? -24.0f : 0.0f;
+        };
+        double late[2] = { 0.0, 0.0 }, depth[2] = { 0.0, 0.0 };
+        for (const int kind : { 0, 1 })
+        {
+            auto f = std::make_unique<F>();
+            f->prepare(AudioSpec { 48000.0, 512, 1 });
+            f->setShortKernel(kind == 1);
+            EXPECT_TRUE(f->isShortKernel() == (kind == 1));
+            std::vector<float> click(32768, 0.0f);
+            click[8192] = 1.0f;
+            const std::vector<float> h = dfRun(*f, click, 512, cut);
+            // From the peak of the response: its energy half a window on, against all of it.
+            size_t peak = 0;
+            for (size_t i = 0; i < h.size(); ++i)
+                if (std::abs(h[i]) > std::abs(h[peak])) peak = i;
+            double all = 0.0, tail = 0.0;
+            for (size_t i = peak; i < h.size(); ++i)
+            {
+                const double e = static_cast<double>(h[i]) * h[i];
+                all += e;
+                if (i >= peak + 512) tail += e;
+            }
+            late[kind] = 10.0 * std::log10(std::max(tail / all, 1e-30));
+            f->reset();
+            std::vector<float> tone(48000);
+            for (size_t i = 0; i < tone.size(); ++i) tone[i] = static_cast<float>(0.5 * std::sin(2.0 * kDfPi * 3000.0 * static_cast<double>(i) / 48000.0));
+            const std::vector<float> y = dfRun(*f, tone, 512, cut);
+            double in2 = 0.0, out2 = 0.0;
+            for (size_t i = 24000; i < tone.size(); ++i)
+            {
+                in2 += static_cast<double>(tone[i]) * tone[i];
+                out2 += static_cast<double>(y[i]) * y[i];
+            }
+            depth[kind] = 10.0 * std::log10(std::max(out2 / in2, 1e-30));
+        }
+        std::printf("  [detail filter] a cut %.2f oct wide: half a window after its peak %.1f dB of the response's energy, %.1f with the short kernel; depth %.1f and %.1f dB\n",
+                    2.0 * half, late[0], late[1], depth[0], depth[1]);
+        EXPECT_LT(late[1], late[0] - 8.0);
+        EXPECT_LT(depth[1], -20.0);
+    }
+}
+
+// New: what the filter says it plays is what it plays, point by point from
+// 25 Hz to 18 kHz, where the grid is finer than its bins too.
+DSPARK_TEST(DetailFilter_says_what_it_plays)
+{
+    using F = DetailFilter<float>;
+    constexpr size_t look = 262144, at = 65536;
+    const auto check = [](const char* name, auto&& asked) {
+        auto f = std::make_unique<F>();
+        f->prepare(AudioSpec { 48000.0, 512, 1 });
+        std::vector<float> x(at + look + 4096, 0.0f);
+        x[at] = 1.0f;
+        const std::vector<float> out = dfRun(*f, x, 512, [&](float* db) {
+            for (int i = 0; i < F::kPoints; ++i) db[i] = static_cast<float>(asked(F::frequency(i)));
+        });
+        std::array<float, static_cast<size_t>(F::kPoints)> said {};
+        f->getPlayedCurve(0, said.data());
+        FFTReal<double> fft(look);
+        std::vector<double> h(look), spectrum(look + 2);
+        for (size_t i = 0; i < look; ++i) h[i] = out[at + static_cast<size_t>(f->getLatency()) - 1024 + i];
+        fft.forward(h.data(), spectrum.data());
+        double worst = 0.0, worstHz = 0.0;
+        for (int i = 0; i < F::kPoints; ++i)
+        {
+            const double hz = F::frequency(i);
+            if (hz < 25.0 || hz > 18000.0) continue;
+            const double bin = hz * static_cast<double>(look) / 48000.0;
+            const auto k = static_cast<size_t>(bin);
+            const auto level = [&](size_t n) {
+                return 10.0 * std::log10(spectrum[2 * n] * spectrum[2 * n] + spectrum[2 * n + 1] * spectrum[2 * n + 1] + 1e-30);
+            };
+            const double played = level(k) + (bin - static_cast<double>(k)) * (level(k + 1) - level(k));
+            const double off = static_cast<double>(said[static_cast<size_t>(i)]) - played;
+            if (std::abs(off) > std::abs(worst)) { worst = off; worstHz = hz; }
+        }
+        std::printf("  [detail filter] %-26s says %+.3f dB from what it plays at worst (%.1f Hz)\n", name, worst, worstHz);
+        EXPECT_LT(std::abs(worst), 0.5);
+    };
+    check("-24 everywhere", [](double) { return -24.0; });
+    for (const double parts : { 6.0, 12.0, 24.0 })
+        check("comb of 12 dB", [parts](double hz) { return -6.0 - 6.0 * std::cos(kDfPi * std::log2(hz / 100.0) * parts); });
+    check("squares of 11, 1/6 oct", [](double hz) { return std::sin(kDfPi * std::log2(hz / 50.0) * 6.0) > 0.5 ? 0.0 : -11.0; });
+    check("squares of 11, 1/24 oct", [](double hz) { return std::sin(kDfPi * std::log2(hz / 2000.0) * 24.0) > 0.5 ? 0.0 : -11.0; });
 }

@@ -1428,6 +1428,82 @@ DSPARK_TEST(SimdOps_runtime_dispatch_matches_the_baseline)
     }
 }
 
+DSPARK_TEST(SimdOps_complex_exp_matches_the_library)
+{
+    // e^re (cos im + i sin im) a bin: the baseline is the library's to the
+    // bit; the AVX2+FMA copy is within 4e-16 of it (1e-15 allowed here), and a
+    // group of four holding a value out of its range is the library's again.
+    using namespace dspark;
+    DispatchScope scope;
+    constexpr int kBins = 211;
+    std::vector<double> input(2 * kBins);
+    for (int k = 0; k < kBins; ++k)
+    {
+        input[2 * static_cast<size_t>(k)] = -3.0 + 11.0 * std::sin(0.031 * k) + 0.5 * std::sin(0.7 * k);
+        input[2 * static_cast<size_t>(k) + 1] = 40.0 * std::sin(0.013 * k) * std::cos(0.05 * k);
+    }
+    input[2 * 5] = 750.0;                                          // the library's infinity
+    input[2 * 9] = -800.0;                                         // and its zero
+    input[2 * 13 + 1] = 1e9;                                       // a phase beyond the reduction's range
+    input[2 * 17] = std::numeric_limits<double>::quiet_NaN();
+    input[2 * 23 + 1] = std::numeric_limits<double>::infinity();
+    std::vector<double> library(input);
+    for (int k = 0; k < kBins; ++k)
+    {
+        const double m = std::exp(library[2 * static_cast<size_t>(k)]), p = library[2 * static_cast<size_t>(k) + 1];
+        library[2 * static_cast<size_t>(k)] = m * std::cos(p);
+        library[2 * static_cast<size_t>(k) + 1] = m * std::sin(p);
+    }
+    const auto run = [&](int bins) {
+        std::vector<double> z(input);
+        simd::complexExp(z.data(), bins);
+        return z;
+    };
+    const auto same = [](double a, double b) {
+        return std::isnan(a) ? std::isnan(b) : a == b;
+    };
+
+    simd::setRuntimeDispatch(false);
+    for (int bins : { 0, 1, 3, 4, 5, 67, kBins })
+    {
+        const auto z = run(bins);
+        bool exact = true;
+        for (int i = 0; i < 2 * kBins; ++i)
+            exact = exact && same(z[static_cast<size_t>(i)], i < 2 * bins ? library[static_cast<size_t>(i)] : input[static_cast<size_t>(i)]);
+        EXPECT_TRUE(exact);
+    }
+    simd::complexExp(nullptr, 4);
+    if (!simd::runtimeDispatchSupported()) return;
+
+    simd::setRuntimeDispatch(true);
+    for (int bins : { 1, 4, 7, 64, kBins })
+    {
+        const auto z = run(bins);
+        double worst = 0.0;
+        bool special = true, untouched = true;
+        for (int k = 0; k < kBins; ++k)
+        {
+            const auto u = 2 * static_cast<size_t>(k);
+            if (k >= bins)
+            {
+                untouched = untouched && same(z[u], input[u]) && same(z[u + 1], input[u + 1]);
+                continue;
+            }
+            if (!std::isfinite(library[u]) || !std::isfinite(library[u + 1]))
+            {
+                special = special && same(z[u], library[u]) && same(z[u + 1], library[u + 1]);
+                continue;
+            }
+            const double size = std::hypot(library[u], library[u + 1]);
+            if (size > 0.0) worst = std::max(worst, std::hypot(z[u] - library[u], z[u + 1] - library[u + 1]) / size);
+            else special = special && z[u] == 0.0 && z[u + 1] == 0.0;
+        }
+        EXPECT_LT(worst, 1e-15);
+        EXPECT_TRUE(special);
+        EXPECT_TRUE(untouched);
+    }
+}
+
 DSPARK_TEST(SimdOps_dot_product_of_four_matches_four_dot_products)
 {
     // dotProduct4() loads its shared operand once for four products and

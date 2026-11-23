@@ -348,6 +348,42 @@ bool checkSimdUnaligned()
     return ok;
 }
 
+// complexExp() against the library a bin, on the active path: within 1e-15 of
+// the bin's magnitude, and the library's own result for values out of range.
+bool simdComplexExpMatchesLibrary()
+{
+    constexpr int kBins = 103;
+    double z[2 * kBins], ref[2 * kBins];
+    uint32_t seed = 0xE1E1E1E1u;
+    for (int k = 0; k < kBins; ++k)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        z[2 * k] = 24.0 * (static_cast<double>(seed >> 8) / 16777216.0) - 16.0;
+        seed = seed * 1664525u + 1013904223u;
+        z[2 * k + 1] = 80.0 * (static_cast<double>(seed >> 8) / 16777216.0) - 40.0;
+    }
+    z[2 * 6] = 800.0;
+    z[2 * 11 + 1] = 1e8;
+    for (int k = 0; k < kBins; ++k)
+    {
+        const double m = std::exp(z[2 * k]), p = z[2 * k + 1];
+        ref[2 * k] = m * std::cos(p);
+        ref[2 * k + 1] = m * std::sin(p);
+    }
+    dspark::simd::complexExp(z, kBins);
+    for (int k = 0; k < kBins; ++k)
+    {
+        if (!std::isfinite(ref[2 * k]) || !std::isfinite(ref[2 * k + 1]))
+        {
+            if (z[2 * k] != ref[2 * k] || z[2 * k + 1] != ref[2 * k + 1]) return false;
+            continue;
+        }
+        const double size = std::hypot(ref[2 * k], ref[2 * k + 1]);
+        if (std::hypot(z[2 * k] - ref[2 * k], z[2 * k + 1] - ref[2 * k + 1]) > 1e-15 * size) return false;
+    }
+    return true;
+}
+
 void runSimdKernelTests()
 {
     bool elementwise = true, reductions = true, cma = true, ramps = true;
@@ -361,6 +397,7 @@ void runSimdKernelTests()
           "simd", "peakLevel ignores NaN samples");
     check(checkSimdUnaligned<float>() && checkSimdUnaligned<double>(),
           "simd", "kernels match the scalar reference at unaligned start offsets");
+    check(simdComplexExpMatchesLibrary(), "simd", "complexExp matches the library's exponential");
 }
 
 // -----------------------------------------------------------------------------

@@ -325,6 +325,23 @@ public:
         refreshGateHold();
         postEq_.prepare(sr);
         wall_.prepare(sr);
+        {
+            auto& p = plate_;
+            p.scale = sr / PlateTank::kRate;
+            for (int b = 0; b < 2; ++b)
+            {
+                const auto s = static_cast<std::size_t>(b);
+                p.lAp1[s] = p.at(PlateTank::kAp1[s]);
+                p.lD1[s] = p.at(PlateTank::kD1[s]);
+                p.lAp2[s] = p.at(PlateTank::kAp2[s]);
+                p.lD2[s] = p.at(PlateTank::kD2[s]);
+                p.ap1[s].prepare(p.lAp1[s] + p.at(PlateTank::kExcursion) + 4);
+                p.d1[s].prepare(p.lD1[s] + 1);
+                p.ap2[s].prepare(p.lAp2[s] + 1);
+                p.d2[s].prepare(p.lD2[s] + 1);
+            }
+            p.loopSec = 0.5 * (p.lAp1[0] + p.lD1[0] + p.lAp2[0] + p.lD2[0] + p.lAp1[1] + p.lD1[1] + p.lAp2[1] + p.lD2[1]) / sr;
+        }
         for (int j = 0; j < SecondSlope::kLines; ++j)
         {
             const auto s = static_cast<std::size_t>(j);
@@ -582,6 +599,15 @@ public:
         postEq_.reset();
         wall_.reset();
         for (auto& l : slope2_.line) l.clear();
+        for (int b = 0; b < 2; ++b)
+        {
+            plate_.ap1[static_cast<std::size_t>(b)].clear();
+            plate_.d1[static_cast<std::size_t>(b)].clear();
+            plate_.ap2[static_cast<std::size_t>(b)].clear();
+            plate_.d2[static_cast<std::size_t>(b)].clear();
+        }
+        plate_.lp.fill(T(0));
+        plate_.phase = 0.0;
         slope2_.x1.fill(T(0));
         slope2_.y1.fill(T(0));
         slope2_.gainNow = slope2_.gain;
@@ -1163,6 +1189,28 @@ public:
     }
 
     /**
+     * @brief The plate's own tank (off by default; Type::Plate only): the
+     *        figure-eight of Dattorro's plate instead of the delay network.
+     *        Two branches feed each other, each an all-pass that the
+     *        modulation moves, a delay, the damping and the decay, a second
+     *        all-pass and a delay; each side of the output is read at seven
+     *        points inside the other branch and its own. Decay, high decay
+     *        and its crossover, modulation and its rate follow the controls;
+     *        a plate has one size, so Size does not change it, and Bass Decay
+     *        does not reach it. The wet level is that of the network within
+     *        0.25 dB; the decay is the one asked within 5 % from 2 s up (a
+     *        branch takes a third of a second, so at 1.5 s it is 12 % short).
+     */
+    void setPlateTank(bool on) noexcept
+    {
+        plateTank_.store(on, std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return Whether a Plate runs its own tank. */
+    [[nodiscard]] bool isPlateTank() const noexcept { return plateTank_.load(std::memory_order_relaxed); }
+
+    /**
      * @brief A second slope, 0 to 1 (0, the default, is off): beside the
      *        tank, four lines of its own decay in 0.3 of its times, so the
      *        first decibels of the tail fall faster than the rest, as in a
@@ -1305,6 +1353,7 @@ public:
         w.write("shimmer", static_cast<float>(getShimmer()));
         w.write("bandLimit", static_cast<float>(getBandLimit()));
         w.write("doubleSlope", static_cast<float>(getDoubleSlope()));
+        w.write("plateTank", isPlateTank());
         postEq_.writeState(w, "post");
         return w.blob();
     }
@@ -1365,6 +1414,7 @@ public:
         setShimmer(static_cast<T>(r.read("shimmer", 0.0f)));
         setBandLimit(static_cast<T>(r.read("bandLimit", 0.0f)));
         setDoubleSlope(static_cast<T>(r.read("doubleSlope", 0.0f)));
+        setPlateTank(r.read("plateTank", false));
         postEq_.readState(r, "post");
         return true;
     }
@@ -1687,6 +1737,29 @@ protected:
         double loopSec = 0.0;                ///< mean loop length
         bool on = false;
     };
+    /// The plate's own tank: Dattorro's figure-eight (lengths at 29761 Hz,
+    /// scaled to the rate). Branch 0 is the left one of his figure.
+    struct PlateTank
+    {
+        static constexpr double kRate = 29761.0;
+        static constexpr std::array<int, 2> kAp1 { 672, 908 }, kD1 { 4453, 4217 }, kAp2 { 1800, 2656 }, kD2 { 3720, 3163 };
+        static constexpr double kExcursion = 16.0;   ///< Of the modulated all-passes at full modulation.
+        static constexpr T kDiffusion1 = T(-0.7), kDiffusion2 = T(0.5);
+        std::array<Line, 2> ap1, d1, ap2, d2;
+        std::array<int, 2> lAp1 {}, lD1 {}, lAp2 {}, lD2 {};
+        std::array<T, 2> gain {}, lp {};
+        T damp = T(0);
+        double excursion = 0.0, phase = 0.0, phaseStep = 0.0;
+        double loopSec = 0.0;          ///< Mean branch length.
+        double scale = 1.0;            ///< The rate over Dattorro's.
+        bool on = false;
+
+        [[nodiscard]] int at(double samples29k) const noexcept { return std::max(1, static_cast<int>(std::lround(samples29k * scale))); }
+    };
+    PlateTank plate_;
+    std::atomic<bool> plateTank_ { false };
+    static constexpr double kPlateEnergy = 0.50;  ///< The plate's tail energy over the tail formula (measured, 1.5 to 8 s: within 0.25 dB).
+
     SecondSlope slope2_;
     std::atomic<T> doubleSlope_ { T(0) };
     static constexpr std::array<double, SecondSlope::kLines> kSecondMs { 23.3, 29.1, 37.9, 44.7 };
@@ -2583,6 +2656,86 @@ protected:
     }
 
     /**
+     * @brief The plate tank's decay and damping. A branch takes its gain once
+     *        a pass, from its own length; the damping is a one-pole low-pass
+     *        whose loss at the high crossover makes the high decay asked for.
+     *        Its tail sets the wet level as the network's does.
+     */
+    void designPlate(double decay, double t60H, double crossoverHz) noexcept
+    {
+        auto& p = plate_;
+        const double sr = spec_.sampleRate;
+        p.on = plateTank_.load(std::memory_order_relaxed) && erType_ == Type::Plate && !spring_;
+        if (!p.on) return;
+        double damp = 0.0;
+        for (int b = 0; b < 2; ++b)
+        {
+            const auto s = static_cast<std::size_t>(b);
+            const double L = static_cast<double>(p.lAp1[s] + p.lD1[s] + p.lAp2[s] + p.lD2[s]);
+            p.gain[s] = static_cast<T>(std::pow(0.001, L / (decay * sr)));
+            // |(1 - d) / (1 - d e^-jw)| at the crossover equals what the high
+            // decay takes over the mid one in a pass: the lower root of
+            // (1 - q^2) d^2 - 2 (1 - q^2 c) d + (1 - q^2) = 0.
+            const double q = std::pow(0.001, L / sr * (1.0 / t60H - 1.0 / decay));
+            if (q < 1.0)
+            {
+                const double c = std::cos(2.0 * 3.14159265358979323846 * crossoverHz / sr), q2 = q * q;
+                const double A = 1.0 - q2, B = 1.0 - q2 * c;
+                damp = std::max(damp, (B - std::sqrt(std::max(0.0, B * B - A * A))) / A);
+            }
+        }
+        p.damp = static_cast<T>(std::clamp(damp, 0.0, 0.99));
+        p.excursion = static_cast<double>(modDepth_.load(std::memory_order_relaxed)) * PlateTank::kExcursion * p.scale;
+        p.phaseStep = static_cast<double>(modRate_.load(std::memory_order_relaxed)) / sr;
+        // The taps read inside the branches, so the first pass counts in full.
+        const double tail = 1.0 / -std::expm1(-std::min(2.0 * 6.907755278982137 * p.loopSec / std::max(1e-3, decay), 50.0));
+        wetLevel_ = static_cast<T>(kWetCalibration / std::sqrt(std::max(1e-6, kPlateEnergy * tail)));
+    }
+
+    /** @brief One sample of the plate tank: the late pair, from the diffused feed. */
+    void runPlate(T& lateL, T& lateR, int injLag, T inGain, T extra) noexcept
+    {
+        auto& p = plate_;
+        const T in = T(0.5) * (ring_[0].at(injLag + 1) + ring_[1].at(injLag + 1)) * inGain + extra;
+        const T hold = holdNow_;
+        const std::array<T, 2> ends { p.d2[0].at(p.lD2[0]), p.d2[1].at(p.lD2[1]) };
+        p.phase += p.phaseStep;
+        if (p.phase >= 1.0) p.phase -= 1.0;
+        for (int b = 0; b < 2; ++b)
+        {
+            const auto s = static_cast<std::size_t>(b);
+            T x = in + ends[1 - s];
+            // The first all-pass, its length moved by the modulation (the
+            // two branches a quarter of a turn apart), read between samples.
+            const double turn = p.phase + 0.25 * b;
+            const double pos = static_cast<double>(p.lAp1[s])
+                + p.excursion * static_cast<double>(fastSin(static_cast<T>(6.283185307179586 * (turn - std::floor(turn)) - 3.141592653589793)));
+            const int k = static_cast<int>(pos);
+            const T fr = static_cast<T>(pos - k);
+            const T dl = p.ap1[s].at(k) + fr * (p.ap1[s].at(k + 1) - p.ap1[s].at(k));
+            const T w1 = x + PlateTank::kDiffusion1 * dl;
+            p.ap1[s].push(w1);
+            x = dl - PlateTank::kDiffusion1 * w1;
+            const T v = p.d1[s].at(p.lD1[s]);
+            p.d1[s].push(x);
+            // Damping and decay (both open while the tail is held).
+            const T damp = p.damp * (T(1) - hold);
+            p.lp[s] = v + damp * (p.lp[s] - v);
+            x = p.lp[s] * (p.gain[s] + (T(1) - p.gain[s]) * hold);
+            const T d2 = p.ap2[s].at(p.lAp2[s]);
+            const T w2 = x + PlateTank::kDiffusion2 * d2;
+            p.ap2[s].push(w2);
+            p.d2[s].push(d2 - PlateTank::kDiffusion2 * w2);
+        }
+        // Dattorro's taps (at 29761 Hz), each side mostly from the other branch.
+        auto tap = [&p](const Line& l, double at29k) { return l.at(p.at(at29k)); };
+        lateL += T(0.6) * (tap(p.d1[1], 266) + tap(p.d1[1], 2974) - tap(p.ap2[1], 1913) + tap(p.d2[1], 1996)
+                           - tap(p.d1[0], 1990) - tap(p.ap2[0], 187) - tap(p.d2[0], 1066));
+        lateR += T(0.6) * (tap(p.d1[0], 353) + tap(p.d1[0], 3627) - tap(p.ap2[0], 1228) + tap(p.d2[0], 2673)
+                           - tap(p.d1[1], 2111) - tap(p.ap2[1], 335) - tap(p.d2[1], 121));
+    }
+
+    /**
      * @brief The second slope's absorption and shares. Fed and summed as the
      *        tank is (unit energy in, every line out), a network's tail holds
      *        1 / (e^(13.8 x its mean loop / T60) - 1) of energy; the share asked for sets
@@ -3127,7 +3280,8 @@ protected:
             {
                 const T loopG = loopAP0 + (loopAPCoeff_ - loopAP0) * a;
                 const T extra = cachedParams_.shimmer > T(0) ? shimmerStep(lastLateMono_) * cachedParams_.shimmer * kShimmerFeed : T(0);
-                if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
+                if (plate_.on)  runPlate(lateL, lateR, gap + last - n, inGain, extra);
+                else if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
                 else      runFdn<kMaxLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
                 lastLateMono_ = (lateL + lateR) * T(0.5);
                 if (slope2_.on || slope2_.gainNow != T(0)) runSecondSlope(lateL, lateR, gap + last - n);
@@ -3539,6 +3693,7 @@ protected:
         wetLevel_ = static_cast<T>((spring_ ? kWetCalibrationSpring : kWetCalibration)
             / std::sqrt(std::max(1e-6, heardTailEnergy(decay, t60H, t60B, Kh, Kb) + earlyEnergy())));
         designSecondSlope(decay, t60H, Kh);
+        designPlate(decay, t60H, fh);
 
         // With signal in the tank the loop gains glide to the new design (a
         // step of them is a step of every line's output: a click); an empty

@@ -842,7 +842,9 @@ All notable user-facing changes to DSPark are documented here.
   `DetailFilter`; `getDisplayCorrection()` is the response it plays. A
   correction reaches the audio some 6 ms after the instant it reads (its
   kernels are blended smoothly, which keeps what a moving curve leaves
-  beside a line 2 to 30 dB lower than with a bank of filters).
+  beside a line 2 to 30 dB lower than with a bank of filters). The filter
+  runs in double, so what rounding leaves 1.5 kHz from a line stays under
+  -158 dBc (in float it was -151), for a tenth more of the cost.
   `setLevelCompensation()` converts loudness to decibels with each band's
   exponent. A key can drive it (with a fade). Lines a sixth or a twelfth of
   an octave from their gaps move 8.2 dB or more apart in the audio at full

@@ -1326,8 +1326,8 @@ private:
                           int offset, int len) noexcept
     {
         IirBank& k = bank(bank_);
-        const int large = std::max(fadeFrom_, iirBands_);
-        const int small = std::min(fadeFrom_, iirBands_);
+        const int most = std::max(fadeFrom_, iirBands_);
+        const int fewest = std::min(fadeFrom_, iirBands_);
         const bool adding = iirBands_ > fadeFrom_;
         T* work[16] = {};
         for (int ch = 0; ch < nCh; ++ch)
@@ -1338,22 +1338,22 @@ private:
         }
         T* top[16] = {};
         for (int ch = 0; ch < nCh; ++ch) top[ch] = fadeTop_.data() + static_cast<size_t>(ch) * kFadeChunk;
-        for (int s = 0; s < large - 1; ++s)
+        for (int s = 0; s < most - 1; ++s)
         {
-            if (s == small - 1)
+            if (s == fewest - 1)
                 for (int ch = 0; ch < nCh; ++ch) std::copy(work[ch], work[ch] + len, top[ch]);
             T* low[16] = {};
             for (int ch = 0; ch < nCh; ++ch) low[ch] = fadeBandOf(fadeBands_, s, ch);
             runSplit(k, s, work, low, nCh, len);
         }
         for (int ch = 0; ch < nCh; ++ch)
-            std::copy(work[ch], work[ch] + len, fadeBandOf(fadeBands_, large - 1, ch));
+            std::copy(work[ch], work[ch] + len, fadeBandOf(fadeBands_, most - 1, ch));
         // The corrections, the smaller topology's lower bands read off
-        // before the first split it does not have (small - 1 <= large - 2).
-        for (int s = 1; s < large - 1; ++s)
+        // before the first split it does not have (fewest - 1 <= most - 2).
+        for (int s = 1; s < most - 1; ++s)
         {
-            if (s == small - 1)
-                for (int b = 0; b < small - 1; ++b)
+            if (s == fewest - 1)
+                for (int b = 0; b < fewest - 1; ++b)
                     for (int ch = 0; ch < nCh; ++ch)
                         std::copy_n(fadeBandOf(fadeBands_, b, ch), len, fadeBandOf(fadeLower_, b, ch));
             for (int b = 0; b < s; ++b)
@@ -1372,13 +1372,13 @@ private:
             {
                 T* out = outputs[b].getChannel(ch) + offset;
                 const T* lg = fadeBandOf(fadeBands_, b, ch);
-                const T* sm = b < small - 1 ? fadeBandOf(fadeLower_, b, ch) : b == small - 1 ? top[ch] : nullptr;
+                const T* sm = b < fewest - 1 ? fadeBandOf(fadeLower_, b, ch) : b == fewest - 1 ? top[ch] : nullptr;
                 for (int i = 0; i < len; ++i)
                 {
                     const T w = (start + static_cast<T>(i + 1)) * step;   // the new topology's share
                     T inLarge = lg[i];
-                    if (!adding && b == small - 1)
-                        for (int j = b + 1; j < large; ++j) inLarge += fadeBandOf(fadeBands_, j, ch)[i];
+                    if (!adding && b == fewest - 1)
+                        for (int j = b + 1; j < most; ++j) inLarge += fadeBandOf(fadeBands_, j, ch)[i];
                     const T inSmall = sm != nullptr ? sm[i] : T(0);
                     out[i] = adding ? inSmall + (inLarge - inSmall) * w : inLarge + (inSmall - inLarge) * w;
                 }

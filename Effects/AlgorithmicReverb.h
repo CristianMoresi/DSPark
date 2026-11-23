@@ -195,9 +195,9 @@
  * - Valimaki et al. (2012, IEEE): "50 Years of Artificial Reverberation"
  * - Abel & Huang (2006): normalized echo density
  *
- * Dependencies: DryWetMixer.h, DspMath.h, Biquad.h, AudioSpec.h,
- *               AudioBuffer.h, DenormalGuard.h, StateBlob.h, SimdOps.h,
- *               KeyEqualizer.h, TailShaper.h.
+ * Dependencies: DryWetMixer.h, DspMath.h, Biquad.h, BiquadCascade.h,
+ *               FilterDesign.h, AudioSpec.h, AudioBuffer.h, DenormalGuard.h,
+ *               StateBlob.h, SimdOps.h, KeyEqualizer.h, TailShaper.h.
  *
  * @code
  *   dspark::AlgorithmicReverb<float> reverb;
@@ -219,6 +219,8 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/DenormalGuard.h"
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
+#include "../Core/FilterDesign.h"
 #include "../Core/StateBlob.h"
 #include "../Core/SimdOps.h"
 #include "../Core/KeyEqualizer.h"
@@ -322,6 +324,13 @@ public:
         tail_.prepare(sr);
         refreshGateHold();
         postEq_.prepare(sr);
+        wall_.prepare(sr);
+        for (int j = 0; j < SecondSlope::kLines; ++j)
+        {
+            const auto s = static_cast<std::size_t>(j);
+            slope2_.len[s] = nearestPrime(static_cast<int>(std::lround(kSecondMs[s] * 1e-3 * sr)));
+            slope2_.line[s].prepare(slope2_.len[s] + 1);
+        }
         {
             int size = 1;
             while (size < static_cast<int>(2.0 * kShimmerMaxMs * 0.001 * sr) + 8) size <<= 1;
@@ -477,6 +486,21 @@ public:
             }
         }
 
+        // The band limit, on the whole wet signal.
+        wall_.retarget(static_cast<double>(bandLimit_.load(std::memory_order_relaxed)));
+        if (wall_.active())
+        {
+            T* l = buffer.getChannel(0);
+            T* r = nCh >= 2 ? buffer.getChannel(1) : nullptr;
+            for (int i = 0; i < nS; ++i)
+            {
+                T a = l[i], b = r ? r[i] : l[i];
+                wall_.frame(a, b);
+                l[i] = a;
+                if (r) r[i] = b;
+            }
+        }
+
         mixer_.mixWet(buffer, mix_.load(std::memory_order_relaxed));
     }
 
@@ -508,6 +532,8 @@ public:
             outR = frame[1];
             postEq_.advance(1);
         }
+        wall_.retarget(static_cast<double>(bandLimit_.load(std::memory_order_relaxed)));
+        if (wall_.active()) wall_.frame(outL, outR);
         return { outL, outR };
     }
 
@@ -554,6 +580,12 @@ public:
         distMix_ = sourceDepth_.load(std::memory_order_relaxed) > T(0) ? T(1) : T(0);
         tail_.reset();
         postEq_.reset();
+        wall_.reset();
+        for (auto& l : slope2_.line) l.clear();
+        slope2_.x1.fill(T(0));
+        slope2_.y1.fill(T(0));
+        slope2_.gainNow = slope2_.gain;
+        slope2_.keepNow = slope2_.keep;
         holdNow_ = tailHold_.load(std::memory_order_relaxed) ? T(1) : T(0);
         quietSamples_ = 1e300;
         snapAbsorption();
@@ -1091,6 +1123,16 @@ public:
      * pair, on its middle or on its sides (Band::placement).
      */
     void setPostEqBand(int index, const typename KeyEqualizer<T, 2>::Band& band) noexcept { postEq_.setBand(index, band); }
+
+    /**
+     * @brief Keeps the loudness of the wet signal through its equalizer (off
+     *        by default; see KeyEqualizer::setLoudnessCompensation()). State
+     *        key `postloudness`.
+     */
+    void setPostEqLoudness(bool on) noexcept { postEq_.setLoudnessCompensation(on); }
+
+    /** @return Whether the wet equalizer keeps the loudness. */
+    [[nodiscard]] bool getPostEqLoudness() const noexcept { return postEq_.getLoudnessCompensation(); }
     /** @return The settings of a band of the wet signal's equalizer. */
     [[nodiscard]] typename KeyEqualizer<T, 2>::Band getPostEqBand(int index) const noexcept { return postEq_.getBand(index); }
 
@@ -1119,6 +1161,41 @@ public:
         layout_.store(std::clamp(static_cast<int>(layout), 0, 1), std::memory_order_relaxed);
         paramsDirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief A second slope, 0 to 1 (0, the default, is off): beside the
+     *        tank, four lines of its own decay in 0.3 of its times, so the
+     *        first decibels of the tail fall faster than the rest, as in a
+     *        hall coupled to a smaller space. At 1 the early decay time falls
+     *        to 0.87 (Hall) to 0.90 (Room) of what it was, the T30 moves under
+     *        3 % and the energy of the tail under 0.2 dB. Not for Spring. Non-finite values are
+     *        ignored.
+     */
+    void setDoubleSlope(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        doubleSlope_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return The second slope, 0 to 1. */
+    [[nodiscard]] T getDoubleSlope() const noexcept { return doubleSlope_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Limits the band of the wet signal, as early digital reverbs
+     *        did: an elliptic wall (order 12, 0.05 dB of ripple, 100 dB down
+     *        a fifth of an octave above the corner) on the output, outside
+     *        the tank, so the decay does not change. 0, the default, is off;
+     *        otherwise 1 kHz up to 0.4 of the rate. A move fades over 20 ms
+     *        (one during a fade waits for it). Non-finite values are ignored.
+     */
+    void setBandLimit(T hz) noexcept
+    {
+        if (std::isfinite(hz)) bandLimit_.store(hz <= T(0) ? T(0) : std::max(hz, T(1000)), std::memory_order_relaxed);
+    }
+
+    /** @return The corner of the band limit in hertz (0 when off). */
+    [[nodiscard]] T getBandLimit() const noexcept { return bandLimit_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Octave-up shimmer, 0 to 1 (0, the default, is off): the tail is
@@ -1226,6 +1303,8 @@ public:
         w.write("modStyle", modStyle_.load(std::memory_order_relaxed));
         w.write("layout", layout_.load(std::memory_order_relaxed));
         w.write("shimmer", static_cast<float>(getShimmer()));
+        w.write("bandLimit", static_cast<float>(getBandLimit()));
+        w.write("doubleSlope", static_cast<float>(getDoubleSlope()));
         postEq_.writeState(w, "post");
         return w.blob();
     }
@@ -1284,6 +1363,8 @@ public:
         setModulationStyle(static_cast<ModulationStyle>(r.read("modStyle", 0)));
         setSpaceLayout(static_cast<SpaceLayout>(r.read("layout", 0)));
         setShimmer(static_cast<T>(r.read("shimmer", 0.0f)));
+        setBandLimit(static_cast<T>(r.read("bandLimit", 0.0f)));
+        setDoubleSlope(static_cast<T>(r.read("doubleSlope", 0.0f)));
         postEq_.readState(r, "post");
         return true;
     }
@@ -1511,6 +1592,107 @@ protected:
      * interpolation between xorshift32 random targets: smooth, non-periodic
      * modulation.
      */
+    /// The band limit: an elliptic wall on the wet pair, in double, in two
+    /// banks faded over 20 ms when the corner moves.
+    struct Wall
+    {
+        static constexpr int kSections = 6;
+        using Cascade = BiquadCascade<T, kSections, 2>;
+
+        void prepare(double sampleRate)
+        {
+            rate = sampleRate;
+            step = 1.0 / (0.02 * sampleRate);
+            for (auto& b : bank)
+            {
+                b.setNumSections(kSections);
+                b.reset();
+            }
+            hz = 0.0;
+            fade = 1.0;
+            fromOn = toOn = false;
+        }
+
+        void reset() noexcept
+        {
+            for (auto& b : bank) b.reset();
+            fade = 1.0;
+            fromOn = toOn;
+        }
+
+        [[nodiscard]] bool active() const noexcept { return toOn || fade < 1.0; }
+
+        /// The corner wanted now (0 = off); a fade under way finishes first.
+        void retarget(double want) noexcept
+        {
+            if (want > 0.0) want = std::min(want, 0.4 * rate);
+            if (want == hz || fade < 1.0) return;
+            fromOn = toOn;
+            live = 1 - live;
+            toOn = want > 0.0;
+            if (toOn)
+            {
+                BiquadCoeffs c[kSections];
+                // By the bilinear transform with the corner mapped exactly: the
+                // ripple of the pass band stays the prototype's (a fit of each
+                // section moves it by half a decibel), the stop band only gets deeper.
+                const AnalogCascade proto = FilterDesign::ellipticHighCut(want);
+                const int n = std::min(proto.count, kSections);
+                for (int s = 0; s < n; ++s) c[s] = FilterDesign::bilinear(proto.sections[static_cast<std::size_t>(s)], rate, want);
+                for (int s = 0; s < kSections; ++s) bank[live].setCoeffs(s, s < n ? c[s] : BiquadCoeffs {});
+                bank[live].reset();
+            }
+            hz = want;
+            fade = 0.0;
+        }
+
+        void frame(T& l, T& r) noexcept
+        {
+            const double x[2] = { static_cast<double>(l), static_cast<double>(r) };
+            double to[2] = { x[0], x[1] };
+            if (toOn)
+                for (int c = 0; c < 2; ++c) to[c] = bank[live].processSample(x[c], c);
+            if (fade < 1.0)
+            {
+                double from[2] = { x[0], x[1] };
+                if (fromOn)
+                    for (int c = 0; c < 2; ++c) from[c] = bank[1 - live].processSample(x[c], c);
+                fade = std::min(1.0, fade + step);
+                for (int c = 0; c < 2; ++c) to[c] = from[c] + fade * (to[c] - from[c]);
+            }
+            l = static_cast<T>(to[0]);
+            r = static_cast<T>(to[1]);
+        }
+
+        Cascade bank[2];
+        double rate = 48000.0, hz = 0.0, fade = 1.0, step = 0.0;
+        int live = 0;
+        bool fromOn = false, toOn = false;
+    };
+
+    Wall wall_;
+    std::atomic<T> bandLimit_ { T(0) };
+
+    /// The second slope: four lines of their own beside the tank (0.3 of its
+    /// decay times), each with
+    /// the tank's kind of absorption (a shelf at the high crossover).
+    struct SecondSlope
+    {
+        static constexpr int kLines = 4;
+        std::array<Line, kLines> line;
+        std::array<int, kLines> len {};
+        std::array<T, kLines> b0 {}, b1 {}, a1 {}, x1 {}, y1 {};
+        T gain = T(0), keep = T(1);          ///< its share of the output, what the tank keeps (targets)
+        T gainNow = T(0), keepNow = T(1);    ///< where they are now (they glide)
+        double loopSec = 0.0;                ///< mean loop length
+        bool on = false;
+    };
+    SecondSlope slope2_;
+    std::atomic<T> doubleSlope_ { T(0) };
+    static constexpr std::array<double, SecondSlope::kLines> kSecondMs { 23.3, 29.1, 37.9, 44.7 };
+    static constexpr double kSecondRatio = 0.3;   ///< its decay times, as a share of the tank's
+    static constexpr double kSecondShare = 0.30;  ///< its share of the tail's energy at 1
+
     struct SmoothRandomLFO
     {
         // Double state whatever T is: the increment is tiny against the phase,
@@ -2400,6 +2582,79 @@ protected:
         if (fading) [[unlikely]] advanceSizeFade();
     }
 
+    /**
+     * @brief The second slope's absorption and shares. Fed and summed as the
+     *        tank is (unit energy in, every line out), a network's tail holds
+     *        1 / (e^(13.8 x its mean loop / T60) - 1) of energy; the share asked for sets
+     *        its gain from the two, and the tank keeps the rest, so the sum
+     *        has the tail's energy.
+     */
+    void designSecondSlope(double decay, double t60H, double Kh) noexcept
+    {
+        auto& s = slope2_;
+        const double sr = spec_.sampleRate;
+        const double d2 = kSecondRatio * decay, h2 = kSecondRatio * t60H;
+        double loop = 0.0;
+        for (int j = 0; j < SecondSlope::kLines; ++j)
+        {
+            const auto l = static_cast<std::size_t>(j);
+            const double M = static_cast<double>(s.len[l]);
+            loop += M;
+            const double gM = std::pow(0.001, M / (d2 * sr));
+            const double gH = std::min(std::pow(0.001, M / (h2 * sr)), gM);
+            const double ratio = std::sqrt(gM / gH);
+            const double a = Kh * ratio, b = Kh / ratio, inv = 1.0 / (1.0 + b);
+            s.b0[l] = static_cast<T>(gH * (1.0 + a) * inv);
+            s.b1[l] = static_cast<T>(gH * (a - 1.0) * inv);
+            s.a1[l] = static_cast<T>((b - 1.0) * inv);
+        }
+        s.loopSec = loop / (SecondSlope::kLines * sr);
+        const double amount = static_cast<double>(doubleSlope_.load(std::memory_order_relaxed));
+        s.on = amount > 0.0 && !spring_;
+        if (!s.on)
+        {
+            s.gain = T(0);
+            s.keep = T(1);
+            return;
+        }
+        const double share = kSecondShare * amount;
+        // Each network's tail: g^2 / (1 - g^2) per unit in, g^2 = e^-(13.8 loop / T60).
+        const auto tail = [](double loopSec, double t60) { return 1.0 / std::expm1(std::min(2.0 * 6.907755278982137 * loopSec / std::max(1e-3, t60), 50.0)); };
+        const double own = tail(s.loopSec, kSecondRatio * decay) / std::max(1e-9, tail(meanLoopSec_, decay));   // its energy over the tank's
+        s.gain = static_cast<T>(std::sqrt(share / ((1.0 - share) * own)));
+        s.keep = static_cast<T>(std::sqrt(1.0 - share));
+    }
+
+    /** @brief One sample of the second slope, added to the late pair. */
+    void runSecondSlope(T& lateL, T& lateR, int injLag) noexcept
+    {
+        auto& s = slope2_;
+        constexpr T kGlide = T(0.001);
+        s.gainNow += kGlide * (s.gain - s.gainNow);
+        s.keepNow += kGlide * (s.keep - s.keepNow);
+        T y[SecondSlope::kLines];
+        for (int j = 0; j < SecondSlope::kLines; ++j)
+        {
+            const auto l = static_cast<std::size_t>(j);
+            const T x = s.line[l].at(s.len[l]);
+            const T v = s.b0[l] * x + s.b1[l] * s.x1[l] - s.a1[l] * s.y1[l];
+            s.x1[l] = x;
+            s.y1[l] = v;
+            y[j] = v;
+        }
+        const T outL = y[0] - y[1] + y[2] - y[3];
+        const T outR = y[0] + y[1] - y[2] - y[3];
+        hadamardSmall<SecondSlope::kLines>(y);
+        for (int j = 0; j < SecondSlope::kLines; ++j)
+        {
+            const auto l = static_cast<std::size_t>(j);
+            const T feed = ring_[static_cast<std::size_t>(j & 1)].at(injLag + 1 + 7 * j);
+            s.line[l].push(T(0.5) * (y[j] + ((j & 2) ? -feed : feed)));
+        }
+        lateL = s.keepNow * lateL + s.gainNow * outL;
+        lateR = s.keepNow * lateR + s.gainNow * outR;
+    }
+
     /** @brief One sample of a size fade; at its end the second heads become the first. */
     void advanceSizeFade() noexcept
     {
@@ -2875,6 +3130,7 @@ protected:
                 if (eco_) runFdn<kEcoLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
                 else      runFdn<kMaxLines>(lateL, lateR, gap + last - n, loopG, inGain, extra);
                 lastLateMono_ = (lateL + lateR) * T(0.5);
+                if (slope2_.on || slope2_.gainNow != T(0)) runSecondSlope(lateL, lateR, gap + last - n);
             }
 
             const T earlyNow = early0 + (earlyCur_ - early0) * a;
@@ -3282,6 +3538,7 @@ protected:
         // signal's level whatever the type, decay, damping and size.
         wetLevel_ = static_cast<T>((spring_ ? kWetCalibrationSpring : kWetCalibration)
             / std::sqrt(std::max(1e-6, heardTailEnergy(decay, t60H, t60B, Kh, Kb) + earlyEnergy())));
+        designSecondSlope(decay, t60H, Kh);
 
         // With signal in the tank the loop gains glide to the new design (a
         // step of them is a step of every line's output: a click); an empty

@@ -11707,7 +11707,7 @@ Decays schroederDecays(const std::vector<double>& ir)
 DSPARK_TEST(AlgoReverb_double_slope_shortens_the_early_decay_only)
 {
     using Type = AlgorithmicReverb<double>::Type;
-    for (const auto [type, decay] : { std::pair { Type::Hall, 2.0 }, std::pair { Type::Room, 1.0 } })
+    for (const auto& [type, decay] : { std::pair { Type::Hall, 2.0 }, std::pair { Type::Room, 1.0 } })
     {
         const Decays a = schroederDecays(lateIR(type, decay, 0.0));
         const Decays b = schroederDecays(lateIR(type, decay, 1.0));

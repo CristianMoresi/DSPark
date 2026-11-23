@@ -223,6 +223,12 @@ public:
         spec_ = spec;
         for (int i = 0; i < MaxBands; ++i)
             bands_[i].prepare(spec);
+        // The K weighting of BS.1770 (its shelf and its high-pass).
+        kShelf_ = BiquadCoeffs::makeHighShelf(spec.sampleRate, 1681.974450955533, 3.999843853973347);
+        kHighPass_ = BiquadCoeffs::makeHighPass(spec.sampleRate, 38.13547087602444, 0.5003270373238773);
+        compRamp_ = std::max(1, static_cast<int>(0.05 * spec.sampleRate));
+        compNow_ = compTarget_;
+        compLeft_ = 0;
 
         // Band crossfade scratch: one block of dry signal per channel the
         // FilterEngines process (they hold at most 16 channels).
@@ -388,6 +394,7 @@ public:
         if (configDirty_.exchange(false, std::memory_order_acquire))
         {
             updateActiveFilters();
+            refreshCompensation();
             lpDirty_.store(true, std::memory_order_release);
         }
 
@@ -405,6 +412,7 @@ public:
                 lpWasActive_ = true;
             }
             processLinearPhase(buffer);
+            applyCompensation(buffer);
             return;
         }
         if (lpWasActive_) conditionBandsAfterLinearPhase();
@@ -424,6 +432,7 @@ public:
         {
             prototypeWasActive_ = false;
         }
+        applyCompensation(buffer);
     }
 
     /**
@@ -450,6 +459,7 @@ public:
             && configDirty_.exchange(false, std::memory_order_acquire))
         {
             updateActiveFilters();
+            refreshCompensation();
             const int n = numBands_.load(std::memory_order_relaxed);
             for (int i = 0; i < n; ++i)
                 bands_[i].applyParametersNow();
@@ -488,7 +498,8 @@ public:
                 sample = bands_[i].processSample(sample, slot);
             }
         }
-        return sample;
+        // The compensation, at its target at once.
+        return compTarget_ == 1.0 ? sample : static_cast<T>(static_cast<double>(sample) * compTarget_);
     }
 
     /**
@@ -498,6 +509,8 @@ public:
     {
         for (int i = 0; i < MaxBands; ++i)
             bands_[i].reset();
+        compNow_ = compTarget_;
+        compLeft_ = 0;
         if (analog_)
             for (auto& band : *analog_) band.cascade.reset();
 
@@ -618,6 +631,25 @@ public:
     {
         return numBands_.load(std::memory_order_relaxed);
     }
+
+    /**
+     * @brief Keeps the loudness (off by default): the bands' change of the
+     *        K-weighted level of pink noise (as BS.1770 hears it) is taken
+     *        back by a gain, which moves in 50 ms when the bands change. With
+     *        bands on the middle, the sides or one channel it reads every
+     *        band together. processSample() applies it at once.
+     */
+    void setLoudnessCompensation(bool on) noexcept
+    {
+        loudnessComp_.store(on, std::memory_order_relaxed);
+        configDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return Whether the loudness is kept. */
+    [[nodiscard]] bool getLoudnessCompensation() const noexcept { return loudnessComp_.load(std::memory_order_relaxed); }
+
+    /** @return The gain the compensation is heading for, in dB (0 when off). */
+    [[nodiscard]] T getCompensationDb() const noexcept { return compensationDb_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Switches Peak bands to the analog-matched (de-cramped) design.
@@ -987,6 +1019,7 @@ public:
         w.write("structure", static_cast<int32_t>(getStructure()));
         w.write("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)));
         w.write("softMode", softMode_.load(std::memory_order_relaxed));
+        w.write("loudnessComp", getLoudnessCompensation());
         w.write("analog", analogResponse_.load(std::memory_order_relaxed));
         w.write("resonantShelves", resonantShelves_.load(std::memory_order_relaxed));
         char key[24];
@@ -1030,6 +1063,7 @@ public:
         setFilterMode(static_cast<FilterMode>(
             r.read("filterMode", static_cast<int32_t>(filterMode_.load(std::memory_order_relaxed)))));
         setSoftMode(r.read("softMode", softMode_.load(std::memory_order_relaxed)));
+        setLoudnessCompensation(r.read("loudnessComp", false));
         setAnalogResponse(r.read("analog", analogResponse_.load(std::memory_order_relaxed)));
         setResonantShelves(r.read("resonantShelves", false));
         char key[24];
@@ -1096,6 +1130,54 @@ protected:
      * set is retried on a later call. Reconfiguring a band from its published
      * config is idempotent, so retrying all of them costs nothing but the work.
      */
+    /**
+     * @brief The compensation's target: on a log grid (where pink noise has
+     *        the same power in every point), the K-weighted mean of the
+     *        bands' squared magnitude over that of the weighting alone.
+     */
+    void refreshCompensation() noexcept
+    {
+        double target = 1.0;
+        if (loudnessComp_.load(std::memory_order_relaxed) && spec_.sampleRate > 0.0)
+        {
+            constexpr int kPoints = 96;
+            const double top = std::min(20000.0, 0.45 * spec_.sampleRate);
+            T f[kPoints], m[kPoints];
+            for (int i = 0; i < kPoints; ++i)
+                f[i] = static_cast<T>(20.0 * std::pow(top / 20.0, static_cast<double>(i) / (kPoints - 1)));
+            magnitudeOfBands(f, m, kPoints, -1);
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < kPoints; ++i)
+            {
+                const double hz = static_cast<double>(f[i]);
+                const double k = kShelf_.getMagnitude(hz, spec_.sampleRate) * kHighPass_.getMagnitude(hz, spec_.sampleRate);
+                const double w = k * k, g = static_cast<double>(m[i]);
+                num += w * g * g;
+                den += w;
+            }
+            if (num > 0.0 && den > 0.0) target = std::sqrt(den / num);
+        }
+        compensationDb_.store(static_cast<T>(20.0 * std::log10(target)), std::memory_order_relaxed);
+        if (target == compTarget_) return;
+        compTarget_ = target;
+        compStep_ = (compTarget_ - compNow_) / static_cast<double>(compRamp_);
+        compLeft_ = compRamp_;
+    }
+
+    /** @brief The compensation's gain on a block (nothing at rest at unity). */
+    void applyCompensation(AudioBufferView<T>& buffer) noexcept
+    {
+        if (compLeft_ == 0 && compNow_ == 1.0) return;
+        const int nS = buffer.getNumSamples(), nCh = buffer.getNumChannels();
+        for (int i = 0; i < nS; ++i)
+        {
+            if (compLeft_ > 0 && --compLeft_ == 0) compNow_ = compTarget_;
+            else if (compLeft_ > 0) compNow_ += compStep_;
+            const T g = static_cast<T>(compNow_);
+            for (int ch = 0; ch < nCh; ++ch) buffer.getChannel(ch)[i] *= g;
+        }
+    }
+
     void updateActiveFilters() noexcept
     {
         const bool matched = matchedBells_.load(std::memory_order_relaxed);
@@ -2764,6 +2846,12 @@ protected:
     // on the hot path, so it gets its own atomic to avoid a torn/unsynchronized read.
     std::array<std::atomic<bool>, MaxBands> bandEnabled_ {};
 
+    // Loudness compensation (setLoudnessCompensation()).
+    std::atomic<bool> loudnessComp_ { false };
+    std::atomic<T> compensationDb_ { T(0) };
+    BiquadCoeffs kShelf_ {}, kHighPass_ {};
+    double compTarget_ = 1.0, compNow_ = 1.0, compStep_ = 0.0;
+    int compRamp_ = 2400, compLeft_ = 0;
     std::atomic<bool> softMode_ { false };
     std::atomic<bool> configDirty_ { false };
     std::atomic<bool> matchedBells_ { true };  ///< Matched (de-cramped) bells by default.

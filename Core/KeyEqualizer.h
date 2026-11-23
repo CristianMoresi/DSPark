@@ -180,6 +180,7 @@ public:
         active_ = false;
         placed_ = false;
         inParts_ = false;
+        compSnap_ = true;
         dirty_.store(true, std::memory_order_release);
     }
 
@@ -194,6 +195,8 @@ public:
         if (!bank_[0].cascade || !bank_[1].cascade) return;
         if (changing_) finishChange();
         for (Bank& bank : bank_) bank.cascade->reset();
+        compNow_ = compTarget_;
+        compLeft_ = 0;
     }
 
     // -- Settings (any thread) --------------------------------------------------
@@ -276,9 +279,27 @@ public:
     }
 
     /**
+     * @brief Keeps the loudness (off by default): the bands' change of the
+     *        K-weighted level of pink noise (as BS.1770 hears it) is taken
+     *        back by a gain, which moves in 50 ms (as advance() goes) when
+     *        the bands change. It reads every band, wherever it is placed.
+     */
+    void setLoudnessCompensation(bool on) noexcept
+    {
+        loudnessComp_.store(on, std::memory_order_relaxed);
+        dirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return Whether the loudness is kept. */
+    [[nodiscard]] bool getLoudnessCompensation() const noexcept { return loudnessComp_.load(std::memory_order_relaxed); }
+
+    /** @return The gain the compensation is heading for, in dB (0 when off). */
+    [[nodiscard]] double getCompensationDb() const noexcept { return compensationDb_.load(std::memory_order_relaxed); }
+
+    /**
      * @brief Writes the bands under keys that start with a prefix
      *        ("<prefix><band>.shape", ".freq", ".gain", ".q", ".slope",
-     *        ".place").
+     *        ".place"), and "<prefix>loudness".
      */
     void writeState(StateWriter& w, const char* prefix) const
     {
@@ -299,6 +320,8 @@ public:
             std::snprintf(key, sizeof(key), "%s%d.place", prefix, b);
             w.write(key, static_cast<int32_t>(band.placement));
         }
+        std::snprintf(key, sizeof(key), "%sloudness", prefix);
+        w.write(key, getLoudnessCompensation());
     }
 
     /** @brief Reads the bands writeState() wrote (a band that is missing reads
@@ -325,6 +348,8 @@ public:
                                                                static_cast<int>(Placement::Side)));
             setBand(b, band);
         }
+        std::snprintf(key, sizeof(key), "%sloudness", prefix);
+        setLoudnessCompensation(r.read(key, false));
     }
 
     // -- Audio thread -----------------------------------------------------------
@@ -337,7 +362,10 @@ public:
     {
         if (!bank_[0].cascade || !bank_[1].cascade) return false;
         if (dirty_.load(std::memory_order_relaxed) && dirty_.exchange(false, std::memory_order_acquire))
+        {
             apply();
+            refreshCompensation();
+        }
         return active_;
     }
 
@@ -367,7 +395,7 @@ public:
     [[nodiscard]] T processSample(T input, int channel) noexcept
     {
         if (!active_) return input;
-        return static_cast<T>(run(static_cast<double>(input), channel, Placement::Stereo));
+        return static_cast<T>(run(static_cast<double>(input), channel, Placement::Stereo) * compNow_);
     }
 
     /**
@@ -398,13 +426,13 @@ public:
             const double left = static_cast<double>(frame[0]), right = static_cast<double>(frame[1]);
             const double mid = run(0.5 * (left + right), 0, Placement::Mid);
             const double side = run(0.5 * (left - right), 1, Placement::Side);
-            frame[0] = static_cast<T>(mid + side);
-            frame[1] = static_cast<T>(mid - side);
+            frame[0] = static_cast<T>((mid + side) * compNow_);
+            frame[1] = static_cast<T>((mid - side) * compNow_);
             return;
         }
         const Placement part = nCh == 1 ? Placement::Mid : Placement::Stereo;
         for (int ch = 0; ch < nCh; ++ch)
-            frame[ch] = static_cast<T>(run(static_cast<double>(frame[ch]), ch, part));
+            frame[ch] = static_cast<T>(run(static_cast<double>(frame[ch]), ch, part) * compNow_);
     }
 
     /**
@@ -416,6 +444,12 @@ public:
     void advance(int samples) noexcept
     {
         if (!active_ || samples <= 0) return;
+        if (compLeft_ > 0)
+        {
+            const int n = std::min(samples, compLeft_);
+            compLeft_ -= n;
+            compNow_ = compLeft_ == 0 ? compTarget_ : compNow_ + compStep_ * static_cast<double>(n);
+        }
         Cascade& live = *bank_[static_cast<size_t>(live_)].cascade;
         if (live.isRamping()) live.advanceRamps(samples);
         if (gliding_)
@@ -581,6 +615,48 @@ private:
      * whole set goes into the other bank and the two cross over. Settings
      * that come while a crossing is in flight wait for it to end.
      */
+    /**
+     * @brief The compensation's target: on a log grid (where pink noise has
+     *        the same power in every point), the K-weighted mean of the
+     *        bands' squared magnitude over that of the weighting alone.
+     */
+    void refreshCompensation() noexcept
+    {
+        double target = 1.0;
+        const double fs = sampleRate_.load(std::memory_order_relaxed);
+        if (loudnessComp_.load(std::memory_order_relaxed))
+        {
+            constexpr int kPoints = 96;
+            const Response r = getResponse(Placement::Stereo);
+            const BiquadCoeffs shelf = BiquadCoeffs::makeHighShelf(fs, 1681.974450955533, 3.999843853973347);
+            const BiquadCoeffs low = BiquadCoeffs::makeHighPass(fs, 38.13547087602444, 0.5003270373238773);
+            const double top = std::min(20000.0, 0.45 * fs);
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < kPoints; ++i)
+            {
+                const double hz = 20.0 * std::pow(top / 20.0, static_cast<double>(i) / (kPoints - 1));
+                const double k = shelf.getMagnitude(hz, fs) * low.getMagnitude(hz, fs);
+                const double w = k * k, g = std::pow(10.0, r.magnitudeDb(hz) / 10.0);
+                num += w * g;
+                den += w;
+            }
+            if (num > 0.0 && den > 0.0) target = std::sqrt(den / num);
+        }
+        compensationDb_.store(20.0 * std::log10(target), std::memory_order_relaxed);
+        if (compSnap_)
+        {
+            compSnap_ = false;
+            compTarget_ = compNow_ = target;
+            compLeft_ = 0;
+            return;
+        }
+        if (target == compTarget_) return;
+        compTarget_ = target;
+        const int ramp = std::max(1, static_cast<int>(0.05 * fs));
+        compStep_ = (compTarget_ - compNow_) / static_cast<double>(ramp);
+        compLeft_ = ramp;
+    }
+
     void apply() noexcept
     {
         if (changing_) { waiting_ = true; return; }
@@ -763,6 +839,11 @@ private:
     std::array<Published, kBands> published_ {};
     std::atomic<bool> dirty_ { true };
     std::atomic<double> sampleRate_ { 48000.0 };
+    std::atomic<bool> loudnessComp_ { false };
+    std::atomic<double> compensationDb_ { 0.0 };
+    double compTarget_ = 1.0, compNow_ = 1.0, compStep_ = 0.0;   ///< Audio thread.
+    int compLeft_ = 0;
+    bool compSnap_ = true;                       ///< After prepare(): the first target is taken at once.
 
     // Audio thread.
     std::array<Bank, 2> bank_ {};

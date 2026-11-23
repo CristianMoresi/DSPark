@@ -11719,3 +11719,93 @@ DSPARK_TEST(AlgoReverb_double_slope_shortens_the_early_decay_only)
     }
 }
 
+
+namespace {
+// A plate's impulse response (left), with its own tank or the network.
+std::vector<double> plateIR(bool tank, double decay, double seconds)
+{
+    using ARevD = AlgorithmicReverb<double>;
+    ARevD rev;
+    rev.prepare(spec(48000.0, 256, 2));
+    rev.setType(ARevD::Type::Plate);
+    rev.setMix(1.0);
+    rev.setPreDelay(0.0);
+    rev.setDecay(decay);
+    rev.setHighDecayMultiplier(0.5);
+    rev.setPlateTank(tank);
+    const int total = static_cast<int>(seconds * 48000.0) / 256 * 256;
+    std::vector<double> ir(static_cast<size_t>(total));
+    std::vector<double> l(256), r(256);
+    for (int off = 0; off < total; off += 256)
+    {
+        for (int i = 0; i < 256; ++i) l[static_cast<size_t>(i)] = r[static_cast<size_t>(i)] = off + i == 0 ? 1.0 : 0.0;
+        double* ch[2] = { l.data(), r.data() };
+        rev.processBlock(AudioBufferView<double>(ch, 2, 256));
+        for (int i = 0; i < 256; ++i) ir[static_cast<size_t>(off + i)] = l[static_cast<size_t>(i)];
+    }
+    return ir;
+}
+
+// Schroeder T20 of an impulse response through a band-pass of Q 1.4 (an octave).
+double bandT20(std::vector<double> ir, double hz)
+{
+    Biquad<double, 1> bp;
+    bp.setCoeffs(BiquadCoeffs::makeBandPass(48000.0, hz, 1.41));
+    for (auto& v : ir) v = bp.processSample(v, 0);
+    double total = 0.0;
+    for (const double v : ir) total += v * v;
+    double rem = total;
+    int t5 = -1, t25 = -1;
+    for (int i = 0; i < static_cast<int>(ir.size()); ++i)
+    {
+        const double r = rem / total;
+        if (t5 < 0 && r <= 0.31622776601683794) t5 = i;
+        if (t25 < 0 && r <= 0.0031622776601683794) { t25 = i; break; }
+        rem -= ir[static_cast<size_t>(i)] * ir[static_cast<size_t>(i)];
+    }
+    return 3.0 * (t25 - t5) / 48000.0;
+}
+
+// Normalized echo density (Abel and Huang) over a window of 10 ms.
+double densityAt(const std::vector<double>& ir, int centre)
+{
+    constexpr int kHalf = 240;
+    double sq = 0.0;
+    for (int i = centre - kHalf; i <= centre + kHalf; ++i) sq += ir[static_cast<size_t>(i)] * ir[static_cast<size_t>(i)];
+    const double sigma = std::sqrt(sq / (2 * kHalf + 1));
+    int over = 0;
+    for (int i = centre - kHalf; i <= centre + kHalf; ++i) over += std::abs(ir[static_cast<size_t>(i)]) > sigma ? 1 : 0;
+    return over / (2.0 * kHalf + 1.0) / 0.31731050786291415;
+}
+} // namespace
+
+DSPARK_TEST(AlgoReverb_plate_tank_decays_as_asked_and_keeps_the_level)
+{
+    std::vector<double> levels, t20s;
+    for (const double decay : { 1.5, 2.0, 3.0, 5.0, 8.0 })
+    {
+        const auto n = plateIR(false, decay, 2.5 * decay), p = plateIR(true, decay, 2.5 * decay);
+        double a = 0.0, b = 0.0;
+        for (size_t i = 0; i < n.size(); ++i) { a += n[i] * n[i]; b += p[i] * p[i]; }
+        std::printf("    plate tank, decay %.1f s: level %+.2f dB against the network, T20 1 kHz %.3f s%c", decay, 10.0 * std::log10(b / a), bandT20(p, 1000.0), 10);
+        levels.push_back(10.0 * std::log10(b / a));
+        t20s.push_back(bandT20(p, 1000.0) / decay);
+    }
+    for (size_t i = 0; i < levels.size(); ++i)
+    {
+        EXPECT_NEAR(levels[i], 0.0, 1.0);
+        EXPECT_NEAR(t20s[i], 1.0, 0.15);
+    }
+    const auto net = plateIR(false, 2.0, 4.0), tank = plateIR(true, 2.0, 4.0);
+    double eNet = 0.0, eTank = 0.0;
+    for (size_t i = 0; i < net.size(); ++i) { eNet += net[i] * net[i]; eTank += tank[i] * tank[i]; }
+    int onset = 0;
+    while (std::abs(tank[static_cast<size_t>(onset)]) < 1e-7) ++onset;
+    const double t1k = bandT20(tank, 1000.0), t4k = bandT20(tank, 4000.0), n1k = bandT20(net, 1000.0);
+    std::printf("    plate tank: level %+.2f dB against the network, T20 1 kHz %.3f s (network %.3f), 4 kHz %.3f s, density at 10 ms %.2f (network %.2f)%c",
+                10.0 * std::log10(eTank / eNet), t1k, n1k, t4k, densityAt(tank, onset + 480), densityAt(net, onset + 480), 10);
+    EXPECT_NEAR(10.0 * std::log10(eTank / eNet), 0.0, 1.0);
+    EXPECT_GT(densityAt(tank, onset + 480), 0.8);   // measured 0.96 (the network: 0.07)
+    EXPECT_NEAR(t1k, 2.0, 0.25);
+    EXPECT_LT(t4k, t1k);
+}

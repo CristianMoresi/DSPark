@@ -68,13 +68,15 @@
  * untouched.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h, Core/AudioSpec.h,
- * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h, Core/StateBlob.h.
+ * Core/AudioBuffer.h, Core/DspMath.h, Core/DenormalGuard.h, Core/DryWetMixer.h,
+ * Core/StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
 #include "../Core/DenormalGuard.h"
+#include "../Core/DryWetMixer.h"
 #include "../Core/DspMath.h"
 #include "../Core/Hysteresis.h"
 #include "../Core/Oversampling.h"
@@ -137,6 +139,7 @@ public:
         dryRing_.assign(static_cast<size_t>(numChannels_),
                         std::vector<T>(static_cast<size_t>(drySize_), T(0)));
         dryPos_ = 0;
+        dryLead_.prepare(spec.sampleRate, numChannels_);
 
         channels_.assign(static_cast<size_t>(numChannels_), {});
         for (auto& ch : channels_)
@@ -183,6 +186,9 @@ public:
         hScaleSm_ = -1.0;
         mScaleSm_ = -1.0;
         currentMix_ = mix_.load(std::memory_order_relaxed);
+        dryLead_.aim(currentMix_ > T(0));
+        dryLead_.reset();
+        dryLead_.land();
     }
 
     // -- Parameters (thread-safe) ---------------------------------------------------
@@ -216,8 +222,10 @@ public:
     }
 
     /** @brief Dry/wet mix [0, 1]; the dry path is delayed to getLatency()
-     *  and the mix is ramped over at least 20 ms. Non-finite values are
-     *  ignored. */
+     *  and the mix is ramped over at least 20 ms. Between the two ends the
+     *  dry side leads as the magnetizing corner does, by phase alone, so a
+     *  partial mix loses no more than 0.1 dB to phase from 20 Hz up; at 0 it
+     *  is the delayed input to the bit. Non-finite values are ignored. */
     void setMix(T mix) noexcept
     {
         if (!std::isfinite(mix)) return;
@@ -446,15 +454,19 @@ private:
         if (calActive_) stepCalibration(osN);
         if (osOn) oversampler_->downsample(buffer);
 
-        for (int ch = 0; ch < nCh; ++ch)
+        dryLead_.aim(mixTarget > T(0));
+        for (int i = 0; i < nS; ++i)
         {
-            T* d = buffer.getChannel(ch);
-            const auto& dry = dryRing_[static_cast<size_t>(ch)];
-            for (int i = 0; i < nS; ++i)
+            const int idx = (dryPos_ + i - latency_) & (drySize_ - 1);
+            const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
+            const double turn = dryLead_.advance();
+            for (int ch = 0; ch < nCh; ++ch)
             {
-                const int idx = (dryPos_ + i - latency_) & (drySize_ - 1);
-                const T drySample = dry[static_cast<size_t>(idx)];
-                const T mixVal = moveTowards(mixStart, mixTarget, mixMaxStep_ * static_cast<T>(i + 1));
+                T* d = buffer.getChannel(ch);
+                const T rawDry = dryRing_[static_cast<size_t>(ch)][static_cast<size_t>(idx)];
+                const T turned = dryLead_.processSample(ch, rawDry, turn);
+                // All wet, the sum keeps the rounding it has with the raw copy.
+                const T drySample = mixVal == T(1) ? rawDry : turned;
                 d[i] = drySample + (d[i] - drySample) * mixVal;
             }
         }
@@ -504,6 +516,9 @@ private:
         const double cornerHz = 40.0 * std::pow(0.125, size);   // 40 -> 5 Hz
         leak_ = std::exp(-2.0 * std::numbers::pi * cornerHz / sampleRate_);
         hpA_ = 1.0 - 2.0 * std::numbers::pi * cornerHz / sampleRate_;
+        // A first-order all-pass at tan(pi/8) of the corner leads by as much
+        // as the one-pole high-pass at that corner, and within a few degrees over it.
+        dryLead_.setCorner((std::numbers::sqrt2 - 1.0) * cornerHz);
         halfT_ = 0.5 / sampleRate_;
         invHalfT_ = 2.0 * sampleRate_;
 
@@ -593,6 +608,7 @@ private:
     std::vector<std::vector<T>> dryRing_;   ///< Per-channel dry history.
     int drySize_ = 1;
     int dryPos_ = 0;
+    detail::DryPhase dryLead_;              ///< The lead of the magnetizing corner on the dry side.
     std::atomic<bool> prepared_ { false };
 
     std::vector<ChannelState> channels_;

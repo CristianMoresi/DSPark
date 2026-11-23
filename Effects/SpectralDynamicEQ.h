@@ -5,54 +5,53 @@
 
 /**
  * @file SpectralDynamicEQ.h
- * @brief Dynamic bands that act frequency by frequency inside themselves: a
- *        band is cut into cells, each cell follows its own level, and the
- *        reduction takes the band's shape, applied as a minimum-phase filter.
+ * @brief Dynamic bands that act frequency by frequency inside themselves, as
+ *        fine as setDetail(), applied as a minimum-phase filter.
  *
  * A dynamic bell set on a resonance acts on the whole bell when only one
  * frequency in it is loud. Here a band (a bell or a shelf, with its
- * frequency, Q and range) covers the frequencies where its static response
- * at full range (its analog prototype's, so it keeps its width up to the top
- * of the band) is over one percent of that range, cut into up to 128
- * cells (setBand(): `cells`) placed by the band's weight: equal steps of
- * its shape integrated over log frequency, so they crowd where the band
- * acts and the skirts take a few wide ones. Every hop the
- * level of a cell is the largest power of the key's spectrum in it,
- * weighted by the band's shape there; a cell also looks half a cell into
- * each neighbour, with a weight that falls to nothing at the neighbour's
- * centre, so a partial on a border belongs to both cells instead of
- * changing hands. The threshold is relative to the
- * band's own recent peak (it rises at once and falls by 2 dB per second),
- * so it follows the programme's level; over the threshold the cell's action
- * is the excess times (1 - 1 / ratio), limited by the range, with an attack
- * and a release that are faster in the upper cells (by the square root of
- * the frequency). The actions are projected onto the bins between the cells'
- * centres, multiplied by the band's shape (so the result stays between the
- * band's base response, flat, and its extreme one, the full range) and the
- * bands add in decibels. The gain curve is applied by a SpectralFilter: a
- * minimum-phase FIR designed every hop, without pre-echo.
+ * frequency, Q and range) says where, and the detail says how finely: the
+ * band covers the frequencies where its static response at full range (its
+ * analog prototype's, so it keeps its width up to the top) is over one
+ * percent of that range, and inside it every point of a log-frequency grid
+ * of 1024 has its own level, read by a window that follows the detail
+ * (DetailAnalysis: a third of a second in the low end, 21 ms at the top),
+ * held over an eighth of the detail so that what moves keeps its reduction,
+ * and weighted by the band's shape. The threshold is relative to the band's
+ * own recent peak (it rises at once and falls by 2 dB per second), so it
+ * follows the programme's level; over it a point's action is the excess
+ * times (1 - 1 / ratio), limited by the range, with an attack and a release
+ * that are faster up the band (by the square root of the frequency). The
+ * actions times the band's shape stay between flat and its full range, and
+ * the bands add in decibels. A DetailFilter plays that curve: minimum phase,
+ * with detail in the low end too (see Limits), and the curve shown is that one.
  *
- * When a band is edited at work, what each cell was doing is carried to the
- * new cells by frequency (read on the log-frequency axis; nothing outside the
- * span it had), and if its span moved, a second reference of level listens
- * to the new span for half a second before it replaces the first.
+ * When a band is edited at work each frequency keeps what the band was
+ * doing there; if its span moved, a second reference of level listens to the
+ * new span for half a second before it replaces the first.
  *
- * Latency: the analysis window, about 46 ms (doubling by octaves with the
- * rate; getLatency()).
+ * Limits: a sixth of an octave is told apart from 50 Hz, a twelfth from
+ * 100 Hz, a 24th from 200 Hz; the finer, the later the low end follows (some
+ * tenths of a second).
+ *
+ * Latency: 2048 samples at 44.1 and 48 kHz, doubling by octaves with the rate
+ * (getLatency()).
  *
  * Threading: prepare() and setState() on the setup thread (allocate);
- * processBlock() and reset() on the audio thread; setBand() publishes
- * lock-free (the audio thread redesigns the band at its next block).
- * getDisplayGain() and getPeakGain() read the last frame's gain curve from
- * any thread.
- * Non-finite fields are ignored.
+ * processBlock() and reset() on the audio thread; setBand() and setDetail()
+ * publish lock-free (the audio thread takes them at its next block).
+ * getDisplayGain() and getPeakGain() read, from any thread, the curve last
+ * drawn (one every 21 ms): a short action shows there up to that much late
+ * or long. Non-finite fields are ignored.
  *
- * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h, FilterDesign.h,
- * SpectralFilter.h, StateBlob.h.
+ * Dependencies: AudioBuffer.h, AudioSpec.h, DetailAnalysis.h, DetailFilter.h,
+ * DspMath.h, FilterDesign.h, SpectralFilter.h, StateBlob.h.
  */
 
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
+#include "../Core/DetailAnalysis.h"
+#include "../Core/DetailFilter.h"
 #include "../Core/DspMath.h"
 #include "../Core/FilterDesign.h"
 #include "../Core/SpectralFilter.h"
@@ -64,13 +63,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <numbers>
+#include <utility>
 #include <vector>
 
 namespace dspark {
 
 /**
  * @class SpectralDynamicEQ
- * @brief Dynamic equalizer bands with a level per cell inside each band.
+ * @brief Dynamic equalizer bands with a level at every frequency inside each band.
  *
  * @tparam T Sample type (float or double).
  */
@@ -78,8 +79,7 @@ template <FloatType T>
 class SpectralDynamicEQ
 {
 public:
-    static constexpr int kBands = 4;      ///< Bands.
-    static constexpr int kMaxCells = 128; ///< Most cells in a band.
+    static constexpr int kBands = 4; ///< Bands.
 
     /** @brief The shape of a band. */
     enum class Shape { Off, Bell, LowShelf, HighShelf };
@@ -95,28 +95,32 @@ public:
         T range = T(-12);        ///< Most action, -24 (cut) to +24 dB.
         T attack = T(10);        ///< At 1 kHz, 0.5 to 500 ms.
         T release = T(150);      ///< At 1 kHz, 5 to 2000 ms.
-        int cells = 32;          ///< 1 to 128.
     };
 
     /** @brief Allocates for a rate and a layout (an invalid spec is ignored). */
     void prepare(const AudioSpec& spec)
     {
         if (!spec.isValid()) return;
+        prepared_ = false;
         spec_ = spec;
-        const int octaves = std::max(0, static_cast<int>(std::lround(std::log2(std::max(spec.sampleRate, 44100.0) / 44100.0))));
-        filter_.prepare(spec, std::min(2048 << octaves, 16384), 2, 4);
+        channels_ = std::min(spec.numChannels, DetailFilter<T>::kMaxChannels);
+        filter_.prepare(spec);
         filter_.setLinked(true);
-        bins_ = filter_.getNumBins();
+        analysis_.setLinked(true);
+        analysis_.prepare(spec);
+        hopSeconds_ = static_cast<double>(filter_.getHopSize()) / spec.sampleRate;
         for (auto& s : state_)
         {
-            s.shape.assign(static_cast<size_t>(bins_), 0.0);
-            s.cellOf.assign(static_cast<size_t>(bins_), -1);
-            s.action.fill(0.0);
-            s.peak = -200.0;
+            for (auto* v : { &s.share, &s.shareDb, &s.action, &s.attack, &s.release }) v->assign(kSize, T(0));
+            s.peak = kSilent;
             s.active = false;
+            s.first = s.end = 0;
         }
-        gainDb_.assign(static_cast<size_t>(bins_), 0.0);
-        readout_.prepare(filter_.getBinHz(), bins_);
+        for (auto* v : { &power_, &level_, &held_, &total_ }) v->assign(kSize, T(0));
+        sum_.assign(kSize + 1, 0.0);
+        queue_.assign(kSize, 0);
+        lastDetail_ = T(-1);   // the detail is taken at the first block
+        shownCurve_ = 0;
         for (auto& d : dirty_) d.store(true, std::memory_order_release);
         prepared_ = true;
     }
@@ -125,8 +129,14 @@ public:
     void reset() noexcept
     {
         filter_.reset();
-        for (auto& s : state_) { s.action.fill(0.0); s.peak = -200.0; }
-        readout_.clear();
+        analysis_.reset();
+        for (auto& s : state_)
+        {
+            std::fill(s.action.begin(), s.action.end(), T(0));
+            s.peak = kSilent;
+            s.watching = 0;
+        }
+        shownCurve_ = 0;
     }
 
     /** @brief Sets a band (out-of-range indices are ignored; fields are clamped). */
@@ -143,7 +153,6 @@ public:
         put(p.range, band.range, T(-24), T(24));
         put(p.attack, band.attack, T(0.5), T(500));
         put(p.release, band.release, T(5), T(2000));
-        p.cells.store(std::clamp(band.cells, 1, kMaxCells), std::memory_order_relaxed);
         dirty_[static_cast<size_t>(index)].store(true, std::memory_order_release);
     }
 
@@ -161,46 +170,70 @@ public:
         b.range = p.range.load(std::memory_order_relaxed);
         b.attack = p.attack.load(std::memory_order_relaxed);
         b.release = p.release.load(std::memory_order_relaxed);
-        b.cells = p.cells.load(std::memory_order_relaxed);
         return b;
     }
+
+    /**
+     * @brief The detail: how finely the bands move inside themselves, from
+     *        an octave to 1/24 of one (default 1/12). It moves while
+     *        playing, at the same latency.
+     */
+    void setDetail(T octaves) noexcept
+    {
+        if (std::isfinite(octaves))
+            detail_.store(std::clamp(octaves, static_cast<T>(DetailAnalysis<T>::kFinest), static_cast<T>(DetailAnalysis<T>::kWidest)), std::memory_order_relaxed);
+    }
+    /** @return The detail, in octaves. */
+    [[nodiscard]] T getDetail() const noexcept { return detail_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief Reads the levels at the top through a window that shortens as
+     *        frequency rises, centred where the curve is played (off by
+     *        default; see DetailAnalysis::setTimeFocus()), and plays a brief
+     *        move as brief as it is drawn (DetailHold::None):
+     *        what an event there sets off starts later and lasts less, at
+     *        part of its depth and with less detail at the top.
+     */
+    void setTimeFocus(bool on) noexcept { timeFocus_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the levels at the top are read through the focus. */
+    [[nodiscard]] bool getTimeFocus() const noexcept { return timeFocus_.load(std::memory_order_relaxed); }
 
     /** @return The latency in samples. */
     [[nodiscard]] int getLatency() const noexcept { return filter_.getLatency(); }
     /** @return The gain of the last frame at a frequency, in dB (audio thread or after processing). */
     [[nodiscard]] double getGain(double hz) const noexcept
     {
-        if (bins_ < 2) return 0.0;
-        return gainDb_[static_cast<size_t>(std::clamp(static_cast<int>(std::lround(hz / filter_.getBinHz())), 0, bins_ - 1))];
+        if (total_.empty() || !(hz > 0.0)) return 0.0;
+        const double at = (kPoints - 1) * std::log(hz / 20.0) / std::log(1000.0);
+        return static_cast<double>(total_[static_cast<size_t>(std::lround(std::clamp(at, 0.0, static_cast<double>(kPoints - 1))))]);
     }
 
     /** @brief Points of the display curve, evenly in log frequency from 20 Hz to 20 kHz. */
     static constexpr int kDisplayPoints = SpectralReadout<T>::kPoints;
     /** @return The frequency of a display point, in hertz. */
     [[nodiscard]] static double getDisplayFrequency(int point) noexcept { return SpectralReadout<T>::frequency(point); }
-    /** @return The gain of the last frame around a display point, in dB (all bands; any thread). */
-    [[nodiscard]] T getDisplayGain(int point) const noexcept { return readout_.value(0, point); }
-    /** @return The gain of the last frame with the largest magnitude, in dB, its sign kept (any thread). */
-    [[nodiscard]] T getPeakGain() const noexcept { return readout_.extreme(); }
-
     /**
-     * @brief Reads the levels through a window that shortens as frequency
-     *        rises (off by default; see SpectralFilter::setTimeFocus()).
-     *        A held tone is cut the same; the cut a 10 ms burst at 8 kHz
-     *        sets off lasts 21 ms in place of 43 and starts 17 ms before
-     *        the burst comes out in place of 28.
+     * @return The gain played at a display point, in dB (all bands): the
+     *         response of the kernels handed over every 21 ms, made by the
+     *         first read after they change (any thread).
      */
-    void setTimeFocus(bool on) noexcept { timeFocus_.store(on, std::memory_order_relaxed); }
-    [[nodiscard]] bool getTimeFocus() const noexcept { return timeFocus_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getDisplayGain(int point) const noexcept { return filter_.playedValue(0, point); }
+    /** @return The gain with the largest magnitude of that response, in dB, its sign kept (any thread). */
+    [[nodiscard]] T getPeakGain() const noexcept { return filter_.playedExtreme(); }
 
     /** @brief Processes the programme in place, its own level driving the bands. */
     void processBlock(AudioBufferView<T> buffer) noexcept { run(buffer, nullptr); }
     /** @brief Processes the programme in place, a key's level driving the bands. */
-    void processBlock(AudioBufferView<T> buffer, AudioBufferView<T> key) noexcept { run(buffer, &key); }
+    void processBlock(AudioBufferView<T> buffer, AudioBufferView<T> key) noexcept
+    {
+        run(buffer, key.getNumChannels() > 0 && key.getNumSamples() >= buffer.getNumSamples() ? &key : nullptr);
+    }
 
     [[nodiscard]] std::vector<uint8_t> getState() const
     {
-        StateWriter w(stateId("SDEQ"), 1);
+        StateWriter w(stateId("SDEQ"), 2);
+        w.write("detail", static_cast<float>(getDetail()));
+        w.write("timeFocus", getTimeFocus());
         char key[32];
         for (int i = 0; i < kBands; ++i)
         {
@@ -215,17 +248,21 @@ public:
             put("range", static_cast<float>(b.range));
             put("att", static_cast<float>(b.attack));
             put("rel", static_cast<float>(b.release));
-            std::snprintf(key, sizeof(key), "b%d.cells", i);
-            w.write(key, static_cast<int32_t>(b.cells));
         }
-        w.write("timeFocus", getTimeFocus());
         return w.blob();
     }
 
+    /**
+     * @brief Restores the settings. A blob of the first version, with cells
+     *        in each band, gives as detail the width of the finest of them
+     *        (two bandwidths over the cells; 32 at a Q of 1 is 1/12).
+     */
     bool setState(const uint8_t* data, size_t size)
     {
         StateReader r(data, size);
         if (!r.isValid() || r.processorId() != stateId("SDEQ")) return false;
+        const bool first = r.processorVersion() < 2;
+        double finest = 0.0;
         char key[32];
         for (int i = 0; i < kBands; ++i)
         {
@@ -240,18 +277,30 @@ public:
             b.range = get("range", -12.0f);
             b.attack = get("att", 10.0f);
             b.release = get("rel", 150.0f);
-            std::snprintf(key, sizeof(key), "b%d.cells", i);
-            b.cells = r.read(key, 32);
             setBand(i, b);
+            if (!first || b.shape == Shape::Off) continue;
+            std::snprintf(key, sizeof(key), "b%d.cells", i);
+            const int cells = std::clamp(r.read(key, 32), 1, 128);
+            const double q = std::clamp(static_cast<double>(getBand(i).q), 0.1, 20.0);
+            const double band = b.shape == Shape::Bell ? 2.0 * std::asinh(0.5 / q) / std::numbers::ln2 : kShelfOctaves;
+            const double width = 2.0 * band / cells;
+            if (finest == 0.0 || width < finest) finest = width;
         }
+        setDetail(first && finest > 0.0 ? static_cast<T>(finest) : static_cast<T>(r.read("detail", 1.0f / 12.0f)));
         setTimeFocus(r.read("timeFocus", false));
         return true;
     }
 
 private:
+    static constexpr int kPoints = SpectralReadout<T>::kPoints;
+    static constexpr size_t kSize = static_cast<size_t>(kPoints);
+    static constexpr double kSilent = -200.0;
+    static constexpr double kLeastLevel = -120.0;  ///< Under this, in dBFS, there is nothing to act on.
+    static constexpr double kShelfOctaves = 2.0;   ///< What a shelf counts as, to convert its old cells.
+
     struct Published
     {
-        std::atomic<int> shape { 0 }, cells { 32 };
+        std::atomic<int> shape { 0 };
         std::atomic<T> frequency { T(1000) }, q { T(1) }, threshold { T(-12) }, ratio { T(3) };
         std::atomic<T> range { T(-12) }, attack { T(10) }, release { T(150) };
     };
@@ -260,210 +309,234 @@ private:
     {
         Band band {};
         bool active = false;
-        std::vector<double> shape;           ///< Per bin, 0 to 1.
-        std::vector<int> cellOf;             ///< Per bin, the cell below it (-1 outside).
-        std::array<double, kMaxCells> centre {}, action {}, attack {}, release {};
-        std::array<int, kMaxCells + 1> edge {};
-        int cells = 0;
-        double peak = -200.0;
-        double candidate = -200.0;           ///< The reference of a span just moved, still listening.
+        int first = 0, end = 0;              ///< The span, in points.
+        std::vector<T> share, shareDb;       ///< The band's shape, 0 to 1, and as a weight of the power in dB.
+        std::vector<T> action, attack, release;
+        double peak = kSilent;
+        double candidate = kSilent;          ///< The reference of a span just moved, still listening.
         int watching = 0;                    ///< Hops it still listens before it replaces the peak.
     };
 
-    /** @brief Designs a band's shape, span and cells on the audio thread. */
+    /** @brief A band's shape, span and times, on the audio thread. */
     void redesign(int index) noexcept
     {
         auto& s = state_[static_cast<size_t>(index)];
-        // What the band was doing, to carry it to the new cells by frequency.
-        const bool wasActive = s.active && s.cells > 0;
-        const int oldCells = s.cells, oldLo = s.edge[0], oldHi = s.edge[static_cast<size_t>(std::max(0, s.cells))];
-        const auto oldCentre = s.centre, oldAction = s.action;
+        const bool wasActive = s.active;
+        const int oldFirst = s.first, oldEnd = s.end;
         s.band = getBand(index);
         const Band& b = s.band;
         s.active = b.shape != Shape::Off && std::abs(static_cast<double>(b.range)) > 1e-3;
-        std::fill(s.shape.begin(), s.shape.end(), 0.0);
-        std::fill(s.cellOf.begin(), s.cellOf.end(), -1);
-        s.cells = 0;
         s.watching = 0;
+        s.first = s.end = 0;
+        std::fill(s.share.begin(), s.share.end(), T(0));
+        if (s.active)
+        {
+            const double f0 = std::clamp(static_cast<double>(b.frequency), 20.0, 0.45 * spec_.sampleRate);
+            const double range = static_cast<double>(b.range), q = std::max(static_cast<double>(b.q), 0.025);
+            // The band's shape from its analog prototype: a bilinear design
+            // narrows toward the top of the band.
+            const AnalogSection proto = b.shape == Shape::Bell ? AnalogSection::peak(f0, q, range)
+                                      : b.shape == Shape::LowShelf ? AnalogSection::lowShelf(f0, range)
+                                      : AnalogSection::highShelf(f0, range);
+            const double attack = 0.001 * static_cast<double>(b.attack), release = 0.001 * static_cast<double>(b.release);
+            int first = -1, last = -1;
+            for (int i = 0; i < kPoints; ++i)
+            {
+                const auto u = static_cast<size_t>(i);
+                const double hz = DetailFilter<T>::frequency(i);
+                const double share = std::clamp(proto.magnitudeDb(hz) / range, 0.0, 1.0);
+                if (!(share > 0.01)) continue;
+                if (first < 0) first = i;
+                last = i;
+                s.share[u] = static_cast<T>(share);
+                s.shareDb[u] = static_cast<T>(10.0 * std::log10(share));
+                const double scale = std::sqrt(1000.0 / hz);
+                s.attack[u] = static_cast<T>(std::exp(-hopSeconds_ / std::max(1e-4, attack * scale)));
+                s.release[u] = static_cast<T>(std::exp(-hopSeconds_ / std::max(1e-3, release * scale)));
+            }
+            s.active = first >= 0;
+            if (s.active)
+            {
+                s.first = first;
+                s.end = last + 1;
+            }
+        }
+        // Each frequency keeps what the band was doing there; outside, nothing.
+        for (int i = 0; i < kPoints; ++i)
+            if (i < s.first || i >= s.end || s.share[static_cast<size_t>(i)] == T(0)) s.action[static_cast<size_t>(i)] = T(0);
         if (!s.active) return;
-        const double fs = spec_.sampleRate, binHz = filter_.getBinHz();
-        const double f0 = std::clamp(static_cast<double>(b.frequency), 20.0, 0.45 * fs);
-        const double range = static_cast<double>(b.range);
-        // The band's shape from its analog prototype: a bilinear design
-        // narrows toward the top of the band.
-        const double q = std::max(static_cast<double>(b.q), 0.025);
-        const AnalogSection proto = b.shape == Shape::Bell ? AnalogSection::peak(f0, q, range)
-                                  : b.shape == Shape::LowShelf ? AnalogSection::lowShelf(f0, range)
-                                  : AnalogSection::highShelf(f0, range);
-        int lo = -1, hi = -1;
-        for (int k = 1; k < bins_; ++k)
-        {
-            const double db = proto.magnitudeDb(k * binHz);
-            const double share = std::clamp(db / range, 0.0, 1.0);
-            s.shape[static_cast<size_t>(k)] = share;
-            if (share > 0.01) { if (lo < 0) lo = k; hi = k; }
-        }
-        if (lo < 0) { s.active = false; return; }
-        // Cells by the band's weight: equal steps of the shape integrated over
-        // log frequency (each bin weighs its share over its index), so the
-        // cells crowd where the band acts and the skirts, where it barely
-        // moves, take a few wide ones. Every cell keeps at least one bin.
-        s.cells = std::min(b.cells, hi - lo + 1);
-        double total = 0.0;
-        for (int k = lo; k <= hi; ++k) total += s.shape[static_cast<size_t>(k)] / static_cast<double>(k);
-        s.edge[0] = lo;
-        int cell = 1;
-        double acc = 0.0;
-        for (int k = lo; k <= hi && cell < s.cells; ++k)
-        {
-            acc += s.shape[static_cast<size_t>(k)] / static_cast<double>(k);
-            while (cell < s.cells && acc >= total * static_cast<double>(cell) / static_cast<double>(s.cells))
-            {
-                const int room = hi + 1 - (s.cells - cell);   // what the cells after this one still need
-                s.edge[static_cast<size_t>(cell)] = std::min(room, std::max(s.edge[static_cast<size_t>(cell - 1)] + 1, k + 1));
-                ++cell;
-            }
-        }
-        for (; cell < s.cells; ++cell)
-            s.edge[static_cast<size_t>(cell)] = std::min(hi + 1 - (s.cells - cell), s.edge[static_cast<size_t>(cell - 1)] + 1);
-        s.edge[static_cast<size_t>(s.cells)] = hi + 1;
-        const double hopSeconds = static_cast<double>(filter_.getHopSize()) / fs;
-        for (int j = 0; j < s.cells; ++j)
-        {
-            const auto i = static_cast<size_t>(j);
-            const int a = s.edge[i], e = std::max(s.edge[i] + 1, s.edge[i + 1]);
-            s.centre[i] = 0.5 * (a + e - 1);
-            for (int k = a; k < std::min(e, bins_); ++k) s.cellOf[static_cast<size_t>(k)] = j;
-            const double scale = std::sqrt(1000.0 / std::max(20.0, s.centre[i] * binHz));
-            s.attack[i] = std::exp(-hopSeconds / std::max(1e-4, 0.001 * static_cast<double>(b.attack) * scale));
-            s.release[i] = std::exp(-hopSeconds / std::max(1e-3, 0.001 * static_cast<double>(b.release) * scale));
-        }
-        // Each new cell takes what the band was doing at its frequency: the
-        // old actions read between the old centres on the log-frequency
-        // axis, and nothing outside the span the band had.
-        for (int j = 0; j < kMaxCells; ++j)
-        {
-            const auto i = static_cast<size_t>(j);
-            double carried = 0.0;
-            const double at = s.centre[i];
-            if (j < s.cells && wasActive && at >= oldLo && at < oldHi)
-            {
-                int m = 0;
-                while (m + 1 < oldCells && oldCentre[static_cast<size_t>(m + 1)] <= at) ++m;
-                const double c0 = oldCentre[static_cast<size_t>(m)], a0 = oldAction[static_cast<size_t>(m)];
-                if (m + 1 < oldCells && at > c0 && c0 > 0.0)
-                {
-                    const double c1 = oldCentre[static_cast<size_t>(m + 1)];
-                    const double t = std::clamp(std::log(at / c0) / std::log(c1 / c0), 0.0, 1.0);
-                    carried = a0 + t * (oldAction[static_cast<size_t>(m + 1)] - a0);
-                }
-                else carried = a0;
-            }
-            s.action[i] = carried;
-        }
         // A span that moved has another level: a second reference listens
         // to it for half a second, then replaces the first.
-        if (wasActive && (std::abs(lo - oldLo) > 1 || std::abs(hi + 1 - oldHi) > 1))
+        if (wasActive && (std::abs(s.first - oldFirst) > 1 || std::abs(s.end - oldEnd) > 1))
         {
-            s.candidate = -200.0;
-            s.watching = std::max(1, static_cast<int>(0.5 / hopSeconds));
+            s.candidate = kSilent;
+            s.watching = std::max(1, static_cast<int>(0.5 / hopSeconds_));
         }
     }
 
     void run(AudioBufferView<T>& buffer, const AudioBufferView<T>* key) noexcept
     {
         if (!prepared_) return;
+        const int channels = std::min(buffer.getNumChannels(), channels_);
+        if (channels <= 0) return;
         for (int i = 0; i < kBands; ++i)
             if (dirty_[static_cast<size_t>(i)].exchange(false, std::memory_order_acquire)) redesign(i);
-        filter_.setTimeFocus(timeFocus_.load(std::memory_order_relaxed));
-        filter_.processBlock(buffer, key, [&](int, const T* power, T* gain, int bins) noexcept { design(power, gain, bins); });
+        if (const T detail = detail_.load(std::memory_order_relaxed); detail != lastDetail_)
+        {
+            lastDetail_ = detail;
+            analysis_.setWidth(static_cast<double>(detail));
+            const double points = static_cast<double>(detail) * (kPoints - 1) * std::numbers::ln2 / std::log(1000.0);
+            hold_ = std::max(1, static_cast<int>(std::lround(points / 8.0)));
+        }
+        {
+            const bool focus = timeFocus_.load(std::memory_order_relaxed);
+            analysis_.setTimeFocus(focus);
+            filter_.setHold(focus ? DetailHold::None : DetailHold::Reach);
+        }
+        filter_.processBlock(
+            buffer,
+            [&](int offset, int count) noexcept {
+                for (int ch = 0; ch < channels; ++ch)
+                {
+                    const T* from = key != nullptr ? key->getChannel(std::min(ch, key->getNumChannels() - 1)) : buffer.getChannel(ch);
+                    analysis_.feed(ch, from + offset, count);
+                }
+            },
+            [&](int, T* curveDb) noexcept {
+                analysis_.update(channels);
+                design(curveDb);
+            });
+        if (!filter_.isDisplayDue(shownCurve_)) return;
+        shownCurve_ = filter_.getCurveCount();
+        filter_.publishPlayed(channels);
     }
 
-    void design(const T* power, T* gain, int bins) noexcept
+    /**
+     * @brief The level of each point: the largest within the hold, then
+     *        smoothed over half of it. Read from `first` to before `end`
+     *        only; the points outside, which reach no band, stay silent.
+     */
+    void readLevels(int first, int end) noexcept
     {
-        std::fill(gainDb_.begin(), gainDb_.end(), 0.0);
-        const double hopSeconds = static_cast<double>(filter_.getHopSize()) / spec_.sampleRate;
+        analysis_.read(0, power_.data(), first, end);
+        std::fill(level_.begin(), level_.begin() + first, T(kSilent));
+        for (int i = first; i < end; ++i)
+            level_[static_cast<size_t>(i)] = T(4.3429448190325183) * std::log(power_[static_cast<size_t>(i)] + T(1e-20));
+        std::fill(level_.begin() + end, level_.end(), T(kSilent));
+        holdLargest();
+        const int half = hold_ / 2;
+        if (half == 0) return;
+        double sum = 0.0;
+        for (size_t i = 0; i < kSize; ++i)
+        {
+            sum_[i] = sum;
+            sum += static_cast<double>(held_[i]);
+        }
+        sum_[kSize] = sum;
+        for (int i = 0; i < kPoints; ++i)
+        {
+            const int from = std::max(0, i - half), to = std::min(kPoints, i + half + 1);
+            held_[static_cast<size_t>(i)] = static_cast<T>((sum_[static_cast<size_t>(to)] - sum_[static_cast<size_t>(from)]) / (to - from));
+        }
+    }
+
+    /** @brief The largest level within hold_ points of each, in held_. */
+    void holdLargest() noexcept
+    {
+        if (hold_ <= kFewPoints)
+        {
+            // A few points: as many passes of three, which compilers vectorise.
+            T* from = level_.data();
+            T* to = held_.data();
+            for (int pass = 0; pass < hold_; ++pass)
+            {
+                to[0] = std::max(from[0], from[1]);
+                for (int i = 1; i < kPoints - 1; ++i) to[i] = std::max(std::max(from[i - 1], from[i]), from[i + 1]);
+                to[kPoints - 1] = std::max(from[kPoints - 2], from[kPoints - 1]);
+                std::swap(from, to);
+            }
+            if (from != held_.data()) std::copy_n(from, kPoints, held_.data());
+            return;
+        }
+        int head = 0, tail = 0, next = 0;
+        for (int i = 0; i < kPoints; ++i)
+        {
+            for (; next < kPoints && next <= i + hold_; ++next)
+            {
+                const T v = level_[static_cast<size_t>(next)];
+                while (tail > head && level_[static_cast<size_t>(queue_[static_cast<size_t>(tail - 1)])] <= v) --tail;
+                queue_[static_cast<size_t>(tail++)] = next;
+            }
+            while (queue_[static_cast<size_t>(head)] < i - hold_) ++head;
+            held_[static_cast<size_t>(i)] = level_[static_cast<size_t>(queue_[static_cast<size_t>(head)])];
+        }
+    }
+
+    static constexpr int kFewPoints = 4;
+
+    void design(T* curve) noexcept
+    {
+        std::fill(total_.begin(), total_.end(), T(0));
+        // The points the bands reach, and as far again as the hold and its
+        // smoothing read around them.
+        int first = kPoints, end = 0;
+        for (const auto& s : state_)
+            if (s.active)
+            {
+                first = std::min(first, s.first);
+                end = std::max(end, s.end);
+            }
+        if (end > first)
+        {
+            const int reach = hold_ + hold_ / 2 + 1;
+            readLevels(std::max(0, first - reach), std::min(kPoints, end + reach));
+        }
         for (auto& s : state_)
         {
-            if (!s.active || s.cells <= 0) continue;
+            if (!s.active) continue;
             const Band& b = s.band;
-            // Each cell's level: the largest power in it, weighted by the shape.
-            std::array<double, kMaxCells> level {};
-            double top = -300.0;
-            for (int j = 0; j < s.cells; ++j)
-            {
-                const auto i = static_cast<size_t>(j);
-                double m = 0.0;
-                const int first = s.edge[i], end = std::min(s.edge[i + 1], bins);
-                for (int k = first; k < end; ++k)
-                    m = std::max(m, static_cast<double>(power[k]) * s.shape[static_cast<size_t>(k)]);
-                // Half a cell into each neighbour, fading to nothing at its centre.
-                if (j > 0)
-                {
-                    const double c0 = s.centre[i - 1], span = static_cast<double>(first) - c0;
-                    for (int k = static_cast<int>(std::ceil(c0)); k < first && span > 0.0; ++k)
-                        m = std::max(m, static_cast<double>(power[k]) * s.shape[static_cast<size_t>(k)] * ((k - c0) / span));
-                }
-                if (j + 1 < s.cells)
-                {
-                    const double c1 = s.centre[i + 1], span = c1 - static_cast<double>(end - 1);
-                    for (int k = end; k < bins && k < c1 && span > 0.0; ++k)
-                        m = std::max(m, static_cast<double>(power[k]) * s.shape[static_cast<size_t>(k)] * ((c1 - k) / span));
-                }
-                level[i] = 10.0 * std::log10(m + 1e-20);
-                top = std::max(top, level[i]);
-            }
+            const T* held = held_.data();
+            T top = T(-300);
+            for (int i = s.first; i < s.end; ++i) top = std::max(top, held[i] + s.shareDb[static_cast<size_t>(i)]);
             // The band's recent peak: up at once, down by 2 dB per second.
-            s.peak = top > s.peak ? top : std::max(top, s.peak - 2.0 * hopSeconds);
+            const double loudest = static_cast<double>(top);
+            s.peak = loudest > s.peak ? loudest : std::max(loudest, s.peak - 2.0 * hopSeconds_);
             if (s.watching > 0)
             {
-                s.candidate = top > s.candidate ? top : std::max(top, s.candidate - 2.0 * hopSeconds);
+                s.candidate = loudest > s.candidate ? loudest : std::max(loudest, s.candidate - 2.0 * hopSeconds_);
                 if (--s.watching == 0) s.peak = s.candidate;
             }
-            const double thr = s.peak + static_cast<double>(b.threshold);
-            const double slope = 1.0 - 1.0 / static_cast<double>(b.ratio);
-            const double range = std::abs(static_cast<double>(b.range));
-            for (int j = 0; j < s.cells; ++j)
+            const T threshold = static_cast<T>(std::max(s.peak + static_cast<double>(b.threshold), kLeastLevel));
+            const T range = std::abs(b.range);
+            const T perDb = (T(1) - T(1) / b.ratio) / range;
+            for (int i = s.first; i < s.end; ++i)
             {
-                const auto i = static_cast<size_t>(j);
-                const double target = std::min(1.0, std::max(0.0, level[i] - thr) * slope / range);
-                const double c = target > s.action[i] ? s.attack[i] : s.release[i];
-                s.action[i] = target + c * (s.action[i] - target);
-            }
-            // Projected onto the bins between the cells' centres, with the shape.
-            const double sign = b.range < T(0) ? -1.0 : 1.0;
-            for (int k = 0; k < bins; ++k)
-            {
-                const double share = s.shape[static_cast<size_t>(k)];
-                if (share <= 0.0) continue;
-                const int j = s.cellOf[static_cast<size_t>(k)];
-                double a;
-                if (j < 0) a = k < s.edge[0] ? s.action[0] : s.action[static_cast<size_t>(s.cells - 1)];
-                else
-                {
-                    const double ck = s.centre[static_cast<size_t>(j)];
-                    const int other = k < ck ? std::max(0, j - 1) : std::min(s.cells - 1, j + 1);
-                    const double co = s.centre[static_cast<size_t>(other)];
-                    const double t = other == j || co == ck ? 0.0 : std::clamp((k - ck) / (co - ck), 0.0, 1.0);
-                    a = s.action[static_cast<size_t>(j)] + t * (s.action[static_cast<size_t>(other)] - s.action[static_cast<size_t>(j)]);
-                }
-                gainDb_[static_cast<size_t>(k)] += sign * range * a * share;
+                const auto u = static_cast<size_t>(i);
+                const T target = std::min(T(1), std::max(T(0), held[i] + s.shareDb[u] - threshold) * perDb);
+                T& a = s.action[u];
+                a = target + (target > a ? s.attack[u] : s.release[u]) * (a - target);
+                if (target == T(0) && a < T(1e-5)) a = T(0);
+                total_[u] += b.range * a * s.share[u];
             }
         }
-        for (int k = 0; k < bins; ++k) gain[k] = static_cast<T>(std::pow(10.0, gainDb_[static_cast<size_t>(k)] / 20.0));
-        readout_.publish(0, gainDb_.data(), bins);
+        std::copy(total_.begin(), total_.end(), curve);
     }
 
     AudioSpec spec_ {};
-    int bins_ = 0;
+    int channels_ = 0, hold_ = 1, shownCurve_ = 0;
     bool prepared_ = false;
-    SpectralFilter<T> filter_;
-    SpectralReadout<T> readout_;
+    double hopSeconds_ = 256.0 / 48000.0;
+    T lastDetail_ = T(-1);
+    DetailFilter<T> filter_;
+    DetailAnalysis<T> analysis_;
     std::array<Published, kBands> published_ {};
     std::array<std::atomic<bool>, kBands> dirty_ {};
+    std::atomic<T> detail_ { T(1.0 / 12.0) };
     std::atomic<bool> timeFocus_ { false };
     std::array<State, kBands> state_ {};
-    std::vector<double> gainDb_;
+    std::vector<T> power_, level_, held_, total_;
+    std::vector<double> sum_;
+    std::vector<int> queue_;
 };
 
 } // namespace dspark

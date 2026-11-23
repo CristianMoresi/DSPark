@@ -363,6 +363,63 @@ public:
     }
 
     /**
+     * @brief The bilinear transform of a whole analog network, polynomial to
+     *        polynomial, with no factoring.
+     *
+     * H(s) = (n_0 + n_1 s + ... + n_N s^N) / (d_0 + d_1 s + ... + d_N s^N)
+     * becomes b(z) / a(z), of the same order: with s = K (1 - z^-1) / (1 + z^-1),
+     * each power s^j times (1 + z^-1)^N is K^j (1 - z^-1)^j (1 + z^-1)^(N - j), a
+     * fixed binomial row, so the digital coefficients are sums of the analog
+     * ones over those rows. The result is scaled so a[0] = 1; it feeds
+     * NormalizedLadderN directly.
+     *
+     * @param analogNum  N + 1 coefficients of the numerator, from s^0.
+     * @param analogDen  N + 1 coefficients of the denominator, from s^0.
+     * @param order      N, 1 to 16.
+     * @param sampleRate Sample rate in Hz.
+     * @param exactHz    Frequency that keeps its place (from 0.49 of the rate
+     *                   up, or 0, none does and K = 2 fs).
+     * @param digitalNum Receives the N + 1 coefficients of b, from z^0.
+     * @param digitalDen Receives the N + 1 coefficients of a, from z^0.
+     * @return False (outputs untouched) for an order out of range or a
+     *         denominator that maps to a[0] = 0.
+     */
+    static bool bilinearPolynomial(const double* analogNum, const double* analogDen, int order, double sampleRate,
+                                   double exactHz, double* digitalNum, double* digitalDen) noexcept
+    {
+        if (order < 1 || order > 16 || !(sampleRate > 0.0)) return false;
+        const double c = (exactHz > 0.0 && exactHz < 0.49 * sampleRate)
+                       ? 2.0 * kPi * exactHz / std::tan(kPi * exactHz / sampleRate)
+                       : 2.0 * sampleRate;
+        double num[17] = {}, den[17] = {};
+        double power = 1.0;   // c^j
+        for (int j = 0; j <= order; ++j)
+        {
+            // The row (1 - z^-1)^j (1 + z^-1)^(order - j).
+            double row[17] = { 1.0 };
+            for (int r = 0; r < order; ++r)
+            {
+                const double sign = r < j ? -1.0 : 1.0;
+                for (int i = r + 1; i >= 1; --i) row[i] += sign * row[i - 1];
+            }
+            for (int i = 0; i <= order; ++i)
+            {
+                num[i] += analogNum[j] * power * row[i];
+                den[i] += analogDen[j] * power * row[i];
+            }
+            power *= c;
+        }
+        if (!(std::abs(den[0]) > 0.0)) return false;
+        const double inverse = 1.0 / den[0];
+        for (int i = 0; i <= order; ++i)
+        {
+            digitalNum[i] = num[i] * inverse;
+            digitalDen[i] = den[i] * inverse;
+        }
+        return true;
+    }
+
+    /**
      * @brief The biquad whose magnitude follows an analog section up to Nyquist.
      *
      * The section returned is minimum phase and has positive gain, whatever

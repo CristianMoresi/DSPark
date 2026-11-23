@@ -29,7 +29,14 @@
  * into the band when the clock is faster than the host), then low-passed.
  * Its two filters are fourth-order Butterworth low-passes (input and
  * output) at a corner the caller sets, usually under half the slowest clock
- * the delay will need.
+ * the delay will need, or (setShape(Shape::Chorus)) the pair of a chorus
+ * circuit: two equal, slightly resonant sections at the input (Q 0.8) and,
+ * at the output, a mean of two steps then one section damped below
+ * Butterworth (Q 0.6), each at its own corner (setCorners()). The sections
+ * are state-variable filters in the trapezoidal form, whose memory is the
+ * state of their integrators: a corner glides to a new value over 32 steps
+ * of the line (the coefficient moving every step), so a corner that follows
+ * a moving delay leaves no steps in the output.
  *
  * When the clock runs near or below the host's rate, the held steps carry
  * images at the clock rate minus the signal, which in the device lie above
@@ -58,10 +65,9 @@
  * Threading: prepare() on the setup thread (allocates); the rest on the
  * audio thread or the stream owner.
  *
- * Dependencies: Biquad.h, DspMath.h.
+ * Dependencies: DspMath.h.
  */
 
-#include "Biquad.h"
 #include "DspMath.h"
 
 #include <algorithm>
@@ -108,9 +114,35 @@ public:
         rate_ = fs_ * static_cast<double>(factor_);
         stages_ = std::clamp(stages / 2 * 2, kMinStages, kMaxStages);
         buckets_.assign(static_cast<size_t>(stages_ / 2), 0.0);
+        snap_ = true;
+        setShape(shape_);
         setCorner(cornerHz);
         reset();
     }
+
+    /** @brief The pair of filters around the chain (setShape()). */
+    enum class Shape
+    {
+        Butterworth,  ///< Fourth-order Butterworth low-passes at the input and the output (default).
+        Chorus        ///< Two sections of Q 0.8 at the input; a mean of two steps and a section of Q 0.6 at the output.
+    };
+
+    /** @brief The pair of filters around the chain; takes effect from the next corner set. */
+    void setShape(Shape shape) noexcept
+    {
+        shape_ = shape == Shape::Chorus ? Shape::Chorus : Shape::Butterworth;
+        const bool chorus = shape_ == Shape::Chorus;
+        in_.count = 2;
+        in_.k = chorus ? std::array<double, 2> { 1.0 / 0.8, 1.0 / 0.8 } : kButterworthK;
+        in_.mean = false;
+        out_.count = chorus ? 1 : 2;
+        out_.k = chorus ? std::array<double, 2> { 1.0 / 0.6, 0.0 } : kButterworthK;
+        out_.mean = chorus;
+        snap_ = true;
+        setCorners(inCorner_, outCorner_);
+    }
+    /** @return The pair of filters around the chain. */
+    [[nodiscard]] Shape getShape() const noexcept { return shape_; }
 
     /** @brief Empties the chain and the filters. */
     void reset() noexcept
@@ -123,25 +155,43 @@ public:
         lastInput_ = 0.0;
         rise1_ = rise2_ = middle1_ = 0.0;
         history_ = {};
-        for (auto& s : inState_) s = {};
-        for (auto& s : outState_) s = {};
+        in_.clear();
+        out_.clear();
     }
 
     /** @brief Corner of the input and output low-passes, 200 Hz to 0.45 of the host's rate. */
-    void setCorner(double hz) noexcept
+    void setCorner(double hz) noexcept { setCorners(hz, hz); }
+
+    /**
+     * @brief Corners of the input and the output low-passes, each 200 Hz to
+     *        0.45 of the host's rate (non-finite values are ignored). Set
+     *        before the line runs (or after prepare()) they take effect at
+     *        once; while it runs they glide over 32 steps of the line.
+     */
+    void setCorners(double inputHz, double outputHz) noexcept
     {
-        if (!std::isfinite(hz)) return;
-        corner_ = std::clamp(hz, 200.0, 0.45 * fs_);
-        static constexpr double kQ4[2] = { 0.5411961001461970, 1.3065629648763764 };
-        for (int k = 0; k < 2; ++k)
-        {
-            in_[static_cast<size_t>(k)] = BiquadCoeffs::makeLowPass(rate_, corner_, kQ4[k]);
-            out_[static_cast<size_t>(k)] = in_[static_cast<size_t>(k)];
-        }
+        if (!std::isfinite(inputHz) || !std::isfinite(outputHz)) return;
+        inCorner_ = std::clamp(inputHz, 200.0, 0.45 * fs_);
+        outCorner_ = std::clamp(outputHz, 200.0, 0.45 * fs_);
+        in_.aim(std::tan(3.141592653589793 * inCorner_ / rate_), inCorner_, snap_ ? 0 : kCornerRampSteps);
+        out_.aim(std::tan(3.141592653589793 * outCorner_ / rate_), outCorner_, snap_ ? 0 : kCornerRampSteps);
+    }
+
+    /**
+     * @brief The corners taken at once, without the glide: for an owner that
+     *        moves them every sample itself. Non-finite values are ignored.
+     */
+    void setCornersNow(double inputHz, double outputHz) noexcept
+    {
+        snap_ = true;
+        setCorners(inputHz, outputHz);
     }
 
     [[nodiscard]] int getStages() const noexcept { return stages_; }
-    [[nodiscard]] double getCorner() const noexcept { return corner_; }
+    /** @return The input low-pass's corner (the corner of both with setCorner()). */
+    [[nodiscard]] double getCorner() const noexcept { return inCorner_; }
+    /** @return The output low-pass's corner. */
+    [[nodiscard]] double getOutputCorner() const noexcept { return outCorner_; }
     /** @return 1, or 2 when the line runs at twice the host's rate. */
     [[nodiscard]] int getFactor() const noexcept { return factor_; }
 
@@ -176,11 +226,10 @@ public:
      */
     [[nodiscard]] double delayFor(double wantedSeconds) const noexcept
     {
-        // Group delay at low frequencies of a fourth-order Butterworth
-        // low-pass, in units of one over its corner in radians per second:
-        // the sum of one over the Q of its two sections.
-        static constexpr double kFourthOrderDelay = 1.0 / 0.5411961001461970 + 1.0 / 1.3065629648763764;
-        const double filters = 2.0 * kFourthOrderDelay / (2.0 * 3.141592653589793 * corner_);
+        // Group delay at low frequencies of the low-passes: one over the Q of
+        // each section over its corner in radians per second, and half a
+        // step for a mean of two.
+        const double filters = in_.delay(rate_) + out_.delay(rate_);
         const double steps = (precision_ == Precision::High ? 3.5 : 0.5) / rate_;
         const double chainOnly = (wantedSeconds - filters - steps) / (1.0 + 1.0 / static_cast<double>(stages_));
         return std::max(chainOnly, 1e-5);
@@ -234,11 +283,7 @@ public:
 
 private:
     /** The input low-pass on one step of the line's rate. */
-    double lowPass(double x) noexcept
-    {
-        for (size_t k = 0; k < 2; ++k) x = section(in_[k], inState_[k], x);
-        return x;
-    }
+    double lowPass(double x) noexcept { return in_.run(x); }
 
     /**
      * The input at fraction t of the step two before this one (high
@@ -260,6 +305,7 @@ private:
     /** One step of the line's rate: the clock's ticks, the held output, its low-pass. */
     double chain(double x, double delaySeconds) noexcept
     {
+        snap_ = false;
         const double step = std::min(clockFor(delaySeconds) / rate_, 64.0);
         const double start = phase_;
         phase_ += step;
@@ -308,24 +354,81 @@ private:
             middle1_ = middle;
             history_ = { history_[1], history_[2], history_[3], history_[4], x };
         }
-        for (size_t k = 0; k < 2; ++k) y = section(out_[k], outState_[k], y);
-        return y;
+        return out_.run(y);
     }
 
-    struct State
+    static constexpr std::array<double, 2> kButterworthK = { 1.0 / 0.5411961001461970, 1.0 / 1.3065629648763764 };
+    static constexpr int kCornerRampSteps = 32;
+
+    /// One low-pass: up to two state-variable sections (trapezoidal) on one
+    /// corner, after an optional mean of two steps, the corner gliding.
+    struct LowPass
     {
-        double z1 = 0.0, z2 = 0.0;
+        int count = 2;
+        std::array<double, 2> k = kButterworthK;   ///< One over the Q of each section.
+        bool mean = false;
+        double g = 0.1, target = 0.1, step = 0.0;   ///< tan(pi corner / rate): now, heading to, per step.
+        double hz = 4000.0, hzTarget = 4000.0, hzStep = 0.0;   ///< The corner: now, heading to, per step.
+        int left = 0;
+        std::array<double, 2> a1 {};                ///< 1 / (1 + g (g + k)) of each section.
+        std::array<double, 2> s1 {}, s2 {};         ///< The integrators.
+        double last = 0.0;                          ///< The mean's step before.
+
+        void solve() noexcept
+        {
+            for (int i = 0; i < count; ++i) a1[static_cast<size_t>(i)] = 1.0 / (1.0 + g * (g + k[static_cast<size_t>(i)]));
+        }
+        void aim(double to, double toHz, int steps) noexcept
+        {
+            target = to;
+            hzTarget = toHz;
+            if (steps <= 0) { g = to; hz = toHz; left = 0; solve(); return; }
+            left = steps;
+            step = (to - g) / static_cast<double>(steps);
+            hzStep = (toHz - hz) / static_cast<double>(steps);
+        }
+        void clear() noexcept
+        {
+            s1 = {};
+            s2 = {};
+            last = 0.0;
+        }
+        double run(double x) noexcept
+        {
+            if (left > 0)
+            {
+                const bool landed = --left == 0;
+                g = landed ? target : g + step;
+                hz = landed ? hzTarget : hz + hzStep;
+                solve();
+            }
+            if (mean)
+            {
+                const double m = 0.5 * (x + last);
+                last = x;
+                x = m;
+            }
+            for (int i = 0; i < count; ++i)
+            {
+                const auto j = static_cast<size_t>(i);
+                const double v1 = a1[j] * (s1[j] + g * (x - s2[j]));
+                const double v2 = s2[j] + g * v1;
+                s1[j] = 2.0 * v1 - s1[j];
+                s2[j] = 2.0 * v2 - s2[j];
+                x = v2;
+            }
+            return x;
+        }
+        /// Group delay at low frequencies, in seconds, at the corner now.
+        [[nodiscard]] double delay(double rate) const noexcept
+        {
+            double sum = 0.0;
+            for (int i = 0; i < count; ++i) sum += k[static_cast<size_t>(i)];
+            return sum / (2.0 * 3.141592653589793 * hz) + (mean ? 0.5 / rate : 0.0);
+        }
     };
 
-    static double section(const BiquadCoeffs& c, State& s, double x) noexcept
-    {
-        const double y = c.b0 * x + s.z1;
-        s.z1 = c.b1 * x - c.a1 * y + s.z2;
-        s.z2 = c.b2 * x - c.a2 * y;
-        return y;
-    }
-
-    double fs_ = 48000.0, rate_ = 48000.0, corner_ = 4000.0;
+    double fs_ = 48000.0, rate_ = 48000.0, inCorner_ = 4000.0, outCorner_ = 4000.0;
     int stages_ = 1024, factor_ = 1;
     std::vector<double> buckets_;
     int head_ = 0;
@@ -333,9 +436,9 @@ private:
     double rise1_ = 0.0, rise2_ = 0.0, middle1_ = 0.0;   ///< High precision: the spline's pieces still to come.
     std::array<double, 5> history_ {};   ///< High precision: the five steps of input before this one.
     Precision precision_ = Precision::Standard;
-    std::array<BiquadCoeffs, 2> in_ {};
-    std::array<BiquadCoeffs, 2> out_ {};
-    std::array<State, 2> inState_ {}, outState_ {};
+    Shape shape_ = Shape::Butterworth;
+    LowPass in_ {}, out_ {};
+    bool snap_ = true;   ///< The next corner is taken at once (before the line has run).
 };
 
 } // namespace dspark

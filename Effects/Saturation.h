@@ -27,7 +27,7 @@
  *   spec (or beyond 16) bypass the saturation stage.
  *
  * Dependencies: Core/AudioBuffer.h, Core/AudioSpec.h, Core/Biquad.h,
- * Core/DryWetMixer.h, Core/DspMath.h, Core/Oversampling.h, Core/Smoothers.h,
+ * Core/BiquadCascade.h, Core/DryWetMixer.h, Core/DspMath.h, Core/Oversampling.h, Core/Smoothers.h,
  * Core/AnalogRandom.h, Core/SpscQueue.h, Core/SpinLock.h, Core/StateBlob.h,
  * Core/detail/Adaa.h, Core/detail/LogCosh.h, Effects/DCBlocker.h, Effects/MidSide.h.
  *
@@ -42,6 +42,7 @@
 #include "../Core/AudioBuffer.h"
 #include "../Core/AudioSpec.h"
 #include "../Core/Biquad.h"
+#include "../Core/BiquadCascade.h"
 #include "../Core/DryWetMixer.h"
 #include "../Core/DspMath.h"
 #include "../Core/Interpolation.h"
@@ -63,6 +64,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1788,6 +1790,13 @@ public:
         dcStep_ = 1.0 / std::max(1.0, kDcFadeSeconds * spec.sampleRate);
         modeDipStep_ = 1.0 / std::max(1.0, kModeDipSeconds * spec.sampleRate);
         dcScratch_.resize(spec.numChannels, spec.maxBlockSize);
+        if (!tone_) tone_ = std::make_unique<BiquadCascade<SampleType, 4, 16>>();
+        tone_->setNumSections(kToneSections);
+        for (int s = 0; s < kToneSections; ++s) tone_->setSectionEnabled(s, false);
+        toneLeft_.fill(-1);
+        toneOn_ = false;
+        toneDirty_.store(true, std::memory_order_release);
+        designTone(0);
         dcWanted_ = dcBlockingEnabled_ && curveMakesDc();
         dcShare_ = dcWanted_ ? 1.0 : 0.0;
         dcSnap_ = true;
@@ -1878,6 +1887,7 @@ public:
         dcBlocker_.reset();
         dryWetMixer_.reset();
         dcSnap_ = true;
+        if (tone_) tone_->reset();
         modeDipping_ = false;
         modeDip_ = 0.0;
         procMode_ = pendingMode_ = applied_.processingMode;
@@ -2208,6 +2218,28 @@ private:
 
         if (isMidSide) MidSide<SampleType>::decode(buffer);
 
+        // The tone after the curve. With every section out the cascade only
+        // remembers the last two samples, so a section that comes in starts
+        // from what has just gone by.
+        designTone(static_cast<int>(kToneRampSeconds * spec_.sampleRate));
+        tone_->processBlock(buffer);
+        if (toneOn_)
+        {
+            for (int s = 0; s < kToneSections; ++s)
+            {
+                int& left = toneLeft_[static_cast<std::size_t>(s)];
+                if (left < 0) continue;
+                left -= buffer.getNumSamples();
+                if (left <= 0 && !tone_->isRamping(s))
+                {
+                    tone_->setSectionEnabled(s, false);
+                    left = -1;
+                }
+            }
+            toneOn_ = false;
+            for (int s = 0; s < kToneSections; ++s) toneOn_ = toneOn_ || tone_->isSectionEnabled(s);
+        }
+
         // Program-dependent adaptive blend, applied at BASE rate in the L/R
         // domain where the latency-compensated dry capture is valid.
         if (adaptiveBlend_.load(std::memory_order_relaxed))
@@ -2398,6 +2430,37 @@ public:
     [[nodiscard]] Antialiasing getAntialiasing() const noexcept
     {
         return static_cast<Antialiasing>(antialiasOrder_.load(std::memory_order_relaxed));
+    }
+
+    /**
+     * @brief A section of the tone after the curve: 0 a low shelf (100 Hz by
+     *        default), 1 and 2 bells of Q 0.7 (500 Hz and 2.5 kHz), 3 a high
+     *        shelf (8 kHz). At 0 dB a section is out of the path and costs
+     *        nothing; it comes in, moves and goes out over 20 ms, without a
+     *        step. Thread-safe; values that are not finite are ignored.
+     * @param section 0 to 3 (others are ignored).
+     * @param hz      Its frequency, 20 Hz to 20 kHz.
+     * @param gainDb  Its gain, -18 to 18 dB.
+     */
+    void setTone(int section, SampleType hz, SampleType gainDb) noexcept
+    {
+        if (section < 0 || section >= kToneSections || !std::isfinite(hz) || !std::isfinite(gainDb)) return;
+        const auto s = static_cast<std::size_t>(section);
+        toneHz_[s].store(std::clamp(hz, SampleType(20), SampleType(20000)), std::memory_order_relaxed);
+        toneDb_[s].store(std::clamp(gainDb, SampleType(-18), SampleType(18)), std::memory_order_relaxed);
+        toneDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return A section's frequency in hertz. */
+    [[nodiscard]] SampleType getToneFrequency(int section) const noexcept
+    {
+        return toneHz_[static_cast<std::size_t>(std::clamp(section, 0, kToneSections - 1))].load(std::memory_order_relaxed);
+    }
+
+    /** @return A section's gain in dB. */
+    [[nodiscard]] SampleType getToneGain(int section) const noexcept
+    {
+        return toneDb_[static_cast<std::size_t>(std::clamp(section, 0, kToneSections - 1))].load(std::memory_order_relaxed);
     }
 
     /**
@@ -2867,6 +2930,14 @@ public:
         w.write("curveAsymmetry", static_cast<float>(getCurveAsymmetry()));
         w.write("curveBase", static_cast<int32_t>(curve().getBase()));
         w.write("drivePan", static_cast<float>(getDrivePan()));
+        for (int s = 0; s < kToneSections; ++s)
+        {
+            char key[16];
+            std::snprintf(key, sizeof(key), "tone%dHz", s);
+            w.write(key, static_cast<float>(getToneFrequency(s)));
+            std::snprintf(key, sizeof(key), "tone%dDb", s);
+            w.write(key, static_cast<float>(getToneGain(s)));
+        }
         w.write("asymmetry", static_cast<float>(getAsymmetry()));
         w.write("programNoise", static_cast<float>(getProgramNoise()));
         w.write("levelTracking", static_cast<float>(getLevelTracking()));
@@ -2912,6 +2983,14 @@ public:
                       static_cast<SampleType>(r.read("curveAsymmetry", 0.0f)));
         setCurveBase(static_cast<CurveBase>(std::clamp(static_cast<int>(r.read("curveBase", 0)), 0, 6)));
         setDrivePan(static_cast<SampleType>(r.read("drivePan", 0.0f)));
+        for (int s = 0; s < kToneSections; ++s)
+        {
+            constexpr float kDefault[4] = { 100.0f, 500.0f, 2500.0f, 8000.0f };
+            char hz[16], db[16];
+            std::snprintf(hz, sizeof(hz), "tone%dHz", s);
+            std::snprintf(db, sizeof(db), "tone%dDb", s);
+            setTone(s, static_cast<SampleType>(r.read(hz, kDefault[s])), static_cast<SampleType>(r.read(db, 0.0f)));
+        }
         setAsymmetry(static_cast<SampleType>(r.read("asymmetry", 0.0f)));
         setProgramNoise(static_cast<SampleType>(r.read("programNoise", -120.0f)));
         setLevelTracking(static_cast<SampleType>(r.read("levelTracking", 0.0f)));
@@ -3537,6 +3616,56 @@ protected:
         }
     }
 
+    /**
+     * @brief The tone's sections from what was published: a section at 0 dB
+     *        ramps to the identity and leaves; one coming in starts as the
+     *        identity of its own design and ramps to it.
+     */
+    void designTone(int ramp) noexcept
+    {
+        if (!tone_ || !toneDirty_.load(std::memory_order_relaxed) || !toneDirty_.exchange(false, std::memory_order_acquire)) return;
+        const double fs = spec_.sampleRate;
+        for (int s = 0; s < kToneSections; ++s)
+        {
+            const auto i = static_cast<std::size_t>(s);
+            const double hz = std::min(static_cast<double>(toneHz_[i].load(std::memory_order_relaxed)), 0.45 * fs);
+            const double db = static_cast<double>(toneDb_[i].load(std::memory_order_relaxed));
+            if (db == 0.0)
+            {
+                if (tone_->isSectionEnabled(s) && toneLeft_[i] < 0)
+                {
+                    // Out of the path once the ramp is over and what the
+                    // section still adds has died away with its poles.
+                    tone_->rampToBypass(s, ramp);
+                    toneLeft_[i] = ramp + poleDecaySamples(tone_->getTargetCoeffs(s));
+                }
+                continue;
+            }
+            const BiquadCoeffs c = s == 0 ? BiquadCoeffs::makeLowShelf(fs, hz, db)
+                                 : s == 3 ? BiquadCoeffs::makeHighShelf(fs, hz, db)
+                                          : BiquadCoeffs::makePeak(fs, hz, 0.7, db);
+            if (!tone_->isSectionEnabled(s))
+            {
+                tone_->setCoeffs(s, c.bypassed());
+                tone_->setSectionEnabled(s, true);
+            }
+            toneLeft_[i] = -1;
+            tone_->rampCoeffs(s, c, ramp);
+            toneOn_ = true;
+        }
+    }
+
+    /** @brief Samples for the poles of a section to fall 140 dB (what it adds once transparent). */
+    [[nodiscard]] int poleDecaySamples(const BiquadCoeffs& c) const noexcept
+    {
+        const double disc = c.a1 * c.a1 - 4.0 * c.a2;
+        const double radius = disc < 0.0 ? std::sqrt(std::max(0.0, c.a2))
+                                         : 0.5 * (std::abs(c.a1) + std::sqrt(disc));
+        if (!(radius > 0.0)) return 0;
+        if (!(radius < 1.0)) return static_cast<int>(spec_.sampleRate);
+        return static_cast<int>(std::min(spec_.sampleRate, std::ceil(std::log(1e-7) / std::log(radius))));
+    }
+
     /** @brief The drive's gain of a channel at a sample of the block (a straight line between its ends). */
     [[nodiscard]] SampleType panGain(int ch, int i, int samples) const noexcept
     {
@@ -4067,6 +4196,15 @@ protected:
     std::array<SampleType, 2> panFrom_ { SampleType(1), SampleType(1) }, panTo_ { SampleType(1), SampleType(1) };
     bool panning_ = false;
     static constexpr double kDrivePanDb = 6.0;
+    // The tone after the curve (setTone()).
+    static constexpr int kToneSections = 4;
+    static constexpr double kToneRampSeconds = 0.02;
+    std::array<std::atomic<SampleType>, 4> toneHz_ { SampleType(100), SampleType(500), SampleType(2500), SampleType(8000) };
+    std::array<std::atomic<SampleType>, 4> toneDb_ { SampleType(0), SampleType(0), SampleType(0), SampleType(0) };
+    std::atomic<bool> toneDirty_ { false };
+    std::unique_ptr<BiquadCascade<SampleType, 4, 16>> tone_;
+    std::array<int, 4> toneLeft_ { -1, -1, -1, -1 };   // samples before a leaving section is switched off, -1 when it is not leaving
+    bool toneOn_ = false;
     bool dcWanted_ = true;
     bool dcSnap_ = true;
     AudioBuffer<SampleType> dcScratch_;

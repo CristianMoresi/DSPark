@@ -170,7 +170,8 @@
  * keeps the power (setInputWidth(), setWidthLaw()), a parametric equalizer of
  * the wet signal (setPostEqBand()), modulation by random segments
  * (setModulationStyle()), line lengths in a geometric series
- * (setSpaceLayout()) and an octave-up shimmer (setShimmer()).
+ * (setSpaceLayout()), an octave-up shimmer (setShimmer()) and the air's
+ * absorption, which takes the very top of the tail sooner (setAirAbsorption()).
  *
  * Threading: prepare() belongs to the setup thread (allocates). processBlock(),
  * processSample() and reset() belong to the audio thread. All setters are
@@ -583,6 +584,8 @@ public:
         jotY1_.fill(T(0));
         bassX1_.fill(T(0));
         bassY1_.fill(T(0));
+        for (auto& v : airHist_) v.fill(T(0));
+        airW_ = 0;
         for (auto& z : dqZ1_) z.fill(T(0));
         for (auto& z : dqZ2_) z.fill(T(0));
         std::fill(shimBuf_.begin(), shimBuf_.end(), T(0));
@@ -902,6 +905,41 @@ public:
         markUserParam(kUserHighXover);
         paramsDirty_.store(true, std::memory_order_release);
     }
+
+    /**
+     * @brief The absorption of the air inside the tank, on top of the
+     *        walls' (opt-in; the network types).
+     *
+     * The walls' absorption is a shelf: above the high crossover every
+     * frequency decays in the HF time, so the top octave rings as long as
+     * 8 kHz. In a room the air takes more the higher the frequency, so the
+     * very top of a tail dies much sooner. Each line takes a filter whose
+     * loss in decibels is b (1 - cos w), the FIR e^-b (1 + b z^-1 + ... +
+     * (b z^-1)^n / n!) (minimum phase, 16 taps, unity at DC), with b set so
+     * that a round trip at 12 kHz loses what the air takes in that time
+     * (ISO 9613-1: 20 degrees C, 50 % relative humidity). That law follows
+     * the air's at 48 kHz from 4 to 16 kHz (12 % under it at 16 kHz),
+     * whatever a line's length. At 1, a Hall of 2.4 s with the HF decay at
+     * 0.4 of it from 5 kHz: 16 kHz 1.05 -> 0.40 s, 8 kHz 1.22 -> 0.83 s,
+     * 4 kHz 1.65 -> 1.38 s, 1 kHz 2.39 -> 2.31 s; the late tail's spectrum
+     * keeps falling over 8 kHz (-29 dB at 16 kHz against the 0.5-4 kHz
+     * band, where without it it holds at -13 from 10 kHz up), and pink
+     * noise comes out 0.14 dB quieter. The decay bands, the wet level and
+     * the tail hold take it in. Springs and the plate's own tank keep
+     * theirs. On, the tank costs 13 % more (Full) and 9 % (Eco).
+     *
+     * @param amount 0 (off, the default) to 2; 1 is the air of the standard.
+     *               Non-finite values are ignored.
+     */
+    void setAirAbsorption(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        airAbsorption_.store(std::clamp(amount, T(0), T(2)), std::memory_order_relaxed);
+        paramsDirty_.store(true, std::memory_order_release);
+    }
+
+    /** @return The absorption of the air (0 off, 1 the standard's). */
+    [[nodiscard]] T getAirAbsorption() const noexcept { return airAbsorption_.load(std::memory_order_relaxed); }
 
     /**
      * @brief Frequency where the bass decay transition is centered.
@@ -1354,6 +1392,7 @@ public:
         w.write("bandLimit", static_cast<float>(getBandLimit()));
         w.write("doubleSlope", static_cast<float>(getDoubleSlope()));
         w.write("plateTank", isPlateTank());
+        w.write("airAbsorption", static_cast<float>(getAirAbsorption()));
         postEq_.writeState(w, "post");
         return w.blob();
     }
@@ -1415,6 +1454,7 @@ public:
         setBandLimit(static_cast<T>(r.read("bandLimit", 0.0f)));
         setDoubleSlope(static_cast<T>(r.read("doubleSlope", 0.0f)));
         setPlateTank(r.read("plateTank", false));
+        setAirAbsorption(static_cast<T>(r.read("airAbsorption", 0.0f)));
         postEq_.readState(r, "post");
         return true;
     }
@@ -1999,6 +2039,22 @@ protected:
     // Absorption: Jot shelf (mid/high) and bass shelf, per line
     std::array<T, kMaxLines> jotB0_ {}, jotB1_ {}, jotA1_ {}, jotX1_ {}, jotY1_ {};
     std::array<T, kMaxLines> bassB0_ {}, bassB1_ {}, bassA1_ {}, bassX1_ {}, bassY1_ {};
+    // Air absorption: per line, the taps of e^-b sum (b z^-1)^n / n! over the
+    // last kAirTaps samples of what the shelves leave ([tap][line]), their
+    // ramp across a chunk, and b designed, gliding and in use (with the hold).
+    static constexpr int kAirTaps = 16;
+    using AirTaps = std::array<std::array<T, kMaxLines>, kAirTaps>;
+    static constexpr AirTaps identityAirTaps() noexcept
+    {
+        AirTaps t {};
+        for (auto& v : t[0]) v = T(1);
+        return t;
+    }
+    AirTaps airTap_ = identityAirTaps(), airTapFrom_ {}, airTapStep_ {}, airHist_ {};
+    int airW_ = 0;
+    int airTapCount_ = 1;     ///< taps that carry more than 1e-7 of the largest b's sum
+    bool airInUse_ = false;   ///< any line's b, designed, gliding or in use, above 0
+    std::array<T, kMaxLines> airGoal_ {}, airBase_ {}, airNow_ {};
 
     // Output stage
     // These low-frequency recursions need the shared double-precision core.
@@ -2050,6 +2106,7 @@ protected:
     std::atomic<T> highDecayMult_ { T(0.5) };   // HF T60 multiplier (0.05-1.0)
     std::atomic<T> bassDecayMult_ { T(1.2) };   // bass T60 multiplier (0.3-3.0)
     std::atomic<T> highCrossover_ { T(5000) };  // Hz
+    std::atomic<T> airAbsorption_ { T(0) };     // 0 off, 1 the air of ISO 9613-1
     std::atomic<T> bassCrossover_ { T(200) };   // Hz
 
     std::atomic<Quality> quality_ { Quality::Full };
@@ -2557,6 +2614,21 @@ protected:
             O::store(bassX1_.data() + i, j);
             O::store(bassY1_.data() + i, b);
             O::store(r.data() + i, b);
+        }
+        if (airInUse_)
+        {
+            const int at = airW_;
+            T* const now = airHist_[static_cast<std::size_t>(at)].data();
+            for (int i = 0; i < N; i += W) O::store(now + i, O::load(r.data() + i));
+            for (int i = 0; i < N; i += W)
+            {
+                V acc = O::mul(O::load(airTap_[0].data() + i), O::load(now + i));
+                for (int n = 1; n < airTapCount_; ++n)
+                    acc = O::madd(O::load(airTap_[static_cast<std::size_t>(n)].data() + i),
+                                  O::load(airHist_[static_cast<std::size_t>((at - n) & (kAirTaps - 1))].data() + i), acc);
+                O::store(r.data() + i, acc);
+            }
+            airW_ = (at + 1) & (kAirTaps - 1);
         }
         if (dqCount_ > 0) applyDecayBands<N, W, O>(r.data());
 
@@ -3358,6 +3430,46 @@ protected:
     /** @brief The absorption and decay bands in use: the designed ones moved toward unity by the tail hold. */
     void applyHoldCoeffs() noexcept
     {
+        applyHoldShelves();
+        if (airInUse_)
+        {
+            // As many taps as the line with the largest b needs.
+            T most = T(0);
+            for (const T b : airNow_) most = std::max(most, b);
+            const double b = static_cast<double>(most);
+            double t = 1.0, sum = 1.0;
+            int count = 1;
+            while (count < kAirTaps)
+            {
+                t *= b / static_cast<double>(count);
+                if (t <= 1e-7 * (sum + t)) break;
+                sum += t;
+                ++count;
+            }
+            airTapCount_ = count;
+            for (int i = 0; i < kMaxLines; ++i) setAirTaps(static_cast<std::size_t>(i));
+        }
+    }
+
+    /// The air's taps of a line from its b in use: b^n / n! over the taps in
+    /// use, summed to one (unity at DC).
+    void setAirTaps(std::size_t l) noexcept
+    {
+        const double b = static_cast<double>(airNow_[l]);
+        double taps[kAirTaps] = {};
+        double t = 1.0, sum = 0.0;
+        for (int n = 0; n < airTapCount_; ++n)
+        {
+            if (n > 0) t *= b / static_cast<double>(n);
+            taps[n] = t;
+            sum += t;
+        }
+        for (int n = 0; n < kAirTaps; ++n) airTap_[static_cast<std::size_t>(n)][l] = static_cast<T>(taps[n] / sum);
+    }
+
+    /** @brief The shelves and decay bands of applyHoldCoeffs(). */
+    void applyHoldShelves() noexcept
+    {
         const T f = holdNow_, k = T(1) - f;
         for (int i = 0; i < kMaxLines; ++i)
         {
@@ -3368,6 +3480,7 @@ protected:
             bassB0_[l] = bassBase_[0][l] + (T(1) - bassBase_[0][l]) * f;
             bassB1_[l] = bassBase_[1][l] * k;
             bassA1_[l] = bassBase_[2][l] * k;
+            airNow_[l] = airBase_[l] * k;
             for (int q = 0; q < dqCount_; ++q)
             {
                 const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
@@ -3385,6 +3498,7 @@ protected:
     {
         absFrom_[0] = jotB0_; absFrom_[1] = jotB1_; absFrom_[2] = jotA1_;
         absFrom_[3] = bassB0_; absFrom_[4] = bassB1_; absFrom_[5] = bassA1_;
+        if (airInUse_) airTapFrom_ = airTap_;
         for (int q = 0; q < dqCount_; ++q)
         {
             const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
@@ -3406,6 +3520,9 @@ protected:
         };
         ramp(jotB0_, absFrom_[0], absStep_[0]); ramp(jotB1_, absFrom_[1], absStep_[1]); ramp(jotA1_, absFrom_[2], absStep_[2]);
         ramp(bassB0_, absFrom_[3], absStep_[3]); ramp(bassB1_, absFrom_[4], absStep_[4]); ramp(bassA1_, absFrom_[5], absStep_[5]);
+        if (airInUse_)
+            for (int n = 0; n < kAirTaps; ++n)
+                ramp(airTap_[static_cast<std::size_t>(n)], airTapFrom_[static_cast<std::size_t>(n)], airTapStep_[static_cast<std::size_t>(n)]);
         for (int q = 0; q < dqCount_; ++q)
         {
             const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
@@ -3423,6 +3540,8 @@ protected:
         };
         add(jotB0_, absStep_[0]); add(jotB1_, absStep_[1]); add(jotA1_, absStep_[2]);
         add(bassB0_, absStep_[3]); add(bassB1_, absStep_[4]); add(bassA1_, absStep_[5]);
+        if (airInUse_)
+            for (int n = 0; n < kAirTaps; ++n) add(airTap_[static_cast<std::size_t>(n)], airTapStep_[static_cast<std::size_t>(n)]);
         for (int q = 0; q < dqCount_; ++q)
         {
             const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
@@ -3642,6 +3761,7 @@ protected:
             bassCrossover_.load(std::memory_order_relaxed)), 10.0, 0.45 * sr);
         const double Kh = std::tan(kPi * fh / sr);
         const double Kb = std::tan(kPi * fb / sr);
+        const double air = static_cast<double>(airAbsorption_.load(std::memory_order_relaxed));
         double loopSum = 0.0;
         for (int i = 0; i < kMaxLines; ++i)
         {
@@ -3675,6 +3795,7 @@ protected:
                 bassB1_[i] = static_cast<T>((a - 1.0) * inv);
                 bassA1_[i] = static_cast<T>((b - 1.0) * inv);
             }
+            airGoal_[static_cast<std::size_t>(i)] = spring_ ? T(0) : static_cast<T>(airDepth(air, M / sr, sr));
         }
         meanLoopSec_ = loopSum / std::max(1, nLines_) / sr;
         for (int i = 0; i < kMaxLines; ++i)
@@ -3730,6 +3851,8 @@ protected:
     {
         jotBase_ = jotGoal_;
         bassBase_ = bassGoal_;
+        airBase_ = airGoal_;
+        refreshAirInUse();
         for (int q = 0; q < dqCount_; ++q)
         {
             const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
@@ -3756,6 +3879,14 @@ protected:
                 step(jotBase_[rr][l], jotGoal_[rr][l]);
                 step(bassBase_[rr][l], bassGoal_[rr][l]);
             }
+        for (int i = 0; i < kMaxLines; ++i)
+            step(airBase_[static_cast<std::size_t>(i)], airGoal_[static_cast<std::size_t>(i)]);
+        // Going off, one more chunk takes the taps in use to the identity.
+        for (int i = 0; i < kMaxLines; ++i)
+        {
+            const auto l = static_cast<std::size_t>(i);
+            moving = moving || (airNow_[l] != T(0) && airBase_[l] == T(0));
+        }
         for (int q = 0; q < dqCount_; ++q)
         {
             const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(q)]);
@@ -3765,6 +3896,67 @@ protected:
                          dqGoal_[static_cast<std::size_t>(r)][b][static_cast<std::size_t>(i)]);
         }
         absorbGlide_ = moving;
+        refreshAirInUse();
+    }
+
+    /// Whether the air's filter runs: a line's b designed, gliding or in
+    /// use above 0. Off, its taps are the identity; on again, its history
+    /// starts clear.
+    void refreshAirInUse() noexcept
+    {
+        bool on = false;
+        for (int i = 0; i < kMaxLines; ++i)
+        {
+            const auto l = static_cast<std::size_t>(i);
+            on = on || airGoal_[l] != T(0) || airBase_[l] != T(0) || airNow_[l] != T(0);
+        }
+        if (on && !airInUse_)
+        {
+            for (auto& v : airHist_) v.fill(T(0));
+            airW_ = 0;
+            airTapFrom_ = airTap_;   // the identity: a ramp starts from it
+        }
+        if (!on) airTap_ = identityAirTaps();
+        airInUse_ = on;
+    }
+
+    /// Speed of sound at 20 degrees C (m/s), the frequency the air's loss is
+    /// set at and the largest b the taps carry (its Poisson tail past the
+    /// taps under 1e-4).
+    static constexpr double kSoundSpeed = 343.2;
+    static constexpr double kAirFitHz = 12000.0;
+    static constexpr double kAirMaxDepth = 5.0;
+
+    /**
+     * @brief The air's attenuation in dB per metre at 20 degrees C, 50 %
+     *        relative humidity and one atmosphere (ISO 9613-1: the classical
+     *        and rotational loss and the oxygen and nitrogen relaxations).
+     */
+    [[nodiscard]] static double airAttenuationDbPerMetre(double hz) noexcept
+    {
+        const double t = 293.15, t0 = 293.15, t01 = 273.16, hr = 50.0;
+        const double psat = std::pow(10.0, -6.8346 * std::pow(t01 / t, 1.261) + 4.6151);
+        const double h = hr * psat;   // molar concentration of water vapour, %
+        const double frO = 24.0 + 4.04e4 * h * (0.02 + h) / (0.391 + h);
+        const double frN = std::pow(t / t0, -0.5) * (9.0 + 280.0 * h * std::exp(-4.170 * (std::pow(t / t0, -1.0 / 3.0) - 1.0)));
+        const double f2 = hz * hz;
+        return 8.686 * f2 * (1.84e-11 * std::sqrt(t / t0)
+            + std::pow(t / t0, -2.5) * (0.01275 * std::exp(-2239.1 / t) / (frO + f2 / frO)
+                                       + 0.1068 * std::exp(-3352.0 / t) / (frN + f2 / frN)));
+    }
+
+    /**
+     * @brief The b of a line: its loss in decibels, 8.686 b (1 - cos w),
+     *        at kAirFitHz is the air's over a round trip of `loopSeconds`,
+     *        `amount` times the standard's.
+     */
+    [[nodiscard]] static double airDepth(double amount, double loopSeconds, double sr) noexcept
+    {
+        if (!(amount > 0.0) || !(loopSeconds > 0.0)) return 0.0;
+        const double hz = std::min(kAirFitHz, 0.4 * sr);
+        const double lossDb = amount * airAttenuationDbPerMetre(hz) * kSoundSpeed * loopSeconds;
+        const double x = 1.0 - std::cos(2.0 * 3.14159265358979323846 * hz / sr);
+        return std::min(lossDb / (8.685889638065037 * x), kAirMaxDepth);
     }
 
     /** |H(e^jw)| of ((1 + a) + (a - 1) z^-1) / ((1 + b) + (b - 1) z^-1). */
@@ -3814,7 +4006,8 @@ protected:
                 const double gH = std::min(std::pow(0.001, M / (t60H * sr)), gM);
                 const double gB = std::min(std::pow(0.001, M / (t60B * sr)), 0.9995);
                 const double rh = std::sqrt(gM / gH), rb = std::sqrt(gB / gM);
-                double g = gH * shelfGain(Kh * rh, Kh / rh, w) * shelfGain(Kb * rb, Kb / rb, w);
+                double g = gH * shelfGain(Kh * rh, Kh / rh, w) * shelfGain(Kb * rb, Kb / rb, w)
+                         * std::exp(-static_cast<double>(airGoal_[l]) * (1.0 - std::cos(w)));
                 for (int k = 0; k < dqCount_; ++k)
                 {
                     const auto b = static_cast<std::size_t>(dqList_[static_cast<std::size_t>(k)]);

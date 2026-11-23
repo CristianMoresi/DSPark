@@ -2865,3 +2865,239 @@ DSPARK_TEST(Delay_bucket_echo_lands_on_its_time)
         }
     }
 }
+
+// The bucket line's corner glides: worked out every 32 samples for where it
+// will be at their end, a line whose delay slides from 300 to 150 ms stays
+// within -80 dB of one whose corner is exact at every sample (the old rule
+// of the delay, a jump at every 2 % of delay: -41 dB).
+DSPARK_TEST(BucketBrigade_corner_glides_with_a_moving_delay)
+{
+    const double sr = 48000.0, kPi = 3.14159265358979323846;
+    auto run = [&](bool exact, std::vector<double>& out) {
+        BucketBrigade<double> b;
+        b.prepare(sr, 4096, 0.45 * sr);
+        out.clear();
+        double cornerFor = -1.0;
+        int tick = 0;
+        for (int i = 0; i < 96000; ++i)
+        {
+            const double t = std::clamp((i - 24000) / 48000.0, 0.0, 1.0);
+            const double delay = 0.300 - 0.150 * t;
+            const double corner = std::min(0.3 * b.clockFor(delay), 0.45 * sr);
+            if (exact) b.setCornersNow(corner, corner);
+            else if (cornerFor < 0.0 || ++tick >= 32)
+            {
+                tick = 0;
+                if (cornerFor < 0.0) b.setCornersNow(corner, corner);
+                else b.setCorner(std::clamp(2.0 * corner - cornerFor, 0.5 * corner, 2.0 * corner));
+                cornerFor = corner;
+            }
+            out.push_back(b.processSample(0.25 * std::sin(2 * kPi * 1000.0 * i / sr), b.delayFor(delay)));
+        }
+    };
+    std::vector<double> glided, exact;
+    run(false, glided);
+    run(true, exact);
+    double err = 0.0, sig = 0.0;
+    for (size_t i = 24000; i < 72000; ++i)
+    {
+        err += (glided[i] - exact[i]) * (glided[i] - exact[i]);
+        sig += exact[i] * exact[i];
+    }
+    std::printf("    corner glide against exact: %.1f dB%c", 10.0 * std::log10(err / sig), 10);
+    EXPECT_LT(10.0 * std::log10(err / sig), -80.0);
+}
+
+namespace {
+std::vector<float> m14Tone(size_t n, double hz, double fs)
+{
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.14159265358979323846 * hz * static_cast<double>(i) / fs));
+    return v;
+}
+double m14Rms(const std::vector<float>& x, size_t a, size_t b)
+{
+    double e = 0.0;
+    for (size_t i = a; i < b; ++i) e += double(x[i]) * x[i];
+    return std::sqrt(e / double(b - a));
+}
+double m14StepRatio(const std::vector<float>& x, size_t at)
+{
+    double steady = 0.0, around = 0.0;
+    for (size_t i = 1; i < x.size(); ++i)
+    {
+        const double d = std::abs(x[i] - x[i - 1]);
+        if (i > at / 2 && i + 2000 < at) steady = std::max(steady, d);
+        if (i >= at && i < at + 9600) around = std::max(around, d);
+    }
+    return around / steady;
+}
+}
+
+// The analog chorus's filters are fixed in hertz: the wet of the three
+// modes is the same at any frequency (Slow and Vibrato 4.5 dB apart at 7 kHz
+// before), and its hiss has no lows.
+DSPARK_TEST(Chorus_analog_filters_are_the_same_in_every_mode)
+{
+    const double fs = 48000.0;
+    for (const double hz : { 1000.0, 3000.0, 5000.0, 7000.0 })
+    {
+        double level[2];
+        for (int m = 0; m < 2; ++m)
+        {
+            auto c = std::make_unique<Chorus<float>>();
+            c->setModel(Chorus<float>::Model::Analog);
+            c->setAnalogMode(m == 0 ? Chorus<float>::AnalogMode::Slow : Chorus<float>::AnalogMode::Vibrato);
+            c->setDepthMs(0.0f);
+            c->setAnalogNoise(-200.0f);
+            c->setMix(1.0f);
+            c->prepare(spec(fs, 256, 2));
+            std::vector<float> l = m14Tone(49152, hz, fs), r = l;
+            for (size_t off = 0; off < l.size(); off += 256)
+            {
+                float* p[2] = { l.data() + off, r.data() + off };
+                c->processBlock(AudioBufferView<float>(p, 2, 256));
+            }
+            level[m] = 20.0 * std::log10(m14Rms(l, 24576, 49152) / (0.25 / std::sqrt(2.0)));
+        }
+        EXPECT_NEAR(level[0], level[1], 0.35);
+    }
+
+    // The hiss: 50 Hz against 4 kHz, per hertz (bandpasses of Q 1), in silence.
+    auto c = std::make_unique<Chorus<float>>();
+    c->setModel(Chorus<float>::Model::Analog);
+    c->setAnalogNoise(-60.0f);
+    c->setMix(1.0f);
+    c->prepare(spec(fs, 256, 2));
+    std::vector<float> l(480000, 0.0f), r(480000, 0.0f);
+    for (size_t off = 0; off < l.size(); off += 256)
+    {
+        float* p[2] = { l.data() + off, r.data() + off };
+        c->processBlock(AudioBufferView<float>(p, 2, 256));
+    }
+    auto band = [&](double f0) {
+        const auto bp = BiquadCoeffs::makeBandPass(fs, f0, 1.0);
+        double z1 = 0.0, z2 = 0.0, e = 0.0;
+        for (size_t i = 0; i < l.size(); ++i)
+        {
+            const double x = l[i];
+            const double y = bp.b0 * x + z1;
+            z1 = bp.b1 * x - bp.a1 * y + z2;
+            z2 = bp.b2 * x - bp.a2 * y;
+            if (i > 48000) e += y * y;
+        }
+        return e / f0;
+    };
+    EXPECT_LT(10.0 * std::log10(band(50.0) / band(4000.0)), -2.0);   // was +2.6
+}
+
+// The offset between the analog taps runs from in phase (L and R the same)
+// to opposition, the wet's correlation falling all the way; the tone moves
+// the corner after the lines.
+DSPARK_TEST(Chorus_analog_tap_phase_and_tone)
+{
+    const double fs = 48000.0;
+    double previous = 2.0;
+    for (const float degrees : { 0.0f, 45.0f, 90.0f, 135.0f, 180.0f })
+    {
+        auto c = std::make_unique<Chorus<float>>();
+        c->setModel(Chorus<float>::Model::Analog);
+        c->setAnalogMode(Chorus<float>::AnalogMode::Slow);
+        c->setAnalogTapPhase(degrees);
+        c->setAnalogNoise(-200.0f);
+        c->setMix(1.0f);
+        c->prepare(spec(fs, 256, 2));
+        // Noise low-passed at 150 Hz: its correlation falls with the lag
+        // between the taps, which grows with their offset.
+        std::vector<float> l(196608);
+        uint32_t seed = 12345u;
+        double lp = 0.0;
+        const double a = 1.0 - std::exp(-2.0 * 3.14159265358979323846 * 150.0 / fs);
+        for (auto& v : l)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            lp += a * ((double(seed >> 8) / 8388608.0 - 1.0) - lp);
+            v = float(lp);
+        }
+        std::vector<float> r = l;
+        for (size_t off = 0; off < l.size(); off += 256)
+        {
+            float* p[2] = { l.data() + off, r.data() + off };
+            c->processBlock(AudioBufferView<float>(p, 2, 256));
+        }
+        double lr = 0.0, ll = 0.0, rr = 0.0;
+        bool same = true;
+        for (size_t i = 48000; i < l.size(); ++i)
+        {
+            lr += double(l[i]) * r[i];
+            ll += double(l[i]) * l[i];
+            rr += double(r[i]) * r[i];
+            same = same && l[i] == r[i];
+        }
+        const double corr = lr / std::sqrt(ll * rr);
+        if (degrees == 0.0f) EXPECT_TRUE(same);
+        EXPECT_LT(corr, previous + 1e-9);
+        previous = corr;
+    }
+    EXPECT_LT(previous, 0.5);
+
+    auto toneAt = [&](float tone) {
+        auto c = std::make_unique<Chorus<float>>();
+        c->setModel(Chorus<float>::Model::Analog);
+        c->setDepthMs(0.0f);
+        c->setAnalogNoise(-200.0f);
+        c->setAnalogTone(tone);
+        c->setMix(1.0f);
+        c->prepare(spec(fs, 256, 2));
+        std::vector<float> l = m14Tone(49152, 5000.0, fs), r = l;
+        for (size_t off = 0; off < l.size(); off += 256)
+        {
+            float* p[2] = { l.data() + off, r.data() + off };
+            c->processBlock(AudioBufferView<float>(p, 2, 256));
+        }
+        return m14Rms(l, 24576, 49152);
+    };
+    EXPECT_LT(toneAt(-1.0f), toneAt(0.0f) * 0.7);
+    EXPECT_GT(toneAt(1.0f), toneAt(0.0f));
+}
+
+// A change of engine, and of the delay's character, fills the incoming one
+// before it is heard: no step (9.8 and 15.8 times the steady one before),
+// and the bucket delay no longer starts from an empty line (a gap 69 dB down).
+DSPARK_TEST(Chorus_and_delay_engine_changes_fill_then_open)
+{
+    const double fs = 48000.0;
+    const size_t at = 48000 / 256 * 256;
+    for (int dir = 0; dir < 2; ++dir)
+    {
+        auto c = std::make_unique<Chorus<float>>();
+        c->setModel(dir == 0 ? Chorus<float>::Model::Digital : Chorus<float>::Model::Analog);
+        c->setAnalogMode(Chorus<float>::AnalogMode::Slow);
+        c->setAnalogNoise(-200.0f);
+        c->setMix(0.5f);
+        c->prepare(spec(fs, 256, 2));
+        std::vector<float> l = m14Tone(147456, 440.0, fs), r = l;
+        for (size_t off = 0; off < l.size(); off += 256)
+        {
+            if (off == at) c->setModel(dir == 0 ? Chorus<float>::Model::Analog : Chorus<float>::Model::Digital);
+            float* p[2] = { l.data() + off, r.data() + off };
+            c->processBlock(AudioBufferView<float>(p, 2, 256));
+        }
+        EXPECT_LT(m14StepRatio(l, at), 1.5);
+    }
+
+    auto d = std::make_unique<Delay<float>>();
+    d->prepare(spec(fs, 256, 1));
+    std::vector<float> x = m14Tone(147456, 440.0, fs);
+    for (size_t off = 0; off < x.size(); off += 256)
+    {
+        if (off == at) d->setCharacter(Delay<float>::Character::Bucket);
+        float* p[1] = { x.data() + off };
+        AudioBufferView<float> v(p, 1, 256);
+        d->processBlock(v, 50.0f, 0.0f, 1.0f);
+    }
+    EXPECT_LT(m14StepRatio(x, at), 1.5);
+    const double before = m14Rms(x, at - 9600, at), after = m14Rms(x, at + 24000, at + 48000);
+    for (size_t w = at; w + 480 < at + 9600; w += 240)
+        EXPECT_GT(20.0 * std::log10(m14Rms(x, w, w + 480) / std::min(before, after)), -1.0);
+}

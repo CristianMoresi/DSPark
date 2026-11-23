@@ -2826,3 +2826,23 @@ DSPARK_TEST(Oversampling_audible_band_in_the_polyphase_mode)
     EXPECT_EQ(line.getLatency(), fir.getLatency());
     EXPECT_LT(line.getLatency(), 64);
 }
+
+// The rule of hardware that adds dry and wet: the dry stays whole up to half
+// and the wet reaches whole there.
+DSPARK_TEST(DryWetMixer_full_dry_to_half_rule)
+{
+    for (const float m : { 0.25f, 0.5f, 0.75f })
+    {
+        DryWetMixer<float> mixer;
+        mixer.prepare(defaultSpec());
+        mixer.setMixRule(DryWetMixer<float>::MixRule::FullDryToHalf);
+        EXPECT_TRUE(mixer.getMixRule() == DryWetMixer<float>::MixRule::FullDryToHalf);
+        auto tb = makeMonoBuffer(256);
+        generateDC(tb.ch(0), 256, 1.0f);       // dry 1
+        mixer.pushDry(tb.view());
+        generateDC(tb.ch(0), 256, 0.5f);       // wet 0.5
+        mixer.mixWet(tb.view(), m);
+        const float dry = std::min(1.0f, 2.0f * (1.0f - m)), wet = std::min(1.0f, 2.0f * m);
+        EXPECT_NEAR(tb.ch(0)[200], dry + 0.5f * wet, 1e-6f);
+    }
+}

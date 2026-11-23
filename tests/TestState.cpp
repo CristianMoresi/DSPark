@@ -180,6 +180,8 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
         c.setModel(Chorus<float>::Model::Analog); c.setAnalogMode(Chorus<float>::AnalogMode::Fast);
         c.setAnalogNoise(-70.0f);
+        c.setAnalogTapPhase(120.0f); c.setAnalogTone(-0.4f); c.setAnalogCircuitFilters(true);
+        c.setMixRule(DryWetMixer<float>::MixRule::FullDryToHalf);
     })));
     EXPECT_TRUE((roundTrip<Phaser<float>>([](auto& p) {
         p.setRate(0.9f); p.setStages(6); p.setFeedback(0.5f);

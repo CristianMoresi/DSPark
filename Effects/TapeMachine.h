@@ -88,16 +88,17 @@
  * unprepared instance passes audio through). reset() belongs to the stream
  * owner. getState()/setState() are setup/UI threads. A parameter change
  * re-calibrates the drive makeup on a scratch push-pull pair, spread over
- * the following blocks (one internal sample of calibration per internal
- * sample of audio, about 24 ms of audio, allocation-free) instead of running
+ * the following blocks (one step of calibration per step of the core,
+ * about 24 ms of audio, allocation-free) instead of running
  * it all inside one callback. The calibrated (drive, makeup, bias) set is
  * adopted when its calibration completes and reached through a ~30 ms
  * geometric ramp, so automation neither overruns the callback nor clicks.
  * Blocks longer than the prepared maximum are processed in pieces.
  *
  * Cost: the push-pull biased core runs two JA solvers at the active
- * oversampling factor (4x default), ~11% of one core at 48 kHz stereo on a
- * desktop CPU at 4x - the price of physical AC bias (history-independent LF
+ * oversampling factor (4x default, in two steps), started from the carrier's
+ * period of four (Hysteresis::setPredictorPeriod()): ~9% of one core at 48 kHz
+ * stereo on a desktop CPU - the price of physical AC bias (history-independent LF
  * response, exact even-harmonic cancellation, ultrasonic residue below
  * -75 dB). A SIMD lane-parallel JA (2 channels x 2 polarities) is the noted
  * future optimisation if a lighter budget is ever needed.
@@ -108,19 +109,28 @@
  * carrier is always a quarter of the internal rate, so the factor sets how
  * far the carrier sits above the audio band: at 4x/48k it is ultrasonic
  * (48 kHz) and its folds die in the downsampler; CPU scales ~linearly with
- * the factor. factor = 1 means OFF - no internal resampling and zero added
- * oversampler latency, but then the carrier lands at a quarter of the base
- * rate (12 kHz at 48k), i.e. IN-BAND, so 1x is only sensible when the host
- * runs a high sample rate or the surrounding chain is already oversampled
- * (the AC-bias model needs ultrasonic headroom). getLatency() always
+ * the factor. factor = 1 means OFF - no oversampler and no latency of its
+ * own. With four levels the core still solves each sample in two steps, so
+ * the carrier sits at half the base rate (24 kHz at 48k), on the zero of
+ * the steps' half-band; it is still too close to the top of the band to
+ * linearise it as it does at 4x (at 48 kHz a quiet 10 kHz comes out 0.6 dB
+ * under where it is at 4x at the nominal bias, 4.1 with no bias), so 1x is
+ * for a host at a high sample rate or a chain already oversampled (the
+ * AC-bias model needs ultrasonic headroom). getLatency() always
  * reflects the active factor (oversampler group delay + loss FIR + transport
  * delay), so hosts get correct PDC.
  *
- * **The carrier and the gain.** Two sign levels are a dither with two
- * peaks, and the gain of such a loop rises with the level before it
- * saturates: 2.8 dB at 1 kHz and 3.2 dB at 10 kHz at the nominal bias, up to
- * 9.9 dB at full bias. setBiasShape(BiasShape::FourLevel) takes that away
- * at twice the internal rate and about twice the cost; see it.
+ * **The carrier and the gain.** The carrier has four levels, an inner and an
+ * outer one of each sign: the gain holds and then falls with the level, at
+ * any bias, as a tape compresses. Its hysteresis makes more of the top's
+ * upper harmonics, so from 44.1 to under 352.8 kHz of internal rate the core
+ * solves each internal sample in two steps, through a half-band each way:
+ * the factor stays the one chosen, the latency too (the transport's delay
+ * gives the four internal samples of the steps back), and the cost stays
+ * under that of two levels in one step. Two sign levels are a dither with
+ * two peaks, whose gain rises
+ * with the level before it saturates (3.2 dB at the nominal bias, up to
+ * 9.9 dB at full bias); setBiasShape() keeps them to compare.
  *
  * Dependencies: Core/Hysteresis.h, Core/Oversampling.h, Core/Biquad.h,
  * Core/DryWetMixer.h,
@@ -275,13 +285,25 @@ public:
         maxBlock_ = std::max(spec.maxBlockSize, 1);
         if (osAutomatic_)
             osRequested_ = Oversampling<T>::factorForRate(spec.sampleRate, kAutomaticInternalRate);
-        osFactor_ = factorInUse(spec.sampleRate);
+        osFactor_ = osRequested_;
+        steps_ = stepsInUse(spec.sampleRate);
 
         // The hysteresis core runs at the active oversampling factor (4x
         // default) so the quarter-internal-rate AC bias carrier and its
         // sidebands stay clear of the audio band. factor = 1 = OFF: no
         // resampling and zero added latency; the carrier is then in-band.
+        // With four levels it takes two steps a sample from 44.1 to under 352.8 kHz.
         const double osRate = sampleRate_ * static_cast<double>(osFactor_);
+        const double coreRate = osRate * static_cast<double>(steps_);
+        const double tolerance = fourLevel_ ? kFourLevelTolerance : kExactTolerance;
+        stepped_.assign(static_cast<size_t>(numChannels_), {});
+        calib_.setTolerance(tolerance);
+        calib2_.setTolerance(tolerance);
+        // With four levels the solver starts from the carrier's own period;
+        // two levels keep the exact solver of before, to compare.
+        const int period = fourLevel_ ? kCarrierPeriod : 0;
+        calib_.setPredictorPeriod(period);
+        calib2_.setPredictorPeriod(period);
         if (osFactor_ > 1)
         {
             oversampler_ = std::make_unique<Oversampling<T>>(
@@ -303,12 +325,16 @@ public:
         hysteresisN_.assign(static_cast<size_t>(numChannels_), {});
         for (auto& h : hysteresis_)
         {
-            h.prepare(osRate);
+            h.prepare(coreRate);
+            h.setTolerance(tolerance);
+            h.setPredictorPeriod(period);
             h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
         }
         for (auto& h : hysteresisN_)
         {
-            h.prepare(osRate);
+            h.prepare(coreRate);
+            h.setTolerance(tolerance);
+            h.setPredictorPeriod(period);
             h.setParameters(3.5e5, 2.2e4, 1.6e-3, 2.7e4, 0.17);
         }
 
@@ -388,8 +414,10 @@ public:
         overBiasX1_.assign(static_cast<size_t>(numChannels_), 0.0);
 
         // Transport delay scales with the rate so the wow excursion (sized in
-        // samples at 48k, scaled by fs/48k) always fits under the centre.
-        delayCenter_ = std::max(96, static_cast<int>(96.0 * sampleRate_ / 48000.0));
+        // samples at 48k, scaled by fs/48k) always fits under the centre. What
+        // the two steps of the core delay is taken off it: the latency stays
+        // that of one step.
+        delayCenter_ = std::max(96, static_cast<int>(96.0 * sampleRate_ / 48000.0)) - (steps_ > 1 ? kStepDelay / osFactor_ : 0);
         int dsz = 1;
         // Room for the speed transport too: its delay is the head distance
         // over the speed, from a quarter to four times the centre.
@@ -411,7 +439,8 @@ public:
         asymMeanA_ = std::exp(-2.0 * std::numbers::pi * 10.0 * dt / static_cast<double>(osFactor_));
         trMeanA_ = std::exp(-2.0 * std::numbers::pi * 5.0 * dt);
 
-        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + firCenter_ + delayCenter_;
+        latency_ = (oversampler_ ? oversampler_->getLatency() : 0) + firCenter_ + delayCenter_
+                 + (steps_ > 1 ? kStepDelay / osFactor_ : 0);   // the steps' delay, taken off the transport's
         // Behind minimum-phase filters the dry copy crosses the same filters
         // (in phase at every frequency) and the ring adds the rest of the delay.
         dryThroughFilters_ = oversampler_ && osMode_ == OversamplingMode::MinimumPhase;
@@ -485,8 +514,12 @@ public:
 
     // -- Parameters (thread-safe) ---------------------------------------------------
 
-    /** @brief Input drive in dB [-12, +24]. Level-compensated: more drive means
-     *  more saturation at roughly constant loudness. Non-finite values are ignored. */
+    /** @brief Input drive in dB [-12, +24]. Level-compensated at -12 dBFS, with
+     *  a quarter of a dB a dB left: more drive means more saturation at
+     *  roughly constant loudness there. Pushed hard the tape compresses as a
+     *  tape does, so what is quieter comes out louder than what is loud: at
+     *  +24 dB a programme at -33 dBFS RMS gains 11.8 dB and one at -15 dBFS
+     *  2.2 dB. Non-finite values are ignored. */
     void setDrive(T driveDb) noexcept
     {
         if (!std::isfinite(driveDb)) return;
@@ -529,7 +562,7 @@ public:
         if (factor == osRequested_ && !osAutomatic_) return;
         osAutomatic_ = false;
         osRequested_ = factor;
-        osFactor_ = factorInUse(sampleRate_);
+        osFactor_ = factor;
         if (prepared_.load(std::memory_order_relaxed))
             prepare(spec_);
     }
@@ -540,7 +573,8 @@ public:
      *
      * With it on, every prepare() takes the smallest factor that brings the
      * core to an internal rate of at least 176.4 kHz: 4x at 44.1 and 48 kHz
-     * (the default factor), 2x at 88.2 and 96 kHz, none from 176.4 kHz up. The
+     * (the default factor), 2x at 88.2 and 96 kHz, none from 176.4 kHz up
+     * (where the four levels keep their two steps). The
      * bias carrier and the hysteresis then run at the same rate whatever the
      * session rate, and a high-rate session stops paying for a factor it does
      * not need. Off by default; an explicit setOversampling() turns it off.
@@ -561,33 +595,30 @@ public:
     /** @brief The levels of the bias carrier (see setBiasShape()). */
     enum class BiasShape
     {
-        TwoLevel, ///< Every sample at plus or minus the amplitude (default).
-        FourLevel ///< An inner and an outer level of each sign: the gain only falls with the level.
+        TwoLevel, ///< Every sample at plus or minus the amplitude: the gain rises with the level before it saturates.
+        FourLevel ///< An inner and an outer level of each sign: the gain only falls with the level (default).
     };
 
     /**
      * @brief Chooses the levels of the bias carrier (SETUP THREAD ONLY, as
      *  setOversampling(): an active instance is prepared again).
      *
-     * TwoLevel, the default, is the sound the machine has had: its gain
-     * rises with the level before it saturates (3.2 dB at the nominal bias,
-     * up to 9.9 dB at full bias).
+     * FourLevel, the default, holds the gain and then lets it fall, at any
+     * bias, as a tape compresses. The factor of setOversampling() is left as
+     * it is: at 1x, 2x or 4x, from 44.1 to under 352.8 kHz of internal rate,
+     * the core takes two steps a sample, at the same latency.
      *
-     * With FourLevel the gain holds and then falls, at any bias, as a tape
-     * compresses. It is another sound, quieter when driven: 1 kHz at 0 dBFS
-     * leaves 1.9 dB lower. The four levels need twice the headroom over the
-     * audio band, so the core then runs at no less than 352.8 kHz whatever
-     * setOversampling() asked: 8x at 44.1 and 48 kHz, about twice the cost
-     * and a latency of its own (getOversamplingFactor(), getLatency()).
+     * TwoLevel is the earlier carrier, kept to compare: its gain rises with
+     * the level before it saturates (3.2 dB at the nominal bias, up to 9.9 dB
+     * at full bias), so 1 kHz at 0 dBFS leaves it 1.9 dB louder.
      *
-     * @param shape TwoLevel (default) or FourLevel.
+     * @param shape FourLevel (default) or TwoLevel.
      */
     void setBiasShape(BiasShape shape)
     {
         const bool four = shape == BiasShape::FourLevel;
         if (four == fourLevel_) return;
         fourLevel_ = four;
-        osFactor_ = factorInUse(sampleRate_);
         if (prepared_.load(std::memory_order_relaxed))
             prepare(spec_);
     }
@@ -956,7 +987,7 @@ public:
         // Default 4 = the historical fixed factor (older blobs restore 4x).
         setOversampling(r.read("oversampling", 4));
         setAutomaticOversampling(r.read("oversamplingAuto", false));
-        setBiasShape(r.read("biasShape", 0) == 1 ? BiasShape::FourLevel : BiasShape::TwoLevel);
+        setBiasShape(r.read("biasShape", 1) == 0 ? BiasShape::TwoLevel : BiasShape::FourLevel);
         setOversamplingMode(static_cast<OversamplingMode>(r.read("oversamplingMode", 0)));
         return true;
     }
@@ -1066,7 +1097,7 @@ private:
                     buffer.getChannel(ch)[i] = turnDry(ch, dryRing_[static_cast<size_t>(ch)][static_cast<size_t>(at)], inTurn, outTurn, ironTurn);
             }
             dryPos_ = (dryPos_ + nS) & (drySize_ - 1);
-            if (calActive_) stepCalibration(nS * osFactor_);
+            if (calActive_) stepCalibration(nS * osFactor_ * steps_);
             resting_ = true;
             return;
         }
@@ -1166,6 +1197,7 @@ private:
                 T* d = osView.getChannel(ch);
                 auto& hp = hysteresis_[static_cast<size_t>(ch)];
                 auto& hn = hysteresisN_[static_cast<size_t>(ch)];
+                auto& stepped = stepped_[static_cast<size_t>(ch)];
                 auto& rec = recNet_[static_cast<size_t>(ch)];
                 auto& play = playNet_[static_cast<size_t>(ch)];
                 double& mean = asymMean_[static_cast<size_t>(ch)];
@@ -1190,11 +1222,21 @@ private:
                         xs += asym.next() * kAsymmetryShare * (square - mean);
                     }
                     const double x = inScale * xs;
-                    const double c = carrier(B, biasNominal_, phase);
-                    phase = (phase + 1) & 7;
-                    const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
-                    const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
-                    double out = (mS * 0.5) * (mp + mn);
+                    double pair;
+                    if (steps_ > 1)
+                    {
+                        pair = twoSteps(stepped, hp, hn, x, B, phase);
+                        phase = (phase + 2) & 7;
+                    }
+                    else
+                    {
+                        const double c = carrier(B, biasNominal_, phase);
+                        phase = (phase + 1) & 7;
+                        const double mp = static_cast<double>(hp.processSample(static_cast<T>(x + c)));
+                        const double mn = static_cast<double>(hn.processSample(static_cast<T>(x - c)));
+                        pair = mp + mn;
+                    }
+                    double out = (mS * 0.5) * pair;
                     if (circuit) out = play[1].processSample(play[0].processSample(out, 0), 0);
                     d[i] = static_cast<T>(out);
                 }
@@ -1211,10 +1253,10 @@ private:
             hSm_ = hEnd;
             mSm_ = mEnd;
             bSm_ = bEnd;
-            biasPhase_ = (phaseStart + osN) & 7;
-            // Advance a pending makeup calibration by as many internal
-            // samples as this block has: bounded work per callback.
-            if (calActive_) stepCalibration(osN);
+            biasPhase_ = (phaseStart + osN * steps_) & 7;
+            // Advance a pending makeup calibration by as many steps of the
+            // core as this block has: bounded work per callback.
+            if (calActive_) stepCalibration(osN * steps_);
             if (osOn) oversampler_->downsample(buffer);
         }
 
@@ -1424,10 +1466,63 @@ private:
             dryOutputLead_.processSample(channel, dryInputLead_.processSample(channel, x, inTurn), outTurn), ironTurn);
     }
 
-    /** @brief The factor in use: the one asked for, or the least the four levels need. */
-    [[nodiscard]] int factorInUse(double rate) const noexcept
+    /**
+     * @brief The steps of the core in an internal sample: two with four
+     *        levels from 44.1 to under 352.8 kHz, at a factor whose own
+     *        samples hold the half-bands' delay (1x, 2x and 4x). At 1x and
+     *        48 kHz with no bias the top's gain still rises with the level,
+     *        by 0.9 dB at 10 kHz (in one step, 4.2).
+     */
+    [[nodiscard]] int stepsInUse(double rate) const noexcept
     {
-        return fourLevel_ ? std::max(osRequested_, Oversampling<T>::factorForRate(rate, kFourLevelInternalRate)) : osRequested_;
+        const bool whole = osFactor_ == 1 || osFactor_ == 2 || osFactor_ == 4;
+        const double internal = rate * static_cast<double>(osFactor_);
+        return fourLevel_ && whole && 4.0 * internal > 0.999999 * kAutomaticInternalRate && internal < 0.999999 * kFourLevelInternalRate ? 2 : 1;
+    }
+
+    /** @brief What the two half-bands of the steps remember. */
+    struct Stepped
+    {
+        double in[3] {};    ///< The last internal samples in.
+        double even[5] {};  ///< The first step's output of the last samples.
+        double odd[3] {};   ///< The second step's.
+    };
+
+    /**
+     * @brief One internal sample solved in two: a maximally flat half-band
+     *        of 7 taps up and one of 11 down, four internal samples in all.
+     *
+     * Both are linear phase; at 20 kHz they take 0.02 dB off. The band
+     * around the new Nyquist frequency, where the carrier's own square
+     * lies, meets a zero of sixth order on the way down.
+     */
+    [[nodiscard]] double twoSteps(Stepped& s, Hysteresis<T>& hp, Hysteresis<T>& hn, double x, double amplitude, int phase) const noexcept
+    {
+        const auto solve = [&](double field, int at) noexcept
+        {
+            const double c = carrier(amplitude, biasNominal_, at);
+            return static_cast<double>(hp.processSample(static_cast<T>(field + c)))
+                 + static_cast<double>(hn.processSample(static_cast<T>(field - c)));
+        };
+        const double first = (9.0 * (s.in[0] + s.in[1]) - (x + s.in[2])) * 0.0625;
+        const double second = s.in[0];
+        s.in[2] = s.in[1];
+        s.in[1] = s.in[0];
+        s.in[0] = x;
+
+        const double a = solve(first, phase);
+        const double out = (3.0 * (a + s.even[4]) - 25.0 * (s.even[0] + s.even[3]) + 150.0 * (s.even[1] + s.even[2])) * (1.0 / 512.0)
+                         + 0.5 * s.odd[2];
+        const double b = solve(second, (phase + 1) & 7);
+        s.even[4] = s.even[3];
+        s.even[3] = s.even[2];
+        s.even[2] = s.even[1];
+        s.even[1] = s.even[0];
+        s.even[0] = a;
+        s.odd[2] = s.odd[1];
+        s.odd[1] = s.odd[0];
+        s.odd[0] = b;
+        return out;
     }
 
     /**
@@ -1655,6 +1750,7 @@ private:
     {
         for (auto& h : hysteresis_) h.reset();
         for (auto& h : hysteresisN_) h.reset();
+        for (auto& s : stepped_) s = Stepped {};
         for (auto& f : firState_) std::fill(f.begin(), f.end(), T(0));
         for (auto& d : delayRing_) std::fill(d.begin(), d.end(), T(0));
         for (auto& s : inputAc_) s = {};
@@ -2059,7 +2155,7 @@ private:
     void startCalibration() noexcept
     {
         calRun_ = calReq_;
-        const double fs4 = sampleRate_ * static_cast<double>(osFactor_);
+        const double fs4 = sampleRate_ * static_cast<double>(osFactor_ * steps_);
         // 16 ms settle + 8 ms measured: the biased loop's mean state needs a
         // few hundred carrier cycles to reach its steady branch.
         calN_ = static_cast<int>(0.024 * fs4);
@@ -2109,7 +2205,11 @@ private:
         // clean, a pure attenuator above as compression eats level). A
         // +0.25 dB/dB residual slope keeps it alive: backing off cleans AND
         // drops slightly, pushing holds level while the tape density grows.
-        mScale_ = ((fund > 0.0) ? calRun_.calAmp / fund : 1.0) * std::pow(calRun_.drive, 0.25);
+        // Four levels compress the tone harder than a programme 9 dB under
+        // it, so pushed they take 0.23: the programme then stays within the
+        // 8 dB the knob is allowed over its whole travel.
+        const double link = fourLevel_ && calRun_.drive > 1.0 ? kFourLevelDriveLink : kDriveLink;
+        mScale_ = ((fund > 0.0) ? calRun_.calAmp / fund : 1.0) * std::pow(calRun_.drive, link);
         hScale_ = calRun_.hScale;
         biasAmp_ = calRun_.biasAmp;
         calActive_ = false;
@@ -2188,7 +2288,12 @@ private:
     int latency_ = 0;
     int drySize_ = 1;
     int osRequested_ = 4;            ///< The factor asked for (setOversampling(), the automatic one).
-    bool fourLevel_ = false;         ///< The levels of the bias carrier (setBiasShape(); setup thread).
+    bool fourLevel_ = true;          ///< The levels of the bias carrier (setBiasShape(); setup thread).
+    int steps_ = 1;                  ///< Steps of the core in an internal sample (stepsInUse()).
+    static constexpr double kDriveLink = 0.25, kFourLevelDriveLink = 0.23; ///< Level left to the drive knob, in dB a dB.
+    static constexpr int kStepDelay = 4; ///< Of the two half-bands, in internal samples.
+    static constexpr double kExactTolerance = 1e-9, kFourLevelTolerance = 1e-6; ///< Where the solver stops.
+    std::vector<Stepped> stepped_;   ///< The half-bands of each channel.
     double biasNominal_ = 3.0 * 2.2e4; ///< The bias at the optimum of the material.
     static constexpr double kFourLevelInternalRate = 352800.0;
     static constexpr double kInnerLevel = 0.2, kOuterLevel = 0.6; ///< Of the bias amplitude, inner level up to the optimum.
@@ -2201,6 +2306,7 @@ private:
     bool dryThroughFilters_ = false; ///< The dry copy crosses the filters (minimum phase).
     int dryDelay_ = 0;               ///< Delay of the dry ring: what the filters do not bring.
     static constexpr double kAutomaticInternalRate = 176400.0; ///< Rate the automatic factor reaches.
+    static constexpr int kCarrierPeriod = 4; ///< Core samples the carrier repeats over (sign and level).
 
     std::unique_ptr<Oversampling<T>> oversampler_;
     std::vector<Hysteresis<T>> hysteresis_;   ///< +carrier instances (push-pull pair A).
@@ -2218,9 +2324,10 @@ private:
     /// the internal rate, less the audio band, away from 0 - above what the
     /// downsampler keeps. Products of the programme's own HARMONICS with twice
     /// the carrier are not covered by that argument: with bright material and
-    /// drive they reach the band (measured at the default 4x, 48 kHz: a
+    /// drive they reach the band (measured with two levels at 4x, 48 kHz: a
     /// 19.25 kHz tone at -6 dBFS leaves a 255 Hz product (5f - 2fc) at
-    /// -46 dBc at drive 0 and -6 dBc at +12 dB; 8x moves it to -98 dBc). At 0.375 of the rate its third harmonic folded
+    /// -46 dBc at drive 0 and -6 dBc at +12 dB; four levels in two steps
+    /// leave -72 and -37 dBc). At 0.375 of the rate its third harmonic folded
     /// onto the base-rate Nyquist frequency and mirrored the programme about
     /// a quarter of the base rate: a 10.1 kHz tone at -30 dBFS came out with
     /// a 13.9 kHz image 9.9 dB down, and 80 dB down now.

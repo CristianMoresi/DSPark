@@ -139,7 +139,7 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     })));
     EXPECT_TRUE((roundTrip<Saturation<float>>([](auto& s) {
         s.setAlgorithm(Saturation<float>::Algorithm::Curve);
-        s.setCurveShape(0.3f, 2.0f, -0.4f); s.setAsymmetry(0.25f);
+        s.setCurveShape(0.3f, 2.0f, -0.4f); s.setAsymmetry(0.25f); s.setCurveBase(Saturation<float>::CurveBase::Erf); s.setDrivePan(-0.4f);
         s.setProgramNoise(-60.0f); s.setLevelTracking(0.5f); s.setTrackingCorner(150.0f);
         s.setCombLoop(-0.3f, 330.0f); s.setDriveCompensation(true);
         s.setOversamplingMode(Saturation<float>::OversamplingMode::MinimumPhase);

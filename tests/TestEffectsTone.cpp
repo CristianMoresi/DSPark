@@ -7250,3 +7250,183 @@ DSPARK_TEST(Equalizer_loudness_compensation_keeps_pink_noise_as_loud)
     EXPECT_NEAR(loudness(flat.get()), dry, 1e-4);
     EXPECT_NEAR(static_cast<double>(flat->getCompensationDb()), 0.0, 1e-6);
 }
+
+DSPARK_TEST(Saturation_dc_filter_only_where_a_curve_makes_dc_and_modes_switch_without_a_step)
+{
+    // A symmetric curve makes no DC (the pre-filter takes the input's): the
+    // DC filter leaves the path and with it its turn of the lowest octave. A
+    // switch from Stereo to MidSide on a hot pair dips to the dry and back
+    // instead of jumping.
+    using Sat = Saturation<double>;
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    auto phaseAt = [&](Sat::Algorithm algo, double character, double hz) {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(algo);
+        s->setDrive(0.0);
+        s->setCharacter(character);
+        s->prepare(spec(fs, 480, 1));
+        std::vector<double> x(480);
+        double re = 0.0, im = 0.0;
+        for (int b = 0; b < 400; ++b)
+        {
+            for (int i = 0; i < 480; ++i) x[static_cast<size_t>(i)] = 0.01 * std::sin(2.0 * kPi * hz * (b * 480 + i) / fs);
+            double* c[1] = { x.data() };
+            s->processBlock(AudioBufferView<double>(c, 1, 480));
+            if (b >= 200)
+                for (int i = 0; i < 480; ++i)
+                {
+                    const double w = 2.0 * kPi * hz * (b * 480 + i - s->getLatencySamples()) / fs;
+                    re += x[static_cast<size_t>(i)] * std::sin(w);
+                    im += x[static_cast<size_t>(i)] * std::cos(w);
+                }
+        }
+        return std::atan2(im, re) * 180.0 / kPi;
+    };
+    const double symmetric = phaseAt(Sat::Algorithm::SoftClip, 0.0, 20.0);
+    const double asymmetric = phaseAt(Sat::Algorithm::Tube, 0.0, 20.0);
+    std::printf("    phase at 20 Hz: SoftClip %.2f deg, Tube %.2f deg%c", symmetric, asymmetric, 10);
+    EXPECT_GT(std::abs(asymmetric), std::abs(symmetric) + 5.0);   // the DC filter's turn is only where it is needed
+
+    // Stereo to MidSide on two low tones, drive 18 dB: the step at the switch
+    // stays that of the regime (before the dip it was 42 times it).
+    for (const auto algo : { Sat::Algorithm::SoftClip, Sat::Algorithm::Tube, Sat::Algorithm::Tape })
+    {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(algo);
+        s->setDrive(18.0);
+        s->prepare(spec(fs, 256, 2));
+        std::vector<double> l(256), r(256), out;
+        for (int b = 0; b < 200; ++b)
+        {
+            if (b == 120) s->setProcessingMode(Sat::ProcessingMode::MidSide);
+            for (int i = 0; i < 256; ++i)
+            {
+                const double t = (b * 256 + i) / fs;
+                l[static_cast<size_t>(i)] = 0.5 * std::sin(2.0 * kPi * 55.0 * t);
+                r[static_cast<size_t>(i)] = 0.5 * std::sin(2.0 * kPi * 82.0 * t);
+            }
+            double* c[2] = { l.data(), r.data() };
+            s->processBlock(AudioBufferView<double>(c, 2, 256));
+            out.insert(out.end(), l.begin(), l.end());
+        }
+        double before = 0.0, after = 0.0, around = 0.0;
+        for (size_t i = 60 * 256; i < 110 * 256; ++i) before = std::max(before, std::abs(out[i] - out[i - 1]));
+        for (size_t i = 140 * 256; i < 199 * 256; ++i) after = std::max(after, std::abs(out[i] - out[i - 1]));
+        for (size_t i = 118 * 256; i < 126 * 256; ++i) around = std::max(around, std::abs(out[i] - out[i - 1]));
+        std::printf("    Stereo to MidSide, algorithm %d: step %.2f times the regime%c", static_cast<int>(algo), around / std::max(before, after), 10);
+        EXPECT_LT(around, 1.3 * std::max(before, after));
+    }
+}
+
+DSPARK_TEST(Saturation_curve_bases_keep_the_line_and_the_ceiling)
+{
+    // Every base under the Curve controls has a slope of 1 at 0 and stays
+    // under its ceiling; the symmetric ones make odd harmonics only, the
+    // valve and the rectifier even ones too (and their DC brings the DC
+    // filter in).
+    using Sat = Saturation<double>;
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    const char* names[] = { "tanh", "algebraic", "arctangent", "erf", "cubic", "valve", "rectifier" };
+    for (int base = 0; base <= 6; ++base)
+    {
+        auto level = [&](double amp, double drive, double* h2, double* h3, double* peak) {
+            auto s = std::make_unique<Sat>();
+            s->setAlgorithm(Sat::Algorithm::Curve);
+            s->setCurveBase(static_cast<Sat::CurveBase>(base));
+            s->setDrive(drive);
+            s->setOversampling(1);
+            s->setDcBlocking(false);
+            s->setPreFilterHpFrequency(10.0);
+            s->prepare(spec(fs, 480, 1));
+            std::vector<double> x(480);
+            double a1 = 0, b1 = 0, a2 = 0, b2 = 0, a3 = 0, b3 = 0, top = 0;
+            for (int b = 0; b < 200; ++b)
+            {
+                for (int i = 0; i < 480; ++i) x[static_cast<size_t>(i)] = amp * std::sin(2.0 * kPi * 1000.0 * (b * 480 + i) / fs);
+                double* c[1] = { x.data() };
+                s->processBlock(AudioBufferView<double>(c, 1, 480));
+                if (b < 100) continue;
+                for (int i = 0; i < 480; ++i)
+                {
+                    const double w = 2.0 * kPi * 1000.0 * (b * 480 + i) / fs, v = x[static_cast<size_t>(i)];
+                    a1 += v * std::sin(w); b1 += v * std::cos(w);
+                    a2 += v * std::sin(2 * w); b2 += v * std::cos(2 * w);
+                    a3 += v * std::sin(3 * w); b3 += v * std::cos(3 * w);
+                    top = std::max(top, std::abs(v));
+                }
+            }
+            const double f = std::hypot(a1, b1);
+            if (h2) *h2 = 20.0 * std::log10(std::hypot(a2, b2) / f + 1e-12);
+            if (h3) *h3 = 20.0 * std::log10(std::hypot(a3, b3) / f + 1e-12);
+            if (peak) *peak = top;
+            return f / (100.0 * 480.0 * 0.5 * amp);
+        };
+        const double small = level(0.01, 0.0, nullptr, nullptr, nullptr);
+        double h2 = 0, h3 = 0, peak = 0;
+        (void)level(0.5, 24.0, &h2, &h3, &peak);
+        std::printf("    %-10s small-signal gain %+.4f dB, at +24 dB H2 %.1f H3 %.1f dBc, peak %.4f%c",
+                    names[base], 20.0 * std::log10(small), h2, h3, peak, 10);
+        EXPECT_NEAR(20.0 * std::log10(small), 0.0, 0.05);
+        EXPECT_LT(peak, 1.02);
+        if (base <= 4) EXPECT_LT(h2, -90.0);
+        else EXPECT_GT(h2, -60.0);
+        EXPECT_GT(h3, -60.0);
+    }
+}
+
+DSPARK_TEST(Saturation_drive_pan_moves_the_saturation_not_the_level)
+{
+    // Centred it is what it was, to the bit; at -1 the first channel takes
+    // 6 dB more drive and the second 6 dB less, each back at its level
+    // where the curve is straight.
+    using Sat = Saturation<double>;
+    constexpr double fs = 48000.0, kPi = 3.14159265358979323846;
+    auto run = [&](bool touch, double pan, double amp, std::vector<double>& outL, std::vector<double>& outR) {
+        auto s = std::make_unique<Sat>();
+        s->setAlgorithm(Sat::Algorithm::SoftClip);
+        s->setDrive(12.0);
+        if (touch) s->setDrivePan(pan);
+        s->prepare(spec(fs, 480, 2));
+        std::vector<double> l(480), r(480);
+        outL.clear();
+        outR.clear();
+        for (int b = 0; b < 100; ++b)
+        {
+            for (int i = 0; i < 480; ++i)
+                l[static_cast<size_t>(i)] = r[static_cast<size_t>(i)] = amp * std::sin(2.0 * kPi * 1000.0 * (b * 480 + i) / fs);
+            double* c[2] = { l.data(), r.data() };
+            s->processBlock(AudioBufferView<double>(c, 2, 480));
+            outL.insert(outL.end(), l.begin(), l.end());
+            outR.insert(outR.end(), r.begin(), r.end());
+        }
+    };
+    auto thd = [&](const std::vector<double>& x) {
+        double a1 = 0, b1 = 0, rest = 0, all = 0;
+        for (size_t i = 24000; i < x.size(); ++i)
+        {
+            const double w = 2.0 * kPi * 1000.0 * static_cast<double>(i) / fs;
+            a1 += x[i] * std::sin(w);
+            b1 += x[i] * std::cos(w);
+            all += x[i] * x[i];
+        }
+        const double n = static_cast<double>(x.size() - 24000);
+        const double fund = 2.0 * (a1 * a1 + b1 * b1) / n;
+        rest = std::max(1e-30, all - fund);
+        return 10.0 * std::log10(rest / fund);
+    };
+    std::vector<double> l0, r0, l1, r1;
+    run(false, 0.0, 0.5, l0, r0);
+    run(true, 0.0, 0.5, l1, r1);
+    EXPECT_TRUE(l0 == l1 && r0 == r1);
+    run(true, -1.0, 0.5, l1, r1);
+    std::printf("    drive pan -1: THD left %.1f dB, right %.1f dB, centred %.1f dB%c", thd(l1), thd(r1), thd(l0), 10);
+    EXPECT_GT(thd(l1), thd(l0) + 3.0);
+    EXPECT_LT(thd(r1), thd(l0) - 3.0);
+    // Small signals: the same level on both sides.
+    run(true, -1.0, 0.001, l1, r1);
+    run(false, 0.0, 0.001, l0, r0);
+    double el = 0, er = 0, e0 = 0;
+    for (size_t i = 24000; i < l1.size(); ++i) { el += l1[i] * l1[i]; er += r1[i] * r1[i]; e0 += l0[i] * l0[i]; }
+    EXPECT_NEAR(10.0 * std::log10(el / e0), 0.0, 0.05);
+    EXPECT_NEAR(10.0 * std::log10(er / e0), 0.0, 0.05);
+}

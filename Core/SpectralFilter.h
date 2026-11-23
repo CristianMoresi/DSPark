@@ -36,13 +36,13 @@
  * can look at the other channels of the same frame (getFramePower()).
  *
  * SpectralReadout publishes a per-bin quantity of the last frame (a gain
- * curve, a reduction) at 128 points for a display read from any thread.
+ * curve, a reduction) at 1024 points for a display read from any thread.
  *
  * Threading: prepare() on the setup thread (allocates); processBlock(),
  * reset() and the setters on the audio thread (owner-managed).
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, DenormalGuard.h, DspMath.h,
- * FFT.h, SpectralEnvelope.h, WindowFunctions.h.
+ * FFT.h, SimdOps.h, SpectralEnvelope.h, WindowFunctions.h.
  */
 
 #include "AudioBuffer.h"
@@ -50,6 +50,7 @@
 #include "DenormalGuard.h"
 #include "DspMath.h"
 #include "FFT.h"
+#include "SimdOps.h"
 #include "SpectralEnvelope.h"
 #include "WindowFunctions.h"
 
@@ -62,6 +63,57 @@
 #include <vector>
 
 namespace dspark {
+
+namespace detail {
+
+/**
+ * @class MinimumPhase
+ * @brief The minimum-phase kernel of a log magnitude, by its real cepstrum:
+ *        what SpectralFilter and DetailFilter design their kernels with.
+ *
+ * Audio thread, except prepare() (setup thread).
+ */
+class MinimumPhase
+{
+public:
+    static constexpr double kLeastLogGain = -13.815510557964274; ///< A log gain is taken no lower: -120 dB.
+
+    /**
+     * @brief Takes the size of the design (allocates nothing).
+     * @param bins Bins of the transform of the design.
+     */
+    void prepare(int bins) noexcept { bins_ = bins; }
+
+    /**
+     * @brief The kernel, cut and tapered.
+     * @param fft    The transform of the design.
+     * @param h      On entry the log magnitude as a real spectrum; overwritten.
+     * @param c      The kernel in time: `length` samples, zeros after them.
+     * @param size   The size of the transform.
+     * @param taper  `length` weights.
+     * @param length The samples kept.
+     */
+    void build(FFTReal<double>& fft, double* h, double* c, int size, const double* taper, int length) noexcept
+    {
+        // The inverse of the log magnitude, real and even, is the real cepstrum.
+        fft.inverse(h, c);
+        // Fold onto the positive quefrencies: the minimum-phase cepstrum.
+        for (int q = 1; q < size / 2; ++q) c[q] *= 2.0;
+        std::fill(c + size / 2 + 1, c + size, 0.0);
+        fft.forward(c, h);
+        // Its exponential is the minimum-phase spectrum.
+        simd::complexExp(h, bins_);
+        // Cut to the room the padding leaves, with a raised-cosine tail.
+        fft.inverse(h, c);
+        for (int q = 0; q < length; ++q) c[q] *= taper[q];
+        std::fill(c + length, c + size, 0.0);
+    }
+
+private:
+    int bins_ = 0;
+};
+
+} // namespace detail
 
 /**
  * @class SpectralFilter
@@ -129,6 +181,7 @@ public:
         focus_.prepare(window_.data(), n_, m_, focusWidth_, static_cast<double>(pad_));
         powers_.assign(static_cast<size_t>(ch), std::vector<T>(static_cast<size_t>(bins_), T(0)));
         gain_.assign(static_cast<size_t>(bins_), T(1));
+        minimumPhase_.prepare(bins_);
         channels_ = ch;
         prepared_ = true;
     }
@@ -248,22 +301,24 @@ public:
             for (int ch = 0; ch < nCh; ++ch)
             {
                 const T* in = buffer.getChannel(ch) + i;
-                auto& r = ring_[static_cast<size_t>(ch)];
-                for (int k = 0; k < chunk; ++k) r[static_cast<size_t>((writePos_ + k) & mask)] = static_cast<double>(in[k]);
+                double* r = ring_[static_cast<size_t>(ch)].data();
+                inSpans(writePos_, chunk, n_, [&](int from, int at, int count) noexcept {
+                    for (int k = 0; k < count; ++k) r[at + k] = static_cast<double>(in[from + k]);
+                });
                 const T* kin = key != nullptr ? key->getChannel(std::min(ch, key->getNumChannels() - 1)) + i : in;
-                auto& kr = keyRing_[static_cast<size_t>(ch)];
-                for (int k = 0; k < chunk; ++k) kr[static_cast<size_t>((writePos_ + k) & mask)] = static_cast<double>(kin[k]);
+                double* kr = keyRing_[static_cast<size_t>(ch)].data();
+                inSpans(writePos_, chunk, n_, [&](int from, int at, int count) noexcept {
+                    for (int k = 0; k < count; ++k) kr[at + k] = static_cast<double>(kin[from + k]);
+                });
             }
             for (int ch = 0; ch < nCh; ++ch)
             {
                 T* out = buffer.getChannel(ch) + i;
-                auto& a = accum_[static_cast<size_t>(ch)];
-                for (int k = 0; k < chunk; ++k)
-                {
-                    const auto p = static_cast<size_t>((readPos_ + k) & accMask);
-                    out[k] = static_cast<T>(a[p]);
-                    a[p] = 0.0;
-                }
+                double* a = accum_[static_cast<size_t>(ch)].data();
+                inSpans(readPos_, chunk, 2 * m_, [&](int from, int at, int count) noexcept {
+                    for (int k = 0; k < count; ++k) out[from + k] = static_cast<T>(a[at + k]);
+                    std::fill_n(a + at, count, 0.0);
+                });
             }
             writePos_ = (writePos_ + chunk) & mask;
             readPos_ = (readPos_ + chunk) & accMask;
@@ -278,6 +333,15 @@ public:
     }
 
 private:
+    /// A stretch of a ring in the one or two runs it takes: body(from, at, count).
+    template <typename Body>
+    static void inSpans(int start, int count, int size, Body&& body) noexcept
+    {
+        const int first = std::min(count, size - start);
+        body(0, start, first);
+        if (first < count) body(first, 0, count - first);
+    }
+
     template <typename Design>
     void hop(int nCh, Design& design) noexcept
     {
@@ -285,9 +349,12 @@ private:
         // Analysis of every channel: the last n samples, windowed, zero-padded.
         for (int ch = 0; ch < nCh; ++ch)
         {
-            const auto& r = ring_[static_cast<size_t>(ch)];
-            for (int k = 0; k < n_; ++k)
-                frame_[static_cast<size_t>(k)] = r[static_cast<size_t>((writePos_ + k) & (n_ - 1))] * window_[static_cast<size_t>(k)];
+            const double* r = ring_[static_cast<size_t>(ch)].data();
+            const double* w = window_.data();
+            double* x = frame_.data();
+            inSpans(writePos_, n_, n_, [&](int from, int at, int count) noexcept {
+                for (int k = 0; k < count; ++k) x[from + k] = r[at + k] * w[from + k];
+            });
             std::fill(frame_.begin() + n_, frame_.begin() + m_, 0.0);
             fft_->forward(frame_.data(), spectra_[static_cast<size_t>(ch)].data());
         }
@@ -366,23 +433,9 @@ private:
             h[2 * k] = std::log(std::max(static_cast<double>(gain_[static_cast<size_t>(k)]), 1e-6));
             h[2 * k + 1] = 0.0;
         }
-        fft_->inverse(h, c);
-        // Fold onto the positive quefrencies: the minimum-phase cepstrum.
-        for (int q = 1; q < m_ / 2; ++q) c[q] *= 2.0;
-        std::fill(c + m_ / 2 + 1, c + m_, 0.0);
-        fft_->forward(c, h);
-        for (int k = 0; k < bins_; ++k)
-        {
-            const double mag = std::exp(h[2 * k]), ph = h[2 * k + 1];
-            h[2 * k] = mag * std::cos(ph);
-            h[2 * k + 1] = mag * std::sin(ph);
-        }
-        // Cut to the room the padding leaves, with a raised-cosine tail.
-        fft_->inverse(h, c);
         const int length = shortKernel_ ? shortLength_ : kernelLength_;
         const double* taper = shortKernel_ ? shortTaper_.data() : taper_.data();
-        for (int q = 0; q < length; ++q) c[q] *= taper[q];
-        std::fill(c + length, c + m_, 0.0);
+        minimumPhase_.build(*fft_, h, c, m_, taper, length);
         fft_->forward(c, h);
         return false;
     }
@@ -416,9 +469,11 @@ private:
         }
         double* y = frame_.data();
         fft_->inverse(s, y);
-        auto& a = accum_[static_cast<size_t>(ch)];
-        const int accMask = 2 * m_ - 1;
-        for (int k = 0; k < m_; ++k) a[static_cast<size_t>((readPos_ + k) & accMask)] += norm_ * y[k];
+        double* a = accum_[static_cast<size_t>(ch)].data();
+        const double norm = norm_;
+        inSpans(readPos_, m_, 2 * m_, [&](int from, int at, int count) noexcept {
+            for (int k = 0; k < count; ++k) a[at + k] += norm * y[from + k];
+        });
     }
 
     double fs_ = 48000.0, norm_ = 0.5, focusWidth_ = 1.0 / 6.0;
@@ -428,6 +483,7 @@ private:
     SpectralFocus<T> focus_;
     std::unique_ptr<FFTReal<double>> fft_;
     std::vector<double> window_, taper_, shortTaper_, frame_, kernel_, keySpectrum_;
+    detail::MinimumPhase minimumPhase_;
     std::vector<std::vector<double>> ring_, keyRing_, accum_, spectra_;
     std::vector<T> power_, gain_, focusPower_;
     std::vector<std::vector<T>> powers_;
@@ -438,10 +494,12 @@ private:
  * @brief A per-bin quantity of the last frame (a gain curve, a reduction),
  *        read at fixed points for a display from any thread.
  *
- * The points sit evenly in log frequency from 20 Hz to 20 kHz. Each point
- * takes, from the bins within half a point of it, the value with the
- * largest magnitude (its sign kept), so a narrow peak or notch between two
- * points still shows. prepare() maps the points onto a transform (setup
+ * The points sit evenly in log frequency from 20 Hz to 20 kHz, over a
+ * hundred an octave. A point with bins within half a point of it takes the
+ * value with the largest magnitude (its sign kept), so a narrow peak or
+ * notch between two points still shows; a point with none, as in the low
+ * end, reads straight between the bins on either side of it, so the curve
+ * has no steps. prepare() maps the points onto a transform (setup
  * thread, no allocation); publish() runs on the audio thread once a frame;
  * value() and extreme() on any thread. The points are relaxed atomics: a
  * reader may see a curve whose points come from two consecutive frames.
@@ -452,13 +510,34 @@ template <FloatType T>
 class SpectralReadout
 {
 public:
-    static constexpr int kPoints = 128;  ///< Points of each curve.
+    static constexpr int kPoints = 1024; ///< Points of each curve.
     static constexpr int kChannels = 2;  ///< Curves (channels).
 
     /** @return The frequency of a point, in hertz. */
     [[nodiscard]] static double frequency(int point) noexcept
     {
         return 20.0 * std::pow(1000.0, static_cast<double>(std::clamp(point, 0, kPoints - 1)) / (kPoints - 1));
+    }
+
+    /**
+     * @brief A curve of the points at any frequency, as a display should
+     *        draw it: a cubic through the four points around it. Straight
+     *        lines would lose half a decibel of a peak a 24th of an octave
+     *        wide, which has four points.
+     * @tparam ValueAt `value(int point)`.
+     * @param hz      The frequency, held within the ends of the curve.
+     * @param valueAt The curve.
+     */
+    template <typename ValueAt>
+    [[nodiscard]] static double between(double hz, ValueAt&& valueAt) noexcept
+    {
+        constexpr int last = kPoints - 1;
+        const double at = hz > 20.0 ? std::min(last * std::log(hz / 20.0) / std::log(1000.0), static_cast<double>(last)) : 0.0;
+        const int under = std::min(static_cast<int>(at), last - 1);
+        const double t = at - under;
+        const double a = static_cast<double>(valueAt(std::max(0, under - 1))), b = static_cast<double>(valueAt(under));
+        const double c = static_cast<double>(valueAt(under + 1)), d = static_cast<double>(valueAt(std::min(last, under + 2)));
+        return b + 0.5 * t * (c - a + t * (2.0 * a - 5.0 * b + 4.0 * c - d + t * (3.0 * (b - c) + d - a)));
     }
 
     /** @brief Maps the points onto the bins of a transform and clears the curves. */
@@ -469,12 +548,22 @@ public:
         const int top = std::max(0, bins_ - 1);
         for (int i = 0; i < kPoints; ++i)
         {
-            const double f = frequency(i);
-            int first = static_cast<int>(std::ceil(f / half / binHz));
-            int last = static_cast<int>(std::floor(f * half / binHz));
-            if (last < first) first = last = static_cast<int>(std::lround(f / binHz));
-            first_[static_cast<size_t>(i)] = std::clamp(first, 0, top);
-            last_[static_cast<size_t>(i)] = std::clamp(last, first_[static_cast<size_t>(i)], top);
+            const auto u = static_cast<size_t>(i);
+            const double at = frequency(i) / binHz;   // in bins
+            const int first = static_cast<int>(std::ceil(at / half));
+            const int last = static_cast<int>(std::floor(at * half));
+            part_[u] = 0.0f;
+            if (last >= first)
+            {
+                first_[u] = std::clamp(first, 0, top);
+                last_[u] = std::clamp(last, first_[u], top);
+                continue;
+            }
+            // No bin within the point: between the one under it and the one over it.
+            const int under = std::clamp(static_cast<int>(std::floor(at)), 0, top);
+            first_[u] = under;
+            last_[u] = std::min(under + 1, top);
+            part_[u] = static_cast<float>(std::clamp(at - static_cast<double>(under), 0.0, 1.0));
         }
         clear();
     }
@@ -499,14 +588,66 @@ public:
         auto& curve = values_[static_cast<size_t>(channel)];
         for (int i = 0; i < kPoints; ++i)
         {
+            const auto u = static_cast<size_t>(i);
             double best = 0.0;
-            for (int k = first_[static_cast<size_t>(i)]; k <= last_[static_cast<size_t>(i)]; ++k)
+            if (part_[u] > 0.0f)
             {
-                const double v = static_cast<double>(perBin[k]);
-                if (std::abs(v) > std::abs(best)) best = v;
+                const double below = static_cast<double>(perBin[first_[u]]);
+                const double above = static_cast<double>(perBin[last_[u]]);
+                best = below + static_cast<double>(part_[u]) * (above - below);
             }
-            curve[static_cast<size_t>(i)].store(static_cast<float>(best), std::memory_order_relaxed);
+            else
+            {
+                for (int k = first_[u]; k <= last_[u]; ++k)
+                {
+                    const double v = static_cast<double>(perBin[k]);
+                    if (std::abs(v) > std::abs(best)) best = v;
+                }
+            }
+            curve[u].store(static_cast<float>(best), std::memory_order_relaxed);
         }
+    }
+
+    /**
+     * @brief One point of a frame of gains no higher than 1, in decibels:
+     *        what publish() would show of their decibels, with a logarithm a
+     *        point in place of one a bin. For an owner that keeps a frame's
+     *        gains (as relaxed atomics, the audio thread's only work) and
+     *        leaves the points to the thread that reads them.
+     * @tparam GainAt `float gainAt(int bin)`, for the bins of prepare().
+     * @param point  0 to kPoints - 1 (others, or before prepare(), read 0).
+     * @param gainAt The gains, from 0 to 1 (under 1e-6: -120 dB).
+     */
+    template <typename GainAt>
+    [[nodiscard]] T gainPoint(int point, GainAt&& gainAt) const noexcept
+    {
+        if (point < 0 || point >= kPoints || bins_ <= 0) return T(0);
+        const auto decibels = [](float g) noexcept { return 8.6858896f * fastLog(std::max(g, 1e-6f)); };
+        const auto u = static_cast<size_t>(point);
+        const int first = first_[u], last = last_[u];
+        if (part_[u] > 0.0f)
+        {
+            const double below = static_cast<double>(decibels(gainAt(first))), above = static_cast<double>(decibels(gainAt(last)));
+            return static_cast<T>(static_cast<float>(below + static_cast<double>(part_[u]) * (above - below)));
+        }
+        // Of gains no higher than 1 the largest magnitude is the smallest gain.
+        float least = gainAt(first);
+        for (int k = first + 1; k <= last; ++k) least = std::min(least, static_cast<float>(gainAt(k)));
+        return static_cast<T>(decibels(least));
+    }
+
+    /**
+     * @brief Publishes one frame of a channel that is already on the points
+     *        (audio thread; prepare() is not needed for it).
+     * @param channel  0 or 1; others are ignored.
+     * @param perPoint kPoints values.
+     */
+    template <typename V>
+    void publishPoints(int channel, const V* perPoint) noexcept
+    {
+        if (channel < 0 || channel >= kChannels || perPoint == nullptr) return;
+        auto& curve = values_[static_cast<size_t>(channel)];
+        for (int i = 0; i < kPoints; ++i) curve[static_cast<size_t>(i)].store(static_cast<float>(perPoint[i]), std::memory_order_relaxed);
     }
 
     /** @return The value of a point of a channel's curve (0 for indices out of range). */
@@ -532,6 +673,7 @@ public:
 private:
     std::array<std::array<std::atomic<float>, kPoints>, kChannels> values_ {};
     std::array<int, kPoints> first_ {}, last_ {};
+    std::array<float, kPoints> part_ {};   ///< Over zero: how far the point lies from the bin under it to the one over it.
     int bins_ = 0;
 };
 

@@ -381,10 +381,10 @@
  * | `TransformerModel<T>`    | Effects/TransformerModel.h | Audio transformer: flux-domain JA hysteresis, LF bloom, HF bell |
  * | `GranularProcessor<T>`   | Effects/GranularProcessor.h | Granular clouds/freeze: per-grain pitch, jitter, stereo spread |
  * | `SpectralFreeze<T>`      | Effects/SpectralFreeze.h | Tonal or diffuse STFT magnitude hold with deterministic transitions |
- * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral noise reduction (Wiener, decision-directed) |
- * | `TonalBalance<T>`        | Effects/TonalBalance.h   | Adaptive equalizer toward a balanced loudness shape (auditory model, graphic bank) |
- * | `ResonanceSuppressor<T>` | Effects/ResonanceSuppressor.h | Dynamic suppression of resonances over the spectral envelope, minimum phase |
- * | `SpectralDynamicEQ<T>`   | Effects/SpectralDynamicEQ.h | Dynamic bands with a level per cell inside each band, minimum phase |
+ * | `SpectralDenoiser<T>`    | Effects/SpectralDenoiser.h | Learnable-profile spectral noise reduction (Wiener, decision-directed), by the bin or by a band in octaves |
+ * | `TonalBalance<T>`        | Effects/TonalBalance.h   | Adaptive equalizer toward a balanced loudness shape (auditory model), with dips and peaks as fine as a 24th of an octave |
+ * | `ResonanceSuppressor<T>` | Effects/ResonanceSuppressor.h | Dynamic suppression of peaks that stand over their neighbours and last, minimum phase |
+ * | `SpectralDynamicEQ<T>`   | Effects/SpectralDynamicEQ.h | Dynamic bands that move as fine as a 24th of an octave inside each band, minimum phase |
  * | `PitchCorrector<T>`      | Effects/PitchCorrector.h | Monophonic scale-aware retune: detect, quantize, shift, with formant preservation |
  * | `ChordDetector<T>`       | Music/ChordDetector.h     | Multirate note chroma + template chord recognition with confidence |
  * | `KeyDetector<T>`         | Music/KeyDetector.h       | Musical key estimation: tuned spectral-peak chroma against measured key profiles, or the published ones |
@@ -465,6 +465,8 @@
  * | `TapeTransport<T>`       | Core/TapeTransport.h      | A tape transport as a speed state: the delay of a moving tape, with inertia, wow and flutter |
  * | `AuditoryBands<T>`       | Core/AuditoryBands.h      | Bands uniform in Bark over a power spectrum, the loudness law, the dominant level of a pair |
  * | `SpectralEnvelope<T>`    | Core/SpectralEnvelope.h   | The envelope of a spectrum by a smoothing proportional to frequency; resonances over it |
+ * | `DetailAnalysis<T>`      | Core/DetailAnalysis.h     | Multiresolution power on 1024 log points: as fine as the detail asked, from an octave to a 24th |
+ * | `DetailFilter<T>`        | Core/DetailFilter.h       | A curve on 1024 log points played in minimum phase, with detail in the low end too |
  * | `SpectralFilter<T>`      | Core/SpectralFilter.h     | A gain curve per frame applied as a minimum-phase FIR (no time aliasing, no pre-echo) |
  * | `LaneCascade<T, L>`      | Core/LaneCascade.h        | A long cascade of biquads on the lanes of a vector, L - 1 samples late |
  * | `GraphicBank<T, L>`      | Core/GraphicBank.h        | A graphic equalizer whose bands do not interact (least-squares section gains) |
@@ -719,6 +721,8 @@
 #include "Core/AuditoryBands.h"
 #include "Core/SpectralEnvelope.h"
 #include "Core/SpectralFilter.h"
+#include "Core/DetailAnalysis.h"
+#include "Core/DetailFilter.h"
 #include "Core/LaneCascade.h"
 #include "Core/GraphicBank.h"
 #include "Core/DryWetMixer.h"

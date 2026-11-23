@@ -65,6 +65,23 @@ bool roundTripHeap(Configure&& configure, PrepArgs... prepArgs)
     return blobsEqual(blobA, blobB) && !blobA.empty();
 }
 
+// configure -> getState -> fresh setState: the blobs match and `check` reads
+// the restored instance.
+template <typename Effect, typename Configure, typename Check>
+void roundTripReads(Configure&& configure, Check&& check)
+{
+    const AudioSpec sp = spec(48000.0, 512, 2);
+    auto a = std::make_unique<Effect>();
+    a->prepare(sp);
+    configure(*a);
+    const auto blob = a->getState();
+    auto b = std::make_unique<Effect>();
+    b->prepare(sp);
+    EXPECT_TRUE(b->setState(blob.data(), blob.size()));
+    EXPECT_TRUE(blobsEqual(blob, b->getState()));
+    check(*b);
+}
+
 } // namespace
 
 DSPARK_TEST(State_roundtrip_dynamics)
@@ -86,7 +103,6 @@ DSPARK_TEST(State_roundtrip_dynamics)
         Compressor<float>::KeyBand band;
         band.shape = Compressor<float>::KeyShape::HighShelf;
         band.frequency = 3200.0f; band.gainDb = -4.5f; band.q = 1.3f; band.slope = 6.0f;
-        band.placement = Compressor<float>::KeyPlacement::Side;
         c.setSidechainBand(4, band);
         c.setGainSmoothing(7.5f);
         c.setOptoCell(Compressor<float>::OptoCell::ThreeStage);
@@ -139,11 +155,10 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     })));
     EXPECT_TRUE((roundTrip<Saturation<float>>([](auto& s) {
         s.setAlgorithm(Saturation<float>::Algorithm::Curve);
-        s.setCurveShape(0.3f, 2.0f, -0.4f); s.setAsymmetry(0.25f); s.setCurveBase(Saturation<float>::CurveBase::Erf); s.setDrivePan(-0.4f); s.setTone(2, 3000.0f, -4.5f);
+        s.setCurveShape(0.3f, 2.0f, -0.4f); s.setAsymmetry(0.25f);
         s.setProgramNoise(-60.0f); s.setLevelTracking(0.5f); s.setTrackingCorner(150.0f);
         s.setCombLoop(-0.3f, 330.0f); s.setDriveCompensation(true);
         s.setOversamplingMode(Saturation<float>::OversamplingMode::MinimumPhase);
-        s.setOversamplingBand(Saturation<float>::OversamplingBand::Audible);
     })));
     {
         auto a = std::make_unique<MultibandSaturation<float>>();
@@ -153,7 +168,6 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         a->setBandMute(0, true); a->setBandSolo(2, true);
         a->getBandSaturation(3).setAlgorithm(Saturation<float>::Algorithm::Curve);
         a->setCrossoverStructure(MultibandSaturation<float>::Crossover::Structure::Ladder);
-        a->setCrossoverTopology(MultibandSaturation<float>::Crossover::Topology::Balanced);
         const auto blob = a->getState();
         auto b = std::make_unique<MultibandSaturation<float>>();
         b->prepare(spec(48000.0, 512, 2));
@@ -169,7 +183,6 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
         c.setInputGain(3.0f); c.setStages(3); c.setMix(0.65f);
         c.setSlewLimit(0.4f); c.setOversampling(4);
         c.setOversamplingMode(Clipper<float>::OversamplingMode::MinimumPhase);
-        c.setOversamplingBand(Clipper<float>::OversamplingBand::Audible);
     })));
     EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
         c.setRate(1.8f); c.setDepthMs(5.0f); c.setVoices(3);
@@ -180,8 +193,6 @@ DSPARK_TEST(State_roundtrip_tone_and_modulation)
     EXPECT_TRUE((roundTrip<Chorus<float>>([](auto& c) {
         c.setModel(Chorus<float>::Model::Analog); c.setAnalogMode(Chorus<float>::AnalogMode::Fast);
         c.setAnalogNoise(-70.0f);
-        c.setAnalogTapPhase(120.0f); c.setAnalogTone(-0.4f); c.setAnalogCircuitFilters(true);
-        c.setMixRule(DryWetMixer<float>::MixRule::FullDryToHalf);
     })));
     EXPECT_TRUE((roundTrip<Phaser<float>>([](auto& p) {
         p.setRate(0.9f); p.setStages(6); p.setFeedback(0.5f);
@@ -251,7 +262,6 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         r.setGateHoldNote(AR::NoteValue::Quarter); r.setInputWidth(0.6f); r.setWidthLaw(AR::WidthLaw::PowerKept);
         r.setModulationStyle(AR::ModulationStyle::Segments); r.setSpaceLayout(AR::SpaceLayout::Geometric);
         r.setShimmer(0.3f);
-        r.setBandLimit(11000.0f); r.setDoubleSlope(0.7f); r.setPostEqLoudness(true); r.setPlateTank(true);
         KeyEqualizer<float, 2>::Band b; b.shape = KeyEqualizer<float, 2>::Shape::Bell; b.frequency = 900.0f; b.gainDb = -3.0f;
         r.setPostEqBand(2, b);
     })));
@@ -261,7 +271,6 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         r.setDryDip(9.0f); r.setGate(-35.0f); r.setGateHold(300.0f); r.setGateRelease(80.0f);
     })));
     EXPECT_TRUE((roundTrip<Equalizer<float>>([](auto& e) {
-        e.setLoudnessCompensation(true);
         Equalizer<float>::BandConfig b;
         b.frequency = 320.0f; b.gain = 4.0f; b.q = 1.4f;
         e.setBand(0, b);
@@ -280,7 +289,6 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
         x.setOrder(48);
         x.setFilterMode(CrossoverFilter<float>::FilterMode::LinearPhase);
         x.setStructure(CrossoverFilter<float>::Structure::Ladder);
-        x.setTopology(CrossoverFilter<float>::Topology::Balanced);
     })));
     EXPECT_TRUE((roundTrip<DynamicEQ<float>>([](auto& d) {
         DynamicEQ<float>::BandConfig b;
@@ -297,7 +305,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
 DSPARK_TEST(State_roundtrip_new_effects)
 {
     EXPECT_TRUE((roundTrip<TapeMachine<float>>([](auto& t) {
-        t.setDrive(5.0f); t.setBias(0.35f); t.setWowFlutter(0.25f); t.setAlignmentTolerance(0.6f);
+        t.setDrive(5.0f); t.setBias(0.35f); t.setWowFlutter(0.25f);
     })));
     using TM = TapeMachine<float>;
     EXPECT_TRUE((roundTrip<TM>([](auto& t) {
@@ -411,7 +419,6 @@ DSPARK_TEST(State_multiband_nested_blobs)
     a.setOrder(48);
     a.setCrossoverMode(CrossoverFilter<float, 12>::FilterMode::LinearPhase);
     a.setCrossoverStructure(CrossoverFilter<float, 12>::Structure::Ladder);
-    a.setCrossoverTopology(CrossoverFilter<float, 12>::Topology::Balanced);
     a.setCrossoverFrequency(0, 180.0f);
     a.setCrossoverFrequency(1, 3500.0f);
     a.setBandThreshold(0, -24.0f);
@@ -427,7 +434,6 @@ DSPARK_TEST(State_multiband_nested_blobs)
     EXPECT_EQ(b.getOrder(), 48);
     EXPECT_TRUE((b.getCrossoverMode() == CrossoverFilter<float, 12>::FilterMode::LinearPhase));
     EXPECT_TRUE((b.getCrossoverStructure() == CrossoverFilter<float, 12>::Structure::Ladder));
-    EXPECT_TRUE((b.getCrossoverTopology() == CrossoverFilter<float, 12>::Topology::Balanced));
     EXPECT_NEAR(static_cast<float>(b.getCrossoverFrequency(0)), 180.0f, 1e-3f);
 
     // The nested band states really carried the per-band parameters.
@@ -436,6 +442,78 @@ DSPARK_TEST(State_multiband_nested_blobs)
     EXPECT_TRUE(r.isValid());
     EXPECT_NEAR(r.read("threshold", 0.0f), -24.0f, 1e-6f);
     EXPECT_NEAR(r.read("ratio", 0.0f), 2.5f, 1e-6f);
+}
+
+// The settings that came after the round-trips above, each restored and read
+// back: the key band's placement, the saturation's base curve, drive pan,
+// tone and oversampler band, the crossover's topology (alone and in the
+// multiband effects), the clipper's oversampler band, the chorus's taps,
+// tone, circuit and mix rule, the reverb's band limit, second slope, wet
+// equalizer loudness and plate tank, the equalizer's loudness and the tape's
+// alignment.
+DSPARK_TEST(State_roundtrip_later_settings)
+{
+    roundTripReads<Compressor<float>>(
+        [](auto& c) {
+            Compressor<float>::KeyBand band;
+            band.shape = Compressor<float>::KeyShape::HighShelf;
+            band.frequency = 3200.0f; band.gainDb = -4.5f; band.q = 1.3f; band.slope = 6.0f;
+            band.placement = Compressor<float>::KeyPlacement::Side;
+            c.setSidechainBand(4, band);
+        },
+        [](auto& c) { EXPECT_TRUE((c.getSidechainBand(4).placement == Compressor<float>::KeyPlacement::Side)); });
+    roundTripReads<Saturation<float>>(
+        [](auto& s) {
+            s.setAlgorithm(Saturation<float>::Algorithm::Curve);
+            s.setCurveBase(Saturation<float>::CurveBase::Erf);
+            s.setDrivePan(-0.4f);
+            s.setTone(2, 3000.0f, -4.5f);
+            s.setOversamplingBand(Saturation<float>::OversamplingBand::Audible);
+        },
+        [](auto& s) {
+            EXPECT_TRUE((s.getCurveBase() == Saturation<float>::CurveBase::Erf));
+            EXPECT_NEAR(s.getDrivePan(), -0.4f, 1e-6f);
+            EXPECT_NEAR(s.getToneFrequency(2), 3000.0f, 1e-3f);
+            EXPECT_NEAR(s.getToneGain(2), -4.5f, 1e-6f);
+            EXPECT_TRUE((s.getOversamplingBand() == Saturation<float>::OversamplingBand::Audible));
+        });
+    roundTripReads<MultibandSaturation<float>>(
+        [](auto& m) { m.setCrossoverTopology(MultibandSaturation<float>::Crossover::Topology::Balanced); },
+        [](auto& m) { EXPECT_TRUE((m.getCrossoverTopology() == MultibandSaturation<float>::Crossover::Topology::Balanced)); });
+    roundTripReads<MultibandCompressor<float>>(
+        [](auto& m) { m.setCrossoverTopology(CrossoverFilter<float, 12>::Topology::Balanced); },
+        [](auto& m) { EXPECT_TRUE((m.getCrossoverTopology() == CrossoverFilter<float, 12>::Topology::Balanced)); });
+    roundTripReads<CrossoverFilter<float>>(
+        [](auto& x) { x.setTopology(CrossoverFilter<float>::Topology::Balanced); },
+        [](auto& x) { EXPECT_TRUE((x.getTopology() == CrossoverFilter<float>::Topology::Balanced)); });
+    roundTripReads<Clipper<float>>(
+        [](auto& c) { c.setOversamplingBand(Clipper<float>::OversamplingBand::Audible); },
+        [](auto& c) { EXPECT_TRUE((c.getOversamplingBand() == Clipper<float>::OversamplingBand::Audible)); });
+    roundTripReads<Chorus<float>>(
+        [](auto& c) {
+            c.setAnalogTapPhase(120.0f); c.setAnalogTone(-0.4f); c.setAnalogCircuitFilters(true);
+            c.setMixRule(DryWetMixer<float>::MixRule::FullDryToHalf);
+        },
+        [](auto& c) {
+            EXPECT_NEAR(c.getAnalogTapPhase(), 120.0f, 1e-4f);
+            EXPECT_NEAR(c.getAnalogTone(), -0.4f, 1e-6f);
+            EXPECT_TRUE(c.getAnalogCircuitFilters());
+            EXPECT_TRUE((c.getMixRule() == DryWetMixer<float>::MixRule::FullDryToHalf));
+        });
+    roundTripReads<AlgorithmicReverb<float>>(
+        [](auto& r) { r.setBandLimit(11000.0f); r.setDoubleSlope(0.7f); r.setPostEqLoudness(true); r.setPlateTank(true); },
+        [](auto& r) {
+            EXPECT_NEAR(r.getBandLimit(), 11000.0f, 1e-2f);
+            EXPECT_NEAR(r.getDoubleSlope(), 0.7f, 1e-6f);
+            EXPECT_TRUE(r.getPostEqLoudness());
+            EXPECT_TRUE(r.isPlateTank());
+        });
+    roundTripReads<Equalizer<float>>(
+        [](auto& e) { e.setLoudnessCompensation(true); },
+        [](auto& e) { EXPECT_TRUE(e.getLoudnessCompensation()); });
+    roundTripReads<TapeMachine<float>>(
+        [](auto& t) { t.setAlignmentTolerance(0.6f); },
+        [](auto& t) { EXPECT_NEAR(t.getAlignmentTolerance(), 0.6f, 1e-6f); });
 }
 
 DSPARK_TEST(State_json_roundtrip_and_tolerance)

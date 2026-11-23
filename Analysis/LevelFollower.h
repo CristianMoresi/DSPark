@@ -16,6 +16,12 @@
  * equilibrium floor, offset / (1 - coefficient), stays below -120 dB for any
  * time constant up to 60 s at 384 kHz, under the -100 dB readout floor.
  *
+ * setVuEnabled() adds a volume-unit needle: the full-wave rectified signal
+ * through a second-order low-pass that is the needle's mass, spring and
+ * damping (2.15 Hz, damping 0.813), calibrated so a steady sine reads its
+ * RMS: a step to a 1 kHz tone reaches 99 % of its reading in 300 ms and
+ * overshoots it by 1.25 %, the ballistics of the standard volume indicator.
+ *
  * Threading:
  * - prepare() / reset(): setup thread (not concurrent with process()).
  * - setAttackMs() / setReleaseMs() / setRmsWindowMs(): control thread (ONE
@@ -24,7 +30,7 @@
  *   them up at the next block. A block may observe one changed coefficient
  *   before another (benign for metering). Non-finite values are ignored.
  * - process(): audio thread (stream owner).
- * - getPeakLevel() / getRmsLevel() / *Db(): any thread (relaxed atomic
+ * - getPeakLevel() / getRmsLevel() / getVuLevel() / *Db(): any thread (relaxed atomic
  *   reads; values are approximate while a block is in flight - metering).
  *
  * Dependencies: AudioBuffer.h, AudioSpec.h, DspMath.h.
@@ -93,6 +99,9 @@ public:
         sampleRate_  = spec.sampleRate;
         numChannels_ = std::min(spec.numChannels, MaxChannels);
         updateCoefficients();
+        // The needle depends on the rate only (setup thread).
+        vuG_ = std::tan(3.141592653589793 * kVuHz / sampleRate_);
+        vuA1_ = 1.0 / (1.0 + vuG_ * (vuG_ + 2.0 * kVuDamping));
         reset();
     }
 
@@ -158,6 +167,14 @@ public:
         return rmsWindowMs_.load(std::memory_order_relaxed);
     }
 
+    /**
+     * @brief Runs the volume-unit needle too (see the file notes; off by
+     *        default, when it costs nothing). Setup or control thread.
+     */
+    void setVuEnabled(bool on) noexcept { vuOn_.store(on, std::memory_order_relaxed); }
+    /** @return Whether the needle runs. */
+    [[nodiscard]] bool isVuEnabled() const noexcept { return vuOn_.load(std::memory_order_relaxed); }
+
     /** @brief Resets all envelope states to zero safely. */
     void reset() noexcept
     {
@@ -165,6 +182,8 @@ public:
         {
             s.peak.store(T(0), std::memory_order_relaxed);
             s.rmsAccum.store(T(0), std::memory_order_relaxed);
+            s.vu.store(T(0), std::memory_order_relaxed);
+            s.vuS1 = s.vuS2 = 0.0;
         }
     }
 
@@ -193,6 +212,7 @@ public:
         const T attackCoeff  = attackCoeff_.load(std::memory_order_relaxed);
         const T releaseCoeff = releaseCoeff_.load(std::memory_order_relaxed);
         const T rmsCoeff     = rmsCoeff_.load(std::memory_order_relaxed);
+        const bool vu        = vuOn_.load(std::memory_order_relaxed);
 
         for (int ch = 0; ch < nCh; ++ch)
         {
@@ -229,8 +249,41 @@ public:
             // Publish final states for the UI thread once per block
             s.peak.store(localPeak, std::memory_order_relaxed);
             s.rmsAccum.store(localRms, std::memory_order_relaxed);
+
+            if (vu)
+            {
+                // The needle: |x| scaled so a sine reads its RMS, through a
+                // second-order low-pass (state-variable, trapezoidal).
+                double s1 = s.vuS1, s2 = s.vuS2;
+                for (int i = 0; i < nS; ++i)
+                {
+                    const double x = kVuSineToRms * std::abs(static_cast<double>(data[i]));
+                    const double v1 = vuA1_ * (s1 + vuG_ * (x - s2));
+                    const double v2 = s2 + vuG_ * v1;
+                    s1 = 2.0 * v1 - s1;
+                    s2 = 2.0 * v2 - s2;
+                }
+                if (!std::isfinite(s1) || !std::isfinite(s2)) s1 = s2 = 0.0;
+                s.vuS1 = s1;
+                s.vuS2 = s2;
+                s.vu.store(static_cast<T>(std::max(0.0, s2)), std::memory_order_relaxed);
+            }
         }
     }
+
+    /**
+     * @brief The volume-unit needle (setVuEnabled()), linear: a steady sine
+     *        reads its RMS.
+     * @param channel Channel index (0-based; out-of-range returns 0).
+     */
+    [[nodiscard]] T getVuLevel(int channel) const noexcept
+    {
+        if (channel < 0 || channel >= MaxChannels) return T(0);
+        return state_[channel].vu.load(std::memory_order_relaxed);
+    }
+
+    /** @brief The needle in decibels (floored at -100). */
+    [[nodiscard]] T getVuLevelDb(int channel) const noexcept { return gainToDecibels(getVuLevel(channel)); }
 
     /**
      * @brief Returns the current peak level for the given channel safely.
@@ -296,12 +349,21 @@ private:
         rmsCoeff_.store(std::exp(T(-1) / (fs * rmsMs / T(1000))), std::memory_order_relaxed);
     }
 
+    /// The needle: natural frequency and damping that give 99 % of the
+    /// reading in 300 ms with a 1.25 % overshoot.
+    static constexpr double kVuHz = 2.1504;
+    static constexpr double kVuDamping = 0.8127;
+    /// The mean of a rectified sine to its RMS: pi / (2 sqrt 2).
+    static constexpr double kVuSineToRms = 1.1107207345395915;
+
     struct ChannelState
     {
         // Written once per block by the audio thread, read at UI rate:
         // contention is negligible, so no cache-line padding is needed.
         std::atomic<T> peak{ T(0) };
         std::atomic<T> rmsAccum{ T(0) };
+        std::atomic<T> vu{ T(0) };
+        double vuS1 = 0.0, vuS2 = 0.0;   ///< The needle's state (audio thread).
     };
 
     double sampleRate_  = 44100.0;
@@ -314,6 +376,8 @@ private:
     std::atomic<T> attackCoeff_  { T(0) };
     std::atomic<T> releaseCoeff_ { T(0) };
     std::atomic<T> rmsCoeff_     { T(0) };
+    std::atomic<bool> vuOn_ { false };
+    double vuG_ = 0.0, vuA1_ = 1.0;   ///< The needle's coefficients (set with the rate).
 
     std::array<ChannelState, MaxChannels> state_{};
 };

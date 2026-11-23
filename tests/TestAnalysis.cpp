@@ -4622,3 +4622,37 @@ DSPARK_TEST(SpectrumAnalyzer_asymmetric_window_reads_the_level_and_follows_soone
     }
     EXPECT_GT(onset[1], onset[0] + 2.5f);
 }
+
+// The volume-unit needle: a step to a 1 kHz tone reaches 99 % of its reading
+// in 300 ms (within 10 %) and overshoots it by 1 to 1.5 %; a steady sine
+// reads its RMS.
+DSPARK_TEST(LevelFollower_vu_needle_ballistics)
+{
+    LevelFollower<float> meter;
+    meter.setVuEnabled(true);
+    meter.prepare(spec(48000.0, 48, 1));
+    std::vector<float> block(48);
+    std::vector<double> reading;
+    int n = 0;
+    for (int b = 0; b < 3000; ++b)   // 3 s in blocks of 1 ms
+    {
+        for (int i = 0; i < 48; ++i, ++n)
+            block[static_cast<size_t>(i)] = 0.5f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * 1000.0 * n / 48000.0));
+        const float* p[1] = { block.data() };
+        meter.process(AudioBufferView<const float>(p, 1, 48));
+        reading.push_back(static_cast<double>(meter.getVuLevel(0)));
+    }
+    double final = 0.0;
+    for (size_t k = 2000; k < 3000; ++k) final += reading[k];
+    final /= 1000.0;
+    EXPECT_NEAR(final, 0.5 / std::sqrt(2.0), 0.005 * final);
+    size_t reach = 0;
+    while (reach < reading.size() && reading[reach] < 0.99 * final) ++reach;
+    double top = 0.0;
+    for (double v : reading) top = std::max(top, v);
+    std::printf("    VU: 99 %% at %zu ms, overshoot %.2f %%%c", reach + 1, 100.0 * (top / final - 1.0), 10);
+    EXPECT_GT(static_cast<int>(reach) + 1, 270);
+    EXPECT_LT(static_cast<int>(reach) + 1, 330);
+    EXPECT_GT(top / final - 1.0, 0.010);
+    EXPECT_LT(top / final - 1.0, 0.015);
+}

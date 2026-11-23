@@ -297,7 +297,7 @@ DSPARK_TEST(State_roundtrip_stereo_reverb_spatial)
 DSPARK_TEST(State_roundtrip_new_effects)
 {
     EXPECT_TRUE((roundTrip<TapeMachine<float>>([](auto& t) {
-        t.setDrive(5.0f); t.setBias(0.35f); t.setWowFlutter(0.25f);
+        t.setDrive(5.0f); t.setBias(0.35f); t.setWowFlutter(0.25f); t.setAlignmentTolerance(0.6f);
     })));
     using TM = TapeMachine<float>;
     EXPECT_TRUE((roundTrip<TM>([](auto& t) {

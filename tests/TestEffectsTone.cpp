@@ -7495,3 +7495,79 @@ DSPARK_TEST(Saturation_tone_sections_are_exact_and_move_without_a_step)
     EXPECT_LT(maxStep(59, 66), regime * 1.15);
     EXPECT_GT(maxStep(45, 59), maxStep(10, 29) * 1.5);
 }
+
+// The overload lamp before the tape reads at the internal rate: a 12 kHz
+// tone read at eight phases of the host's samples (which would see 0.707 to
+// 1 of its peak, 3 dB apart) reads within 0.8 dB; and it follows the drive.
+DSPARK_TEST(TapeMachine_record_peak_sees_between_samples)
+{
+    auto peakAt = [](double phase, float driveDb) {
+        TapeMachine<float> tape;
+        tape.setDrive(driveDb);
+        neutralTape(tape);
+        auto buf = makeStereoBuffer(512);
+        int n = 0;
+        for (int b = 0; b < 40; ++b)
+        {
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                const float v = 0.25f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * 12000.0 * n / 48000.0 + phase));
+                buf.ch(0)[i] = v;
+                buf.ch(1)[i] = v;
+            }
+            tape.processBlock(buf.view());
+        }
+        return static_cast<double>(tape.getRecordPeakDb(0));
+    };
+    double lo = 1e9, hi = -1e9;
+    for (int k = 0; k < 8; ++k)
+    {
+        const double v = peakAt(0.25 * 3.14159265358979 * k / 4.0, 0.0f);
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    EXPECT_LT(hi - lo, 0.8);
+    EXPECT_NEAR(peakAt(0.0, 6.0f) - peakAt(0.0, 0.0f), 6.0, 0.15);
+}
+
+// The channels' alignment: at 0 the channels are the same to the bit; at 1
+// each strays its own fixed way, by magnitude only, so a mono sum at 10 kHz
+// stays within half a decibel of the channels' level.
+DSPARK_TEST(TapeMachine_alignment_tolerance_strays_by_channel)
+{
+    auto run = [](float tolerance, double freq, std::vector<float>& l, std::vector<float>& r) {
+        TapeMachine<float> tape;
+        tape.setAlignmentTolerance(tolerance);
+        neutralTape(tape);
+        auto buf = makeStereoBuffer(512);
+        l.clear();
+        r.clear();
+        int n = 0;
+        for (int b = 0; b < 94; ++b)
+        {
+            for (int i = 0; i < 512; ++i, ++n)
+            {
+                const float v = 0.25f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * freq * n / 48000.0));
+                buf.ch(0)[i] = v;
+                buf.ch(1)[i] = v;
+            }
+            tape.processBlock(buf.view());
+            l.insert(l.end(), buf.ch(0), buf.ch(0) + 512);
+            r.insert(r.end(), buf.ch(1), buf.ch(1) + 512);
+        }
+    };
+    std::vector<float> l, r;
+    run(0.0f, 1000.0, l, r);
+    EXPECT_TRUE(l == r);
+    for (const double f : { 1000.0, 10000.0 })
+    {
+        run(1.0f, f, l, r);
+        EXPECT_FALSE(l == r);
+        const double ml = tapeToneMag(l, f), mr = tapeToneMag(r, f);
+        std::vector<float> mono(l.size());
+        for (size_t i = 0; i < l.size(); ++i) mono[i] = 0.5f * (l[i] + r[i]);
+        const double mm = tapeToneMag(mono, f);
+        EXPECT_LT(std::abs(20.0 * std::log10(ml / mr)), f > 5000.0 ? 2.5 : 1.0);
+        EXPECT_GT(20.0 * std::log10(mm / (0.5 * (ml + mr))), -0.5);
+    }
+}

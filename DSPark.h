@@ -482,6 +482,7 @@
  * | `WindowFunctions<T>`     | Core/WindowFunctions.h    | 8 window functions (Hann, Kaiser, Blackman...)    |
  * | `Smoothers`              | Core/Smoothers.h          | 9 parameter smoothing algorithms                  |
  * | `ADSREnvelope<T>`        | Core/EnvelopeGenerator.h  | ADSR envelope for synthesis and dynamics          |
+ * | `TriggeredEnvelope<T>`   | Core/TriggeredEnvelope.h  | DAHDSR with bending curves, note or audio trigger |
  * | `Dither<T>`              | Core/Dither.h             | TPDF dithering with noise shaping                 |
  * | `DenormalGuard`          | Core/DenormalGuard.h      | RAII denormal flush (SSE FTZ/DAZ, ARM FZ)         |
  * | `Interpolation`          | Core/Interpolation.h      | Linear to Lagrange, allpass, 32-tap sinc reader   |
@@ -742,6 +743,7 @@
 #include "Core/Hysteresis.h"
 #include "Core/Resampler.h"
 #include "Core/EnvelopeGenerator.h"
+#include "Core/TriggeredEnvelope.h"
 #include "Core/Dither.h"
 #include "Core/SmoothedValue.h"
 #include "Core/ProcessorTraits.h"

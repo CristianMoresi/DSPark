@@ -7571,3 +7571,24 @@ DSPARK_TEST(TapeMachine_alignment_tolerance_strays_by_channel)
         EXPECT_GT(20.0 * std::log10(mm / (0.5 * (ml + mr))), -0.5);
     }
 }
+
+// The whole of the treble's criterion: nothing expands on the way up to
+// full scale, and the treble, recorded with its emphasis, compresses before
+// the middle, as on tape (where the short wavelengths saturate first).
+DSPARK_TEST(TapeMachine_treble_compresses_before_the_middle)
+{
+    const auto gainDb = [](double hz, double db) {
+        const double amp = std::pow(10.0, db / 20.0);
+        const Sat8Vec in = sat8Sine(hz, amp, 24000);
+        return sat8Line(l10Run([](Tape10& t) { t.setWowFlutter(0.0f); }, in, in).first, hz) - db;
+    };
+    const double quiet1 = gainDb(1000.0, -40.0), quiet10 = gainDb(10000.0, -40.0);
+    for (const double db : { -12.0, -6.0, 0.0 })
+    {
+        const double c1 = quiet1 - gainDb(1000.0, db), c10 = quiet10 - gainDb(10000.0, db);
+        std::printf("  [tape] %+.0f dBFS: compression 1 kHz %.2f dB, 10 kHz %.2f dB\n", db, c1, c10);
+        EXPECT_GT(c1, -0.05);
+        EXPECT_GT(c10, c1 + 0.15);
+        if (db >= -6.0) EXPECT_GT(c10, c1 + 1.0);
+    }
+}

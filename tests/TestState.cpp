@@ -445,12 +445,12 @@ DSPARK_TEST(State_multiband_nested_blobs)
 }
 
 // The settings that came after the round-trips above, each restored and read
-// back: the key band's placement, the saturation's base curve, drive pan,
-// tone and oversampler band, the crossover's topology (alone and in the
-// multiband effects), the clipper's oversampler band, the chorus's taps,
-// tone, circuit and mix rule, the reverb's band limit, second slope, wet
-// equalizer loudness, plate tank and air, the equalizer's loudness and the
-// tape's alignment.
+// back: the key band's placement and the mid-side focus, the saturation's
+// base curve, drive pan, tone and oversampler band, the crossover's topology
+// (alone and in the multiband effects), the clipper's oversampler band, the
+// chorus's taps, tone, circuit and mix rule, the reverb's band limit, second
+// slope, wet equalizer loudness, plate tank and air, the equalizer's loudness
+// and the tape's alignment.
 DSPARK_TEST(State_roundtrip_later_settings)
 {
     roundTripReads<Compressor<float>>(
@@ -460,8 +460,12 @@ DSPARK_TEST(State_roundtrip_later_settings)
             band.frequency = 3200.0f; band.gainDb = -4.5f; band.q = 1.3f; band.slope = 6.0f;
             band.placement = Compressor<float>::KeyPlacement::Side;
             c.setSidechainBand(4, band);
+            c.setMidSideFocus(-0.4f);
         },
-        [](auto& c) { EXPECT_TRUE((c.getSidechainBand(4).placement == Compressor<float>::KeyPlacement::Side)); });
+        [](auto& c) {
+            EXPECT_TRUE((c.getSidechainBand(4).placement == Compressor<float>::KeyPlacement::Side));
+            EXPECT_NEAR(c.getMidSideFocus(), -0.4f, 1e-6f);
+        });
     roundTripReads<Saturation<float>>(
         [](auto& s) {
             s.setAlgorithm(Saturation<float>::Algorithm::Curve);

@@ -9944,3 +9944,96 @@ DSPARK_TEST(Compressor_key_bands_sit_on_the_middle_or_on_the_sides)
     EXPECT_NEAR(reduction(true, mid, 37), wideMid, 0.01);
     EXPECT_NEAR(reduction(false, side, 1), centredSide, 0.01);
 }
+
+// The focus of MidSide: at -1 only the middle is compressed and the sides
+// come out as they went in (to the bit with sides alone); between, the sides
+// take a share of their reduction in decibels; at 1 the other way; and a
+// sweep across it moves the gain without a step.
+DSPARK_TEST(Compressor_mid_side_focus_leans_without_a_step)
+{
+    using C = Compressor<float>;
+    const int n = 48000;
+    // Both parts 12 dB over the threshold and linked: 9 dB of reduction each.
+    const Vec mid = makeSine(1000.0, 0.4, 48000.0, n);
+    const Vec side = makeSine(300.0, 0.4, 48000.0, n);
+    const Vec silent(static_cast<size_t>(n), 0.0f);
+    const auto pairOf = [&](const Vec& m, const Vec& s) {
+        std::vector<Vec> x { Vec(static_cast<size_t>(n)), Vec(static_cast<size_t>(n)) };
+        for (int i = 0; i < n; ++i)
+        {
+            x[0][static_cast<size_t>(i)] = m[static_cast<size_t>(i)] + s[static_cast<size_t>(i)];
+            x[1][static_cast<size_t>(i)] = m[static_cast<size_t>(i)] - s[static_cast<size_t>(i)];
+        }
+        return x;
+    };
+    const auto partOf = [&](const std::vector<Vec>& x, bool sides) {
+        Vec v(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            v[static_cast<size_t>(i)] = 0.5f * (sides ? x[0][static_cast<size_t>(i)] - x[1][static_cast<size_t>(i)]
+                                                      : x[0][static_cast<size_t>(i)] + x[1][static_cast<size_t>(i)]);
+        return v;
+    };
+    int latency = 0;
+    const auto run = [&](std::vector<Vec> x, float focus, bool sweep) {
+        auto c = std::make_unique<C>();
+        c->setDetector(C::DetectorType::Hilbert);
+        c->setThreshold(-20.0f);
+        c->setRatio(4.0f);
+        c->setAttack(1.0f);
+        c->setRelease(100.0f);
+        c->setRoute(C::Route::MidSide);
+        c->setStereoLink(1.0f);
+        c->setMidSideFocus(focus);
+        c->prepare(AudioSpec{ 48000.0, 512, 2 });
+        int at = 0;
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) {
+            if (sweep) c->setMidSideFocus(std::min(0.0f, -1.0f + static_cast<float>(at) / (0.4f * n)));
+            c->processBlock(b);
+            at += b.getNumSamples();
+        });
+        latency = c->getLatency();
+        return x;
+    };
+    const auto levelDb = [&](const Vec& v, double hz) {
+        return toDb(toneAmplitude(v.data() + n - 9600, 9600, hz, 48000.0) / 0.4);
+    };
+
+    const auto both = run(pairOf(mid, side), 0.0f, false);
+    const auto midOnly = run(pairOf(mid, side), -1.0f, false);
+    const auto half = run(pairOf(mid, side), -0.5f, false);
+    const auto sidesOnly = run(pairOf(mid, side), 1.0f, false);
+    std::printf("  [focus] sides: %.2f / %.2f / %.2f dB at 0 / -0.5 / -1; middle at 1: %.2f dB\n",
+                levelDb(partOf(both, true), 300.0), levelDb(partOf(half, true), 300.0),
+                levelDb(partOf(midOnly, true), 300.0), levelDb(partOf(sidesOnly, false), 1000.0));
+    EXPECT_NEAR(levelDb(partOf(both, true), 300.0), -9.03, 0.15);
+    EXPECT_NEAR(levelDb(partOf(midOnly, false), 1000.0), -9.03, 0.15);
+    EXPECT_NEAR(levelDb(partOf(midOnly, true), 300.0), 0.0, 0.01);
+    EXPECT_NEAR(levelDb(partOf(half, true), 300.0), -4.5, 0.3);
+    EXPECT_NEAR(levelDb(partOf(sidesOnly, true), 300.0), -9.03, 0.15);
+    EXPECT_NEAR(levelDb(partOf(sidesOnly, false), 1000.0), 0.0, 0.01);
+
+    // Sides alone, only the middle compressed: out as they went in, late
+    // by the latency, to the bit.
+    const auto in = pairOf(silent, side);
+    const auto out = run(in, -1.0f, false);
+    bool same = latency >= 0 && latency < n;
+    for (int ch = 0; ch < 2 && same; ++ch)
+        for (int i = latency; i < n; ++i)
+            same = same && out[static_cast<size_t>(ch)][static_cast<size_t>(i)] == in[static_cast<size_t>(ch)][static_cast<size_t>(i - latency)];
+    std::printf("  [focus] sides alone, latency %d: %s\n", latency, same ? "as they went in" : "changed");
+    EXPECT_TRUE(same);
+
+    // A sweep from -1 to 0 over 0.4 s: the sides' gain moves sample by
+    // sample, so their second difference stays the tone's (a step of the
+    // gain each block would show as a spike in it).
+    const auto swept = partOf(run(pairOf(mid, side), -1.0f, true), true);
+    double curve = 0.0, tone = 0.0;
+    for (int i = 2; i < n; ++i)
+    {
+        const auto k = static_cast<size_t>(i);
+        curve = std::max(curve, std::abs(static_cast<double>(swept[k]) - 2.0 * swept[k - 1] + swept[k - 2]));
+        tone = std::max(tone, std::abs(static_cast<double>(side[k]) - 2.0 * side[k - 1] + side[k - 2]));
+    }
+    std::printf("  [focus] sweep: the sides' largest second difference %.2e against the tone's %.2e\n", curve, tone);
+    EXPECT_LT(curve, 1.5 * tone);
+}

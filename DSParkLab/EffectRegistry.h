@@ -500,6 +500,10 @@ inline EffectSlot makeCompressor()
     s.addSlider("Control Leak", 0, 1, 0, "");                   // 57: the moves of the gain as low thumps
     s.addSlider("Detector Asymmetry", -1, 1, 0, "");            // 58: the two halves of the wave read differently
     s.addChoice("Route", {"Stereo","Mid + Side","Mid","Side","Mid keys Side","Side keys Mid"}, 0);   // 59
+    // Where the key's low cut and its bell sit (60, 61). Order MUST match
+    // dspark::Compressor<float>::KeyPlacement (Stereo=0, Mid=1, Side=2).
+    s.addChoice("Key Low Cut On", {"Both channels","Middle","Sides"}, 0);
+    s.addChoice("Key Bell On", {"Both channels","Middle","Sides"}, 0);
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -589,6 +593,13 @@ inline EffectSlot makeCompressor()
             case 57: p->setControlLeak(v); break;
             case 58: p->setDetectorAsymmetry(v); break;
             case 59: p->setRoute(static_cast<dspark::Compressor<float>::Route>(static_cast<int>(v))); break;
+            case 60: case 61:
+            {
+                auto& k = *key;
+                k[i == 60 ? 0 : 2].placement = static_cast<dspark::Compressor<float>::KeyPlacement>(std::clamp(static_cast<int>(v), 0, 2));
+                for (int b = 0; b < 4; ++b) p->setSidechainBand(b, k[static_cast<size_t>(b)]);
+                break;
+            }
         }
     };
     s.gainReductionDbFn = [p]() { return static_cast<float>(p->getGainReductionDb()); };
@@ -607,7 +618,7 @@ inline EffectSlot makeCompressor()
     s.group("Main", { 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18 });
     s.group("Character", { 8, 9, 10, 11, 12, 19, 34, 35 });
     s.group("Timing", { 13, 14, 15, 20, 21, 22, 23, 32 });
-    s.group("Key", { 24, 25, 26, 27, 28, 29, 30, 31, 33 });
+    s.group("Key", { 24, 25, 26, 27, 28, 29, 30, 31, 33, 60, 61 });
     s.group("Colour Stage", { 36, 37, 38, 39, 40, 41, 42 });
     s.group("Curve", { 47, 48, 49, 50, 51, 59 });
     s.group("Control Path", { 52, 53, 54, 55, 56, 57, 58 });

@@ -157,6 +157,10 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Route", 2 }, { "Threshold", -22 }, { "Ratio", 4 }, { "Attack", 10 }, { "Release", 150 }, { "Detector", 4 } });
         s->addPreset("Sides ducked by the middle", "Route Mid keys Side: the width closes while the centre is loud.",
             { { "Route", 4 }, { "Threshold", -26 }, { "Ratio", 4 }, { "Attack", 5 }, { "Release", 200 }, { "Detector", 4 } });
+        s->addPreset("Key bell on the sides", "The key's bell at 6 kHz, +12 dB, heard only in the sides: wide cymbals pull the gain down, a centred voice with the same brightness does not. Compare Key Bell On at Both channels.",
+            { { "Threshold", -24 }, { "Ratio", 4 }, { "Attack", 5 }, { "Release", 150 }, { "Key Bell Freq", 6000 }, { "Key Bell Gain", 12 }, { "Key Bell Q", 1 }, { "Key Bell On", 2 } });
+        s->addPreset("Key low cut on the middle", "The key's low cut at 150 Hz only on the middle: a centred kick no longer pumps the mix, a wide bass still does. Compare Key Low Cut On at Both channels.",
+            { { "Threshold", -24 }, { "Ratio", 3 }, { "Attack", 10 }, { "Release", 120 }, { "Key Low Cut", 150 }, { "Key Low Cut Slope", 24 }, { "Key Low Cut On", 1 } });
         s->addPreset("Lookahead as a ramp", "A 5 ms lookahead that brings the reduction in along a ramp, with every peak held 20 ms.",
             { { "Threshold", -16 }, { "Ratio", 20 }, { "Attack", 0.1f }, { "Release", 80 }, { "Knee", 0 },
               { "Max Lookahead", 5 }, { "Lookahead", 5 }, { "Lookahead Shape", 1 }, { "Hold", 20 }, { "Hold Mode", 1 } });

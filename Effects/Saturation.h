@@ -1699,7 +1699,10 @@ public:
      *
      * - Off: plain curves (the Wavefolder keeps its built-in first-order form).
      * - FirstOrder: SoftClip/Tube/HardClip, half a processing sample of
-     *   uncompensated delay, -2.0 dB at 20 kHz at the default 2x.
+     *   uncompensated delay; a small signal falls -0.47 dB at 10 kHz,
+     *   -1.25 dB at 16 kHz and -2.0 dB at 20 kHz at the default 2x (the
+     *   worst alias of a -6 dBFS tone at +12 dB of drive from -53.5 to
+     *   -81.1 dBc at 10 kHz and from -28.3 to -45.7 dBc at 15 kHz).
      * - SecondOrder (Bilbao, Esqueda, Parker and Valimaki 2017): a kernel on
      *   every curve except the Bitcrusher and Downsample
      *   (SoftClip/Tube/HardClip/Wavefolder/Transformer/Exciter/Tape), and on
@@ -2406,7 +2409,9 @@ public:
      * @note First-order ADAA shifts the wet signal by half a sample. With a
      * partial dry/wet mix this causes a very slight HF comb (< 0.2 dB below
      * 10 kHz at 48 kHz) - inherent to the technique and far smaller than the
-     * aliasing it removes.
+     * aliasing it removes. The wet top itself falls as well, -1.25 dB at
+     * 16 kHz at the default 2x (see Antialiasing): the reason it is off by
+     * default.
      */
     void setAntialiasing(bool on) noexcept
     {

@@ -6,6 +6,18 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `TonalBalance::setBalanceAsymmetry()` (-1 to 1) and `setBalanceBias()`
+  (-6 to +6 dB), both 0 by default (the balance as before, to the bit): the
+  broad balance lifts the bands under the reference (what is lacking) and
+  lowers those over it (what is in excess) with shares of its own, up to
+  twice and down to nothing, and the bias moves the point between the two.
+  The loudness is kept as always, so the bias matters with an asymmetry:
+  on a dark programme with the balance at 1, a range of 12 dB and an
+  asymmetry of 0.6, the share of the loudness the lifted bands gain goes
+  0.028 / 0.033 / 0.048 / 0.071 / 0.090 at a bias of -4 / -2 / 0 / +2 /
+  +4 dB, with the loudness change at 0; with the balance alike the bias only
+  moves what the knee bends (0.044 to 0.061, no direction). State keys
+  `balanceAsymmetry` and `balanceBias`.
 - `Compressor::setDetectorDrift()` (0 to 1, 0 by default): the detector's
   asymmetry (`setDetectorAsymmetry()`) wanders slowly at random around the
   one set, as the balance of a rectifier does with its temperature: a walk

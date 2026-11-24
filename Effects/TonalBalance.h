@@ -39,7 +39,10 @@
  * which each band weighs by its audibility) against a reference shape, a
  * formula, flat loudness per Bark tilted by setTilt() around 1 kHz.
  * setBalance() is the share of the way the trend moves toward it, through a
- * soft knee (setKnee()).
+ * soft knee (setKnee()). setBalanceAsymmetry() gives the bands under the
+ * reference (what is lacking, lifted) and those over it (what is in excess,
+ * lowered) slopes of their own, and setBalanceBias() moves the point they
+ * are told apart at.
  *
  * The fine reading is the detail (setDetail(), 1 to 1/24 of an octave): the
  * power at 1024 points of log frequency, over the whole band, through a
@@ -247,6 +250,27 @@ public:
     /** @brief Knee of the balance, 0.1 to 12 dB (default 3); the dips and peaks have setContrastKnee(). */
     void setKnee(T db) noexcept { store(knee_, db, T(0.1), T(12)); }
     /**
+     * @brief How differently the balance lifts what is lacking and lowers what
+     *        is in excess, -1 to 1 (default 0: alike). Toward 1 the bands under
+     *        the reference are lifted by up to twice the share setBalance()
+     *        gives and those over it lowered by less, down to nothing; toward
+     *        -1 the other way. The loudness is kept as always, so what changes
+     *        is the shape: with a positive asymmetry a hole in the balance is
+     *        filled more than a hump is cut. State key "balanceAsymmetry".
+     */
+    void setBalanceAsymmetry(T amount) noexcept { store(balanceAsymmetry_, amount, T(-1), T(1)); }
+    /**
+     * @brief Moves the point the balance tells lacking from excess at, -6 to
+     *        +6 dB (default 0: the programme's own mean). Up, more of the
+     *        bands count as lacking; down, more as in excess. With an
+     *        asymmetry (setBalanceAsymmetry()) it decides how much of the
+     *        programme is lifted and how much lowered; with the balance alike
+     *        on both sides the offset that keeps the loudness takes it back
+     *        but for what the knee bends. Past the range (setRange()) the
+     *        corrections only meet their limits. State key "balanceBias".
+     */
+    void setBalanceBias(T db) noexcept { store(balanceBias_, db, T(-6), T(6)); }
+    /**
      * @brief Knee of the dips and peaks, 0.1 to 12 dB (default 3): smaller
      *        and the ripple of a noisy programme is followed, larger and
      *        only what stands well out is touched.
@@ -360,6 +384,8 @@ public:
     [[nodiscard]] T getTilt() const noexcept { return tilt_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getRange() const noexcept { return range_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getKnee() const noexcept { return knee_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getBalanceAsymmetry() const noexcept { return balanceAsymmetry_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getBalanceBias() const noexcept { return balanceBias_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getContrastKnee() const noexcept { return contrastKnee_.load(std::memory_order_relaxed); }
     [[nodiscard]] T getDetail() const noexcept { return detail_.load(std::memory_order_relaxed); }
     /** @return How many bands getBandCentre() and getCorrection() have: those of the model. */
@@ -451,6 +477,8 @@ public:
         w.write("tilt", static_cast<float>(getTilt()));
         w.write("range", static_cast<float>(getRange()));
         w.write("knee", static_cast<float>(getKnee()));
+        w.write("balanceAsymmetry", static_cast<float>(getBalanceAsymmetry()));
+        w.write("balanceBias", static_cast<float>(getBalanceBias()));
         w.write("contrastKnee", static_cast<float>(getContrastKnee()));
         w.write("detailOctaves", static_cast<float>(getDetail()));
         w.write("rangeKnee", static_cast<float>(getRangeKnee()));
@@ -485,6 +513,8 @@ public:
         setTilt(static_cast<T>(r.read("tilt", 0.0f)));
         setRange(static_cast<T>(r.read("range", 6.0f)));
         setKnee(static_cast<T>(r.read("knee", 3.0f)));
+        setBalanceAsymmetry(static_cast<T>(r.read("balanceAsymmetry", 0.0f)));
+        setBalanceBias(static_cast<T>(r.read("balanceBias", 0.0f)));
         setContrastKnee(static_cast<T>(r.read("contrastKnee", 3.0f)));
         if (r.processorVersion() < 2)
         {
@@ -800,6 +830,11 @@ private:
         }
         meanDev = wsum > 0.0 ? meanDev / wsum : 0.0;
         const double balance = static_cast<double>(balance_.load(std::memory_order_relaxed));
+        // What is lacking (under the reference) and what is in excess, each
+        // with its share of the balance; the point between them moved by the bias.
+        const double asymmetry = static_cast<double>(balanceAsymmetry_.load(std::memory_order_relaxed));
+        const double bias = static_cast<double>(balanceBias_.load(std::memory_order_relaxed));
+        const double liftShare = balance * (1.0 + asymmetry), cutShare = balance * (1.0 - asymmetry);
         const double range = static_cast<double>(range_.load(std::memory_order_relaxed));
         const double knee = static_cast<double>(knee_.load(std::memory_order_relaxed));
         const auto soft = [knee](double d) { return std::copysign(std::sqrt(d * d + knee * knee) - knee, d); };
@@ -822,11 +857,11 @@ private:
             // With the local slope, what a band lacks or has in excess is read with
             // the slope of its own loudness curve (never more than the exponent says).
             const double ease = exponent[i] / steep[i];
-            const double global = ease * (tmpC_[i] - meanDev);
+            const double global = ease * (tmpC_[i] - meanDev - bias);
             // The balance by how present the band is (limited first, so a band
             // half way down to the floor takes half of it), then what the
             // detail moves in the band.
-            double c = limited(-balance * soft(global));
+            double c = limited(-(global < 0.0 ? liftShare : cutShare) * soft(global));
             if (present[i] < 1.0) c *= present[i];
             c = std::clamp(c * weight[i] + detailMean_[i], -range, range);
             // The listening level: a fixed contour, whatever the programme.
@@ -1232,6 +1267,7 @@ private:
     bool prepared_ = false, warm_ = false;
 
     std::atomic<T> balance_ { T(0.5) }, fillDips_ { T(0.3) }, trimPeaks_ { T(0.5) }, tilt_ { T(0) };
+    std::atomic<T> balanceAsymmetry_ { T(0) }, balanceBias_ { T(0) };   ///< setBalanceAsymmetry(), setBalanceBias().
     std::atomic<T> range_ { T(6) }, knee_ { T(3) }, loHz_ { T(40) }, hiHz_ { T(16000) }, referenceSpl_ { T(100) };
     std::atomic<bool> levelComp_ { false }, refDirty_ { false }, localSlope_ { false };
     std::atomic<Reference> reference_ { Reference::FlatLoudness };

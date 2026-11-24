@@ -6,6 +6,24 @@ All notable user-facing changes to DSPark are documented here.
 
 ### Added
 
+- `Compressor::setDetectorDrift()` (0 to 1, 0 by default): the detector's
+  asymmetry (`setDetectorAsymmetry()`) wanders slowly at random around the
+  one set, as the balance of a rectifier does with its temperature: a walk
+  smoothed twice at 0.25 Hz, about 0.1 of asymmetry (one deviation) at full
+  drift, a seed per channel, the same walk from every reset(). With a
+  lopsided 100 Hz signal and a 20 ms release, the reductions of the signal
+  and of its inverse, the same held still, come apart from -1.29 to +1.90 dB
+  over 20 s and move 0.31 dB at most in a tenth of a second. One sample at a
+  time is the block path; at 0 the detector is the one before, to the bit.
+  State key `detectorDrift`.
+- `Expander` and `NoiseGate`: a band of the key's equalizer can sit on the
+  middle or on the sides of a two-channel key (`KeyBand::placement`, and the
+  alias `KeyPlacement`), as in `Compressor`, also with an external key of two
+  channels. With a centred 60 Hz tone and a low cut at 500 Hz, the cut on the
+  middle closes the gate (-60 dB, the range) and brings the expander down
+  (-40 dB); on the sides the output is the same as with no band, to the bit;
+  for a wide tone the other way round. Keys of one channel or of more than
+  two take every band on every channel, as before.
 - `Compressor::setMidSideFocus()` (-1 to 1, 0 by default): in
   `Route::MidSide`, how the compression leans to the middle or to the
   sides, without changing route. Toward -1 the sides take less of their

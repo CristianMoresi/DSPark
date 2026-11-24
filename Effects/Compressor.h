@@ -537,8 +537,8 @@ public:
         detectorIn = keyEq_.processSample(detectorIn, channel);
         // The settings of the audio path that are not the plain gain, once per frame.
         if (channel == 0) (void)syncAudioPath();
-        const T detectorRead = (asymAmount_ != T(0) && rectifies(detTypeEff)) ? asymmetric(detectorIn, channel)
-                                                                              : detectorIn;
+        const T detectorRead = (lopsidedDetector() && rectifies(detTypeEff)) ? asymmetric(detectorIn, channel)
+                                                                             : detectorIn;
 
         const bool layered = isLayered(profile, modeType);
         syncLayerState(layered);
@@ -688,6 +688,9 @@ public:
             networkLow_[ch] = 0.0;
             leakBase_[ch] = T(1);
             asymCrest_[ch] = T(0);
+            asymDrift_[ch] = {};
+            asymDrift_[ch].rng = 0x9E3779B9u * static_cast<std::uint32_t>(ch + 1) + 0x6A09E667u;
+            asymNow_[ch] = T(0);
             balanceBands_[ch] = {};
             hybridMeanSq_[ch] = 0.0;
             lookaheadBuffers_[ch].reset();
@@ -1685,6 +1688,33 @@ public:
     [[nodiscard]] T getDetectorAsymmetry() const noexcept { return detectorAsymmetry_.load(std::memory_order_relaxed); }
 
     /**
+     * @brief Lets the detector's asymmetry wander slowly at random, as the
+     *        balance of a rectifier does with its temperature (0, the
+     *        default, holds it still).
+     *
+     * Each channel's asymmetry moves around the one set with
+     * setDetectorAsymmetry() along a random walk smoothed twice at 0.25 Hz,
+     * by about 0.1 (one deviation) at full drift: the second harmonic of the
+     * modulation and the reading of a lopsided signal against its inverse
+     * come and go over seconds. It acts where the asymmetry does (Peak,
+     * TruePeak and Hybrid), also with the asymmetry at 0. Each channel has
+     * its own seed and the walk starts again at every reset(), so a render
+     * repeats. While it is on, processBlock() runs frame by frame.
+     *
+     * State key "detectorDrift" (absent = 0).
+     *
+     * @param amount 0 to 1. Non-finite values are ignored.
+     */
+    void setDetectorDrift(T amount) noexcept
+    {
+        if (!std::isfinite(amount)) return;
+        detectorDrift_.store(std::clamp(amount, T(0), T(1)), std::memory_order_relaxed);
+    }
+
+    /** @brief How far the detector's asymmetry wanders (setDetectorDrift()). */
+    [[nodiscard]] T getDetectorDrift() const noexcept { return detectorDrift_.load(std::memory_order_relaxed); }
+
+    /**
      * @brief Selects the Clean character's feed-forward ballistics.
      *
      * Branching (default) is a single branching one-pole on the gain target.
@@ -2059,6 +2089,7 @@ public:
         w.write("toneHigh", static_cast<float>(toneHighDb_.load(std::memory_order_relaxed)));
         w.write("controlLeak", static_cast<float>(controlLeak_.load(std::memory_order_relaxed)));
         w.write("detectorAsymmetry", static_cast<float>(detectorAsymmetry_.load(std::memory_order_relaxed)));
+        w.write("detectorDrift", static_cast<float>(detectorDrift_.load(std::memory_order_relaxed)));
         w.write("liftBelow", static_cast<float>(liftBelow_.load(std::memory_order_relaxed)));
         w.write("liftRatio", static_cast<float>(liftRatio_.load(std::memory_order_relaxed)));
         w.write("liftRange", static_cast<float>(liftRange_.load(std::memory_order_relaxed)));
@@ -2128,6 +2159,7 @@ public:
         setReductionTone(static_cast<T>(r.read("toneLow", 0.0f)), static_cast<T>(r.read("toneHigh", 0.0f)));
         setControlLeak(static_cast<T>(r.read("controlLeak", 0.0f)));
         setDetectorAsymmetry(static_cast<T>(r.read("detectorAsymmetry", 0.0f)));
+        setDetectorDrift(static_cast<T>(r.read("detectorDrift", 0.0f)));
         setLift(static_cast<T>(r.read("liftBelow", 30.0f)), static_cast<T>(r.read("liftRatio", 2.0f)),
                 static_cast<T>(r.read("liftRange", 6.0f)));
         return true;
@@ -2326,7 +2358,7 @@ protected:
         // kDetectorPoints points per sample, kDetectorDelay samples late, and
         // the audio waits for them. The others keep one level per sample.
         const bool points = precise && readsBetweenSamples(detTypeEff);
-        const bool lopsided = asymAmount_ != T(0) && rectifies(detTypeEff);
+        const bool lopsided = lopsidedDetector() && rectifies(detTypeEff);
         const int count = points ? kDetectorPoints : 1;
         const int audioDelay = activeLookahead + (points ? kDetectorDelay : 0);
         const int gainDelay = (feedForward || keyedLoop) ? activeLookahead - lookaheadSamples_ : 0;
@@ -3319,6 +3351,14 @@ protected:
             liftRatioIn_ = std::max(liftRatio_.load(std::memory_order_relaxed), T(1));
             liftRangeDb_ = liftRange_.load(std::memory_order_relaxed);
             asymDecay_ = static_cast<T>(std::exp(-1.0 / (rate * kAsymCrestSeconds)));
+            // Two one-poles of rate r (a = 1 - r) over a uniform in [-1, 1)
+            // have a deviation of sqrt(r^4 (1 + a^2) / (3 (1 - a^2)^3)): the
+            // walk of the drift, scaled to one.
+            asymDriftRate_ = 1.0 - std::exp(-2.0 * std::numbers::pi * kAsymDriftHz * kAsymDriftTick / rate);
+            {
+                const double r = asymDriftRate_, a2 = (1.0 - r) * (1.0 - r);
+                asymDriftScale_ = 1.0 / std::sqrt(r * r * r * r * (1.0 + a2) / (3.0 * (1.0 - a2) * (1.0 - a2) * (1.0 - a2)));
+            }
         }
 
         // The attack as it is observed (a feedback loop, below, changes the
@@ -4307,9 +4347,13 @@ protected:
         leakAmount_ = leak;
 
         asymAmount_ = detectorAsymmetry_.load(std::memory_order_relaxed);
+        driftAmount_ = detectorDrift_.load(std::memory_order_relaxed);
         audioExtras_ = toneActive_ || leakAmount_ > T(0);
-        return audioExtras_ || asymAmount_ != T(0);
+        return audioExtras_ || lopsidedDetector();
     }
+
+    /** @brief Whether the detector reads the two halves of the wave differently (an asymmetry or its drift). */
+    [[nodiscard]] bool lopsidedDetector() const noexcept { return asymAmount_ != T(0) || driftAmount_ > T(0); }
 
     /**
      * @brief The gain on one sample of a channel when it is not a plain
@@ -4347,9 +4391,38 @@ protected:
      */
     [[nodiscard]] T asymmetric(T key, int ch) noexcept
     {
-        T& crest = asymCrest_[static_cast<size_t>(ch)];
+        const size_t c = static_cast<size_t>(ch);
+        T& crest = asymCrest_[c];
         crest = std::max(std::abs(key), crest * asymDecay_);
-        return (key + asymAmount_ * crest) / (T(1) + std::abs(asymAmount_));
+        T amount = asymAmount_;
+        if (driftAmount_ > T(0))
+        {
+            // One step of the channel's walk (this runs once per channel and
+            // frame): a draw every kAsymDriftTick frames, followed in a line.
+            AsymDrift& d = asymDrift_[c];
+            if (d.tick == 0)
+            {
+                d.from = d.to;
+                d.wander += asymDriftRate_ * (driftUniform(d.rng) - d.wander);
+                d.smooth += asymDriftRate_ * (d.wander - d.smooth);
+                d.to = asymDriftScale_ * d.smooth;
+            }
+            const double t = static_cast<double>(d.tick + 1) / kAsymDriftTick;
+            d.tick = (d.tick + 1 == kAsymDriftTick) ? 0 : d.tick + 1;
+            const double wander = d.from + t * (d.to - d.from);
+            amount = std::clamp(static_cast<T>(static_cast<double>(asymAmount_)
+                                               + static_cast<double>(driftAmount_) * kAsymDrift * wander),
+                                T(-1), T(1));
+            asymNow_[c] = amount;
+        }
+        return (key + amount * crest) / (T(1) + std::abs(amount));
+    }
+
+    /** @brief A uniform draw in [-1, 1) (xorshift32). */
+    static double driftUniform(std::uint32_t& s) noexcept
+    {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return static_cast<double>(s) * (2.0 / 4294967296.0) - 1.0;
     }
 
     /** @brief Whether anything stands between the ballistics and the gain: the landing, the network or the smoothing. */
@@ -5857,6 +5930,24 @@ protected:
     T asymAmount_ = T(0);                           ///< The asymmetry as the audio thread took it.
     T asymDecay_ = T(0);
     std::array<T, kMaxChannels> asymCrest_ {};      ///< The crest of each channel's key.
+    // The drift of the asymmetry (setDetectorDrift()).
+    static constexpr double kAsymDrift = 0.1;       ///< Deviation of the asymmetry at full drift.
+    static constexpr double kAsymDriftHz = 0.25;    ///< Corner of each of the walk's two smoothings.
+    static constexpr int kAsymDriftTick = 64;       ///< Frames between draws.
+    /** @brief One channel's walk: smoothed draws, followed in a line between them. */
+    struct AsymDrift
+    {
+        double wander = 0.0;                        ///< The draws through one one-pole.
+        double smooth = 0.0;                        ///< And through the second.
+        double from = 0.0, to = 0.0;                ///< The walk at the start and the end of the tick.
+        int tick = 0;                               ///< Frames into the tick.
+        std::uint32_t rng = 1u;                     ///< The channel's source.
+    };
+    std::atomic<T> detectorDrift_ { T(0) };         ///< setDetectorDrift().
+    T driftAmount_ = T(0);                          ///< The drift as the audio thread took it.
+    double asymDriftRate_ = 0.0, asymDriftScale_ = 1.0;
+    std::array<AsymDrift, kMaxChannels> asymDrift_ {};
+    std::array<T, kMaxChannels> asymNow_ {};        ///< Each channel's asymmetry with its drift.
     bool audioExtras_ = false;                      ///< The gain is not a plain product (tone or leak).
 
     // The routes of a pair (setRoute()).

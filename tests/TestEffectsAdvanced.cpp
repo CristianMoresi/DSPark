@@ -9640,6 +9640,64 @@ DSPARK_TEST(TonalBalance_reads_what_it_raises_and_what_it_lowers)
     EXPECT_EQ(still->getLoudness(), -200.0f);
 }
 
+// New: the balance lifts what is lacking and lowers what is in excess each
+// with a slope of its own, and the point between the two can be moved. With
+// the two alike the bias moves only what the knee bends (the offset that
+// keeps the loudness takes back the rest); with an asymmetry the share of the programme that is
+// lifted grows with the bias, step by step, and the loudness is still kept.
+// At 0 both are the balance as it was, to the bit.
+DSPARK_TEST(TonalBalance_balance_asymmetry_and_bias)
+{
+    const std::vector<float> dark = m9Dark(48000 * 3, 41u, 2000.0);
+    const auto raisedAt = [&](float asymmetry, float bias, double& change) {
+        const auto tb = m9Balance([=](Tb9& t) {
+            t.setBalance(1.0f);
+            t.setRange(12.0f);
+            t.setFillDips(0.0f);
+            t.setTrimPeaks(0.0f);
+            t.setBalanceAsymmetry(asymmetry);
+            t.setBalanceBias(bias);
+        }, dark);
+        change = static_cast<double>(tb->getLoudnessChange());
+        return static_cast<double>(tb->getLoudnessRaised());
+    };
+    const float biases[5] = { -4.0f, -2.0f, 0.0f, 2.0f, 4.0f };
+    double alike[5] = {}, lopsided[5] = {}, worstChange = 0.0;
+    for (int k = 0; k < 5; ++k)
+    {
+        double change = 0.0;
+        alike[k] = raisedAt(0.0f, biases[k], change);
+        worstChange = std::max(worstChange, std::abs(change));
+        lopsided[k] = raisedAt(0.6f, biases[k], change);
+        worstChange = std::max(worstChange, std::abs(change));
+    }
+    std::printf("  [balance bias] raised share at a bias of -4 / -2 / 0 / +2 / +4 dB: alike %.4f %.4f %.4f %.4f %.4f; asymmetry 0.6 %.4f %.4f %.4f %.4f %.4f; loudness change %.4f dB at most\n",
+                alike[0], alike[1], alike[2], alike[3], alike[4], lopsided[0], lopsided[1], lopsided[2], lopsided[3], lopsided[4], worstChange);
+    for (int k = 1; k < 5; ++k) EXPECT_GT(lopsided[k], lopsided[k - 1]);
+    EXPECT_GT(lopsided[4] - lopsided[0], 0.01);
+    double alikeMost = 0.0;
+    for (const double v : alike) alikeMost = std::max(alikeMost, std::abs(v - alike[2]));
+    EXPECT_GT(lopsided[4] - lopsided[0], 2.5 * alikeMost);
+    EXPECT_LT(worstChange, 0.05);
+
+    // At 0, the balance as it was; and the state.
+    const auto plain = m9Balance([](Tb9& t) { t.setBalance(1.0f); }, dark);
+    const auto zero = m9Balance([](Tb9& t) { t.setBalance(1.0f); t.setBalanceAsymmetry(0.0f); t.setBalanceBias(0.0f); }, dark);
+    for (int b = 0; b < Tb9::getNumBands(); ++b) EXPECT_EQ(zero->getCorrection(b), plain->getCorrection(b));
+    Tb9 a;
+    a.setBalanceAsymmetry(-0.4f);
+    a.setBalanceBias(3.5f);
+    const auto blob = a.getState();
+    Tb9 c;
+    EXPECT_TRUE(c.setState(blob.data(), blob.size()));
+    EXPECT_NEAR(static_cast<double>(c.getBalanceAsymmetry()), -0.4, 1e-6);
+    EXPECT_NEAR(static_cast<double>(c.getBalanceBias()), 3.5, 1e-6);
+    c.setBalanceBias(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_NEAR(static_cast<double>(c.getBalanceBias()), 3.5, 1e-6);
+    c.setBalanceAsymmetry(3.0f);
+    EXPECT_EQ(c.getBalanceAsymmetry(), 1.0f);
+}
+
 // New: setRangeKnee(). A dip that deepens is raised more and more, up to the
 // range: with the hard limit the correction stops at a corner; with the knee
 // it bends into the range and settles on it.

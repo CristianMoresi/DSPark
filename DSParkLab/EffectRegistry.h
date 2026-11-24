@@ -2561,6 +2561,8 @@ inline EffectSlot makeTonalBalance()
     s.addToggle("Time Focus", false);                          // 18
     s.addSlider("Contrast Knee", 0.1f, 12, 3, "dB");           // 19 - the knee of dips and peaks
     s.addSlider("Detail", 1, 24, 4, "/oct", true);                       // 20 - parts of an octave
+    s.addSlider("Balance Asymmetry", -1, 1, 0, "");            // 21 - lift what is lacking (+) or lower what is in excess (-) more
+    s.addSlider("Balance Bias", -6, 6, 0, "dB");               // 22 - the point between lacking and in excess
     auto range = std::make_shared<std::array<float, 2>>(std::array<float, 2> { 40.0f, 16000.0f });
     auto spec = std::make_shared<dspark::AudioSpec>();
     s.prepareFn = [p, spec](auto& sp) { *spec = sp; p->prepare(sp); };
@@ -2605,11 +2607,13 @@ inline EffectSlot makeTonalBalance()
             case 18: p->setTimeFocus(v > 0.5f); break;
             case 19: p->setContrastKnee(v); break;
             case 20: p->setDetail(1.0f / v); break;
+            case 21: p->setBalanceAsymmetry(v); break;
+            case 22: p->setBalanceBias(v); break;
         }
     };
     s.leadParam = 20;
     s.group("Main", { 20, 0, 1, 2, 3, 4, 6, 7 });
-    s.group("Shape", { 5, 19, 10, 11, 12, 8, 9, 13 });
+    s.group("Shape", { 5, 21, 22, 19, 10, 11, 12, 8, 9, 13 });
     s.group("Response", { 14, 15, 16, 17, 18 });
     return s;
 }

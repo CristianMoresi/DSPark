@@ -571,6 +571,8 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
     if (EffectSlot* s = findSlot(all, "Tonal Balance"))
     {
         s->addPreset("Gentle", "Half way to an even balance, 6 dB at most.", { { "Balance", 0.5f }, { "Range", 6 } });
+        s->addPreset("Fill more than cut", "The balance lifts what is lacking more than it lowers what is in excess, and the bias counts more of the programme as lacking: holes are filled, humps barely touched. Move Balance Bias from -4 to +4 dB.",
+            { { "Balance", 1 }, { "Range", 12 }, { "Balance Asymmetry", 0.6f }, { "Balance Bias", 2 } });
         s->addPreset("Strong", "All the way, 12 dB at most, with the level kept.",
             { { "Balance", 1 }, { "Range", 12 }, { "Fill Dips", 0.6f }, { "Trim Peaks", 0.8f }, { "Level Compensation", 1 } });
         s->addPreset("Only tame what sticks out", "No filling of dips.", { { "Balance", 0.8f }, { "Fill Dips", 0 }, { "Trim Peaks", 1 } });

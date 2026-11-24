@@ -28,6 +28,7 @@
 #include <limits>
 #include <initializer_list>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -10036,4 +10037,208 @@ DSPARK_TEST(Compressor_mid_side_focus_leans_without_a_step)
     }
     std::printf("  [focus] sweep: the sides' largest second difference %.2e against the tone's %.2e\n", curve, tone);
     EXPECT_LT(curve, 1.5 * tone);
+}
+
+// New: the detector's asymmetry drifts slowly at random. Held still, a
+// lopsided signal and its inverse get the same reduction; with the drift they
+// differ by a little, now one way and now the other, and the difference moves
+// over seconds and not from one period to the next. The walk repeats from
+// every start, one sample at a time is the block path, and a drift of 0 is the
+// detector as it was.
+DSPARK_TEST(Compressor_detector_drift_wanders_slowly_and_repeats)
+{
+    using C = Compressor<float>;
+    const int n = 48000 * 20;
+    Vec lopsided(static_cast<size_t>(n)), inverse(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = 2.0 * kPiD * 100.0 * i / 48000.0;
+        lopsided[static_cast<size_t>(i)] = static_cast<float>(0.4 * std::sin(t) + 0.2 * std::cos(2.0 * t));
+        inverse[static_cast<size_t>(i)] = -lopsided[static_cast<size_t>(i)];
+    }
+    const auto setup = [](float drift) {
+        return [=](C& c) {
+            c.setThreshold(-30.0f);
+            c.setRatio(4.0f);
+            c.setAttack(0.1f);
+            c.setRelease(20.0f);
+            c.setDetectorDrift(drift);
+        };
+    };
+    // The difference of the two reductions, as means over a tenth of a second.
+    const auto apart = [&](float drift) {
+        const std::vector<double> a = compTrace(lopsided, setup(drift)), b = compTrace(inverse, setup(drift));
+        std::vector<double> mean;
+        const size_t w = 300;                       // trace points of 16 samples
+        for (size_t k = 3000; k + w <= a.size(); k += w)
+        {
+            double s = 0.0;
+            for (size_t j = k; j < k + w; ++j) s += a[j] - b[j];
+            mean.push_back(s / static_cast<double>(w));
+        }
+        return mean;
+    };
+    const std::vector<double> still = apart(0.0f), moving = apart(1.0f);
+    double stillMost = 0.0, high = -1e9, low = 1e9, step = 0.0;
+    for (const double d : still) stillMost = std::max(stillMost, std::abs(d));
+    for (size_t k = 0; k < moving.size(); ++k)
+    {
+        high = std::max(high, moving[k]);
+        low = std::min(low, moving[k]);
+        if (k > 0) step = std::max(step, std::abs(moving[k] - moving[k - 1]));
+    }
+    std::printf("  [drift] signal against its inverse: %.3f dB apart held still; with the drift from %.2f to %.2f dB, a tenth of a second moving it %.3f dB at most\n",
+                stillMost, low, high, step);
+    EXPECT_LT(stillMost, 0.02);
+    EXPECT_GT(high, 0.1);
+    EXPECT_LT(low, -0.1);
+    EXPECT_LT(step, 0.15 * (high - low));
+
+    // The walk repeats, one sample at a time is the block path, and a drift of
+    // 0 is no drift at all.
+    const Vec part(lopsided.begin(), lopsided.begin() + 96000);
+    EXPECT_TRUE(compTrace(part, setup(1.0f)) == compTrace(part, setup(1.0f)));
+    EXPECT_LT(compFarthest(compRender(part, setup(1.0f)), compRenderSamples(part, setup(1.0f))), 1e-6);
+    const auto plain = [](C& c) {
+        c.setThreshold(-30.0f);
+        c.setRatio(4.0f);
+        c.setAttack(0.1f);
+        c.setRelease(20.0f);
+    };
+    EXPECT_TRUE(compRender(part, setup(0.0f)) == compRender(part, plain));
+    {
+        auto c = std::make_unique<C>();
+        setup(1.0f)(*c);
+        c->prepare(AudioSpec{ 48000.0, 512, 1 });
+        std::vector<Vec> x { part }, y { part };
+        processInBlocks(x, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+        c->reset();
+        processInBlocks(y, 512, [&](AudioBufferView<float> b) { c->processBlock(b); });
+        EXPECT_TRUE(x[0] == y[0]);
+    }
+
+    // State and wild values.
+    C a;
+    a.setDetectorDrift(0.7f);
+    const auto blob = a.getState();
+    C b;
+    EXPECT_TRUE(b.setState(blob.data(), blob.size()));
+    EXPECT_EQ(b.getDetectorDrift(), 0.7f);
+    b.setDetectorDrift(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_EQ(b.getDetectorDrift(), 0.7f);
+    b.setDetectorDrift(5.0f);
+    EXPECT_EQ(b.getDetectorDrift(), 1.0f);
+    b.setDetectorDrift(-5.0f);
+    EXPECT_EQ(b.getDetectorDrift(), 0.0f);
+}
+
+namespace
+{
+
+// The level (dB) a two-channel gate or expander lets out of a 60 Hz tone,
+// centred or wide, with a low cut at 500 Hz in its key equalizer on a part of
+// the pair (place < 0: no band), over the last tenth of a second.
+template <class Make>
+double placedKeyLevelDb(Make make, bool wide, int place, int block)
+{
+    auto g = make();
+    using G = std::remove_reference_t<decltype(*g)>;
+    if (place >= 0)
+    {
+        typename G::KeyBand cut;
+        cut.shape = G::KeyShape::LowCut;
+        cut.frequency = 500.0f;
+        cut.slope = 24.0f;
+        cut.placement = static_cast<typename G::KeyPlacement>(place);
+        g->setSidechainBand(0, cut);
+    }
+    g->prepare(AudioSpec{ 48000.0, block, 2 });
+    const int n = 24000;
+    std::vector<Vec> x(2, Vec(static_cast<size_t>(n)));
+    for (int i = 0; i < n; ++i)
+    {
+        const float v = static_cast<float>(0.3 * std::sin(2.0 * kPiD * 60.0 * i / 48000.0));
+        x[0][static_cast<size_t>(i)] = v;
+        x[1][static_cast<size_t>(i)] = wide ? -v : v;
+    }
+    processInBlocks(x, block, [&](AudioBufferView<float> b) { g->processBlock(b); });
+    double sq = 0.0;
+    for (int i = n - 4800; i < n; ++i) sq += static_cast<double>(x[0][static_cast<size_t>(i)]) * x[0][static_cast<size_t>(i)];
+    return 10.0 * std::log10(sq / 4800.0 + 1e-30) - 20.0 * std::log10(0.3 / std::sqrt(2.0));
+}
+
+} // namespace
+
+// A band of the key's equalizer on the middle or on the sides of a pair, in
+// the gate and the expander. A low cut on the middle takes a centred low tone
+// out of what the detector reads and the gate closes (the expander comes
+// down); on the sides it leaves the tone there, to the bit; for a wide tone it
+// is the other way round. On both channels it takes either.
+DSPARK_TEST(Gate_and_expander_key_bands_sit_on_the_middle_or_on_the_sides)
+{
+    const auto gate = [] {
+        auto g = std::make_unique<NoiseGate<float>>();
+        g->setThreshold(-30.0f);
+        g->setRange(-60.0f);
+        g->setAttack(1.0f);
+        g->setHold(10.0f);
+        g->setRelease(50.0f);
+        return g;
+    };
+    const auto expander = [] {
+        auto e = std::make_unique<Expander<float>>();
+        e->setThreshold(-30.0f);
+        e->setRatio(4.0f);
+        e->setRange(-40.0f);
+        e->setAttack(1.0f);
+        e->setRelease(50.0f);
+        return e;
+    };
+    using Place = NoiseGate<float>::KeyPlacement;
+    const int stereo = static_cast<int>(Place::Stereo), mid = static_cast<int>(Place::Mid), side = static_cast<int>(Place::Side);
+    const auto check = [&](const char* name, auto make, double closed) {
+        const double open = placedKeyLevelDb(make, false, -1, 512), openWide = placedKeyLevelDb(make, true, -1, 512);
+        const double cMid = placedKeyLevelDb(make, false, mid, 512), cSide = placedKeyLevelDb(make, false, side, 512),
+                     cBoth = placedKeyLevelDb(make, false, stereo, 512);
+        const double wMid = placedKeyLevelDb(make, true, mid, 512), wSide = placedKeyLevelDb(make, true, side, 512),
+                     wBoth = placedKeyLevelDb(make, true, stereo, 512);
+        std::printf("  [%s key place] no band %.2f / %.2f dB; centred: cut on the middle %.2f, on the sides %.2f, on both %.2f; wide: %.2f, %.2f, %.2f dB\n",
+                    name, open, openWide, cMid, cSide, cBoth, wMid, wSide, wBoth);
+        EXPECT_GT(open, -0.5);
+        EXPECT_NEAR(openWide, open, 0.01);
+        EXPECT_LT(cMid, closed);
+        EXPECT_EQ(cSide, open);
+        EXPECT_LT(cBoth, closed);
+        EXPECT_EQ(wMid, openWide);
+        EXPECT_LT(wSide, closed);
+        EXPECT_LT(wBoth, closed);
+        // The size of the block is not in it.
+        EXPECT_NEAR(placedKeyLevelDb(make, true, mid, 37), wMid, 0.01);
+        EXPECT_NEAR(placedKeyLevelDb(make, false, mid, 1), cMid, 0.5);
+    };
+    check("gate", gate, -50.0);
+    check("expander", expander, -30.0);
+
+    // A key of its own, also of two channels: the same.
+    auto g = gate();
+    NoiseGate<float>::KeyBand cut;
+    cut.shape = NoiseGate<float>::KeyShape::LowCut;
+    cut.frequency = 500.0f;
+    cut.slope = 24.0f;
+    cut.placement = Place::Mid;
+    g->setSidechainBand(0, cut);
+    g->prepare(AudioSpec{ 48000.0, 512, 2 });
+    const int n = 24000;
+    std::vector<Vec> audio(2, Vec(static_cast<size_t>(n), 0.25f)), key(2, Vec(static_cast<size_t>(n)));
+    for (int i = 0; i < n; ++i)
+        key[0][static_cast<size_t>(i)] = key[1][static_cast<size_t>(i)]
+            = static_cast<float>(0.3 * std::sin(2.0 * kPiD * 60.0 * i / 48000.0));
+    for (int off = 0; off < n; off += 512)
+    {
+        const int m = std::min(512, n - off);
+        float* a[2] = { audio[0].data() + off, audio[1].data() + off };
+        float* k[2] = { key[0].data() + off, key[1].data() + off };
+        g->processBlock(AudioBufferView<float>(a, 2, m), AudioBufferView<float>(k, 2, m));
+    }
+    EXPECT_LT(std::abs(audio[0][static_cast<size_t>(n - 1)]), 0.25f * 0.01f);
 }

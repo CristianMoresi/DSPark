@@ -445,7 +445,8 @@ DSPARK_TEST(State_multiband_nested_blobs)
 }
 
 // The settings that came after the round-trips above, each restored and read
-// back: the key band's placement and the mid-side focus, the saturation's
+// back: the key band's placement (in the compressor, the expander and the
+// gate), the mid-side focus and the detector's drift, the saturation's
 // base curve, drive pan, tone and oversampler band, the crossover's topology
 // (alone and in the multiband effects), the clipper's oversampler band, the
 // chorus's taps, tone, circuit and mix rule, the reverb's band limit, second
@@ -461,11 +462,31 @@ DSPARK_TEST(State_roundtrip_later_settings)
             band.placement = Compressor<float>::KeyPlacement::Side;
             c.setSidechainBand(4, band);
             c.setMidSideFocus(-0.4f);
+            c.setDetectorDrift(0.6f);
         },
         [](auto& c) {
             EXPECT_TRUE((c.getSidechainBand(4).placement == Compressor<float>::KeyPlacement::Side));
             EXPECT_NEAR(c.getMidSideFocus(), -0.4f, 1e-6f);
+            EXPECT_NEAR(c.getDetectorDrift(), 0.6f, 1e-6f);
         });
+    roundTripReads<Expander<float>>(
+        [](auto& e) {
+            Expander<float>::KeyBand band;
+            band.shape = Expander<float>::KeyShape::LowCut;
+            band.frequency = 180.0f; band.slope = 24.0f;
+            band.placement = Expander<float>::KeyPlacement::Mid;
+            e.setSidechainBand(1, band);
+        },
+        [](auto& e) { EXPECT_TRUE((e.getSidechainBand(1).placement == Expander<float>::KeyPlacement::Mid)); });
+    roundTripReads<NoiseGate<float>>(
+        [](auto& g) {
+            NoiseGate<float>::KeyBand band;
+            band.shape = NoiseGate<float>::KeyShape::Bell;
+            band.frequency = 2500.0f; band.gainDb = 6.0f; band.q = 2.0f;
+            band.placement = NoiseGate<float>::KeyPlacement::Side;
+            g.setSidechainBand(2, band);
+        },
+        [](auto& g) { EXPECT_TRUE((g.getSidechainBand(2).placement == NoiseGate<float>::KeyPlacement::Side)); });
     roundTripReads<Saturation<float>>(
         [](auto& s) {
             s.setAlgorithm(Saturation<float>::Algorithm::Curve);

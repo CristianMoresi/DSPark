@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/CristianMoresi/DSPark/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CristianMoresi/DSPark/actions/workflows/ci.yml)
 [![Docs](https://github.com/CristianMoresi/DSPark/actions/workflows/docs.yml/badge.svg?branch=main)](https://cristianmoresi.github.io/DSPark/)
-[![Release](https://img.shields.io/github/v/release/CristianMoresi/DSPark?label=release)](https://github.com/CristianMoresi/DSPark/releases/tag/v1.8.1)
+[![Release](https://img.shields.io/github/v/release/CristianMoresi/DSPark?label=release)](https://github.com/CristianMoresi/DSPark/releases/tag/v1.9.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 DSPark is a header-only C++20 audio DSP library for developers building
@@ -20,14 +20,14 @@ SIMD intrinsics behind platform guards. The plugin adapters and the Windows-only
 DSParkLab application are separate from the umbrella header and carry their own
 platform integration requirements.
 
-The v1.8.1 CI matrix covers Windows, Linux, macOS, WebAssembly, and an embedded
+The v1.9.0 CI matrix covers Windows, Linux, macOS, WebAssembly, and an embedded
 profile. The framework headers also target iOS and Android, although those two
-platforms do not have dedicated v1.8.1 CI jobs.
+platforms do not have dedicated v1.9.0 CI jobs.
 
-**Current release:** [v1.8.1](https://github.com/CristianMoresi/DSPark/releases/tag/v1.8.1)
+**Current release:** [v1.9.0](https://github.com/CristianMoresi/DSPark/releases/tag/v1.9.0)
 | [API reference](https://cristianmoresi.github.io/DSPark/)
 | [Cookbook](docs/cookbook.md)
-| [Examples](https://github.com/CristianMoresi/DSPark/blob/v1.8.1/examples/README.md)
+| [Examples](https://github.com/CristianMoresi/DSPark/blob/v1.9.0/examples/README.md)
 | [Plugin guide](docs/plugins.md)
 
 ## Quick start
@@ -67,13 +67,13 @@ and the same `dspark::dspark` target. Every route (subdirectory,
 `FetchContent`, installed package) also provides the plugin layer and the
 `dspark_add_plugin()` bundle helper described in [docs/plugins.md](docs/plugins.md).
 
-Or fetch the v1.8.1 release tag:
+Or fetch the v1.9.0 release tag:
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(dspark
     GIT_REPOSITORY https://github.com/CristianMoresi/DSPark.git
-    GIT_TAG v1.8.1
+    GIT_TAG v1.9.0
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(dspark)
 
@@ -117,8 +117,8 @@ int main()
 
 In an audio host, create an `AudioBufferView<float>` over the host-owned channel
 pointers instead of allocating an `AudioBuffer` in the callback. See the
-[real-time-style channel-strip example](https://github.com/CristianMoresi/DSPark/blob/v1.8.1/examples/channel_strip.cpp)
-and the [offline WAV example](https://github.com/CristianMoresi/DSPark/blob/v1.8.1/examples/wav_process.cpp)
+[real-time-style channel-strip example](https://github.com/CristianMoresi/DSPark/blob/v1.9.0/examples/channel_strip.cpp)
+and the [offline WAV example](https://github.com/CristianMoresi/DSPark/blob/v1.9.0/examples/wav_process.cpp)
 for complete programs.
 
 ## Capabilities
@@ -171,14 +171,14 @@ The complete ownership and publication rules are in the
 
 ## Platform and validation coverage
 
-| Target | v1.8.1 validation |
+| Target | v1.9.0 validation |
 |---|---|
 | Windows | MSVC x64 and ARM64: test and conformance suites |
 | Linux | GCC x64/ARM64 and Clang x64: test and conformance suites |
 | macOS | Clang ARM64: test and conformance suites |
 | WebAssembly | Emscripten conformance in scalar and SIMD128 configurations |
 | Embedded profile | GCC compile gate with file I/O, exceptions, and RTTI disabled |
-| iOS and Android | Portable framework headers; not separate targets in the v1.8.1 CI matrix |
+| iOS and Android | Portable framework headers; not separate targets in the v1.9.0 CI matrix |
 
 CI also checks installed-header self-sufficiency with GCC and Clang, warning-free
 builds, sanitizers, concurrent publication paths, examples, native plugin
@@ -204,7 +204,7 @@ On Linux, a custom editor requires WebKitGTK at runtime; the host's generic
 parameter UI remains the fallback when a WebView is unavailable.
 
 Start with the [plugin guide](docs/plugins.md) and the
-[plugin examples](https://github.com/CristianMoresi/DSPark/blob/v1.8.1/examples/README.md).
+[plugin examples](https://github.com/CristianMoresi/DSPark/blob/v1.9.0/examples/README.md).
 
 ## DSParkLab
 
@@ -226,17 +226,41 @@ Build it with `DSParkLab\build.bat` (Visual Studio 2019 or later, any edition).
 - [API reference](https://cristianmoresi.github.io/DSPark/) - generated from
   the public headers and guides.
 - [Cookbook](docs/cookbook.md) - task-oriented DSP recipes.
-- [Examples](https://github.com/CristianMoresi/DSPark/blob/v1.8.1/examples/README.md) - standalone processing and plugin projects.
+- [Examples](https://github.com/CristianMoresi/DSPark/blob/v1.9.0/examples/README.md) - standalone processing and plugin projects.
 - [Plugin guide](docs/plugins.md) - formats, host contract, editors, and
   shipping checks.
 - [Threading model](docs/threading.md) - setup, control, audio, and readout
   ownership.
 - [Quality metrics](docs/metrics.md) - measured settings, results, and caveats.
+- [v1.9.0 migration guide](docs/migration-v1.9.0.md) - changed defaults and
+  latencies from v1.8.1.
 - [v1.8.0 migration guide](docs/migration-v1.8.0.md) - changed defaults,
   plugin timing and packaging from v1.7.0.
 - [v1.7.0 migration guide](docs/migration-v1.7.0.md) - source and latency
   changes from v1.6.1.
 - [Changelog](CHANGELOG.md) - release history.
+
+## What's new in v1.9.0
+
+- New effects: `TonalBalance`, an adaptive equalizer driven by a model of
+  hearing; `ResonanceSuppressor`; `SpectralDynamicEQ`; `MultibandSaturation`;
+  and `LoFi`.
+- New analysis: `DownbeatEstimator`, which finds the first beat of each bar
+  and the metre.
+- New building blocks: `FilterDesign` and `BiquadCascade` (analog-matched
+  filters of any order and slope), `KeyEqualizer` (a sidechain equalizer for
+  the dynamics), `DetailFilter` and `DetailAnalysis` (a spectral engine with
+  a detail control), `BucketBrigade`, `TapeTransport`, `CabinetModel`,
+  `CharacterStage`, `TailShaper`, `NormalizedLadder` and more.
+- New options in the compressor, the gates, the equalizers, the reverbs, the
+  tape, the chorus and the saturators.
+- Improvements across the library in sound quality, accuracy, speed and
+  robustness.
+
+v1.9.0 is source compatible with v1.8.1. Some defaults and latencies change:
+see the [v1.9.0 migration guide](docs/migration-v1.9.0.md), the
+[release notes](https://github.com/CristianMoresi/DSPark/releases/tag/v1.9.0)
+and the [full changelog](CHANGELOG.md).
 
 ## What's new in v1.8.1
 

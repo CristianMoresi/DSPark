@@ -2,7 +2,7 @@
 
 All notable user-facing changes to DSPark are documented here.
 
-## [Unreleased]
+## [1.9.0] - 2026-11-24
 
 ### Added
 
@@ -4166,6 +4166,11 @@ All notable user-facing changes to DSPark are documented here.
 - `LevelFollower`: the float anti-denormal offset no longer lifts a long RMS
   window above the -100 dB floor in silence. A 3 s window at 192 kHz read
   -92.5 dB.
+
+### Migration
+
+Changed defaults and latencies are covered in the
+[v1.9.0 migration guide](docs/migration-v1.9.0.md).
 
 ## [1.8.1] - 2026-10-13
 

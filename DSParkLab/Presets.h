@@ -157,6 +157,9 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
         s->addPreset("Vintage control path", "A lead-lag network, a leak of the control and an asymmetric detector. Turn each to 0 to hear what it adds.",
             { { "Threshold", -24 }, { "Ratio", 6 }, { "Attack", 1 }, { "Release", 60 }, { "Knee", 0 },
               { "Network Depth", 6 }, { "Network Corner", 8 }, { "Control Leak", 0.6f }, { "Detector Asymmetry", 0.3f }, { "Makeup", 6 } });
+        s->addPreset("Detector that drifts", "The asymmetric detector with its balance wandering slowly at random: the colour of the gain comes and goes over seconds. Compare Detector Drift at 0.",
+            { { "Threshold", -24 }, { "Ratio", 6 }, { "Attack", 1 }, { "Release", 60 }, { "Knee", 0 },
+              { "Detector Asymmetry", 0.2f }, { "Detector Drift", 1 }, { "Makeup", 6 } });
         s->addPreset("Middle only", "Route Mid: the centre is compressed and the sides pass untouched.",
             { { "Route", 2 }, { "Threshold", -22 }, { "Ratio", 4 }, { "Attack", 10 }, { "Release", 150 }, { "Detector", 4 } });
         s->addPreset("Sides ducked by the middle", "Route Mid keys Side: the width closes while the centre is loud.",
@@ -197,6 +200,8 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Gate Mode", 1 }, { "Threshold", -40 }, { "Hold", 60 }, { "Release", 150 }, { "Range", -60 } });
         s->addPreset("Keyed to the lows", "The key is cut over 500 Hz: only the low hits open it. Key Listen plays the key.",
             { { "Threshold", -35 }, { "Hold", 60 }, { "Range", -60 }, { "Key High Cut", 500 } });
+        s->addPreset("Key low cut on the middle", "The key's low cut at 200 Hz only on the middle: a centred bass no longer holds the gate open, a wide one still does. Compare Key Low Cut On at Both channels.",
+            { { "Threshold", -35 }, { "Hold", 40 }, { "Release", 80 }, { "Range", -60 }, { "Key Low Cut", 200 }, { "Key Low Cut On", 1 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Expander"))
@@ -205,6 +210,8 @@ inline void addLabPresets(std::vector<EffectSlot>& all)
             { { "Threshold", -40 }, { "Ratio", 2 }, { "Range", -20 } });
         s->addPreset("Tight, 4:1", "A firm expansion with a fast attack.",
             { { "Threshold", -35 }, { "Ratio", 4 }, { "Attack", 1 }, { "Release", 80 }, { "Range", -40 } });
+        s->addPreset("Key low cut on the middle", "The key's low cut at 200 Hz only on the middle: a centred bass no longer holds the expander open, a wide one still does. Compare Key Low Cut On at Both channels.",
+            { { "Threshold", -35 }, { "Ratio", 4 }, { "Attack", 1 }, { "Release", 80 }, { "Range", -40 }, { "Key Low Cut", 200 }, { "Key Low Cut On", 1 } });
     }
 
     if (EffectSlot* s = findSlot(all, "Transient Designer"))

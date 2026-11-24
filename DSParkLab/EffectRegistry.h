@@ -11,6 +11,7 @@
 #include <complex>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace dsplab {
 
@@ -509,6 +510,7 @@ inline EffectSlot makeCompressor()
     s.addChoice("Key Low Cut On", {"Both channels","Middle","Sides"}, 0);
     s.addChoice("Key Bell On", {"Both channels","Middle","Sides"}, 0);
     s.addSlider("Mid/Side Focus", -1, 1, 0, "");   // 62: in Mid + Side, the lean to the middle (-1) or the sides (1)
+    s.addSlider("Detector Drift", 0, 1, 0, "");    // 63: the detector's asymmetry wanders slowly at random
     using CompKeyBand = dspark::Compressor<float>::KeyBand;
     using CompKeyShape = dspark::Compressor<float>::KeyShape;
     auto key = std::make_shared<std::array<CompKeyBand, 4>>();
@@ -599,6 +601,7 @@ inline EffectSlot makeCompressor()
             case 58: p->setDetectorAsymmetry(v); break;
             case 59: p->setRoute(static_cast<dspark::Compressor<float>::Route>(static_cast<int>(v))); break;
             case 62: p->setMidSideFocus(v); break;
+            case 63: p->setDetectorDrift(v); break;
             case 60: case 61:
             {
                 auto& k = *key;
@@ -627,7 +630,7 @@ inline EffectSlot makeCompressor()
     s.group("Key", { 24, 25, 26, 27, 28, 29, 30, 31, 33, 60, 61 });
     s.group("Colour Stage", { 36, 37, 38, 39, 40, 41, 42 });
     s.group("Curve", { 47, 48, 49, 50, 51, 59, 62 });
-    s.group("Control Path", { 52, 53, 54, 55, 56, 57, 58 });
+    s.group("Control Path", { 52, 53, 54, 55, 56, 57, 58, 63 });
     return s;
 }
 
@@ -708,21 +711,36 @@ inline EffectSlot makeNoiseGate()
     s.addToggle("Key Listen", false);
     s.addSlider("Key Low Cut", 20, 2000, 20, "Hz");
     s.addSlider("Key High Cut", 500, 20000, 20000, "Hz");
+    // Where the key's low cut sits (11). Order MUST match
+    // dspark::NoiseGate<float>::KeyPlacement (Stereo=0, Mid=1, Side=2).
+    s.addChoice("Key Low Cut On", {"Both channels","Middle","Sides"}, 0);
+    auto lowCut = std::make_shared<std::pair<float, int>>(20.0f, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, lowCut](int i, float v) {
         using Gate = dspark::NoiseGate<float>;
         switch(i) {
             case 8: p->setSidechainListen(v > 0.5f); break;
-            case 9: case 10:
+            case 9: case 11:
+            {
+                if (i == 9) lowCut->first = v;
+                else        lowCut->second = static_cast<int>(v);
+                Gate::KeyBand band;
+                band.frequency = lowCut->first;
+                band.slope = 24.0f;
+                band.shape = lowCut->first > 20.5f ? Gate::KeyShape::LowCut : Gate::KeyShape::Off;
+                band.placement = static_cast<Gate::KeyPlacement>(lowCut->second);
+                p->setSidechainBand(0, band);
+                break;
+            }
+            case 10:
             {
                 Gate::KeyBand band;
                 band.frequency = v;
                 band.slope = 24.0f;
-                if (i == 9) band.shape = v > 20.5f ? Gate::KeyShape::LowCut : Gate::KeyShape::Off;
-                else        band.shape = v < 19999.0f ? Gate::KeyShape::HighCut : Gate::KeyShape::Off;
-                p->setSidechainBand(i - 9, band);
+                band.shape = v < 19999.0f ? Gate::KeyShape::HighCut : Gate::KeyShape::Off;
+                p->setSidechainBand(1, band);
                 break;
             }
             case 0: p->setThreshold(v); break;
@@ -756,21 +774,36 @@ inline EffectSlot makeExpander()
     s.addToggle("Key Listen", false);
     s.addSlider("Key Low Cut", 20, 2000, 20, "Hz");
     s.addSlider("Key High Cut", 500, 20000, 20000, "Hz");
+    // Where the key's low cut sits (10). Order MUST match
+    // dspark::Expander<float>::KeyPlacement (Stereo=0, Mid=1, Side=2).
+    s.addChoice("Key Low Cut On", {"Both channels","Middle","Sides"}, 0);
+    auto lowCut = std::make_shared<std::pair<float, int>>(20.0f, 0);
     s.prepareFn = [p](auto& sp) { p->prepare(sp); };
     s.processFn = [p](auto b) { p->processBlock(b); };
     s.resetFn   = [p]() { p->reset(); };
-    s.setParamFn = [p](int i, float v) {
+    s.setParamFn = [p, lowCut](int i, float v) {
         using Exp = dspark::Expander<float>;
         switch(i) {
             case 7: p->setSidechainListen(v > 0.5f); break;
-            case 8: case 9:
+            case 8: case 10:
+            {
+                if (i == 8) lowCut->first = v;
+                else        lowCut->second = static_cast<int>(v);
+                Exp::KeyBand band;
+                band.frequency = lowCut->first;
+                band.slope = 24.0f;
+                band.shape = lowCut->first > 20.5f ? Exp::KeyShape::LowCut : Exp::KeyShape::Off;
+                band.placement = static_cast<Exp::KeyPlacement>(lowCut->second);
+                p->setSidechainBand(0, band);
+                break;
+            }
+            case 9:
             {
                 Exp::KeyBand band;
                 band.frequency = v;
                 band.slope = 24.0f;
-                if (i == 8) band.shape = v > 20.5f ? Exp::KeyShape::LowCut : Exp::KeyShape::Off;
-                else        band.shape = v < 19999.0f ? Exp::KeyShape::HighCut : Exp::KeyShape::Off;
-                p->setSidechainBand(i - 8, band);
+                band.shape = v < 19999.0f ? Exp::KeyShape::HighCut : Exp::KeyShape::Off;
+                p->setSidechainBand(1, band);
                 break;
             }
             case 0: p->setThreshold(v); break;

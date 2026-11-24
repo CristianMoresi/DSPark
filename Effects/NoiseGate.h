@@ -151,6 +151,9 @@ public:
         if (nCh <= 0 || nS <= 0) return;
 
         const bool freqMode = (cachedGateMode_ == GateMode::Frequency);
+        // A band of the key's equalizer on the middle or on the sides of a
+        // pair takes the key a frame at a time.
+        const bool keyFrames = keyOn_ && nCh == 2 && keyEq_.isPlaced();
 
         for (int i = 0; i < nS; ++i)
         {
@@ -160,19 +163,22 @@ public:
             // filter between channels would corrupt its history).
             T level = T(0);
             T det0 = T(0);
-            for (int ch = 0; ch < nCh; ++ch)
-            {
-                T s = detectorSafe(buffer.getChannel(ch)[i]);
-                if (cachedScHpfEnabled_ && ch < kMaxScChannels)
-                    s = applyScHpf(s, ch);
-                if (ch < kMaxScChannels)
+            if (keyFrames)
+                level = placedKeyFrame([&](int ch) noexcept { return buffer.getChannel(ch)[i]; }, det0);
+            else
+                for (int ch = 0; ch < nCh; ++ch)
                 {
-                    if (keyOn_) s = keyEq_.processSample(s, ch);
-                    heard_[static_cast<size_t>(ch)] = s;
+                    T s = detectorSafe(buffer.getChannel(ch)[i]);
+                    if (cachedScHpfEnabled_ && ch < kMaxScChannels)
+                        s = applyScHpf(s, ch);
+                    if (ch < kMaxScChannels)
+                    {
+                        if (keyOn_) s = keyEq_.processSample(s, ch);
+                        heard_[static_cast<size_t>(ch)] = s;
+                    }
+                    if (ch == 0) det0 = s;
+                    level = std::max(level, std::abs(s));
                 }
-                if (ch == 0) det0 = s;
-                level = std::max(level, std::abs(s));
-            }
             if (keyOn_) keyEq_.advance(1);
 
             // Zero-crossing runs on the same (filtered) signal the detector
@@ -239,25 +245,29 @@ public:
         else
         {
             const bool freqMode = (cachedGateMode_ == GateMode::Frequency);
+            const bool keyFrames = keyOn_ && scCh == 2 && keyEq_.isPlaced();
 
             for (int i = 0; i < nS; ++i)
             {
                 T scMax = T(0);
                 T det0 = T(0);
-                for (int c = 0; c < scCh; ++c)
-                {
-                    T s = detectorSafe(sidechain.getChannel(c)[i]);
-                    if (cachedScHpfEnabled_ && c < kMaxScChannels)
-                        s = applyScHpf(s, c);
-                    if (c < kMaxScChannels)
+                if (keyFrames)
+                    scMax = placedKeyFrame([&](int c) noexcept { return sidechain.getChannel(c)[i]; }, det0);
+                else
+                    for (int c = 0; c < scCh; ++c)
                     {
-                        if (keyOn_) s = keyEq_.processSample(s, c);
-                        heard_[static_cast<size_t>(c)] = s;
+                        T s = detectorSafe(sidechain.getChannel(c)[i]);
+                        if (cachedScHpfEnabled_ && c < kMaxScChannels)
+                            s = applyScHpf(s, c);
+                        if (c < kMaxScChannels)
+                        {
+                            if (keyOn_) s = keyEq_.processSample(s, c);
+                            heard_[static_cast<size_t>(c)] = s;
+                        }
+                        if (c == 0) det0 = s;
+                        T a = std::abs(s);
+                        if (a > scMax) scMax = a;
                     }
-                    if (c == 0) det0 = s;
-                    T a = std::abs(s);
-                    if (a > scMax) scMax = a;
-                }
                 if (keyOn_) keyEq_.advance(1);
 
                 if (cachedAdaptiveHold_) updateZeroCrossing(det0);
@@ -438,6 +448,8 @@ public:
     using KeyBand = typename KeyEq::Band;
     /** @brief What a band of the key equalizer does. */
     using KeyShape = typename KeyEq::Shape;
+    /** @brief The part of a two-channel key a band of the key equalizer acts on. */
+    using KeyPlacement = typename KeyEq::Placement;
 
     /**
      * @brief Sets a band of the equalizer of the key.
@@ -448,11 +460,16 @@ public:
      * keeps its form glides to a new setting over 20 ms and a change of
      * shape crosses over the same time; a band that is Off costs nothing.
      * Key channels beyond 16 are read unshaped. The detector reads the
-     * loudest channel of the key, each one shaped by every band: a band's
-     * placement on the middle or the sides is not used.
+     * loudest channel of the key.
+     *
+     * With a two-channel key a band can sit on both channels, on the middle
+     * of the pair or on its sides (KeyBand::placement): a low cut on the
+     * middle keeps a centred bass from opening the gate while what is wide
+     * still does. Keys of one channel or of more than two, and
+     * processSample(), take every band on every channel.
      *
      * @param band     Band index in [0, KeyEq::kBands); others are ignored.
-     * @param settings Shape, frequency, gain, q and slope of the band.
+     * @param settings Shape, frequency, gain, q, slope and placement of the band.
      */
     void setSidechainBand(int band, const KeyBand& settings) noexcept { keyEq_.setBand(band, settings); }
 
@@ -802,6 +819,28 @@ protected:
     /** @brief Non-finite detector samples read as silence (they would latch
      *  in the envelope and filter state). */
     [[nodiscard]] static T detectorSafe(T x) noexcept { return std::isfinite(x) ? x : T(0); }
+
+    /**
+     * @brief One frame of a two-channel key whose equalizer has bands on the
+     *        middle or the sides: both channels made finite and high-passed,
+     *        then through the equalizer together (into heard_).
+     * @param sample The key of a channel in this frame.
+     * @param det0   Set to channel 0's key, for the zero-crossing tracker.
+     * @return The larger magnitude of the two.
+     */
+    template <typename Sample>
+    [[nodiscard]] T placedKeyFrame(Sample sample, T& det0) noexcept
+    {
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            T s = detectorSafe(sample(ch));
+            if (cachedScHpfEnabled_) s = applyScHpf(s, ch);
+            heard_[static_cast<size_t>(ch)] = s;
+        }
+        keyEq_.processFrame(heard_.data(), 2);
+        det0 = heard_[0];
+        return std::max(std::abs(heard_[0]), std::abs(heard_[1]));
+    }
 
     [[nodiscard]] T processSampleInternal(T input, T sidechain, int ch) noexcept
     {

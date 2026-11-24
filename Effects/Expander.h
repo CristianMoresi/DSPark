@@ -258,6 +258,8 @@ public:
     using KeyBand = typename KeyEq::Band;
     /** @brief What a band of the key equalizer does. */
     using KeyShape = typename KeyEq::Shape;
+    /** @brief The part of a two-channel key a band of the key equalizer acts on. */
+    using KeyPlacement = typename KeyEq::Placement;
 
     /**
      * @brief Sets a band of the equalizer of the key.
@@ -267,11 +269,16 @@ public:
      * programme or on the external key, and never on the audio. A band that
      * keeps its form glides to a new setting over 20 ms and a change of
      * shape crosses over the same time; a band that is Off costs nothing.
-     * The detector reads the loudest channel of the key, each one shaped by
-     * every band: a band's placement on the middle or the sides is not used.
+     * The detector reads the loudest channel of the key.
+     *
+     * With a two-channel key a band can sit on both channels, on the middle
+     * of the pair or on its sides (KeyBand::placement): a low cut on the
+     * middle keeps a centred bass from holding the expander open while what
+     * is wide still does. Keys of one channel or of more than two take every
+     * band on every channel.
      *
      * @param band     Band index in [0, KeyEq::kBands); others are ignored.
-     * @param settings Shape, frequency, gain, q and slope of the band.
+     * @param settings Shape, frequency, gain, q, slope and placement of the band.
      */
     void setSidechainBand(int band, const KeyBand& settings) noexcept { keyEq_.setBand(band, settings); }
 
@@ -454,6 +461,27 @@ protected:
     }
 
     /**
+     * @brief One sample of a channel's key before its equalizer: made finite
+     *        and, when UseHPF, through the sidechain high-pass.
+     */
+    template <bool UseHPF>
+    [[nodiscard]] T keyInput(T raw, int ch) noexcept
+    {
+        T input = std::isfinite(raw) ? raw : T(0); // non-finite would latch
+        if constexpr (UseHPF)
+        {
+            // One-pole HPF on the raw bipolar signal per channel,
+            // normalized for unity gain at Nyquist (the unnormalized
+            // form boosted the detected HF slightly).
+            T output = cachedScHpfA0_ * (input - scHpfPrev_[ch]) + cachedScHpfCoeff_ * scHpfState_[ch];
+            scHpfPrev_[ch] = input;
+            scHpfState_[ch] = output;
+            input = output;
+        }
+        return input;
+    }
+
+    /**
      * @brief Internal processing loop templated on HPF/sidechain to avoid branching.
      * @tparam UseHPF Compile-time flag to include HPF processing.
      * @tparam UseSc  Compile-time flag: detector keyed by the external sidechain.
@@ -476,6 +504,26 @@ protected:
         const int m = std::min(kDetChunk, nS - c0);
         std::fill(detLevel_.begin(), detLevel_.begin() + m, T(0));
 
+        // A band of the key's equalizer on the middle or on the sides of a
+        // pair takes the key a frame at a time, before each channel is read.
+        const bool keyFrames = keyOn_ && detCh == 2 && keyEq_.isPlaced();
+        if (keyFrames)
+        {
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                const T* src = (UseSc ? sidechain->getChannel(ch) : buffer.getChannel(ch)) + c0;
+                for (int j = 0; j < m; ++j)
+                    heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)] = keyInput<UseHPF>(src[j], ch);
+            }
+            for (int j = 0; j < m; ++j)
+            {
+                T pair[2] = { heard_[0][static_cast<size_t>(j)], heard_[1][static_cast<size_t>(j)] };
+                keyEq_.processFrame(pair, 2);
+                heard_[0][static_cast<size_t>(j)] = pair[0];
+                heard_[1][static_cast<size_t>(j)] = pair[1];
+            }
+        }
+
         // 1. Detector key per channel: sanitised, high-passed, then the larger
         //    of the rectified sample and the analytic magnitude (computed
         //    section by section over the chunk, like DynamicEQ).
@@ -484,19 +532,14 @@ protected:
             const T* src = (UseSc ? sidechain->getChannel(ch) : buffer.getChannel(ch)) + c0;
             for (int j = 0; j < m; ++j)
             {
-                T input = std::isfinite(src[j]) ? src[j] : T(0); // non-finite would latch
-                if constexpr (UseHPF)
+                T input;
+                if (keyFrames) input = heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)];
+                else
                 {
-                    // One-pole HPF on the raw bipolar signal per channel,
-                    // normalized for unity gain at Nyquist (the unnormalized
-                    // form boosted the detected HF slightly).
-                    T output = cachedScHpfA0_ * (input - scHpfPrev_[ch]) + cachedScHpfCoeff_ * scHpfState_[ch];
-                    scHpfPrev_[ch] = input;
-                    scHpfState_[ch] = output;
-                    input = output;
+                    input = keyInput<UseHPF>(src[j], ch);
+                    if (keyOn_) input = keyEq_.processSample(input, ch);
+                    if (listen_) heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)] = input;
                 }
-                if (keyOn_) input = keyEq_.processSample(input, ch);
-                if (listen_) heard_[static_cast<size_t>(ch)][static_cast<size_t>(j)] = input;
                 detIn_[static_cast<size_t>(j)] = static_cast<double>(input);
             }
             analytic_[static_cast<size_t>(ch)].magnitudeBlock(detIn_.data(), detMag_.data(), m);

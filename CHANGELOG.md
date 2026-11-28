@@ -2,6 +2,62 @@
 
 All notable user-facing changes to DSPark are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- `Oscillator::processBlock()` writes the stretches between discontinuities in
+  closed form on vector kernels (SSE2 and NEON, AVX2 selected at run time) and
+  sends only the sample whose interval holds a discontinuity through the
+  per-sample path. It returns what `getNextSample()` returns, bit for bit, for
+  every waveform, correction, pitch from 0 Hz to Nyquist, pulse width and block
+  length, with parameters changing between blocks, on both kernel sets and on
+  targets with a fused multiply-add, and it leaves the same state, so the two
+  can be mixed freely. At 48 kHz in blocks of 64, ns per sample before and
+  after (GCC -O2): minBLEP saw 3.52 -> 0.36 at 55 Hz, 4.27 -> 0.81 at 440 Hz,
+  6.50 -> 2.08 at 1760 Hz and 15.8 -> 7.4 at 7040 Hz; square 4.02 -> 0.42,
+  5.56 -> 1.10, 10.4 -> 3.5 and 31.9 -> 11.4; triangle 4.31 -> 1.73,
+  5.64 -> 2.17, 10.2 -> 3.6 and 32.4 -> 11.8; PolyBLEP saw 3.68 -> 0.23,
+  3.84 -> 0.41 and 3.82 -> 0.96 at the first three. MSVC: minBLEP saw
+  4.45 -> 0.39 and 4.82 -> 0.91, square 6.14 -> 0.38 and 6.76 -> 1.14 at 55
+  and 440 Hz. Hard sync, the sine and pitches above a sixteenth of the sample
+  rate (an eighth for the saw) are rendered sample by sample inside it: their
+  stretches are too short to gain.
+- `Oscillator::getNextSample()` costs less on every waveform. Each
+  discontinuity adds its 128-tap correction with the vector kernels as one
+  contiguous run (the pending corrections are stored linearly from the sample
+  being emitted), nothing is read from that store while none is pending, the
+  discontinuities are handled out of line, and the phase is advanced and
+  stored before the waveform is worked out. At 48 kHz, ns per sample before
+  and after (GCC -O2): minBLEP saw 3.52 -> 3.35 at 55 Hz, 4.27 -> 3.72 at
+  440 Hz, 6.50 -> 4.40 at 1760 Hz, 15.8 -> 7.4 at 7040 Hz and 29.7 -> 11.6 at
+  14080 Hz; square 4.02 -> 3.36, 5.56 -> 4.02, 10.4 -> 5.3, 31.9 -> 11.5 and
+  59.0 -> 21.2; PolyBLEP at 440 Hz saw 3.84 -> 3.33 and square 4.24 -> 3.55;
+  sine 6.38 -> 5.72. MSVC at 440 Hz: minBLEP saw 4.82 -> 4.01 and square
+  6.76 -> 4.25, PolyBLEP saw 3.85 -> 3.44, square 5.72 -> 4.28 and triangle
+  5.34 -> 4.42; its sine stays within 2 to 6 % of before (4.54 -> 4.62).
+- `Oscillator`: the phase and its increment are kept on a grid of 2^-52 of a
+  cycle (1.1e-11 Hz at 48 kHz), on which every addition and wrap is exact: the
+  accumulator carries no rounding error however long it runs, and the phase a
+  number of samples ahead is the increment times that number. The output
+  moves in its last bits; the worst inharmonic component below 20 kHz is the
+  same to 0.1 dB on the 40 pitch and waveform cases measured at 44.1 and
+  48 kHz. `setFrequency()` multiplies by the reciprocal of the sample rate
+  instead of dividing, and skips the sync slave's values while no sync is
+  asked for.
+- `MinBlepTable::addStep()`, `addDelayedStep()` and `addDelayedRamp()` add
+  their rows with vector kernels that perform the scalar loop's operations
+  lane by lane.
+- `Synthesizer`: the analog oscillators and the sub-oscillator render a steady
+  pitch and pulse width through `Oscillator::processBlock()`, the same samples
+  as one by one (the output moves in its last bits with the oscillator's phase
+  grid, and stays the same to the bit for any block size). Eight voices held
+  at 48 kHz, ns per voice and sample before and after, GCC -O2 and MSVC: one
+  saw without filter 21.1 -> 18.9 and 22.9 -> 20.1; three oscillators and the
+  sub 36.3 -> 26.0 and 42.2 -> 27.6; the default patch 41.8 -> 39.7 and
+  45.0 -> 42.6; one saw with analog drift, whose pitch moves every sample and
+  stays on the per-sample path, 24.7 -> 24.3 and 28.2 -> 28.0.
+
 ## [1.9.0] - 2026-11-24
 
 ### Added

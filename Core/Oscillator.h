@@ -33,13 +33,20 @@
  *   -160 dB at 220 Hz x 1.5, -111 dB at 880 Hz x 1.5, and -47 dB at
  *   2.5 kHz x 4.3, where its higher-order discontinuities remain.
  * - Phase, increments and edge times in double whatever T, and the triangle
- *   integrator too (framework rule for recursive state).
+ *   integrator too (framework rule for recursive state). The phase and its
+ *   increment are kept on a grid of 2^-52 of a cycle (1.1e-11 Hz at 48 kHz),
+ *   on which the accumulator is exact: it carries no rounding error however
+ *   long it runs.
+ * - processBlock() writes the stretches between discontinuities in closed
+ *   form with vector kernels and returns what getNextSample() returns, bit
+ *   for bit.
  * - Pitch can change every sample: setFrequency() is cheap for every
  *   waveform (the triangle's normalization follows its increment by a
  *   first-order update, re-solved exactly beyond 0.1% of change).
  * - Zero allocations after prepare(); the shared minBLEP table builds once there.
  *
- * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, MinBlepTable.h.
+ * Dependencies: DspMath.h, AudioSpec.h, AudioBuffer.h, MinBlepTable.h
+ * (and through it SimdOps.h and detail/BlepKernels.inl).
  */
 
 #include "DspMath.h"
@@ -52,7 +59,60 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <type_traits>
+
+// Keeps the per-sample loop of processBlock() out of line, so that
+// getNextSample() has one call site in this header and a caller's own loop
+// over it is inlined as before. Locally defined and guarded, the same way
+// Core/Biquad.h spells it.
+#ifndef DSPARK_NOINLINE
+  #if defined(_MSC_VER)
+    #define DSPARK_NOINLINE __declspec(noinline)
+  #elif defined(__GNUC__) || defined(__clang__)
+    #define DSPARK_NOINLINE __attribute__((noinline))
+  #else
+    #define DSPARK_NOINLINE
+  #endif
+#endif
+
+// The two-line accessors of the correction store, always inside their callers.
+#if defined(_MSC_VER)
+  #define DSPARK_OSC_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+  #define DSPARK_OSC_INLINE inline __attribute__((always_inline))
+#else
+  #define DSPARK_OSC_INLINE inline
+#endif
+
+// MSVC decides about getNextSample() by its size and leaves polyBlep() as a
+// call (two per sample of a PolyBLEP pulse or triangle). There both are
+// forced into their callers, and the minBLEP path stays a function of its
+// own so that what is inlined into a caller's loop remains small. The other
+// compilers already inline all three.
+#if defined(_MSC_VER) && !defined(__clang__)
+  #define DSPARK_OSC_OUTLINE DSPARK_NOINLINE
+  #define DSPARK_OSC_MSVC_INLINE __forceinline
+#else
+  #define DSPARK_OSC_OUTLINE
+  #define DSPARK_OSC_MSVC_INLINE inline
+#endif
+
+// Marks a value as rounded here: the compiler may not fuse the product that
+// made it with a later sum (see Oscillator::integrateTriangle()). An empty
+// statement on the value's register where the compiler takes one, a pass
+// through memory on other GCC targets, nothing where products and sums are
+// only fused inside one expression.
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER) \
+    && (defined(__x86_64__) || defined(__i386__)) && defined(__SSE2__)
+  #define DSPARK_OSC_ROUNDED(value) __asm__ volatile("" : "+x"(value))
+#elif (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER) && defined(__aarch64__)
+  #define DSPARK_OSC_ROUNDED(value) __asm__ volatile("" : "+w"(value))
+#elif defined(__GNUC__) && !defined(__clang__)
+  #define DSPARK_OSC_ROUNDED(value) do { volatile double held = (value); (value) = held; } while (false)
+#else
+  #define DSPARK_OSC_ROUNDED(value) static_cast<void>(value)
+#endif
 
 namespace dspark {
 
@@ -120,6 +180,8 @@ public:
         assert(sampleRate > 0.0);
         if (!(sampleRate > 0.0) || !std::isfinite(sampleRate)) return;
         sampleRate_ = sampleRate;
+        invSampleRate_ = 1.0 / sampleRate;
+        nyquist_ = static_cast<T>(sampleRate * 0.5);
         // Touch the shared minBLEP table here so its one-time FFT build runs
         // on the control thread, never inside the audio callback.
         blepDelay_ = static_cast<Phase>(MinBlepTable<T>::instance().dcDelay());
@@ -147,8 +209,7 @@ public:
         // accumulator forever. Matches Phasor/WavetableOscillator guards.
         if (freq != freq) return;
         // Clamp frequency to valid bounds [0, Nyquist] to prevent aliasing breakdown
-        T nyquist = static_cast<T>(sampleRate_ * 0.5);
-        frequency_ = std::clamp(freq, T(0), nyquist);
+        frequency_ = std::clamp(freq, T(0), nyquist_);
         updatePhaseInc();
     }
 
@@ -274,8 +335,9 @@ public:
     {
         if (!std::isfinite(phase)) return;
         // Wrap (not clamp): a phase of exactly 1.0 must land on 0.0 so the
-        // first sample is not a one-off discontinuity.
-        phase_ = static_cast<Phase>(phase) - std::floor(static_cast<Phase>(phase));
+        // first sample is not a one-off discontinuity. The phase is kept on
+        // the phase grid (see toGrid()).
+        phase_ = toGrid(static_cast<Phase>(phase) - std::floor(static_cast<Phase>(phase)));
         if (phase_ >= 1.0) phase_ -= 1.0;
 
         if (syncOn_)
@@ -302,8 +364,7 @@ public:
     {
         phase_ = 0.0;
         slavePhase_ = 0.0;
-        corr_.fill(T(0));
-        corrHead_ = 0;
+        clearCorrections();
         resetAge_ = { kNoReset, kNoReset };
         if (!syncOn_) primeMinBlep();
         seedTriangle();
@@ -315,83 +376,103 @@ public:
      *         minBLEP edges (the default, and hard sync) ring to ~1.45x full
      *         scale -- Gibbs, see setAntiAliasing().
      */
-    [[nodiscard]] inline T getNextSample() noexcept
+    [[nodiscard]] DSPARK_OSC_MSVC_INLINE T getNextSample() noexcept
     {
-        if (syncOn_)
+        // The branches taken once or twice a cycle (a correction, a wrap) are
+        // marked unlikely here and in polyBlep(): the compiler then lays the
+        // run of every other sample out straight, wherever this is inlined.
+        if (syncOn_) [[unlikely]]
             return nextSyncSample();
         if (antiAliasing_ == AntiAliasing::MinBLEP && waveform_ != Waveform::Sine)
             return nextMinBlepSample();
 
-        T out = T(0);
+        // The phase is advanced and stored first, and the waveform is worked
+        // out from the value it had: the next sample's read of the phase then
+        // never waits behind this sample's waveform. (Fast wrap: positive
+        // frequencies only, enforced in setFrequency().)
+        const Phase ph = phase_;
+        const Phase inc = phaseInc_;
+        Phase next = ph + inc;
+        if (next >= 1.0) [[unlikely]] next -= 1.0;
+        phase_ = next;
 
         switch (waveform_)
         {
             case Waveform::Sine:
                 // fastSin: minimax error ~2e-7 in float / 4e-9 in double
                 // (-135 / -168 dB), 3-6x faster than std::sin.
-                out = static_cast<T>(fastSin(phase_ * twoPi<Phase>));
-                break;
+                return static_cast<T>(fastSin(ph * twoPi<Phase>));
 
             case Waveform::Saw:
-                out = static_cast<T>(2.0 * phase_ - 1.0 - polyBlep(phase_, phaseInc_));
-                break;
+                return static_cast<T>(2.0 * ph - 1.0 - polyBlep(ph, inc));
 
             case Waveform::Square:
             {
-                Phase raw = (phase_ < pulseWidth_) ? 1.0 : -1.0;
-                raw += polyBlep(phase_, phaseInc_);
+                Phase raw = (ph < pulseWidth_) ? 1.0 : -1.0;
+                raw += polyBlep(ph, inc);
 
                 // Phase relative to the falling edge at pulseWidth_ (optimized
                 // shift without std::fmod; 0.5 for the symmetric square).
-                Phase halfPhase = phase_ + (1.0 - static_cast<Phase>(pulseWidth_));
+                Phase halfPhase = ph + (1.0 - static_cast<Phase>(pulseWidth_));
                 if (halfPhase >= 1.0) halfPhase -= 1.0;
 
-                raw -= polyBlep(halfPhase, phaseInc_);
-                out = static_cast<T>(raw - static_cast<Phase>(pulseDc_));
-                break;
+                raw -= polyBlep(halfPhase, inc);
+                return static_cast<T>(raw - static_cast<Phase>(pulseDc_));
             }
 
             case Waveform::Triangle:
             {
-                Phase raw = (phase_ < 0.5) ? 1.0 : -1.0;
-                raw += polyBlep(phase_, phaseInc_);
+                Phase raw = (ph < 0.5) ? 1.0 : -1.0;
+                raw += polyBlep(ph, inc);
 
-                Phase halfPhase = phase_ + 0.5;
+                Phase halfPhase = ph + 0.5;
                 if (halfPhase >= 1.0) halfPhase -= 1.0;
-                raw -= polyBlep(halfPhase, phaseInc_);
+                raw -= polyBlep(halfPhase, inc);
 
                 // Leaky integration for analog-style triangle. The recursion
                 // runs in double (framework rule for recursive state): with a
                 // float accumulator, slow LFO rates quantise near the peaks.
-                const double inc = static_cast<double>(phaseInc_);
-                triState_ = inc * static_cast<double>(raw) + (1.0 - inc) * triState_;
-                out = static_cast<T>(triState_) * triNorm_;
-                break;
+                triState_ = integrateTriangle(triState_, inc, raw);
+                return static_cast<T>(triState_) * triNorm_;
             }
         }
-
-        // Fast phase wrap assuming positive frequencies only (enforced in setFrequency)
-        phase_ += phaseInc_;
-        if (phase_ >= 1.0) phase_ -= 1.0;
-
-        return out;
+        return T(0);
     }
 
     /**
      * @brief Fills a buffer with generated samples.
      *
-     * Plain per-sample loop over getNextSample(): waveform generation is
-     * inherently serial (recursive phase/integrator state), so there is no
-     * SIMD variant and no alignment requirement on @p buffer.
+     * Returns exactly what the same number of getNextSample() calls would,
+     * bit for bit, and leaves the oscillator in the same state, so the two
+     * can be mixed freely. Between two discontinuities the waveform is a
+     * closed form of the phase: those stretches are written by vector
+     * kernels (the ramp, the pending minBLEP corrections and the pulse
+     * level, several samples at a time), and only the sample whose interval
+     * holds a discontinuity goes through the per-sample path. Hard sync, the
+     * sine and pitches whose stretches are a few samples long (above a
+     * sixteenth of the sample rate, an eighth for the saw) are rendered
+     * sample by sample: there the closed form saves nothing.
      *
      * @param buffer Destination pointer (any alignment).
      * @param numSamples Number of samples to generate.
      */
     void processBlock(T* buffer, size_t numSamples) noexcept
     {
-        for (size_t i = 0; i < numSamples; ++i)
+        const Phase longest = waveform_ == Waveform::Saw ? kBlockSawInc : kBlockPulseInc;
+        if (syncOn_ || waveform_ == Waveform::Sine || phaseInc_ > longest)
         {
-            buffer[i] = getNextSample();
+            renderSamples(buffer, numSamples);
+            return;
+        }
+        size_t i = 0;
+        while (i < numSamples)
+        {
+            i += renderQuiet(buffer + i, numSamples - i);
+            if (i < numSamples)
+            {
+                renderSamples(buffer + i, 1);
+                ++i;
+            }
         }
     }
 
@@ -414,8 +495,7 @@ public:
             return;
         }
         T* ch0 = buffer.getChannel(0);
-        for (int i = 0; i < nS; ++i)
-            ch0[i] = getNextSample();
+        processBlock(ch0, static_cast<size_t>(std::max(nS, 0)));
         for (int ch = 1; ch < nCh; ++ch)
             std::copy_n(ch0, static_cast<size_t>(nS), buffer.getChannel(ch));
     }
@@ -427,6 +507,225 @@ public:
     [[nodiscard]] T getPulseWidth() const noexcept { return pulseWidth_; }
 
 private:
+    /// Largest increments processBlock() renders in closed form: beyond them
+    /// a stretch between discontinuities is too short to gain from it.
+    static constexpr Phase kBlockSawInc = 1.0 / 8.0;
+    static constexpr Phase kBlockPulseInc = 1.0 / 16.0;
+
+    /** @brief The per-sample loop of processBlock(), out of line. */
+    DSPARK_NOINLINE void renderSamples(T* out, size_t n) noexcept
+    {
+        for (size_t i = 0; i < n; ++i)
+            out[i] = getNextSample();
+    }
+
+    /**
+     * @brief One step of the triangle's leaky integrator: the state decays
+     *        by 1 - inc and takes inc times the drive.
+     *
+     * The drive term is rounded on its own before the sum, so the only
+     * product a compiler can fuse with the addition is the decay's: the same
+     * one in getNextSample() and in processBlock(), which therefore agree
+     * bit for bit on targets with a fused multiply-add too. (Left to itself
+     * a compiler fuses whichever product it meets first, and that changes
+     * with the code around the expression.)
+     */
+    [[nodiscard]] static DSPARK_OSC_INLINE double integrateTriangle(double state, double inc, double drive) noexcept
+    {
+        double term = inc * drive;
+        DSPARK_OSC_ROUNDED(term);
+        return (1.0 - inc) * state + term;
+    }
+
+    /**
+     * @brief Rounds a phase or an increment in [0, 1] to the phase grid.
+     *
+     * The grid is 2^-52 of a cycle, the spacing of the doubles in [1, 2).
+     * Every multiple of it below 2 is a double, so with the phase and its
+     * increment on the grid each `phase += increment` and each wrap is
+     * exact: the accumulator carries no rounding error at all, and the phase
+     * n samples ahead is exactly `phase + n * increment` while it stays
+     * below the wrap. processBlock() relies on that to write a stretch in
+     * closed form and still match getNextSample() bit for bit. The grid is
+     * 1.1e-11 Hz wide at 48 kHz.
+     */
+    [[nodiscard]] static Phase toGrid(Phase x) noexcept
+    {
+        constexpr Phase kGrid = 4503599627370496.0;   // 2^52
+        return static_cast<Phase>(static_cast<std::int64_t>(x * kGrid + 0.5)) * (1.0 / kGrid);
+    }
+
+    /**
+     * @brief How many of the next samples (at most @p cap) advance without
+     *        reaching @p limit: the count of j >= 0 with
+     *        ph + (j + 1) * inc < limit.
+     *
+     * Exact: ph and inc lie on the phase grid, so every sum compared here is
+     * the phase the per-sample recursion reaches.
+     */
+    [[nodiscard]] static size_t quietAdvances(Phase ph, Phase inc, Phase limit, size_t cap) noexcept
+    {
+        if (cap == 0) return 0;
+        if (!(inc > 0.0)) return ph < limit ? cap : 0;
+        // The usual case of a short block: all of it fits.
+        if (ph + static_cast<Phase>(cap) * inc < limit) return cap;
+        if (!(ph + inc < limit)) return 0;
+        const Phase estimate = (limit - ph) / inc;
+        size_t k = estimate >= static_cast<Phase>(cap) ? cap : static_cast<size_t>(estimate);
+        if (k < 1) k = 1;
+        while (k > 1 && !(ph + static_cast<Phase>(k) * inc < limit)) --k;
+        while (k < cap && ph + static_cast<Phase>(k + 1) * inc < limit) ++k;
+        return k;
+    }
+
+    /// Longest stretch renderQuiet() writes in one call.
+    static constexpr size_t kQuietCap = 4096;
+    /// Guard band around the PolyBLEP corrections' ends, in cycles: wider
+    /// than any rounding of the phases they test, far below an increment.
+    static constexpr Phase kPolyGuard = 1e-9;
+
+    /**
+     * @brief Writes the samples ahead whose intervals hold no discontinuity
+     *        (and, for PolyBLEP, no correction), in closed form.
+     *
+     * Each of them is what getNextSample() returns for it, bit for bit, and
+     * the state is left as that many calls leave it. Stops before the first
+     * sample that needs the per-sample path; never called under hard sync.
+     *
+     * @return Samples written (0 when the next one is not such a sample).
+     */
+    [[nodiscard]] size_t renderQuiet(T* out, size_t n) noexcept
+    {
+        if (n == 0) return 0;
+        n = std::min(n, kQuietCap);
+        const Phase ph = phase_;
+        const Phase inc = phaseInc_;
+        const bool minBlep = antiAliasing_ == AntiAliasing::MinBLEP;
+        size_t q = 0;
+
+        // Renders the next `count` samples in two parts: while corrections
+        // are pending, `withStore(offset, slots, length)` over their slots,
+        // in pieces that end where the store is rebased or emptied; then
+        // `without(offset, length)` for the rest, which have none to add.
+        const auto overStore = [this](size_t count, auto&& withStore, auto&& without) noexcept {
+            size_t done = 0;
+            while (done < count && corrEnd_ != 0)
+            {
+                const int span = std::min(corrEnd_, kCorrLen) - corrHead_;
+                const auto len = static_cast<int>(std::min<size_t>(count - done, static_cast<size_t>(span)));
+                withStore(done, corr_.data() + corrHead_, len);
+                done += static_cast<size_t>(len);
+                advanceCorrections(len);
+            }
+            if (done < count) without(done, count - done);
+        };
+        // The stretch of a PolyBLEP square whose corrections are all zero:
+        // phases at least one increment (and the guard) from both edges.
+        const auto polyZone = [&](Phase edge, Phase& level) noexcept -> size_t {
+            const Phase margin = inc + kPolyGuard;
+            Phase limit;
+            if (ph >= margin && ph < edge - margin)            { limit = edge - margin; level = 1.0; }
+            else if (ph >= edge + margin && ph < 1.0 - margin) { limit = 1.0 - margin;  level = -1.0; }
+            else return 0;
+            return 1 + quietAdvances(ph, inc, limit, n - 1);
+        };
+
+        switch (waveform_)
+        {
+            case Waveform::Sine:
+                return 0;   // processBlock() renders the sine sample by sample
+
+            case Waveform::Saw:
+                if (minBlep)
+                {
+                    q = quietAdvances(ph, inc, 1.0, n);
+                    const T offset = sawDelay_;
+                    overStore(q,
+                        [&](size_t at, T* ring, int len) noexcept {
+                            const Phase start = ph + static_cast<Phase>(at) * inc;
+                            detail::rampOverBlepRing(out + at, ring, len, 2.0 * start - 1.0, 2.0 * inc, offset);
+                        },
+                        [&](size_t at, size_t len) noexcept {
+                            const Phase start = ph + static_cast<Phase>(at) * inc;
+                            detail::rampMinusOffset(out + at, static_cast<int>(len), 2.0 * start - 1.0, 2.0 * inc, offset);
+                        });
+                }
+                else
+                {
+                    // Past the rising correction (phase < increment); the
+                    // falling one begins where the advance would wrap.
+                    if (!(inc < 1e-10) && ph < inc) return 0;
+                    q = quietAdvances(ph, inc, 1.0, n);
+                    detail::rampBlock(out, static_cast<int>(q), 2.0 * ph - 1.0, 2.0 * inc);
+                }
+                break;
+
+            case Waveform::Square:
+                if (minBlep)
+                {
+                    const Phase edge = fallingEdge();
+                    const bool high = ph < edge;
+                    const T level = high ? T(1) : T(-1);
+                    q = quietAdvances(ph, inc, high ? edge : 1.0, n);
+                    overStore(q,
+                        [&](size_t at, T* ring, int len) noexcept {
+                            detail::levelOverBlepRing(out + at, ring, len, level, pulseDc_);
+                        },
+                        [&](size_t at, size_t len) noexcept { std::fill_n(out + at, len, level - pulseDc_); });
+                }
+                else
+                {
+                    Phase level = 0.0;
+                    q = polyZone(fallingEdge(), level);
+                    std::fill_n(out, q, static_cast<T>(level - static_cast<Phase>(pulseDc_)));
+                }
+                break;
+
+            case Waveform::Triangle:
+            {
+                double tri = triState_;
+                const T norm = triNorm_;
+                if (minBlep)
+                {
+                    const bool high = ph < 0.5;
+                    const T level = high ? T(1) : T(-1);
+                    q = quietAdvances(ph, inc, high ? 0.5 : 1.0, n);
+                    overStore(q,
+                        [&](size_t at, T* ring, int len) noexcept {
+                            for (int k = 0; k < len; ++k)
+                            {
+                                const T raw = level + ring[k];
+                                ring[k] = T(0);
+                                tri = integrateTriangle(tri, inc, static_cast<double>(raw));
+                                out[at + static_cast<size_t>(k)] = static_cast<T>(tri) * norm;
+                            }
+                        },
+                        [&](size_t at, size_t len) noexcept {
+                            for (size_t k = 0; k < len; ++k)
+                            {
+                                tri = integrateTriangle(tri, inc, static_cast<double>(level));
+                                out[at + k] = static_cast<T>(tri) * norm;
+                            }
+                        });
+                }
+                else
+                {
+                    Phase level = 0.0;
+                    q = polyZone(0.5, level);
+                    for (size_t j = 0; j < q; ++j)
+                    {
+                        tri = integrateTriangle(tri, inc, level);
+                        out[j] = static_cast<T>(tri) * norm;
+                    }
+                }
+                triState_ = tri;
+                break;
+            }
+        }
+        phase_ = ph + static_cast<Phase>(q) * inc;
+        return q;
+    }
+
     /** @brief Raw (pre-BLEP) slave waveform value at a given phase. */
     [[nodiscard]] T rawSlaveValue(Phase ph) const noexcept
     {
@@ -503,8 +802,7 @@ private:
      */
     void primeMinBlep() noexcept
     {
-        corr_.fill(T(0));
-        corrHead_ = 0;
+        clearCorrections();
         if (antiAliasing_ != AntiAliasing::MinBLEP || waveform_ == Waveform::Sine
             || !(phaseInc_ > 0.0))
             return;
@@ -545,75 +843,89 @@ private:
      * residual of each edge crossed inside the interval (at most one: the
      * increment is clamped to 0.5).
      */
-    [[nodiscard]] T nextMinBlepSample() noexcept
+    [[nodiscard]] DSPARK_OSC_OUTLINE T nextMinBlepSample() noexcept
     {
-        T raw = rawSlaveValue(phase_) + corr_[static_cast<size_t>(corrHead_)];
-        corr_[static_cast<size_t>(corrHead_)] = T(0);
-        corrHead_ = (corrHead_ + 1) & kCorrMask;   // now the NEXT sample's slot
+        // The waveform is decided once, and each one is a straight run:
+        // this is the path of every sample. The interval's discontinuities
+        // are handled out of line (an edge comes once or twice a cycle; an
+        // increment of zero crosses nothing, the phase does not move).
+        const T pending = takeCorrection();
+        const Phase old = phase_;
+        const Phase next = old + phaseInc_;
+        phase_ = next;
+        switch (waveform_)
+        {
+            case Waveform::Saw:
+            {
+                // The ramp is delayed by the minBLEP's own low-frequency
+                // delay so the band-limited jumps and the slope stay
+                // time-aligned (see MinBlepTable::dcDelay): without this the
+                // saw carries a DC offset of 2 * dcDelay * f0 / fs. The term
+                // is kept ready (sawDelay_), one value for this path and for
+                // renderQuiet().
+                const T out = (static_cast<T>(2.0 * old - 1.0) + pending) - sawDelay_;
+                if (next >= 1.0) [[unlikely]] crossEdges(old);
+                return out;
+            }
+            case Waveform::Square:
+            {
+                const Phase edge = static_cast<Phase>(pulseWidth_);
+                const bool high = old < edge;
+                // AC-coupled pulse (pulseDc_ is zero at the 0.5 default).
+                const T out = ((high ? T(1) : T(-1)) + pending) - pulseDc_;
+                if ((high && next >= edge) || next >= 1.0) [[unlikely]] crossEdges(old);
+                return out;
+            }
+            case Waveform::Triangle:
+            {
+                // Leaky integration of the band-limited square (double state:
+                // framework rule for recursive state).
+                const bool high = old < 0.5;
+                const T raw = (high ? T(1) : T(-1)) + pending;
+                triState_ = integrateTriangle(triState_, static_cast<double>(phaseInc_), static_cast<double>(raw));
+                const T out = static_cast<T>(triState_) * triNorm_;
+                if ((high && next >= 0.5) || next >= 1.0) [[unlikely]] crossEdges(old);
+                return out;
+            }
+            case Waveform::Sine:
+                break;   // the sine has no discontinuity: getNextSample() never sends it here
+        }
+        return T(0);
+    }
 
-        T out = raw;
+    /**
+     * @brief Queues the corrections of the discontinuities inside the
+     *        interval just advanced over (from @p old to the phase), and
+     *        wraps the phase.
+     *
+     * The time from an edge to the next sample is the phase past it over
+     * the increment. The saw falls by 2 at its wrap. The square (or the
+     * triangle's drive) rises by 2 at the wrap and falls by 2 at its falling
+     * edge; a narrow or wide pulse can put both inside one interval -- the
+     * falling edge before the wrap (width near 1) or after it (width near 0)
+     * -- so the candidates are taken in time order. The symmetric square
+     * (increment <= 0.5) never reaches a second one.
+     */
+    DSPARK_NOINLINE void crossEdges(Phase old) noexcept
+    {
+        const Phase perCycle = samplesPerCycle();
         if (waveform_ == Waveform::Saw)
         {
-            // Delay the ramp by the minBLEP's own low-frequency delay so the
-            // band-limited jumps and the slope stay time-aligned (see
-            // MinBlepTable::dcDelay): without this the saw carries a DC offset
-            // of 2 * dcDelay * f0 / fs.
-            out -= static_cast<T>(2.0 * phaseInc_ * blepDelay_);
+            scheduleMinBlep(T(-2), (phase_ - 1.0) * perCycle);
         }
-        else if (waveform_ == Waveform::Square)
+        else
         {
-            out -= pulseDc_;   // AC-coupled pulse (zero at the 0.5 default)
-        }
-        else if (waveform_ == Waveform::Triangle)
-        {
-            // Leaky integration of the band-limited square (double state:
-            // framework rule for recursive state).
-            const double inc = static_cast<double>(phaseInc_);
-            triState_ = inc * static_cast<double>(raw) + (1.0 - inc) * triState_;
-            out = static_cast<T>(triState_) * triNorm_;
-        }
-
-        const Phase old = phase_;
-        phase_ += phaseInc_;
-        if (phaseInc_ > 0.0)
-        {
-            if (waveform_ == Waveform::Saw)
+            const Phase edge = fallingEdge();
+            if (old < edge && phase_ >= edge)
+                scheduleMinBlep(T(-2), (phase_ - edge) * perCycle);
+            if (phase_ >= 1.0)
             {
-                if (phase_ >= 1.0)
-                {
-                    // Wrap: the saw falls by 2.
-                    const Phase alpha = (1.0 - old) / phaseInc_;
-                    scheduleMinBlep(T(-2), 1.0 - alpha);
-                }
-            }
-            else
-            {
-                // The square (or the triangle's drive) rises by 2 at the wrap
-                // and falls by 2 at its falling edge. A narrow or wide pulse
-                // can put both inside one interval -- the falling edge before
-                // the wrap (width near 1) or after it (width near 0) -- so the
-                // candidates are taken in time order. The symmetric square
-                // (increment <= 0.5) never reaches a second one.
-                const Phase edge = fallingEdge();
-                if (old < edge && phase_ >= edge)
-                {
-                    const Phase alpha = (edge - old) / phaseInc_;
-                    scheduleMinBlep(T(-2), 1.0 - alpha);
-                }
-                if (phase_ >= 1.0)
-                {
-                    const Phase alpha = (1.0 - old) / phaseInc_;
-                    scheduleMinBlep(T(2), 1.0 - alpha);
-                    if (phase_ >= 1.0 + edge)
-                    {
-                        const Phase alphaFall = (1.0 + edge - old) / phaseInc_;
-                        scheduleMinBlep(T(-2), 1.0 - alphaFall);
-                    }
-                }
+                scheduleMinBlep(T(2), (phase_ - 1.0) * perCycle);
+                if (phase_ >= 1.0 + edge)
+                    scheduleMinBlep(T(-2), (phase_ - (1.0 + edge)) * perCycle);
             }
         }
         if (phase_ >= 1.0) phase_ -= 1.0;
-        return out;
     }
 
     /**
@@ -638,9 +950,7 @@ private:
         const T naive = (waveform_ == Waveform::Sine)
             ? static_cast<T>(fastSin(delayedSinePhase() * twoPi<Phase>))
             : rawSlaveValue(slavePhase_);
-        T raw = naive + corr_[static_cast<size_t>(corrHead_)];
-        corr_[static_cast<size_t>(corrHead_)] = T(0);
-        corrHead_ = (corrHead_ + 1) & kCorrMask;   // now the NEXT sample's slot
+        T raw = naive + takeCorrection();
         resetAge_[0] += 1.0;
         resetAge_[1] += 1.0;
 
@@ -721,8 +1031,9 @@ private:
                 const Phase age = 1.0 - alphaSync;
                 const auto slopeJump = static_cast<T>(
                     twoPi<Phase> * slaveInc_ * (1.0 - std::cos(twoPi<Phase> * atJump)));
-                table.addDelayedStep(corr_.data(), corrHead_, jump, static_cast<T>(age));
-                table.addDelayedRamp(corr_.data(), corrHead_, slopeJump, static_cast<T>(age));
+                table.addDelayedStep(corr_.data() + corrHead_, 0, jump, static_cast<T>(age));
+                table.addDelayedRamp(corr_.data() + corrHead_, 0, slopeJump, static_cast<T>(age));
+                corrEnd_ = corrHead_ + kCorrLen;
                 resetAge_[1] = resetAge_[0];
                 prePhase_[1] = prePhase_[0];
                 resetAge_[0] = age;
@@ -749,7 +1060,71 @@ private:
      */
     void scheduleMinBlep(T jump, Phase frac) noexcept
     {
-        MinBlepTable<T>::instance().addStep(corr_.data(), corrHead_, jump, static_cast<T>(frac));
+        // The store is linear from its head (see corr_): one contiguous run.
+        MinBlepTable<T>::instance().addStep(corr_.data() + corrHead_, 0, jump, static_cast<T>(frac));
+        corrEnd_ = corrHead_ + kCorrLen;
+    }
+
+    /** @brief The correction pending for the sample being emitted (0 when
+     *         none is); frees its slot and moves on to the next sample's. */
+    [[nodiscard]] DSPARK_OSC_INLINE T takeCorrection() noexcept
+    {
+        if (corrEnd_ == 0) return T(0);
+        const auto slot = static_cast<size_t>(corrHead_);
+        const T value = corr_[slot];
+        corr_[slot] = T(0);
+        advanceCorrections(1);
+        return value;
+    }
+
+    /** @brief Moves the head past @p count emitted (and cleared) slots. */
+    DSPARK_OSC_INLINE void advanceCorrections(int count) noexcept
+    {
+        corrHead_ += count;
+        if (corrHead_ >= std::min(corrEnd_, kCorrLen)) [[unlikely]] settleCorrections();
+    }
+
+    /**
+     * @brief Brings the store back to its start once the head has reached
+     *        the end of the pending corrections (none left: nothing to move)
+     *        or the second half of the store (the pending ones move back
+     *        with it).
+     */
+    DSPARK_NOINLINE void settleCorrections() noexcept
+    {
+        const int left = corrEnd_ - corrHead_;
+        if (left > 0)
+        {
+            const auto live = static_cast<size_t>(left);
+            std::copy_n(corr_.data() + corrHead_, live, corr_.data());
+            std::fill_n(corr_.data() + corrHead_, live, T(0));
+        }
+        corrHead_ = 0;
+        corrEnd_ = std::max(left, 0);
+    }
+
+    void clearCorrections() noexcept
+    {
+        if (corrEnd_ != 0)
+            std::fill_n(corr_.data() + corrHead_, static_cast<size_t>(corrEnd_ - corrHead_), T(0));
+        corrHead_ = 0;
+        corrEnd_ = 0;
+    }
+
+    /**
+     * @brief Samples per cycle, 1 / increment, for the edge times.
+     *
+     * A division, kept until the increment changes: a steady pitch pays it
+     * once, and a pitch that moves every sample pays it only at its edges.
+     */
+    [[nodiscard]] Phase samplesPerCycle() noexcept
+    {
+        if (perCycleInc_ != phaseInc_)
+        {
+            perCycleInc_ = phaseInc_;
+            perCycle_ = 1.0 / phaseInc_;
+        }
+        return perCycle_;
     }
 
     /**
@@ -766,8 +1141,7 @@ private:
         const Phase r = slaveInc_ / std::max(phaseInc_, 1e-12);
         slavePhase_ = phase_ * r;
         slavePhase_ -= std::floor(slavePhase_);
-        corr_.fill(T(0));
-        corrHead_ = 0;
+        clearCorrections();
         resetAge_ = { kNoReset, kNoReset };
     }
 
@@ -797,16 +1171,16 @@ private:
      *            updatePhaseInc) or the two correction branches would overlap.
      * @return The polynomial correction value.
      */
-    static inline Phase polyBlep(Phase phase, Phase inc) noexcept
+    static DSPARK_OSC_MSVC_INLINE Phase polyBlep(Phase phase, Phase inc) noexcept
     {
-        if (inc < 1e-10) return 0.0;
+        if (inc < 1e-10) [[unlikely]] return 0.0;
 
-        if (phase < inc)
+        if (phase < inc) [[unlikely]]
         {
             Phase t = phase / inc;
             return t + t - t * t - 1.0;
         }
-        else if (phase > 1.0 - inc)
+        else if (phase > 1.0 - inc) [[unlikely]]
         {
             Phase t = (phase - 1.0) / inc;
             return t * t + t + t + 1.0;
@@ -820,10 +1194,32 @@ private:
         // Defensive Nyquist clamp. setFrequency() already clamps, but prepare()
         // can lower the sample rate afterwards (it re-clamps too), and the
         // T-cast Nyquist bound may round up by an ulp; polyBlep() and the
-        // sync event logic both assume inc <= 0.5.
-        phaseInc_ = std::min(static_cast<Phase>(frequency_) / sampleRate_, 0.5);
+        // sync event logic both assume inc <= 0.5. The increment is kept on
+        // the phase grid (see toGrid()), which makes the accumulator exact.
+        phaseInc_ = toGrid(std::min(static_cast<Phase>(frequency_) * invSampleRate_, 0.5));
+        // The saw's ramp delay (see nextMinBlepSample()), ready for both
+        // render paths.
+        sawDelay_ = static_cast<T>(2.0 * phaseInc_ * blepDelay_);
+        // The slave's values are only read under sync and are worked out,
+        // out of line, when it is asked for: without it (the usual case) a
+        // pitch that changes every sample pays for none of that.
+        if (syncRatio_ > T(1.001)) updateSync();
+        else syncOn_ = false;
+
+        // Only the Triangle reads the normalization, and its solution would
+        // otherwise run on every frequency change of every waveform: a voice
+        // modulating its pitch per sample calls setFrequency() per sample.
+        // setWaveform() and seedTriangle() refresh it when it is next needed,
+        // from the same pure function of the increment.
+        if (waveform_ == Waveform::Triangle) updateTriNorm();
+    }
+
+    /** @brief The slave's increment, the synced square's DC and the sync state
+     *         for the current increment and ratio (see setSyncRatio()). */
+    DSPARK_NOINLINE void updateSync() noexcept
+    {
         const bool wasOn = syncOn_;
-        syncOn_ = syncRatio_ > T(1.001) && phaseInc_ > 0.0;
+        syncOn_ = phaseInc_ > 0.0;
         // Clamp the slave below Nyquist like any oscillator frequency.
         slaveInc_ = std::min(phaseInc_ * static_cast<Phase>(syncRatio_), 0.5);
 
@@ -833,24 +1229,17 @@ private:
         // fractional part f, the +1 time per master cycle exceeds the -1
         // time by min(f, 0.5) - max(f - 0.5, 0) slave cycles.
         syncSquareDc_ = 0.0;
-        if (syncOn_ && phaseInc_ > 0.0)
+        if (syncOn_)
         {
             const Phase r = slaveInc_ / phaseInc_;   // effective (clamped) ratio
             const Phase f = r - std::floor(r);
             syncSquareDc_ = (std::min(f, 0.5) - std::max(f - 0.5, 0.0)) / r;
         }
 
-        // Sync just (re-)engaged: the ring may hold corrections from a
+        // Sync just (re-)engaged: the store may hold corrections from a
         // previous sync run and the slave phase is stale -- re-seed both.
         if (syncOn_ && !wasOn)
             reseedSlave();
-
-        // Only the Triangle reads the normalization, and its std::pow would
-        // otherwise run on every frequency change of every waveform: a voice
-        // modulating its pitch per sample calls setFrequency() per sample.
-        // setWaveform() and seedTriangle() refresh it when it is next needed,
-        // from the same pure function of the increment.
-        if (waveform_ == Waveform::Triangle) updateTriNorm();
     }
 
     /**
@@ -882,14 +1271,7 @@ private:
             }
             else
             {
-                const Phase lnQ = 0.5 * std::log1p(-inc) / inc;
-                const Phase q = std::exp(lnQ);
-                expectedPeak = (1.0 - q) / (1.0 + q);
-                // dp/dinc = dp/dq * q * dlnQ/dinc
-                const Phase dLnQ = 0.5 * (-inc / (1.0 - inc) - std::log1p(-inc)) / (inc * inc);
-                triAnchorInc_ = inc;
-                triAnchorPeak_ = expectedPeak;
-                triAnchorSlope_ = -2.0 / ((1.0 + q) * (1.0 + q)) * q * dLnQ;
+                expectedPeak = solveTrianglePeak(inc);
             }
             triExpectedPeak_ = static_cast<T>(expectedPeak);
             triNorm_ = (expectedPeak > 0.001) ? static_cast<T>(1.0 / expectedPeak) : T(4);
@@ -901,27 +1283,52 @@ private:
         }
     }
 
-    double   sampleRate_ = 48000.0;
-    T        frequency_  = T(440);
+    /** @brief The integrator's exact steady-state peak at @p inc, which
+     *         becomes the anchor of updateTriNorm()'s first-order update. */
+    DSPARK_NOINLINE Phase solveTrianglePeak(Phase inc) noexcept
+    {
+        const Phase lnQ = 0.5 * std::log1p(-inc) / inc;
+        const Phase q = std::exp(lnQ);
+        const Phase expectedPeak = (1.0 - q) / (1.0 + q);
+        // dp/dinc = dp/dq * q * dlnQ/dinc
+        const Phase dLnQ = 0.5 * (-inc / (1.0 - inc) - std::log1p(-inc)) / (inc * inc);
+        triAnchorInc_ = inc;
+        triAnchorPeak_ = expectedPeak;
+        triAnchorSlope_ = -2.0 / ((1.0 + q) * (1.0 + q)) * q * dLnQ;
+        return expectedPeak;
+    }
+
+    // Read or written on every sample: together at the front of the object.
     Phase    phase_      = 0.0;
     Phase    phaseInc_   = 0.0;
     double   triState_   = 0.0;      ///< Leaky-integrator state (double: recursive state rule).
     T        triNorm_    = T(4);
+    T        sawDelay_   = T(0);     ///< 2 * increment * blepDelay_: the saw's ramp delay term.
+    T        pulseWidth_ = T(0.5);   ///< Square duty cycle (setPulseWidth()).
+    T        pulseDc_    = T(0);     ///< 2 * pulseWidth_ - 1, removed from the Square.
+    int      corrHead_   = 0;        ///< Slot of the next output sample (see corr_).
+    int      corrEnd_    = 0;        ///< One past the last slot that may be non-zero (0: none pending).
+    Waveform waveform_   = Waveform::Sine;
+    AntiAliasing antiAliasing_ = AntiAliasing::MinBLEP;
+    bool     syncOn_     = false;
+
+    // Set up by prepare() and the setters.
+    double   sampleRate_ = 48000.0;
+    double   invSampleRate_ = 1.0 / 48000.0;
+    T        nyquist_    = T(24000);
+    T        frequency_  = T(440);
     T        triExpectedPeak_ = T(0.25); ///< Steady-state integrator peak (reset seed).
     Phase    triNormInc_ = -1.0;     ///< Increment the tri norm was computed for (cache key).
     Phase    triAnchorInc_ = -1.0;   ///< Increment the peak was last solved exactly at.
     Phase    triAnchorPeak_ = 0.25;  ///< That exact peak.
     Phase    triAnchorSlope_ = 0.0;  ///< Its derivative with respect to the increment.
-    Waveform waveform_   = Waveform::Sine;
-    AntiAliasing antiAliasing_ = AntiAliasing::MinBLEP;
-    Phase    blepDelay_  = 0.0;          ///< MinBlepTable::dcDelay(), cached by prepare().
+    Phase    blepDelay_  = 0.0;      ///< MinBlepTable::dcDelay(), cached by prepare().
+    Phase    perCycleInc_ = -1.0;    ///< Increment perCycle_ was computed for (cache key).
+    Phase    perCycle_   = 0.0;      ///< 1 / increment (see samplesPerCycle()).
 
     // Hard sync (slave) and minBLEP correction state.
     static constexpr int kCorrLen  = MinBlepTable<T>::kTaps;
-    static constexpr int kCorrMask = kCorrLen - 1;
-    static_assert((kCorrLen & kCorrMask) == 0, "minBLEP ring needs a power-of-two span");
 
-    bool     syncOn_     = false;
     T        syncRatio_  = T(0);
     Phase    slavePhase_ = 0.0;
     Phase    slaveInc_   = 0.0;
@@ -929,10 +1336,18 @@ private:
     static constexpr Phase kNoReset = 1e9;
     std::array<Phase, 2> resetAge_{ kNoReset, kNoReset }; ///< Synced sine: samples since the last two resets.
     std::array<Phase, 2> prePhase_{};  ///< Synced sine: slave phase just before those resets.
-    T        pulseWidth_ = T(0.5);     ///< Square duty cycle (setPulseWidth()).
-    T        pulseDc_    = T(0);       ///< 2 * pulseWidth_ - 1, removed from the Square.
-    std::array<T, kCorrLen> corr_{};   ///< Pending causal minBLEP corrections.
-    int      corrHead_   = 0;          ///< Ring slot of the next output sample.
+    /// Pending causal minBLEP corrections, linear from the head: the one
+    /// for the sample j ahead is corr_[corrHead_ + j], j < kCorrLen, so a
+    /// discontinuity adds its whole kernel as one contiguous run. They end
+    /// before corrEnd_, and every slot outside [corrHead_, corrEnd_) is
+    /// zero; with none pending both are 0 and nothing is read or cleared.
+    /// The head stays below kCorrLen (see settleCorrections()).
+    std::array<T, 2 * kCorrLen> corr_{};
 };
 
 } // namespace dspark
+
+#undef DSPARK_OSC_INLINE
+#undef DSPARK_OSC_OUTLINE
+#undef DSPARK_OSC_MSVC_INLINE
+#undef DSPARK_OSC_ROUNDED

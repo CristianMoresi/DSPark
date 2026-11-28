@@ -2211,6 +2211,10 @@ private:
         }
     };
 
+    /// Most samples renderSources() is asked for at once: one control period
+    /// at the highest oversampling factor (gather() never passes more).
+    static constexpr int kSourceBlock = kControlPeriod * 4;
+
     void renderSources(Voice& v, double* L, double* R, int m) noexcept
     {
         const int pos0 = v.tickPos;
@@ -2246,15 +2250,30 @@ private:
             }
         }
 
-        // Sub-oscillator and noise, centred.
+        // Sub-oscillator and noise, centred. A steady pitch is rendered as a
+        // block (the same samples as one by one, see Oscillator::processBlock).
         if (v.subLevel.live())
-            for (int j = 0; j < m; ++j)
+        {
+            if (v.subFreq.step == 0.0)
             {
-                if (v.subFreq.step != 0.0) v.sub.setFrequency(static_cast<T>(v.subFreq.at(pos0 + j)));
-                const double s = static_cast<double>(v.sub.getNextSample()) * v.subLevel.at(pos0 + j);
-                L[j] += s;
-                R[j] += s;
+                std::array<T, kSourceBlock> wave;   // the first m entries are written
+                v.sub.processBlock(wave.data(), static_cast<size_t>(m));
+                for (int j = 0; j < m; ++j)
+                {
+                    const double s = static_cast<double>(wave[static_cast<size_t>(j)]) * v.subLevel.at(pos0 + j);
+                    L[j] += s;
+                    R[j] += s;
+                }
             }
+            else
+                for (int j = 0; j < m; ++j)
+                {
+                    v.sub.setFrequency(static_cast<T>(v.subFreq.at(pos0 + j)));
+                    const double s = static_cast<double>(v.sub.getNextSample()) * v.subLevel.at(pos0 + j);
+                    L[j] += s;
+                    R[j] += s;
+                }
+        }
         if (v.noiseLevel.live())
             for (int j = 0; j < m; ++j)
             {
@@ -2286,6 +2305,20 @@ private:
                 const auto& fr = uv.freq[static_cast<size_t>(k)];
                 const auto& ms = uv.master[static_cast<size_t>(k)];
                 const bool moving = fr.step != 0.0 || ms.step != 0.0;
+                if (!moving && !(pulse && pw.step != 0.0))
+                {
+                    // Steady pitch and width: the oscillator renders the
+                    // block, the same samples as one by one.
+                    std::array<T, kSourceBlock> wave;   // the first m entries are written
+                    o.processBlock(wave.data(), static_cast<size_t>(m));
+                    for (int j = 0; j < m; ++j)
+                    {
+                        const double s = static_cast<double>(wave[static_cast<size_t>(j)]) * lv.at(pos0 + j);
+                        L[j] += s * uv.gainL;
+                        R[j] += s * uv.gainR;
+                    }
+                    continue;
+                }
                 for (int j = 0; j < m; ++j)
                 {
                     const int pos = pos0 + j;

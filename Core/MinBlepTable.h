@@ -13,10 +13,11 @@
  * fine sub-sample grid and stored as polyphase rows. Oscillator uses it to
  * correct every discontinuity causally (no pre-ring, no look-ahead).
  *
- * Dependencies: FFT.h.
+ * Dependencies: FFT.h, SimdOps.h, detail/BlepKernels.inl.
  */
 
 #include "FFT.h"
+#include "SimdOps.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,7 +26,96 @@
 #include <type_traits>
 #include <vector>
 
+// The block kernels (detail/BlepKernels.inl), once per instruction set: the
+// build's baseline (SSE2, NEON or scalar) and, in x86-64 builds, AVX2 without
+// FMA, selected at run time in baseline builds. Both copies and the scalar
+// loops give the same values bit for bit.
+#if defined(DSPARK_SIMD_SSE2)
+    #define DSPARK_BLEP_SSE2 1
+#elif defined(DSPARK_SIMD_NEON)
+    #define DSPARK_BLEP_NEON 1
+#endif
 namespace dspark {
+namespace detail {
+namespace blep_narrow {
+#include "detail/BlepKernels.inl"
+} // namespace blep_narrow
+} // namespace detail
+} // namespace dspark
+#undef DSPARK_BLEP_SSE2
+#undef DSPARK_BLEP_NEON
+
+#if defined(DSPARK_SIMD_EXACT_AVX2)
+#define DSPARK_BLEP_SSE2 1
+#define DSPARK_BLEP_AVX2 1
+DSPARK_SIMD_EXACT_AVX2_BEGIN
+namespace dspark {
+namespace detail {
+namespace blep_avx2 {
+#include "detail/BlepKernels.inl"
+} // namespace blep_avx2
+} // namespace detail
+} // namespace dspark
+DSPARK_SIMD_EXACT_AVX2_END
+#undef DSPARK_BLEP_SSE2
+#undef DSPARK_BLEP_AVX2
+#endif
+
+namespace dspark {
+namespace detail {
+
+// Each wrapper calls its kernel in the copy in use: the AVX2 one in AVX2
+// builds, the one the run-time check selects in x86-64 baseline builds, the
+// baseline one elsewhere.
+#if defined(DSPARK_SIMD_EXACT_AVX2) && !defined(DSPARK_SIMD_EXACT_AVX2_DISPATCHED)
+    #define DSPARK_BLEP_CALL(kernel, ...) blep_avx2::kernel(__VA_ARGS__)
+#elif defined(DSPARK_SIMD_EXACT_AVX2)
+    #define DSPARK_BLEP_CALL(kernel, ...)                                        \
+        if (simd::isRuntimeDispatchActive()) blep_avx2::kernel(__VA_ARGS__);     \
+        else blep_narrow::kernel(__VA_ARGS__)
+#else
+    #define DSPARK_BLEP_CALL(kernel, ...) blep_narrow::kernel(__VA_ARGS__)
+#endif
+
+/// r[j] += scale * (a[j] + w * (b[j] - a[j])) for j < n.
+template <typename T>
+inline void addBlepRows(const float* a, const float* b, T* r, T scale, T w, int n) noexcept
+{
+    DSPARK_BLEP_CALL(blepAddRows, a, b, r, scale, w, n);
+}
+
+/// out[j] = (T(v0 + j * dv) + ring[j]) - off, then ring[j] = 0, for j < n.
+/// v0 and dv lie on a grid where every v0 + j * dv is exact (see Oscillator).
+template <typename T>
+inline void rampOverBlepRing(T* out, T* ring, int n, double v0, double dv, T off) noexcept
+{
+    DSPARK_BLEP_CALL(blepRampRing, out, ring, n, v0, dv, off);
+}
+
+/// out[j] = T(v0 + j * dv) - off for j < n, on the same grid.
+template <typename T>
+inline void rampMinusOffset(T* out, int n, double v0, double dv, T off) noexcept
+{
+    DSPARK_BLEP_CALL(blepRampOffset, out, n, v0, dv, off);
+}
+
+/// out[j] = T(v0 + j * dv) for j < n, on the same grid.
+template <typename T>
+inline void rampBlock(T* out, int n, double v0, double dv) noexcept
+{
+    DSPARK_BLEP_CALL(blepRamp, out, n, v0, dv);
+}
+
+/// out[j] = (level + ring[j]) - dc, then ring[j] = 0, for j < n.
+template <typename T>
+inline void levelOverBlepRing(T* out, T* ring, int n, T level, T dc) noexcept
+{
+    DSPARK_BLEP_CALL(blepLevelRing, out, ring, n, level, dc);
+}
+
+#undef DSPARK_BLEP_CALL
+
+} // namespace detail
 
 /**
  * @class MinBlepTable
@@ -395,19 +485,13 @@ private:
         const float* a = rows.data() + static_cast<size_t>(q) * kTaps + whole;
         const float* b = a + kTaps;
         const int n = kTaps - whole;
-        // Two contiguous runs around the ring's wrap.
-        const int first = std::min(n, kTaps - (head & (kTaps - 1)));
-        T* r = ring + (head & (kTaps - 1));
-        for (int j = 0; j < first; ++j)
-        {
-            const T ra = static_cast<T>(a[j]);
-            r[j] += scale * (ra + w * (static_cast<T>(b[j]) - ra));
-        }
-        for (int j = first; j < n; ++j)
-        {
-            const T ra = static_cast<T>(a[j]);
-            ring[j - first] += scale * (ra + w * (static_cast<T>(b[j]) - ra));
-        }
+        // Two contiguous runs around the ring's wrap, each on the vector
+        // kernels (the same operations as the scalar form, lane by lane).
+        const int at = head & (kTaps - 1);
+        const int first = std::min(n, kTaps - at);
+        detail::addBlepRows(a, b, ring + at, scale, w, first);
+        if (first < n)
+            detail::addBlepRows(a + first, b + first, ring, scale, w, n - first);
     }
 
     std::vector<float> rows_;       ///< (kPhases + 1) rows of kTaps step residuals.

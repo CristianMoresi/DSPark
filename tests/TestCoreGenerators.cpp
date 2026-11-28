@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -2312,6 +2313,235 @@ DSPARK_TEST(Oscillator_float_phase_keeps_slow_rates_exact)
     const double expected = 48000.0 / static_cast<double>(0.37f);
     std::cout << "  0.37 Hz float saw period error " << (period / expected - 1.0) << "\n";
     EXPECT_NEAR(period / expected, 1.0, 2e-6);
+}
+
+DSPARK_TEST(Oscillator_phase_accumulator_is_exact)
+{
+    // The phase and its increment lie on a grid of 2^-52 of a cycle, where
+    // every addition and wrap is exact: after any number of samples the phase
+    // is the increment times that number, modulo one cycle, with no rounding
+    // at all. An accumulator on arbitrary doubles drifted by about 1e-13 of a
+    // cycle over these runs.
+    constexpr double kGrid = 4503599627370496.0;   // 2^52
+    constexpr std::uint64_t kMask = (std::uint64_t { 1 } << 52) - 1;
+    for (const double f : { 440.0, 0.37, 1234.5678, 9999.99, 23999.0 })
+    {
+        Oscillator<double> osc;
+        osc.prepare(48000.0);
+        osc.setWaveform(Oscillator<double>::Waveform::Saw);
+        osc.setAntiAliasing(Oscillator<double>::AntiAliasing::PolyBLEP);
+        osc.setFrequency(f);
+        osc.reset();
+        const auto step = static_cast<std::uint64_t>(std::min(f * (1.0 / 48000.0), 0.5) * kGrid + 0.5);
+        std::uint64_t units = 0;
+        std::vector<double> block(977);
+        for (int pass = 0; pass < 300; ++pass)
+        {
+            // Sample by sample and in blocks, alternately.
+            if (pass % 2 == 0)
+                for (size_t i = 0; i < block.size(); ++i) (void) osc.getNextSample();
+            else
+                osc.processBlock(block.data(), block.size());
+            units = (units + step * block.size()) & kMask;
+            EXPECT_EQ(osc.getPhase(), static_cast<double>(units) / kGrid);
+        }
+    }
+}
+
+namespace {
+
+// Bits of a sample, so that equality tells +0 from -0 and compares NaNs.
+template <typename T>
+[[nodiscard]] std::uint64_t sampleBits(T v) noexcept
+{
+    if constexpr (sizeof(T) == sizeof(std::uint32_t))
+        return std::bit_cast<std::uint32_t>(v);
+    else
+        return std::bit_cast<std::uint64_t>(v);
+}
+
+// Renders the same stream twice, one oscillator sample by sample and one
+// through processBlock() in blocks of varying length, with the same parameter
+// changes between blocks, and counts the samples that differ in any bit.
+template <typename T>
+[[nodiscard]] long oscillatorBlockMismatches(typename Oscillator<T>::Waveform wave,
+                                             typename Oscillator<T>::AntiAliasing mode,
+                                             double sampleRate, double frequency, double width,
+                                             double syncRatio, bool modulate)
+{
+    Oscillator<T> single, blocked;
+    for (auto* o : { &single, &blocked })
+    {
+        o->prepare(sampleRate);
+        o->setWaveform(wave);
+        o->setAntiAliasing(mode);
+        o->setPulseWidth(static_cast<T>(width));
+        o->setFrequency(static_cast<T>(frequency));
+        o->setSyncRatio(static_cast<T>(syncRatio));
+        o->reset();
+    }
+    // Short and long blocks; below 1 Hz a stretch between discontinuities
+    // outlasts the longest one processBlock() writes at once.
+    static constexpr int kLengths[] = { 1, 2, 3, 5, 8, 16, 17, 64, 129, 300, 4, 1000, 7, 31, 9000 };
+    std::vector<T> a, b;
+    long bad = 0;
+    int step = 0;
+    for (int round = 0; round < 2; ++round)
+        for (const int n : kLengths)
+        {
+            if (n > 1000 && frequency >= 1.0) continue;
+            if (modulate)
+            {
+                // A new pitch, width or phase before some of the blocks.
+                ++step;
+                const auto f = static_cast<T>(frequency * (1.0 + 0.3 * std::sin(0.7 * step)));
+                const auto w = static_cast<T>(std::clamp(width + 0.2 * std::sin(1.3 * step), 0.02, 0.98));
+                for (auto* o : { &single, &blocked })
+                {
+                    if (step % 3 == 0) o->setFrequency(f);
+                    if (step % 4 == 1) o->setPulseWidth(w);
+                    if (step % 11 == 5) o->setPhase(static_cast<T>(0.37));
+                }
+            }
+            a.assign(static_cast<size_t>(n), T(0));
+            b.assign(static_cast<size_t>(n), T(0));
+            for (auto& v : a) v = single.getNextSample();
+            blocked.processBlock(b.data(), b.size());
+            for (size_t i = 0; i < a.size(); ++i)
+                if (sampleBits(a[i]) != sampleBits(b[i])) ++bad;
+            // The state too: the next single sample of each agrees.
+            if (sampleBits(single.getNextSample()) != sampleBits(blocked.getNextSample())) ++bad;
+            if (sampleBits(single.getPhase()) != sampleBits(blocked.getPhase())) ++bad;
+        }
+    if (bad != 0)
+        std::cout << "  block differs: wave " << static_cast<int>(wave) << " mode " << static_cast<int>(mode)
+                  << " rate " << sampleRate << " f " << frequency << " width " << width << " sync " << syncRatio
+                  << " modulated " << modulate << " bytes " << sizeof(T) << ": " << bad << "\n";
+    return bad;
+}
+
+template <typename T>
+[[nodiscard]] long oscillatorBlockMismatchesOverTheRange()
+{
+    using WF = typename Oscillator<T>::Waveform;
+    using AA = typename Oscillator<T>::AntiAliasing;
+    long bad = 0;
+    for (const WF wave : { WF::Sine, WF::Saw, WF::Square, WF::Triangle })
+        for (const AA mode : { AA::MinBLEP, AA::PolyBLEP })
+            for (const double rate : { 48000.0, 44100.0 })
+                for (const double f : { 0.0, 0.37, 27.5, 440.0, 1234.5678, 5000.0, 11000.0, 19000.0, 23990.0 })
+                    for (const double width : { 0.5, 0.07, 0.93 })
+                    {
+                        if (width != 0.5 && wave != WF::Square) continue;
+                        bad += oscillatorBlockMismatches<T>(wave, mode, rate, f, width, 0.0, false);
+                        bad += oscillatorBlockMismatches<T>(wave, mode, rate, f, width, 0.0, true);
+                    }
+    // Hard sync goes through the per-sample path inside processBlock().
+    for (const WF wave : { WF::Sine, WF::Saw, WF::Square, WF::Triangle })
+        bad += oscillatorBlockMismatches<T>(wave, AA::MinBLEP, 48000.0, 330.0, 0.3, 2.7, true);
+    return bad;
+}
+
+} // namespace
+
+// processBlock() writes the stretches between discontinuities in closed form
+// with vector kernels; it must return what getNextSample() returns, bit for
+// bit, for every waveform, correction, pitch (0 Hz to Nyquist), pulse width
+// and block length, with parameters changing between blocks, on both kernel
+// sets (each compared with its own per-sample path).
+DSPARK_TEST(Oscillator_processBlock_matches_getNextSample_bit_for_bit)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    for (const bool vectorWide : { true, false })
+    {
+        simd::setRuntimeDispatch(vectorWide && dispatch);
+        EXPECT_EQ(oscillatorBlockMismatchesOverTheRange<float>(), 0L);
+        EXPECT_EQ(oscillatorBlockMismatchesOverTheRange<double>(), 0L);
+    }
+    simd::setRuntimeDispatch(dispatch);
+}
+
+// The vector kernels behind MinBlepTable::addStep() and processBlock() perform
+// their scalar loops' operations lane by lane: the same bits for every length
+// (whole vectors, their remainders, nothing at all) on both kernel sets.
+DSPARK_TEST(MinBlepTable_block_kernels_match_their_scalar_loops)
+{
+    const bool dispatch = simd::isRuntimeDispatchActive();
+    uint32_t seed = 0x1234567u;
+    const auto uniform = [&seed]() noexcept {
+        seed = seed * 1664525u + 1013904223u;
+        return static_cast<double>(seed >> 8) * (1.0 / 16777216.0) * 2.0 - 1.0;
+    };
+    constexpr double kGrid = 4503599627370496.0;   // 2^52
+    long bad = 0;
+    for (const bool vectorWide : { true, false })
+    {
+        simd::setRuntimeDispatch(vectorWide && dispatch);
+        for (int n = 0; n <= 41; ++n)
+        {
+            const auto count = static_cast<size_t>(n);
+            std::vector<float> rowA(count), rowB(count);
+            for (auto& v : rowA) v = static_cast<float>(uniform());
+            for (auto& v : rowB) v = static_cast<float>(uniform());
+            const auto scale = uniform() * 2.0, w = 0.5 + 0.5 * uniform();
+            // A ramp on the phase grid, as the oscillator passes it.
+            const double v0 = std::floor(uniform() * 0.4 * kGrid) / kGrid;
+            const double dv = std::floor((0.5 + 0.5 * uniform()) * 0.01 * kGrid) / kGrid;
+            const auto each = [&](auto zero) {
+                using S = decltype(zero);
+                (void) zero;
+                std::vector<S> start(count);
+                for (auto& v : start) v = static_cast<S>(uniform());
+                const auto differ = [&](const std::vector<S>& x, const std::vector<S>& y) {
+                    for (size_t i = 0; i < count; ++i)
+                        if (sampleBits(x[i]) != sampleBits(y[i])) ++bad;
+                };
+
+                std::vector<S> ring = start, expected = start;
+                detail::addBlepRows(rowA.data(), rowB.data(), ring.data(), static_cast<S>(scale), static_cast<S>(w), n);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    // One operation per statement (no fused multiply-add).
+                    const S ra = static_cast<S>(rowA[i]);
+                    const S slope = static_cast<S>(w) * (static_cast<S>(rowB[i]) - ra);
+                    const S value = ra + slope;
+                    const S scaled = static_cast<S>(scale) * value;
+                    expected[i] += scaled;
+                }
+                differ(ring, expected);
+
+                const auto off = static_cast<S>(0.01 * uniform());
+                std::vector<S> out(count), want(count);
+                ring = start;
+                detail::rampOverBlepRing(out.data(), ring.data(), n, v0, dv, off);
+                for (size_t i = 0; i < count; ++i)
+                    want[i] = (static_cast<S>(v0 + static_cast<double>(i) * dv) + start[i]) - off;
+                differ(out, want);
+                differ(ring, std::vector<S>(count, S(0)));
+
+                detail::rampBlock(out.data(), n, v0, dv);
+                for (size_t i = 0; i < count; ++i)
+                    want[i] = static_cast<S>(v0 + static_cast<double>(i) * dv);
+                differ(out, want);
+
+                detail::rampMinusOffset(out.data(), n, v0, dv, off);
+                for (size_t i = 0; i < count; ++i)
+                    want[i] = static_cast<S>(v0 + static_cast<double>(i) * dv) - off;
+                differ(out, want);
+
+                ring = start;
+                detail::levelOverBlepRing(out.data(), ring.data(), n, S(-1), off);
+                for (size_t i = 0; i < count; ++i)
+                    want[i] = (S(-1) + start[i]) - off;
+                differ(out, want);
+                differ(ring, std::vector<S>(count, S(0)));
+            };
+            each(0.0f);
+            each(0.0);
+        }
+    }
+    simd::setRuntimeDispatch(dispatch);
+    EXPECT_EQ(bad, 0L);
 }
 
 // ============================================================================
